@@ -3973,10 +3973,11 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  * the shed doesn't help, and the breaker stops at its rewind cap. The 413 arm
  * takes both labels membranes have given a 413, invalid_request and
  * context_length (see the notes below). Other statuses keep the history,
- * since a shed takes the exchange out of the agent's context for good (the
- * record keeps it, and no later start, restart or redo of another turn
- * presents it again), and the status gives no sign that a shed
- * would help: a 404 is a model or an endpoint that doesn't exist, and 405,
+ * since a shed takes the exchange out of the agent's context for good
+ * (presented mode keeps it in the record, but legacy mode deletes it; no
+ * later start, restart or redo of another turn presents it again), and the
+ * status gives no sign that a shed would help: a 404 is a model or an endpoint
+ * that doesn't exist, and 405,
  * 409, 410 and 415 are about the HTTP request or the resource, as a rule,
  * rather than the conversation.
  *
@@ -15324,7 +15325,8 @@ export class AgentFramework {
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
       `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
-      (this.presents(agent) ? `and the originals remain in the raw record. ` : `and the originals were removed from the raw record. `) +
+      (reuse ? `Raw-record retention may differ between omissions; consult the host logs. `
+        : this.presents(agent) ? `and the originals remain in the raw record. ` : `and the originals were removed from the raw record. `) +
       `You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
@@ -15723,9 +15725,10 @@ export class AgentFramework {
     }
 
     // unstick: force the refusal-rewind loop on demand (even if the agent's
-    // autoRewind toggle is off). Redacts the turn that fed the refusal and
-    // re-runs, up to `cap` times, until the model stops refusing. Kicks the
-    // loop and returns immediately; the outcome (what was shed + whether it
+    // autoRewind toggle is off). Removes the newest eligible complete body,
+    // not necessarily the refusal's cause; unsupported plans stop unchanged.
+    // Re-runs supported removals up to `cap` times until the model stops refusing.
+    // Kicks the loop and returns immediately; the outcome (what was shed + whether it
     // cleared) is posted to the channel when the chain resolves.
     if (params.command === 'unstick') {
       const agent = this.agents.get(agentName)!;
@@ -24805,6 +24808,8 @@ export class AgentFramework {
   }
 
   private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
+    // A no-progress failure must not inherit an earlier deferred snapshot.
+    this.exhaustedTurns?.delete(agent.name);
     const callsCutOff = (routing.unflushedRounds ?? 0) > 0;
     if (gotPartway(routing)) {
       this.exhaustedTurns?.set(agent.name, {
@@ -29435,6 +29440,7 @@ export class AgentFramework {
     // Resolve terminal waiters in that same settled callback: an ephemeral
     // caller may dispose its agent as soon as the waiter resolves.
     let exhaustedAtEnd: ((history?: CompiledHistory) => void) | undefined;
+    let exhaustedTurnAtEnd: unknown;
     let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
@@ -30985,6 +30991,7 @@ export class AgentFramework {
               }
             } else {
               this.noteFailedTurnEnd(agent, streamRouting);
+              exhaustedTurnAtEnd = this.exhaustedTurns.get(agent.name);
               exhaustedAtEnd = (history) => {
                 this.settleAgent(agent.name, {
                   stopReason: 'exhausted',
@@ -31008,6 +31015,7 @@ export class AgentFramework {
               // delivery is hung; they cannot quarantine history in any case.
               const classification = this.classifyInferenceError(err);
               if (!shedMayHelp(classification.errorType, classification.httpStatus)) {
+                this.eventGate?.onInferenceEnded(agent.name);
                 exhaustedAtEnd();
                 exhaustedAtEnd = undefined;
               }
@@ -31385,6 +31393,7 @@ export class AgentFramework {
         return;
       }
       this.noteFailedTurnEnd(agent, streamRouting);
+      exhaustedTurnAtEnd = this.exhaustedTurns.get(agent.name);
       exhaustedAtEnd = (history) => {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
@@ -31403,6 +31412,7 @@ export class AgentFramework {
       };
       const classification = this.classifyInferenceError(err);
       if (!shedMayHelp(classification.errorType, classification.httpStatus)) {
+        this.eventGate?.onInferenceEnded(agent.name);
         exhaustedAtEnd();
         exhaustedAtEnd = undefined;
       }
@@ -31585,6 +31595,23 @@ export class AgentFramework {
       const handedOffTurnOver = preserveEventGateForSuccessor && !this.hasTurn(agent.name);
       if (frameReachedTerminal || handedOffTurnOver) this.presentAtEndOf(agent);
 
+      // Close the exhausted logical turn before checking its draft notices.
+      // Otherwise openLogical still names streamRouting and skips settlement.
+      if (exhaustedAtEnd) {
+        // Delivery/notification listeners may have started a successor while
+        // this frame settled. A stale attempt must never recover its history
+        // or answer a replacement forced session.
+        if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId
+          && !this.activeTurnTokens.has(agent.name)
+          && this.forcedRewind?.get(agent.name) === myForcedRewind) {
+          exhaustedAtEnd(settled ? compiledHistory : undefined);
+        } else {
+          // Drop only this failed turn's snapshot, never a successor's.
+          if (this.exhaustedTurns.get(agent.name) === exhaustedTurnAtEnd) this.exhaustedTurns.delete(agent.name);
+          console.error(`[inference-rewind] agent=${agent.name} stopped: terminal ownership changed while stream settled.`);
+        }
+      }
+
       // The logical turn has ended and its notices are written: record the
       // drafts they name as noticed (the store is synced first). A stream
       // whose logical turn is still open leaves its drafts to the stream
@@ -31595,19 +31622,6 @@ export class AgentFramework {
           this.settleTurnDrafts(agent, streamRouting);
         } catch (err) {
           console.error('[drafts] turn-end settlement failed:', err);
-        }
-      }
-
-      if (exhaustedAtEnd) {
-        // Delivery/notification listeners may have started a successor while
-        // this frame settled. A stale attempt must never recover its history
-        // or answer a replacement forced session.
-        if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId
-          && !this.activeTurnTokens.has(agent.name)
-          && this.forcedRewind?.get(agent.name) === myForcedRewind) {
-          exhaustedAtEnd(settled ? compiledHistory : undefined);
-        } else {
-          console.error(`[inference-rewind] agent=${agent.name} stopped: terminal ownership changed while stream settled.`);
         }
       }
 
@@ -36389,7 +36403,7 @@ export class AgentFramework {
           // Settled stream failures are reported after teardown with a witness.
           console.error(`[inference-rewind] agent=${agent.name} stopped: active stream. Wait for stream and tool work to settle, then retry.`);
         } else if (!history) {
-          console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable. Manual repair needed.`);
+          console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable or stream/delivery settlement uncertain. Quarantine skipped; inspect the failure before retrying.`);
         } else {
           let sameBranch = false;
           try { sameBranch = branchKey(agent.getContextManager().currentBranchRef()) === history.branch; }
@@ -36446,7 +36460,7 @@ export class AgentFramework {
     }
 
     if (!carried) {
-      console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable. Manual repair needed.`);
+      console.error(`[inference-rewind] agent=${agent.name} stopped: failed compile history unavailable or stream/delivery settlement uncertain. Quarantine skipped; inspect the failure before retrying.`);
       return;
     }
     // Exhaustion has no ownership exception: queued/held turns also block.

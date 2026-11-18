@@ -790,6 +790,12 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         exhaustionRewinds: Map<string, number>;
         pendingRequests: Array<{ reason: string }>;
       };
+      let retryBudget: number | undefined;
+      const streamYielding = r.membrane.streamYielding.bind(r.membrane);
+      r.membrane.streamYielding = (request) => {
+        if (r.membrane.calls.length === 3) retryBudget = internal.exhaustionRewinds.get('resident');
+        return streamYielding(request);
+      };
       const streaks: number[] = [];
       const answeredBefore: number[] = [];
       let answered = 0;
@@ -824,6 +830,11 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0);
         assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), true);
         assert.equal(r.membrane.calls.length, 4, 'one repaired retry was run');
+        assert.equal(retryBudget, 1, 'the confirmed removal spent a step before the retry began');
+        const repaired = JSON.stringify(r.membrane.calls[3].messages);
+        assert.doesNotMatch(repaired, /"text":"third"/, 'the retry omits the quarantined input');
+        assert.match(repaired, /The 1 most recent/, 'the repaired request carries the rewind notice');
+
         assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false);
         assert.equal(calls.length, 3, 'all call endpoints retained');
         assert.equal(results.length, 3, 'all result endpoints retained');

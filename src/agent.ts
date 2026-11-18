@@ -238,9 +238,13 @@ export function assertAgentSwitches(config: AgentConfig): void {
     assertBooleanSetting(
       `${agent} refusalHandling.autoRewind`,
       config.refusalHandling.autoRewind,
-      'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' +
+      'true removes the newest eligible complete body on refusal and retries only supported plans, ' +
         'and false or leaving it out doesn\'t',
     );
+    const maxRewinds = config.refusalHandling.maxRewinds;
+    if (maxRewinds != null && (typeof maxRewinds !== 'number' || !Number.isFinite(maxRewinds))) {
+      throw new Error(`${agent} refusalHandling.maxRewinds must be a finite number`);
+    }
   }
   assertBooleanSetting(
     `${agent} toolResultGuard`,

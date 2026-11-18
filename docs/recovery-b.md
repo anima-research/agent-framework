@@ -108,8 +108,9 @@ malformed-history repair, storage format or CM API is part of this change.
 
 The rewind **step count** is bounded; snapshot time and memory are not.
 The cap does not preserve a minimum history: even one step can remove all
-eligible conversational content when only one eligible body remains. Every
-plan, including `/unstick` preflight and a plan that ultimately declines, calls
+eligible conversational content when only one eligible body remains. After the
+guard and live-turn checks pass, each plan, including `/unstick` preflight and
+plans that later decline, calls
 `getAllMessages()` and examines raw bodies, including held/unpresented endpoints.
 This can inflate every historical image/blob even for a tiny presented window.
 CM caches may make a warm read cheap; they do not impose a recovery memory cap.
@@ -180,7 +181,8 @@ result, replay a possibly side-effecting tool, or delete just one endpoint.
    branches. If IDs, ownership or closure are uncertain, keep the backup and
    ask the maintainer to repair the snapshot; do not guess.
 3. For a verified trailing call-only body with nothing after it, have the
-   exclusive maintenance process use CM's whole-body `retractRows` on the
+   exclusive maintenance process use CM's whole-body
+   `cm.retractRows([head], { undone: true })` on the
    affected presented window. Do not use normal whole-turn `/undo`: it requires
    a presented window and can retract earlier exchanges and notices as well.
    For legacy raw history, only a verified exact contiguous whole-body interval
@@ -198,8 +200,9 @@ result, replay a possibly side-effecting tool, or delete just one endpoint.
 
 Marker limits: the consolidated count advances when the marker write succeeds,
 not at the removal commit, so a later marker can understate prior removals after
-a cleanup/marker failure. A marker also describes the current window mode; it
-is not a per-step raw-retention audit if modes change mid-episode. Its metadata
+a cleanup/marker failure. An initial marker describes its window mode; a
+consolidated marker makes no aggregate raw-retention claim, since modes can
+change between omissions. Its metadata
 records the initial count/category/cause; consolidation edits only the text,
 so metadata is not a current aggregate either. Consult the
 backed-up store and failure logs for repair, not the marker alone. Forced-session

@@ -67,7 +67,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { residents?: string[]; dir?: string; failWriteDown?: boolean; autoRewind?: boolean; observes?: string[]; seed?: (cm: ContextManager) => void } = {}) {
+async function boot(opts: { gate?: boolean; residents?: string[]; dir?: string; failWriteDown?: boolean; autoRewind?: boolean; observes?: string[]; seed?: (cm: ContextManager) => void } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'af-shed-window-'));
   if (!opts.dir) dirs.push(dir);
   const storePath = join(dir, 'store.chronicle');
@@ -99,6 +99,7 @@ async function boot(opts: { residents?: string[]; dir?: string; failWriteDown?: 
       membrane: membrane.asMembrane(),
       agents: residents.map((name) => ({ name, ...(name === 'mira' && opts.observes ? { observes: opts.observes } : {}), model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', refusalHandling: { autoRewind: opts.autoRewind ?? false, maxRewinds: 1 }, proseRouting: 'disabled' })),
       modules: [new SurfaceModule()],
+      ...(opts.gate ? { gate: { config: { policies: [], default: 'skip' }, onboarding: false } } : {}),
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
       exhaustedTurnRearmMs: false,
       syncIntervalMs: 0,
@@ -556,12 +557,29 @@ for (const caller of ['auto', 'forced', 'exhaustion'] as const) {
   });
 }
 
-for (const legacy of [false, true]) for (const supported of [false, true]) it(`registered provider 400 recovers only a complete failed exchange after stream settlement (legacy:${legacy}, supported:${supported})`, async (t) => {
+for (const legacy of [false, true]) for (const supported of [false, true]) for (const sharded of supported ? [false, true] : [false]) it(`registered provider 400 recovers only a complete failed exchange after stream settlement (legacy:${legacy}, supported:${supported}, sharded:${sharded})`, async (t) => {
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot({ failWriteDown: legacy });
-  const call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('a')]);
-  const result = storeOwnRow(h.agent('mira'), 'user', [resultBlock(supported ? 'a' : 'wrong')]);
+  const cm = h.cm('mira');
+  const store = (cm as any).messageStore;
+  const endpoints: MessageId[] = sharded ? [
+    store.append('mira', [{ type: 'thinking', thinking: '', signature: 'compiled-head-signature' }], {}, undefined, { bodyGroupId: 'compiled-call', shardIndex: 0 }).id,
+    store.append('mira', [callBlock('a')], {}, undefined, { bodyGroupId: 'compiled-call', shardIndex: 1 }).id,
+    store.append('user', [text('compiled-result-head')], {}, undefined, { bodyGroupId: 'compiled-result', shardIndex: 0 }).id,
+    store.append('user', [resultBlock('a')], {}, undefined, { bodyGroupId: 'compiled-result', shardIndex: 1 }).id,
+  ] : [
+    storeOwnRow(h.agent('mira'), 'mira', [callBlock('a')]),
+    storeOwnRow(h.agent('mira'), 'user', [resultBlock(supported ? 'a' : 'wrong')]),
+  ];
+  const call = endpoints[0], result = endpoints[sharded ? 2 : 1];
+  if (sharded && !legacy) cm.presentRows([call, result]);
+  let carriedAtRecovery: ReadonlySet<MessageId> | undefined;
+  const quarantine = h.internals.quarantinePoisonedHistory.bind(h.internals);
+  h.internals.quarantinePoisonedHistory = (agent, reason, carried) => {
+    carriedAtRecovery = new Set(carried);
+    return quarantine(agent, reason, carried);
+  };
   const notice = storeOwnRow(h.agent('mira'), 'user', [text('error-stream-one-shot')], { system: true });
   const original = h.membrane.streamYielding.bind(h.membrane);
   const requests: string[] = [];
@@ -592,7 +610,9 @@ for (const legacy of [false, true]) for (const supported of [false, true]) it(`r
     await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === i + 1
       && !fw.logicalTurnAlive(h.agent('mira')), 'registered failure and teardown');
   }
-  await h.framework.runUntilIdle();
+  if (supported) await until(() => requests.length === 4
+    && h.traces.some((e) => e.type === 'inference:completed')
+    && !fw.logicalTurnAlive(h.agent('mira')), 'repaired request completed and tore down');
   assert.equal(closed, 3);
   assert.equal(requests.length, supported ? 4 : 3, 'only a ready whole plan queues a repaired retry');
   assert.ok(lines.some((line) => line.includes(supported ? 'auto-quarantined' : 'unsupported: missing or ambiguous call body')));
@@ -606,7 +626,13 @@ for (const legacy of [false, true]) for (const supported of [false, true]) it(`r
     assert.match(requests[3], /error-stream-one-shot/);
     assert.match(requests[3], /The 1 most recent/);
   }
-  for (const id of [call, result]) {
+  if (sharded) {
+    assert.ok(carriedAtRecovery, 'the failed compile reaches real quarantine');
+    assert.ok(carriedAtRecovery.has(call) && carriedAtRecovery.has(result), 'real compile provenance names both body heads');
+    assert.equal(carriedAtRecovery.has(endpoints[1]), false, 'the call ID lives in a later shard, not the provenance head');
+    assert.equal(carriedAtRecovery.has(endpoints[3]), false, 'the result ID lives in a later shard, not the provenance head');
+  }
+  for (const id of endpoints) {
     if (legacy) assert.equal(h.cm('mira').getMessage(id) === null, supported);
     else assert.equal(h.cm('mira').windowStatusOf(id), supported ? 'undone' : 'in');
   }
@@ -628,10 +654,17 @@ for (const legacy of [false, true]) it(`observed transcript calls cannot poison 
   assert.ok(h.cm('mira').getMessage(foreign));
   h.framework.start();
   assert.equal(h.framework.nudgeAgent('mira').ok, true);
-  await h.framework.runUntilIdle();
+  await until(() => h.membrane.callsFor('mira').length === 1
+    && h.traces.some((e) => e.type === 'inference:completed')
+    && !(h.framework as any).logicalTurnAlive(h.agent('mira')), 'observing request completed and tore down');
   const messages = h.membrane.callsFor('mira')[0]!.messages;
   const nativeCalls = messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use');
   assert.equal(nativeCalls.length, legacy ? 2 : 1, 'presented observations are transcript text; legacy observations stay raw');
+  if (!legacy) {
+    const prose = messages.flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as any).text).join('\n');
+    assert.match(prose, /shell/, 'the observed call actually appears as transcript text');
+    assert.match(prose, /shell called/, 'the foreign call was rendered, not silently dropped');
+  }
 });
 
 it('refused-reply cleanup failure accounts for removal but stops before marker/retry', async () => {
@@ -1532,7 +1565,8 @@ for (const legacy of [false, true]) it(`live and terminal-but-unsettled streams 
     assert.equal(h.traces.filter((e) => e.type === 'inference:exhausted').length, 0);
   } finally { fail(); finish(); }
   await until(() => h.traces.some((e) => e.type === 'inference:exhausted') && !fw.logicalTurnAlive(h.agent('mira')), 'settled terminal recovers');
-  await h.framework.runUntilIdle();
+  await until(() => attempts === 2 && h.traces.some((e) => e.type === 'inference:completed')
+    && !fw.logicalTurnAlive(h.agent('mira')), 'live-stream control repaired request completed');
   assert.equal(attempts, 2);
   assert.equal(h.internals.exhaustionRewinds.get('mira'), 0, 'completed repaired retry resets the episode');
 });
@@ -1599,7 +1633,7 @@ it('confirmed legacy removal reconciles other windows before stopping on a branc
   assert.equal(h.internals.pendingRequests.length, 0);
 });
 
-it('an old settled failure cannot quarantine after a successor stream already completed', async (t) => {
+for (const newerSnapshot of [false, true]) it(`an old settled failure cannot quarantine after a successor stream already completed (newer snapshot:${newerSnapshot})`, async (t) => {
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot();
@@ -1617,6 +1651,8 @@ it('an old settled failure cannot quarantine after a successor stream already co
       provideToolResults() { throw new Error('not waiting'); }, cancel() { release(); },
       async *[Symbol.asyncIterator]() {
         await Promise.resolve();
+        // Model a finished earlier round; noteFailedTurnEnd records its real snapshot.
+        fw.openLogical.get('mira').roundsRan = true;
         try { yield { type: 'error', error } as StreamEvent; }
         finally { returning = true; await closing; }
       },
@@ -1626,6 +1662,8 @@ it('an old settled failure cannot quarantine after a successor stream already co
   try {
     assert.equal(h.framework.nudgeAgent('mira').ok, true);
     await until(() => returning, 'old iterator finishing');
+    const oldSnapshot = fw.exhaustedTurns.get('mira');
+    assert.equal(oldSnapshot?.roundsRan, true);
     const generation = h.agent('mira').streamId;
     // Framework restart/handoff seam: a newer generation can finish while
     // an older physical stream is still unwinding. No forged exhaustion.
@@ -1634,8 +1672,11 @@ it('an old settled failure cannot quarantine after a successor stream already co
       && !fw.logicalTurnAlive(h.agent('mira')), 'successor completed');
     assert.notEqual(h.agent('mira').streamId, generation);
     fw.consecutiveInferenceFailures.set('mira', 2);
+    const replacement = { roundsRan: false, callsCutOff: true, liveSpeech: false, speechRouting: false };
+    if (newerSnapshot) fw.exhaustedTurns.set('mira', replacement);
     release();
     await until(() => lines.some((line) => line.includes('terminal ownership changed while stream settled')), 'stale terminal declined');
+    assert.equal(fw.exhaustedTurns.get('mira'), newerSnapshot ? replacement : undefined, 'only the old snapshot is discarded');
     assert.equal(h.cm('mira').windowStatusOf(poison), 'in');
     assert.equal(h.internals.exhaustionRewinds.get('mira') ?? 0, 0);
     assert.equal(h.internals.rewindEpisode.size, 0);
@@ -1659,4 +1700,75 @@ for (const legacy of [false, true]) for (const foreign of [false, true]) it(`too
   // The eligible result lends closure, so this reaches endpoint ownership /
   // audience validation, not the earlier incomplete-results guard.
   assertDecline(h, new Set([call]), 'hidden content or marker in tool body');
+});
+
+it('a consolidated marker makes no aggregate raw-retention claim', async () => {
+  const h = await boot({ failWriteDown: true });
+  const cm = h.cm('mira');
+  h.internals.updateRewindMarker(h.agent('mira'), 'legacy');
+  assert.match(textOf(cm.getAllMessages().at(-1)!), /originals were removed from the raw record/);
+  cm.presentRows(cm.getAllMessages().map((m) => m.id));
+  assert.equal(cm.windowMode(), 'presented');
+  h.internals.updateRewindMarker(h.agent('mira'), 'presented');
+  const marker = textOf(cm.getPresentedMessages().at(-1)!);
+  assert.match(marker, /The 2 most recent/);
+  assert.doesNotMatch(marker, /originals remain|originals were removed/);
+  assert.match(marker, /retention may differ/);
+});
+
+it('a non-qualifying failure releases the inference gate before its policy event, even while iterator return waits', async () => {
+  const h = await boot({ gate: true });
+  const fw = h.framework as any;
+  let release!: () => void;
+  const closing = new Promise<void>((r) => { release = r; });
+  let returning = false;
+  let inferringAtEmit: string[] | undefined;
+  fw.errorPolicy.onInferenceError = () => ({ retry: false, emit: { type: 'test:failure-control', source: 'test' } });
+  const pushEvent = h.framework.pushEvent.bind(h.framework);
+  h.framework.pushEvent = (event) => {
+    if (event.type === 'test:failure-control') inferringAtEmit = fw.eventGate.inferenceDiagnostics().inferring;
+    return pushEvent(event);
+  };
+  h.membrane.streamYielding = () => ({
+    isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+    provideToolResults() {}, cancel() { release(); },
+    async *[Symbol.asyncIterator]() {
+      assert.deepEqual(fw.eventGate.inferenceDiagnostics().inferring, ['mira']);
+      try { yield { type: 'error', error: new MembraneError({ type: 'server', retryable: false, httpStatus: 500, message: 'outage' } as never) } as StreamEvent; }
+      finally { returning = true; await closing; }
+    },
+  } as any);
+  h.framework.start();
+  try {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => returning && inferringAtEmit !== undefined, 'policy event emitted before iterator return');
+    assert.deepEqual(inferringAtEmit, [], 'policy work is not buffered behind the failed inference');
+  } finally { release(); }
+  await until(() => !fw.logicalTurnAlive(h.agent('mira')), 'outage stream tore down');
+});
+
+it('an unclean iterator with compile provenance reports uncertain settlement without asserting history damage', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  const h = await boot();
+  const poison = storeOwnRow(h.agent('mira'), 'user', [text('unclean-stream-history')]);
+  const fw = h.framework as any;
+  fw.consecutiveInferenceFailures.set('mira', 2);
+  h.membrane.streamYielding = () => ({
+    isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+    provideToolResults() {}, cancel() {},
+    async *[Symbol.asyncIterator]() {
+      throw new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: 'unclean iterator' } as never);
+    },
+  } as any);
+  h.framework.start();
+  assert.equal(h.framework.nudgeAgent('mira').ok, true);
+  await until(() => h.traces.some((e) => e.type === 'inference:exhausted')
+    && !fw.logicalTurnAlive(h.agent('mira')), 'unclean stream ended');
+  const stop = lines.find((line) => line.includes('stopped: failed compile history unavailable'));
+  assert.match(stop ?? '', /stream\/delivery settlement uncertain/);
+  assert.doesNotMatch(stop ?? '', /Manual repair needed/);
+  assert.equal(h.cm('mira').windowStatusOf(poison), 'in');
+  assert.equal(h.internals.exhaustionRewinds.size, 0);
+  assert.equal(h.internals.pendingRequests.length, 0);
 });
