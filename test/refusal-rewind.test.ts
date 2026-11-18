@@ -147,15 +147,19 @@ class Surface implements Module {
   getTools(): ToolDefinition[] { return [{ name: 'look', description: 'Look at something.', inputSchema: { type: 'object', properties: {} } }]; }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     if (this.heardWhileLooking) {
+      let off!: () => void;
       const heard = new Promise<void>((resolve) => {
-        const off = this.framework!.onTrace((trace) => {
+        off = this.framework!.onTrace((trace) => {
           if (trace.type === 'message:added' && (trace as { source?: string }).source === 'external-message') { off(); resolve(); }
         });
       });
       this.framework!.pushEvent({ type: 'external-message', source: 'tui', content: this.heardWhileLooking, metadata: {}, triggerInference: false } as never);
       let bound: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([heard, new Promise((r) => { bound = setTimeout(r, 5000); })]);
-      clearTimeout(bound);
+      try {
+        await Promise.race([heard, new Promise<never>((_, reject) => {
+          bound = setTimeout(() => reject(new Error('injected message was not observed during the tool call')), 5000);
+        })]);
+      } finally { clearTimeout(bound); off(); }
     }
     return { success: true, data: 'what the tool saw' };
   }

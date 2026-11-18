@@ -781,8 +781,9 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         }),
       }) as StreamEvent;
       // Both ID layouts are complete. Unlike the published pre-stream-only
-      // behavior, the finished terminal can now recover its compiled history.
-      // The just-produced tool round is outside that witness and stays intact.
+      // behavior, the finished terminal recovers the exact failed request.
+      // Its just-submitted round is carried too: shed that newest exchange,
+      // not the older input from the initial compile.
       const r = await resident([1, 2, 3].map((n) => () =>
         new RoundThenEnd(firstUsage, refused(), 'aborted', `echo-${reusedIds ? 1 : n}`)));
       const internal = r.framework as unknown as {
@@ -826,18 +827,25 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
         const rows = cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages();
         const calls = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_use'));
         const results = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_result'));
-        assert.equal(shed, true, 'quarantine runs only after terminal settlement with the failed compile');
+        assert.equal(shed, true, 'quarantine runs only after terminal settlement with the failed request');
         assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0);
         assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), true);
         assert.equal(r.membrane.calls.length, 4, 'one repaired retry was run');
         assert.equal(retryBudget, 1, 'the confirmed removal spent a step before the retry began');
         const repaired = JSON.stringify(r.membrane.calls[3].messages);
-        assert.doesNotMatch(repaired, /"text":"third"/, 'the retry omits the quarantined input');
+        assert.match(repaired, /"text":"third"/, 'the older compiled input stays: the newest submitted exchange was quarantined');
+        const raw = cm.getAllMessages();
+        for (const kind of ['tool_use', 'tool_result']) {
+          const bodies = raw.filter((row) => row.content.some((block) => block.type === kind));
+          assert.equal(bodies.length, 3, 'all three exchanges remain in the raw record');
+          assert.equal(cm.windowStatusOf(bodies[2].id), 'undone', 'only the newest failed-request exchange leaves the window');
+          for (const body of bodies.slice(0, 2)) assert.equal(cm.windowStatusOf(body.id), 'in');
+        }
         assert.match(repaired, /The 1 most recent/, 'the repaired request carries the rewind notice');
 
         assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false);
-        assert.equal(calls.length, 3, 'all call endpoints retained');
-        assert.equal(results.length, 3, 'all result endpoints retained');
+        assert.equal(calls.length, 2, 'the two older call endpoints stay in the window');
+        assert.equal(results.length, 2, 'the two older result endpoints stay in the window');
       } finally {
         console.error = original;
         await r.framework.stop();

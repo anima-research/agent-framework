@@ -16,7 +16,8 @@
   Visible results matching only hidden/foreign calls also stop recovery without
   removing unrelated older history or queuing a retry.
 - Model-visible legacy rewind markers now say originals were removed from the
-  raw record; presented-window markers continue to say originals remain there.
+  raw record; presented-window markers continue to say originals remain there, including
+  same-mode reuse; mixed-mode consolidation explicitly describes both outcomes.
 - A legacy removal confirmed by readback after a throwing write still propagates
   removal to other residents; automatic retry remains stopped. `/unstick`
   preflight now distinguishes wait-for-settlement from inspect/repair guidance.
@@ -30,7 +31,8 @@
 - Confirmed refused-reply deletion after a throwing cleanup still retracts other
   windows; queued/held continuations also block terminal-refusal recovery.
 - Tool IDs are matched within reader-owned live rounds, allowing reuse after
-  completion, by another resident, or after undo. Unresolved reuse and duplicate
+  completion or undo. Presented foreign observations do not reserve native IDs;
+  legacy observed unresolved calls can still conservatively block ID reuse. Unresolved reuse and duplicate
   results still decline; held/unpresented endpoints still participate in validation.
 
 - Legacy selection now uses the compile's recorded visibility, including ordinary
@@ -41,3 +43,9 @@
   reproduction and the large-store/OOM risk.
 - Forced-session summaries and budgets count confirmed exhaustion removals too;
   caller logs use their own confirmed-removal counts, not shared marker counts.
+
+- Exhaustion witnesses now follow the exact failed request through later tool
+  rounds, not just its initial compile. A caught speech-delivery rejection is
+  not successful settlement; uncertain delivery disables quarantine for that
+  Agent instance. Pre-stream failures also wait for preceding queued delivery.
+  Shutdown closes quarantine admission as well as provider admission.

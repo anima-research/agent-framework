@@ -37,7 +37,8 @@ import {
 } from './tool-result-history.js';
 import { appendAll } from './append-all.js';
 
-/** The stored bodies and branch a real start's compile actually presented. */
+/** Request-history witness: initially the real compile's stored bodies and branch;
+ * the framework extends the body set at each verified tool hand-off. */
 export interface CompiledHistory {
   carriedBodies: ReadonlySet<MessageId>;
   branch: string;

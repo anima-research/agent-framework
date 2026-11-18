@@ -281,8 +281,8 @@ export interface AgentConfig {
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
    * When `autoRewind` is on, a refused turn triggers an automatic rewind: the
    * framework plans removal of the newest complete eligible body or tool exchange
-   * (not necessarily the content that caused the refusal), injects a metadata-only
-   * marker in its place (which carries none of the offending content), and
+   * (not necessarily the content that caused the refusal), injects a model-visible
+   * explanatory notice in its place (which carries none of the removed content), and
    * re-runs only when the plan is supported. The refusal budget is at least one,
    * rounded up for fractional values; exhaustion additionally clamps it to ten.
    * This keeps the agent on its own model (no fallback-model substitution) while self-healing around

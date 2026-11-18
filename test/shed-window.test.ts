@@ -21,7 +21,7 @@ import { MembraneError, type ContentBlock, type StreamEvent } from '@animalabs/m
 import { AgentFramework, residentContextOptions, storeOwnRow } from '../src/index.js';
 import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { until } from './helpers/dendrite.js';
-import { WireMembrane, final } from './helpers/wire-membrane.js';
+import { WireMembrane, final, round, signed } from './helpers/wire-membrane.js';
 import { branchKey } from '../src/agent.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
@@ -33,8 +33,8 @@ class SurfaceModule implements Module {
   ctx!: ModuleContext;
   async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
   async stop(): Promise<void> {}
-  getTools(): ToolDefinition[] { return []; }
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'no tools' }; }
+  getTools(): ToolDefinition[] { return [{ name: 'echo', description: 'Echo.', inputSchema: { type: 'object', properties: {} } }]; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: 'new-round-result' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
     const { content, metadata } = event as unknown as { content: ContentBlock[]; metadata: { ask: string[] } };
@@ -67,7 +67,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { gate?: boolean; residents?: string[]; dir?: string; failWriteDown?: boolean; autoRewind?: boolean; observes?: string[]; seed?: (cm: ContextManager) => void } = {}) {
+async function boot(opts: { gate?: boolean; residents?: string[]; dir?: string; failWriteDown?: boolean; autoRewind?: boolean; proseRouting?: 'hybrid'; observes?: string[]; seed?: (cm: ContextManager) => void } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'af-shed-window-'));
   if (!opts.dir) dirs.push(dir);
   const storePath = join(dir, 'store.chronicle');
@@ -97,7 +97,7 @@ async function boot(opts: { gate?: boolean; residents?: string[]; dir?: string; 
     framework = await AgentFramework.create({
       storePath,
       membrane: membrane.asMembrane(),
-      agents: residents.map((name) => ({ name, ...(name === 'mira' && opts.observes ? { observes: opts.observes } : {}), model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', refusalHandling: { autoRewind: opts.autoRewind ?? false, maxRewinds: 1 }, proseRouting: 'disabled' })),
+      agents: residents.map((name) => ({ name, ...(name === 'mira' && opts.observes ? { observes: opts.observes } : {}), model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', refusalHandling: { autoRewind: opts.autoRewind ?? false, maxRewinds: 1 }, proseRouting: opts.proseRouting ?? 'disabled' })),
       modules: [new SurfaceModule()],
       ...(opts.gate ? { gate: { config: { policies: [], default: 'skip' }, onboarding: false } } : {}),
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
@@ -394,7 +394,7 @@ for (const legacy of [false, true]) {
       : hidden === 'held' ? { tuneOut: { epochId: 'held' } } : hidden === 'marker' ? { kind: 'refusal-rewind' } : { system: true };
     store.append('user', [text('non-tool-sibling')], metadata, undefined, { bodyGroupId: 'hidden-result', shardIndex: 1 });
     if (!legacy) cm.presentRows([result]);
-    assertDecline(h, new Set([call]));
+    assertDecline(h, new Set([call]), 'hidden content or marker in tool body');
   });
 }
 
@@ -437,7 +437,7 @@ for (const pending of ['pending', 'queued', 'assistant', 'live'] as const) it(`s
   if (pending === 'queued') Object.defineProperty(guard, 'idle', { get: () => false });
   if (pending === 'assistant') (h.framework as any).pendingAssistantBlocks.set('mira', [callBlock('a')]);
   if (pending === 'live') Object.defineProperty(h.agent('mira'), 'state', { get: () => ({ status: 'streaming' }) });
-  assertDecline(h);
+  assertDecline(h, undefined, pending !== 'live' ? 'unsettled tool round' : 'live assistant round');
   // Restore before shutdown: tests do not ask the guard to settle for planning.
   if (pending === 'assistant') (h.framework as any).pendingAssistantBlocks.clear();
 });
@@ -547,7 +547,12 @@ for (const caller of ['auto', 'forced', 'exhaustion'] as const) {
       for (const id of ids) assert.equal(h.cm('mira').windowStatusOf(id), 'in');
       assert.equal(h.internals.rewindEpisode.size, 0);
       assert.equal(h.internals.exhaustionRewinds.size, 0);
-      if (caller === 'auto') assert.ok(h.cm('mira').getAllMessages().some((m) => textOf(m) === 'refused-reply-payload'), 'unsupported leaves refused reply untouched too');
+      if (caller === 'auto') {
+        assert.ok(lines.some((line) => line.includes('unsupported: missing or ambiguous call body')
+          && line.includes('repeating a wake does not repair unsupported history')
+          && line.includes('docs/recovery-b.md')), 'refusal decline includes actionable inspect/repair guidance');
+        assert.ok(h.cm('mira').getAllMessages().some((m) => textOf(m) === 'refused-reply-payload'), 'unsupported leaves refused reply untouched too');
+      }
       else assert.equal(JSON.stringify(h.cm('mira').getAllMessages()), rawBefore);
     }
     // New shared notices/replies may be stored while Mira is active. The
@@ -725,7 +730,7 @@ for (const mode of ['windowed', 'raw'] as const) {
         const result = h.internals.addMessage('user', [{ type: 'tool_result', toolUseId: 'hidden-a', content: 'visible result' } as ContentBlock]);
         assert.match(await h.compiled('mira'), /visible narration/);
         assert.doesNotMatch(await h.compiled('mira'), /tool_use/);
-        assertDecline(h);
+        assertDecline(h, undefined, 'hidden content or marker in tool body');
         for (const id of [narration, call, ...(notice ? [notice] : [])]) {
           assert.ok(cm.getMessage(id), 'the complete call body and notice remain');
           if (mode === 'windowed') assert.equal(cm.windowStatusOf(id), 'in');
@@ -957,6 +962,7 @@ for (const hidden of ['foreign', 'held', 'audience'] as const) it(`legacy visibl
   h.cm('mira').addMessage('user', [resultBlock('foreign')]);
   const plan = h.internals.planNewestTurn(h.agent('mira'));
   assert.equal(plan.kind, 'unsupported');
+  assert.equal(plan.reason, hidden === 'held' ? 'hidden content or marker in tool body' : 'missing or ambiguous call body');
   const before = snapshot(h);
   h.internals.quarantinePoisonedHistory(h.agent('mira'), 'bad history', snapshotCarried(h.agent('mira')));
   assert.equal(snapshot(h), before);
@@ -1021,7 +1027,9 @@ it('unsupported exhaustion preserves prior confirmed budget and marker', async (
   assert.equal(h.internals.pendingRequests.length, 0);
 });
 
-it('terminal exhaustion settles the guard before declining unsupported history, preserving later arrivals', async () => {
+it('terminal exhaustion clears the batch but declines still-settling guard work, preserving later arrivals', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot();
   const guard = h.agent('mira').toolResultGuard;
   guard.setOverride(true);
@@ -1054,6 +1062,7 @@ it('terminal exhaustion settles the guard before declining unsupported history, 
   await h.framework.runUntilIdle();
   assert.deepEqual(ending, { submitted: false, pending: false, status: 'in' }, 'exhaustion is reported after guard and assistant teardown');
   assert.equal(guard.hasPending, false);
+  assert.ok(lines.some((line) => line.includes('unsupported: unsettled tool round')), 'the real exhaustion reached the still-settling guard decline, not a missing-witness guard');
   assert.equal(requests, 1, 'settled but unsupported history queues no repaired retry');
   for (const id of [call, result, h.rowWith('mira', 'arrived after failed request')!.id]) assert.equal(h.cm('mira').windowStatusOf(id), 'in');
   assert.equal(h.internals.exhaustionRewinds.size, 0);
@@ -1633,7 +1642,7 @@ it('confirmed legacy removal reconciles other windows before stopping on a branc
   assert.equal(h.internals.pendingRequests.length, 0);
 });
 
-for (const newerSnapshot of [false, true]) it(`an old settled failure cannot quarantine after a successor stream already completed (newer snapshot:${newerSnapshot})`, async (t) => {
+for (const newerSnapshot of [false, true, 'no-progress'] as const) it(`an old settled failure cannot quarantine after a successor stream already completed (newer snapshot:${newerSnapshot})`, async (t) => {
   const lines: string[] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot();
@@ -1645,7 +1654,16 @@ for (const newerSnapshot of [false, true]) it(`an old settled failure cannot qua
   const original = h.membrane.streamYielding.bind(h.membrane);
   let starts = 0;
   h.membrane.streamYielding = (request, options) => {
-    if (starts++ > 0) return original(request, options);
+    if (starts++ > 0) {
+      if (newerSnapshot === 'no-progress' && starts === 3) return {
+        isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
+        provideToolResults() {}, cancel() {},
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'error', error: new MembraneError({ type: 'server', httpStatus: 500, retryable: false, message: 'new no-progress failure' } as never) } as StreamEvent;
+        },
+      } as any;
+      return original(request, options);
+    }
     const error = new MembraneError({ type: 'invalid_request', message: 'old provider invalid request', retryable: false, httpStatus: 400 } as never);
     return { isWaitingForTools: false, pendingToolCallIds: [], toolDepth: 0, isCancelled: false,
       provideToolResults() { throw new Error('not waiting'); }, cancel() { release(); },
@@ -1673,15 +1691,25 @@ for (const newerSnapshot of [false, true]) it(`an old settled failure cannot qua
     assert.notEqual(h.agent('mira').streamId, generation);
     fw.consecutiveInferenceFailures.set('mira', 2);
     const replacement = { roundsRan: false, callsCutOff: true, liveSpeech: false, speechRouting: false };
-    if (newerSnapshot) fw.exhaustedTurns.set('mira', replacement);
+    if (newerSnapshot === true) fw.exhaustedTurns.set('mira', replacement);
+    if (newerSnapshot === 'no-progress') {
+      assert.equal(fw.exhaustedTurns.get('mira'), oldSnapshot, 'old failed turn still has its deferred snapshot');
+      const markersBefore = h.cm('mira').getAllMessages().filter((m) => m.metadata?.kind === 'inference-failed').length;
+      await fw.startAgentStream(h.agent('mira'));
+      await until(() => h.traces.some((e) => e.type === 'inference:exhausted')
+        && !fw.logicalTurnAlive(h.agent('mira')), 'new independent no-progress failure finished');
+      assert.equal(fw.exhaustedTurns.get('mira'), undefined, 'the actual no-progress failure cleared inherited provenance');
+      assert.equal(h.cm('mira').getAllMessages().filter((m) => m.metadata?.kind === 'inference-failed').length, markersBefore,
+        'the no-progress failure cannot consume the old snapshot and claim earlier tool progress');
+    }
     release();
     await until(() => lines.some((line) => line.includes('terminal ownership changed while stream settled')), 'stale terminal declined');
-    assert.equal(fw.exhaustedTurns.get('mira'), newerSnapshot ? replacement : undefined, 'only the old snapshot is discarded');
+    assert.equal(fw.exhaustedTurns.get('mira'), newerSnapshot === true ? replacement : undefined, 'only the old snapshot is discarded');
     assert.equal(h.cm('mira').windowStatusOf(poison), 'in');
     assert.equal(h.internals.exhaustionRewinds.get('mira') ?? 0, 0);
     assert.equal(h.internals.rewindEpisode.size, 0);
-    assert.equal(h.traces.filter((e) => e.type === 'inference:exhausted').length, 0);
-    assert.equal(starts, 2, 'old failure queues no repaired retry');
+    assert.equal(h.traces.filter((e) => e.type === 'inference:exhausted').length, newerSnapshot === 'no-progress' ? 1 : 0);
+    assert.equal(starts, newerSnapshot === 'no-progress' ? 3 : 2, 'old failure queues no repaired retry');
   } finally { release(); }
 });
 
@@ -1702,18 +1730,21 @@ for (const legacy of [false, true]) for (const foreign of [false, true]) it(`too
   assertDecline(h, new Set([call]), 'hidden content or marker in tool body');
 });
 
-it('a consolidated marker makes no aggregate raw-retention claim', async () => {
+it('a mixed-mode consolidated marker states both retention outcomes', async () => {
   const h = await boot({ failWriteDown: true });
   const cm = h.cm('mira');
   h.internals.updateRewindMarker(h.agent('mira'), 'legacy');
   assert.match(textOf(cm.getAllMessages().at(-1)!), /originals were removed from the raw record/);
   cm.presentRows(cm.getAllMessages().map((m) => m.id));
   assert.equal(cm.windowMode(), 'presented');
+  // A raw CM write-down alone does not clear the host's pinned legacy state.
+  (h.framework as any).presentation.rebase(h.agent('mira'));
+  assert.equal((h.framework as any).presents(h.agent('mira')), true, 'the host actually switched recovery mode');
   h.internals.updateRewindMarker(h.agent('mira'), 'presented');
   const marker = textOf(cm.getPresentedMessages().at(-1)!);
   assert.match(marker, /The 2 most recent/);
-  assert.doesNotMatch(marker, /originals remain|originals were removed/);
-  assert.match(marker, /retention may differ/);
+  assert.match(marker, /some originals remain in the raw record while others were removed/);
+  assert.doesNotMatch(marker, /consult the host logs/);
 });
 
 it('a non-qualifying failure releases the inference gate before its policy event, even while iterator return waits', async () => {
@@ -1752,6 +1783,14 @@ it('an unclean iterator with compile provenance reports uncertain settlement wit
   t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
   const h = await boot();
   const poison = storeOwnRow(h.agent('mira'), 'user', [text('unclean-stream-history')]);
+  let provenance: ReadonlySet<MessageId> | undefined;
+  const start = h.agent('mira').startStreamWithInjections.bind(h.agent('mira'));
+  h.agent('mira').startStreamWithInjections = (...args) => {
+    const options = args[4]!;
+    const capture = options.onCompiledHistory;
+    options.onCompiledHistory = (history) => { provenance = new Set(history.carriedBodies); capture?.(history); };
+    return start(...args);
+  };
   const fw = h.framework as any;
   fw.consecutiveInferenceFailures.set('mira', 2);
   h.membrane.streamYielding = () => ({
@@ -1766,9 +1805,229 @@ it('an unclean iterator with compile provenance reports uncertain settlement wit
   await until(() => h.traces.some((e) => e.type === 'inference:exhausted')
     && !fw.logicalTurnAlive(h.agent('mira')), 'unclean stream ended');
   const stop = lines.find((line) => line.includes('stopped: failed compile history unavailable'));
+  assert.deepEqual(provenance, new Set([poison]), 'compile provenance really reached this failed attempt');
   assert.match(stop ?? '', /stream\/delivery settlement uncertain/);
   assert.doesNotMatch(stop ?? '', /Manual repair needed/);
   assert.equal(h.cm('mira').windowStatusOf(poison), 'in');
   assert.equal(h.internals.exhaustionRewinds.size, 0);
   assert.equal(h.internals.pendingRequests.length, 0);
+});
+
+
+// The real start/compile/tool-dispatch path; only the provider and external
+// delivery seam are faked. The failed request is a LATER round of one stream.
+async function laterRoundFailure(opts: { legacy?: boolean; delivery?: () => Promise<void>; cleanup?: () => Promise<void>; rounds?: number; qualifying?: boolean } = {}) {
+  const h = await boot({ failWriteDown: opts.legacy, proseRouting: opts.delivery ? 'hybrid' : undefined });
+  const fw = h.framework as any;
+  const prefix = storeOwnRow(h.agent('mira'), 'user', [text('initial-compile-prefix')]);
+  if (opts.delivery) {
+    fw.channelRegistry = new Proxy({ getChannelTools: () => [] }, {
+      get: (target: any, key) => key in target ? target[key] : () => undefined,
+    });
+    fw.deliverHybridProse = opts.delivery;
+  }
+  h.membrane.script('mira', ...Array.from({ length: opts.rounds ?? 1 }, (_, i) =>
+    round(`later-call-${i}`, [signed(`later-signature-${i}`), text('queued live prose')], 'surface--echo')), final([]));
+  const create = h.membrane.streamYielding.bind(h.membrane);
+  let starts = 0, iteratorFinished = false, late: MessageId | undefined;
+  h.membrane.streamYielding = (request, options) => {
+    const stream = create(request, options);
+    if (++starts > 1) return stream;
+    const events = stream[Symbol.asyncIterator].bind(stream);
+    stream[Symbol.asyncIterator] = async function* () {
+      try {
+        for await (const event of { [Symbol.asyncIterator]: events }) {
+          if (event.type !== 'complete') { yield event; continue; }
+          assert.equal(fw.activeStreams.has('mira'), true);
+          assert.equal(h.membrane.streams[0].stream.receivedToolResults.length, opts.rounds ?? 1, 'results really submitted before failing the next request');
+          late = storeOwnRow(h.agent('mira'), 'user', [text('not-in-failed-request')], { system: true });
+          yield { type: 'error', error: new MembraneError({ type: opts.qualifying === false ? 'server' : 'invalid_request', httpStatus: opts.qualifying === false ? 500 : 400, retryable: false, message: 'later round provider failure' } as never) } as StreamEvent;
+        }
+      } finally {
+        await opts.cleanup?.();
+        iteratorFinished = true;
+      }
+    };
+    return stream;
+  };
+  fw.consecutiveInferenceFailures.set('mira', 2);
+  return { ...h, fw, prefix, starts: () => starts, iteratorFinished: () => iteratorFinished, late: () => late };
+}
+
+for (const legacy of [false, true]) it(`later-round recovery uses the exact failed request bodies, not the initial compile (legacy:${legacy})`, async () => {
+  const h = await laterRoundFailure({ legacy, rounds: 2 });
+  let witness: ReadonlySet<MessageId> | undefined;
+  let expected: Set<MessageId> | undefined;
+  const quarantine = h.internals.quarantinePoisonedHistory.bind(h.internals);
+  h.internals.quarantinePoisonedHistory = (agent, reason, carried) => {
+    witness = new Set(carried);
+    const endpoints = h.cm('mira').getAllMessages().filter((m) => m.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result'));
+    expected = new Set([h.prefix, ...endpoints.map((m) => m.id)]);
+    return quarantine(agent, reason, carried);
+  };
+  h.framework.start();
+  assert.equal(h.framework.nudgeAgent('mira').ok, true);
+  await until(() => h.starts() === 2 && !h.fw.logicalTurnAlive(h.agent('mira')), 'later-round repaired retry finished');
+  assert.equal(expected?.size, 5);
+  assert.deepEqual(witness, expected, 'every submitted body, and no post-request notice');
+  assert.equal(h.iteratorFinished(), true);
+  assert.equal(h.fw.activeStreams.has('mira'), false);
+  assert.equal(h.fw.activeTurnTokens.has('mira'), false);
+  const retry = JSON.stringify(h.membrane.callsFor('mira')[1].messages);
+  assert.match(retry, /initial-compile-prefix/);
+  assert.match(retry, /later-call-0/);
+  assert.doesNotMatch(retry, /later-call-1|later-signature-1/);
+  assert.match(retry, /not-in-failed-request/);
+  assert.equal(h.traces.filter((e) => e.type === 'presentation:retracted' && e.reason === 'shed').length, legacy ? 0 : 1);
+});
+
+for (const rejected of [false, true]) it(`queued delivery must finish successfully before later-round quarantine (rejected:${rejected})`, async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  let releaseDelivery!: () => void, releaseCleanup!: () => void;
+  const delivery = new Promise<void>((resolve) => { releaseDelivery = resolve; });
+  const cleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+  let delivering = false, delivered = false, returning = false;
+  const h = await laterRoundFailure({
+    delivery: async () => { delivering = true; await delivery; if (rejected) throw new Error('uncertain publish'); delivered = true; },
+    cleanup: async () => { returning = true; await cleanup; },
+  });
+  let quarantines = 0;
+  const quarantine = h.internals.quarantinePoisonedHistory.bind(h.internals);
+  h.internals.quarantinePoisonedHistory = (agent, reason, carried) => {
+    quarantines++;
+    assert.equal(h.iteratorFinished(), true);
+    assert.equal(h.fw.activeStreams.has('mira'), false);
+    assert.equal(h.fw.activeTurnTokens.has('mira'), false);
+    return quarantine(agent, reason, carried);
+  };
+  h.framework.start();
+  try {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => delivering && returning, 'both queued delivery and iterator cleanup reached their held seams');
+    assert.equal(quarantines, 0);
+    assert.equal(h.traces.filter((e) => e.type === 'inference:exhausted').length, 0);
+    releaseCleanup();
+    await until(() => h.iteratorFinished(), 'iterator cleanup completed while delivery is still held');
+    // Await the actual registered driver boundary, not a host-command guard.
+    assert.equal(h.fw.activeStreams.has('mira'), true);
+    assert.equal(h.fw.activeTurnTokens.has('mira'), true);
+    assert.equal(quarantines, 0);
+    assert.equal(h.cm('mira').windowStatusOf(h.prefix), 'in');
+    releaseDelivery();
+    await until(() => h.traces.some((e) => e.type === 'inference:exhausted')
+      && !h.fw.logicalTurnAlive(h.agent('mira')), 'delivery settled and failed turn torn down');
+    if (rejected) {
+      assert.equal(quarantines, 0, 'a caught delivery rejection is not successful settlement');
+      assert.ok(lines.some((line) => line.includes('stream/delivery settlement uncertain')));
+      assert.equal(h.starts(), 1);
+      assert.equal(h.internals.exhaustionRewinds.size, 0);
+      assert.equal(h.internals.rewindEpisode.size, 0);
+      assert.equal(h.internals.pendingRequests.length, 0);
+      assert.equal(h.cm('mira').getAllMessages().filter((m) => m.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result')).every((m) => h.cm('mira').windowStatusOf(m.id) === 'in'), true);
+    } else {
+      await until(() => h.starts() === 2 && !h.fw.logicalTurnAlive(h.agent('mira')), 'successfully settled recovery retry');
+      assert.equal(quarantines, 1);
+      assert.equal(delivered, true);
+    }
+  } finally { releaseCleanup(); releaseDelivery(); }
+});
+
+
+for (const legacy of [false, true]) it(`same-mode marker reuse retains an actionable raw-retention statement (legacy:${legacy})`, async () => {
+  const h = await boot({ failWriteDown: legacy });
+  const first = h.internals.updateRewindMarker(h.agent('mira'), 'first');
+  const id = h.internals.rewindEpisode.get('mira')!.markerId;
+  assert.equal(first, 1);
+  assert.equal(h.internals.updateRewindMarker(h.agent('mira'), 'second'), 2);
+  assert.equal(h.internals.rewindEpisode.get('mira')!.markerId, id);
+  const marker = textOf(h.cm('mira').getMessage(id)!);
+  assert.match(marker, legacy ? /originals were removed from the raw record/ : /originals remain in the raw record/);
+  assert.doesNotMatch(marker, /consult the host logs|may differ/);
+});
+
+it('/unstick rounds a fractional configured rewind budget up just like automatic recovery', async () => {
+  const h = await boot();
+  storeOwnRow(h.agent('mira'), 'user', [text('eligible history')]);
+  h.agent('mira').refusalHandling!.maxRewinds = 1.5;
+  const ack = await h.internals.handleHostCommand('test', { command: 'unstick', agentName: 'mira' });
+  assert.equal(ack.ok, true);
+  assert.equal(ack.cap, 2);
+  assert.equal((h.framework as any).forcedRewind.get('mira').remaining, 2);
+});
+
+it('stop during terminal delivery settlement prevents quarantine and rewind retry', async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  let release!: () => void;
+  const delivery = new Promise<void>((resolve) => { release = resolve; });
+  let delivering = false, quarantines = 0;
+  const h = await laterRoundFailure({ delivery: async () => { delivering = true; await delivery; } });
+  h.internals.quarantinePoisonedHistory = () => { quarantines++; };
+  h.framework.start();
+  try {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => delivering && h.iteratorFinished(), 'terminal blocked only on delivery');
+    const stopping = h.framework.stop();
+    await until(() => h.fw.providerAdmissionClosed, 'stop closed provider admission');
+    release();
+    await stopping;
+    assert.equal(quarantines, 0);
+    assert.equal(h.starts(), 1);
+    assert.ok(lines.some((line) => line.includes('provider admission closed; no quarantine')));
+    assert.equal(h.traces.some((e) => e.type === 'presentation:retracted' && e.reason === 'shed'), false);
+    assert.equal(h.internals.exhaustionRewinds.size, 0);
+    assert.equal(h.internals.rewindEpisode.size, 0);
+    assert.equal(h.internals.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false);
+  } finally { release(); }
+});
+
+for (const rejected of [false, true]) it(`a pre-stream failure waits for the earlier stream's delivery (rejected:${rejected})`, async (t) => {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  let release!: () => void;
+  const delivery = new Promise<void>((resolve) => { release = resolve; });
+  let delivering = false, delivered = false;
+  // Non-qualifying failure deliberately retains its ordinary terminal timing:
+  // the next start can compile while its predecessor's prose is still queued.
+  const h = await laterRoundFailure({ qualifying: false, delivery: async () => {
+    delivering = true; await delivery;
+    if (rejected) throw new Error('earlier uncertain publish');
+    delivered = true;
+  } });
+  let quarantineAfterDelivery: boolean | undefined;
+  const quarantine = h.internals.quarantinePoisonedHistory.bind(h.internals);
+  h.internals.quarantinePoisonedHistory = (agent, reason, carried) => {
+    quarantineAfterDelivery = delivered;
+    return quarantine(agent, reason, carried);
+  };
+  h.framework.start();
+  try {
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => delivering && h.iteratorFinished() && !h.fw.logicalTurnAlive(h.agent('mira')), 'earlier stream torn down with delivery pending');
+    h.fw.consecutiveInferenceFailures.set('mira', 2);
+    const create = h.membrane.streamYielding.bind(h.membrane);
+    let failed = false;
+    h.membrane.streamYielding = (request, options) => {
+      if (failed) return create(request, options);
+      failed = true;
+      throw new MembraneError({ type: 'invalid_request', httpStatus: 400, retryable: false, message: 'pre-stream failure behind delivery' } as never);
+    };
+    assert.equal(h.framework.nudgeAgent('mira').ok, true);
+    await until(() => failed, 'later start reached provider creation');
+    assert.equal(quarantineAfterDelivery, undefined);
+    assert.equal(h.fw.activeTurnTokens.has('mira'), true);
+    assert.equal(h.traces.filter((e) => e.type === 'inference:exhausted').length, 1);
+    release();
+    await until(() => h.traces.filter((e) => e.type === 'inference:exhausted').length === 2
+      && !h.fw.logicalTurnAlive(h.agent('mira')), 'pre-stream failure settled');
+    assert.equal(quarantineAfterDelivery, rejected ? undefined : true);
+    if (rejected) {
+      assert.ok(lines.some((line) => line.includes('stream/delivery settlement uncertain')));
+      assert.equal(h.internals.exhaustionRewinds.size, 0);
+      assert.equal(h.internals.rewindEpisode.size, 0);
+    } else {
+      await until(() => h.starts() === 2 && !h.fw.logicalTurnAlive(h.agent('mira')), 'pre-stream repaired retry finished');
+    }
+  } finally { release(); }
 });

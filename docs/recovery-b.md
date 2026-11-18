@@ -33,8 +33,11 @@ means absent the served request; **unpresented** means absent the CM window.
 Refusal and standalone recovery can support uncarried result bodies already
 resident in that window; exhaustion requires every selected body to be carried;
 there is no present-first write, raw fallback, or new CM layer. ID matching follows
-reader-owned live rounds in stored order: reuse after completion, by another
-resident, or in an undone older round does not create ambiguity. Within that
+reader-owned live rounds in stored order: reuse after completion or in an undone older round does not create ambiguity.
+Presented observations are transcript text, so another resident's ID reuse does
+not reserve native IDs there. Legacy observations can remain native tool calls;
+an observed unresolved call can therefore conservatively block the same ID in
+the reader's later round. Within that
 scope, stored endpoints including newer skipped/held results are checked in both
 directions; unpresented endpoints are not ignored. It does not repair
 unrelated malformed history or recursively close mixed chains.
@@ -44,7 +47,9 @@ storage/annotation work, and no pending assistant round may remain. A standalone
 attempt also needs the agent's idle boundary: no live turn token, stream, or
 queued, parked, provider-held or budget-held continuation, even when status
 already reads `idle`. Only terminal refusal can recover its own ending turn before token release.
-Exhaustion carries the failed compile's raw-body set into planning;
+Exhaustion carries the failed request's exact raw-body set into planning: the
+initial compile plus each tool round's submitted call, result and supported
+injected-message bodies, never later unsent arrivals;
 every selected body head, including all tool-closure endpoints, must belong to
 that set. If a late result completes a carried call, the whole plan declines
 without removing either endpoint, selecting older history, consuming a step,
@@ -54,12 +59,19 @@ retry. This witness is attempt-local, not a durable fence against future writers
 This follow-up **widens the supported path** compared with the published
 “active-stream terminal failure stops unchanged” behavior. A registered stream's
 qualifying exhausted provider failure (for example `invalid_request` HTTP 400,
-not every HTTP 400) now keeps its compile witness through iterator completion,
-queued speech delivery and terminal teardown. Only then can quarantine run,
-with full logical quiescence, settled guard work and the same terminal owner,
-branch and carried bodies. A genuinely live or unsettled stream still blocks
+not every HTTP 400) now keeps its attempt-local request witness through iterator completion,
+successful queued speech delivery and terminal teardown. Later tool hand-offs
+update that same request-body set; terminal failure snapshots it before waiting.
+Only successful settlement permits quarantine, with full logical quiescence,
+settled guard work and the same terminal owner, branch and carried bodies.
+An unverifiable hand-off cannot supply a witness. Caught delivery rejections
+keep subsequent posts ordered but are not successful settlement: they disable
+automatic exhaustion quarantine for that Agent instance, including later
+pre-stream failures, until it is stopped and recreated after inspection. A genuinely live or unsettled stream still blocks
 recovery; a successor turn or stream invalidates the old terminal's ownership.
-Pre-stream failures retain the same witness requirements. Failure accounting
+Pre-stream failures retain the same witness requirements and wait for earlier
+streams' queued deliveries before accounting for a qualifying failure. Closed
+provider admission during shutdown forbids quarantine and rewind retries. Failure accounting
 may append an `inference-failed` notice even when quarantine declines; an
 unchanged quarantine means no history shedding or rewind retry, not an
 unchanged store. This is a known-writer boundary, not a promise that arbitrary
@@ -200,9 +212,10 @@ result, replay a possibly side-effecting tool, or delete just one endpoint.
 
 Marker limits: the consolidated count advances when the marker write succeeds,
 not at the removal commit, so a later marker can understate prior removals after
-a cleanup/marker failure. An initial marker describes its window mode; a
-consolidated marker makes no aggregate raw-retention claim, since modes can
-change between omissions. Its metadata
+a cleanup/marker failure. Markers are model-visible explanatory text, not
+metadata-only. Consolidation tracks whether omissions retained originals, removed
+them, or did both across a mode change; same-mode reuse preserves the retention
+statement and mixed-mode reuse explicitly states both outcomes. Its metadata
 records the initial count/category/cause; consolidation edits only the text,
 so metadata is not a current aggregate either. Consult the
 backed-up store and failure logs for repair, not the marker alone. Forced-session

@@ -257,6 +257,7 @@ test("an agent that ends while a request waits answers agent-ended, and so does 
     const ack = await rig.host({ command: 'unstick', agentName: 'aide', channelId: 'zz-chan' });
     assert.equal(ack.quiesced, true, 'the premise: the unstick is parked, so its session is live and runs nothing');
     const waiting = rig.host({ command: 'unstick-outcome', agentName: 'aide' });
+    await until(() => rig.waiting('aide') === 1, 'outcome request registered before agent stop');
     rig.framework.stopAgent('aide');
     const ended = { ok: true, outcome: 'agent-ended', rewinds: 0 };
     assert.deepEqual(await within(waiting, 'the waiting request'), ended);
