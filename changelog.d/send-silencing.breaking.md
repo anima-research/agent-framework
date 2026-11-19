@@ -24,7 +24,9 @@
     `reset` names it in `settings` or names nothing, and
     `AgentRuntimeSettingsPatch` and `AgentRuntimeSettingsSnapshot` carry
     `sendSilencing`. A resident's choice overrides its config, persists with
-    its other runtime settings, and applies to sends from the agent's next
+    its other runtime settings (`sendSilencing` is a required field of the
+    snapshot type, so a typed fixture or mock of one needs it), and applies
+    to sends from the agent's next
     response on at the latest (a send made directly in the response that
     changes it is counted under the old value). Turning it off doesn't undo
     a hold an earlier send in the turn already set. A fork takes its
@@ -35,7 +37,9 @@
     upgrade the tool block changes for an agent that has `agent_settings`,
     and for one that has `drafts` unless its `sendSilencing` is true (its
     description is then the one it had). An agent with `drafts` gets a
-    changed block again each time its setting changes.
+    changed block again each time its setting changes. A changed block
+    misses the provider's prompt cache once, and a fork whose setting
+    differs from its parent's doesn't share the parent's cached prefix.
   - **Unchanged:** `skip_reply` keeps its round private, and `think` under
     the private same-round policy holds its round back, whatever the
     setting. Explicit mode never silenced on a send and disabled mode

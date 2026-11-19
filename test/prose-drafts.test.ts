@@ -3187,6 +3187,9 @@ describe('an explicit send holds plain speech only where it may have posted', ()
         createMockResponse([text('Not for the room.'), call('k1', 'skip_reply', { reason: 'done' })], 'tool_use'),
       ]);
       assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL], 'the send ran');
+      for (const line of ['Working it out.', 'Not for the room.']) {
+        assert.ok(h.texts().includes(line), `the round that wrote ${JSON.stringify(line)} ran: its words are in the history`);
+      }
       assert.deepEqual(inRoom(h), ['The answer.']);
     } finally {
       await h.close();
