@@ -12,7 +12,7 @@ import type { ContentBlock, ModelPricing, NormalizedMessage, ToolDefinition } fr
 import { AgentFramework, audienceOf, residentContextOptions, subconsciousContextOptions, taskForkSpec, type Agent, type AgentSpec } from '../src/index.js';
 import { storeOwnRow } from '../src/dendrite/audience.js';
 import { removeSystemChangesOffline, type RemoveSystemChangesResult } from '../src/recovery/remove-system-changes.js';
-import { isDeclarationRow, isSystemChangeMessage, pricedTokens, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
+import { isDeclarationRow, isSystemChangeMessage, pricedCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { foldOf, now } from './helpers/declared.js';
@@ -191,7 +191,7 @@ describe('a change of tools or system text in the framework', () => {
       assert.deepEqual((await alpha.buildActivationRequest([tool('a')])).tools, [tool('a')], 'one counted: the head moves');
       assert.deepEqual(moves('alpha'), ['adopted', 'cost']);
       const moved = traces.filter((t) => t.type === 'head:moved').at(-1) as unknown as { estimated: { carried: number } };
-      assert.equal(moved.estimated.carried, pricedTokens(old), "carried: the old definition, for the one request the tracker counted");
+      assert.equal(moved.estimated.carried, pricedCharacters(old), "carried: the old definition, for the one request the tracker counted");
 
       const { agent: run } = await framework.createEphemeralAgent({ ...resident('run'), systemPrompt: 'You are the run.' } as never);
       say(framework, run, 'user', 'hello');

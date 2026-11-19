@@ -29,8 +29,8 @@ import {
   systemChangeMetadata,
   systemTextOf,
   copyHead,
-  carriedTokens,
-  requestTokens,
+  carriedCharacters,
+  requestCharacters,
   storedRequestCount,
   type CostFigures,
   type DeclarationDifference,
@@ -3054,7 +3054,7 @@ export class Agent {
         requestCount: stored ? storedRequestCount(stored.metadata) : undefined,
       };
     });
-    return carriedTokens(recorded, rows, count);
+    return carriedCharacters(recorded, rows, count);
   }
 
   private costOfCarrying(compiled: CompileResult, carried: number, current: HeadDeclaration): CostFigures | undefined {
@@ -3066,7 +3066,7 @@ export class Agent {
     if (firstChanged == null) return undefined;
     const before = this.rowsAsSent(compiled.messages).slice(0, firstChanged).filter((m) => m.content.length > 0);
     if (this.mayBindThinking && before.some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'))) return undefined;
-    const extraNow = requestTokens(current, before);
+    const extraNow = requestCharacters(current, before);
     return carried >= k * extraNow ? { carried, k, extraNow } : undefined;
   }
 

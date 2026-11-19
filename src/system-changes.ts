@@ -1,6 +1,5 @@
-import { jsonTokenEstimator, type CompileResult, type MessageId } from '@animalabs/context-manager';
+import type { CompileResult, MessageId } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
-import { mediaBlockTokens } from './media-tokens.js';
 import { canonicalJson } from './stable-hash.js';
 
 export interface HeadDeclaration {
@@ -104,12 +103,12 @@ export function copyHead(head: HeadDeclaration): HeadDeclaration {
   return { tools: JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[], system: [...head.system] };
 }
 
-export function carriedTokens(
+export function carriedCharacters(
   head: HeadDeclaration,
   rows: readonly { changes: readonly SystemChangeContent[]; removable: boolean; requestCount: number | undefined }[],
   count: number,
 ): number {
-  const live = new Map(head.tools.map((tool) => [tool.name, pricedTokens(tool)] as const));
+  const live = new Map(head.tools.map((tool) => [tool.name, pricedCharacters(tool)] as const));
   let carried = 0;
   for (const { changes, removable, requestCount } of rows) {
     const since = requestCount !== undefined && requestCount <= count ? count - requestCount : 0;
@@ -120,30 +119,19 @@ export function carriedTokens(
       }
       for (const tool of change.defineTools ?? []) {
         carried += (live.get(tool.name) ?? 0) * since;
-        live.set(tool.name, removable ? pricedTokens(tool) : 0);
+        live.set(tool.name, removable ? pricedCharacters(tool) : 0);
       }
     }
   }
   return carried;
 }
 
-export function requestTokens(head: HeadDeclaration, messages: readonly { content: readonly unknown[] }[]): number {
-  return pricedTokens({ system: head.system, tools: head.tools, messages })
-    + messages.reduce((tokens, message) => tokens + mediaTokens(message.content), 0);
+export function requestCharacters(head: HeadDeclaration, messages: readonly unknown[]): number {
+  return pricedCharacters({ system: head.system, tools: head.tools, messages });
 }
 
-export function pricedTokens(value: unknown): number {
-  return jsonTokenEstimator(JSON.stringify(value, unpricedLeftOut));
-}
-
-function mediaTokens(blocks: readonly unknown[]): number {
-  let tokens = 0;
-  for (const block of blocks) {
-    if (!block || typeof block !== 'object' || !('type' in block)) continue;
-    if (block.type === 'tool_result' && 'content' in block && Array.isArray(block.content)) tokens += mediaTokens(block.content);
-    else tokens += mediaBlockTokens(block as ContentBlock);
-  }
-  return tokens;
+export function pricedCharacters(value: unknown): number {
+  return JSON.stringify(value, unpricedLeftOut).length;
 }
 
 const UNPRICED_BLOCK_FIELDS = new Set(['rawItem', 'rawXml', 'rawXmlImagesAt', 'unparseableInput', 'tokenEstimate']);

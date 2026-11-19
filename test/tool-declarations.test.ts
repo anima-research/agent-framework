@@ -6,7 +6,7 @@ import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, Membrane, ModelPricing, NormalizedMessage, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 
 import { Agent } from '../src/agent.js';
-import { memoryHeadDeclarations, pricedTokens, requestTokens, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
+import { memoryHeadDeclarations, pricedCharacters, requestCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { AgentConfig } from '../src/types/index.js';
 import { foldOf, now } from './helpers/declared.js';
 
@@ -752,8 +752,8 @@ describe('a change of tools or system text, declared in the context', () => {
     const OLD = tool('a', 'a does a thing, as it was first written');
     const NEW = tool('a', 'a does a thing');
     const NOW: HeadDeclaration = { tools: [NEW], system: [SHORT] };
-    const EXTRA = requestTokens(NOW, []);
-    const DEAD = pricedTokens(OLD);
+    const EXTRA = requestCharacters(NOW, []);
+    const DEAD = pricedCharacters(OLD);
     const BAR = Math.ceil((19 * EXTRA) / DEAD);
 
     async function replaced(config: Parameters<typeof agentOn>[1] = {}, rows: Row[] = [said('user', 'hello')], counted = 0, declaredAt = counted) {
@@ -788,8 +788,8 @@ describe('a change of tools or system text, declared in the context', () => {
     it('counts as dead what a move would take out: a removed tool, and a tool that dropped and came back, as its head copy', async () => {
       const BIG = tool('b', 'b does a thing. '.repeat(400));
       for (const [what, steps, dead] of [
-        ['a removed tool', [[NEW, BIG], [NEW]], pricedTokens(BIG)],
-        ['a tool that dropped and came back', [[NEW, BIG], [NEW], [NEW, BIG]], pricedTokens(BIG)],
+        ['a removed tool', [[NEW, BIG], [NEW]], pricedCharacters(BIG)],
+        ['a tool that dropped and came back', [[NEW, BIG], [NEW], [NEW, BIG]], pricedCharacters(BIG)],
       ] as const) {
         const count = { n: 0 };
         const context = fakeContext([said('user', 'hello')], { firstChanged: () => 0 });
