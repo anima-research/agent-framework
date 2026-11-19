@@ -12,7 +12,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -245,8 +245,9 @@ async function games(opts: { policies?: GatePolicy[]; onboarding?: boolean; onto
 }
 
 describe('wake onboarding: the servers a store already had', () => {
-  it('are kept unasked from the first start that finds no decisions file, which that start writes; a later start reads them, and takes no more', () => {
+  it('are kept unasked from the first start that finds no decisions file, which that start writes; a later start reads them, and takes no more', (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'wake-predating-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
     const path = join(dir, 'config', 'wake-decisions.json');
     const t0 = Date.parse('2026-11-10T00:00:00Z');
     const d = new WakeDecisions(path, undefined, ['games', 'discord']);
@@ -264,7 +265,9 @@ describe('wake onboarding: the servers a store already had', () => {
     assert.equal(again.predates('docs'), false, 'added since: offered as before');
     assert.deepEqual(again.get('discord'), { digest: 'a', state: 'unasked', at: new Date(t0).toISOString() });
     // A new store: nothing predates, and the file still says onboarding has started.
-    const fresh = join(mkdtempSync(join(tmpdir(), 'wake-predating-')), 'config', 'wake-decisions.json');
+    const freshDir = mkdtempSync(join(tmpdir(), 'wake-predating-'));
+    t.after(() => rmSync(freshDir, { recursive: true, force: true }));
+    const fresh = join(freshDir, 'config', 'wake-decisions.json');
     const none = new WakeDecisions(fresh);
     assert.deepEqual(JSON.parse(readFileSync(fresh, 'utf8')), { servers: {} });
     assert.equal(none.predates('games'), false);
@@ -277,8 +280,9 @@ describe('wake onboarding: the servers a store already had', () => {
     assert.equal(new WakeDecisions(path, undefined, ['games', 'discord']).predates('games'), false, 'and the start after finds it');
   });
 
-  it('a store that had its gate before onboarding started on it: no notice and no wake for its servers, and their suggestions are still there to take', { timeout: 60_000 }, async () => {
+  it('a store that had its gate before onboarding started on it: no notice and no wake for its servers, and their suggestions are still there to take', { timeout: 60_000 }, async (t) => {
     const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-predating-'));
+    t.after(() => rmSync(gateDir, { recursive: true, force: true }));
     // A release without onboarding ran here, and the agent changed a rule
     // under it: gate.json is written, and no decisions.
     const earlier = await games({ gateDir, onboarding: false });
@@ -298,6 +302,10 @@ describe('wake onboarding: the servers a store already had', () => {
       assert.equal(record.servers.editor!.state, 'unasked');
       assert.equal(record.predating, undefined);
       // The agent can read and take the suggestions whenever it wants them.
+      const tags = await h.tool('event_tags', {});
+      const onboarding = (tags.data as { onboarding: { offers: Record<string, { rules: unknown[] }>; decisions: Record<string, { state: string }> } }).onboarding;
+      assert.equal(onboarding.decisions.editor!.state, 'unasked', 'event_tags shows the server as unasked');
+      assert.equal(onboarding.offers.editor!.rules.length, 2, 'and its suggestions, numbered');
       const taken = await h.tool('wake_accept_suggestions', { server: 'editor' });
       assert.equal(taken.success, true, taken.error);
       assert.deepEqual(h.gateJson().policies.map((p) => p.name).filter((name) => name.startsWith('suggested:')), ['suggested:editor:1', 'suggested:editor:2']);
@@ -305,18 +313,45 @@ describe('wake onboarding: the servers a store already had', () => {
     } finally { await h.f.close(); }
   });
 
-  it("a server whose events the agent's own rule decides is settled at its first event too, against what it declares then", { timeout: 60_000 }, async () => {
-    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-decided-'));
-    const policies: GatePolicy[] = [{ name: 'editor-quiet', match: { source: 'editor' }, behavior: 'defer' }, CATCH_ALL];
-    const earlier = await games({ gateDir, onboarding: false, policies });
+  const agentRules: Array<[string, GatePolicy]> = [
+    ['defers', { name: 'editor-quiet', match: { source: 'editor' }, behavior: 'defer' }],
+    ['wakes on', { name: 'editor-wakes', match: { source: 'editor' }, behavior: 'always' }],
+    ['suppresses', { name: 'editor-hidden', match: { source: 'editor' }, behavior: 'defer', suppress: { description: "the editor's moves" } }],
+  ];
+  for (const [does, rule] of agentRules) {
+    it(`a server whose events a rule of the agent's ${does} is settled at its first event too, against what it declares then`, { timeout: 60_000 }, async (t) => {
+      const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-decided-'));
+      t.after(() => rmSync(gateDir, { recursive: true, force: true }));
+      const policies: GatePolicy[] = [rule, CATCH_ALL];
+      const earlier = await games({ gateDir, onboarding: false, policies });
+      earlier.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
+      await earlier.f.close();
+      const h = await games({ gateDir, policies });
+      try {
+        assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
+        await h.push('Your move.', ['surface:turn']);
+        assert.equal(h.decisions().get('editor')?.state, 'unasked', 'the rule decided the event, and the server is settled all the same');
+        assert.equal(h.stored().length, 0);
+      } finally { await h.f.close(); }
+    });
+  }
+
+  it('a predating server whose declarations cannot be read at its event stays unsettled, rather than settled against nothing', { timeout: 60_000 }, async (t) => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-undeclared-'));
+    t.after(() => rmSync(gateDir, { recursive: true, force: true }));
+    const earlier = await games({ gateDir, onboarding: false });
     earlier.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
     await earlier.f.close();
-    const h = await games({ gateDir, policies });
+    const h = await games({ gateDir });
     try {
       assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
-      await h.push('Your move.', ['surface:turn']);
-      assert.equal(h.decisions().get('editor')?.state, 'unasked', 'the rule decided the event, and the server is settled all the same');
-      assert.equal(h.stored().length, 0);
+      await h.f.send('push/event', { featureSet: 'games', eventId: 'undeclared-1', timestamp: TS, tags: ['surface:turn'], payload: { content: [{ type: 'text', text: 'Your move.' }] } });
+      // The connection's feature sets go, as at a close the server reconnects from, before the loop takes the event.
+      (h.f.framework as unknown as { featureSetManager: { removeServer(id: string): void } }).featureSetManager.removeServer('editor');
+      await h.f.framework.runUntilIdle();
+      assert.equal(h.decisions().get('editor'), undefined, 'no record against a declaration it could not read');
+      assert.equal(h.decisions().predates('editor'), true, 'still the store\'s own server, for its next event');
+      assert.deepEqual(h.stored(), [], 'and no notice');
     } finally { await h.f.close(); }
   });
 
@@ -334,8 +369,9 @@ describe('wake onboarding: the servers a store already had', () => {
     } finally { await h.f.close(); }
   });
 
-  it('only that first start: where onboarding has already started, a server is offered as before', { timeout: 60_000 }, async () => {
+  it('only that first start: where onboarding has already started, a server is offered as before', { timeout: 60_000 }, async (t) => {
     const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-started-'));
+    t.after(() => rmSync(gateDir, { recursive: true, force: true }));
     // A new store's first start: no gate.json before it, so nothing predates.
     // The agent changes a rule, so the store has a gate.json from here on.
     const first = await games({ gateDir });
