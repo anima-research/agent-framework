@@ -284,9 +284,11 @@ export interface AgentConfig {
    * stored result of a call it carried), a tool result with the call it is
    * paired with where a pair is found (the call body right before it, or,
    * on a presented window, one before a run of system notices when the pair
-   * is proven); otherwise the result goes alone and its call can stay. On a
-   * presented window the originals stay in the raw record; a window that is
-   * still the record (legacy mode) removes them, and the notice says which. That isn't necessarily the content that tripped the
+   * is proven); otherwise the result goes alone and its call can stay, or,
+   * when the carried row is the call, the call goes alone and its result
+   * stays. On a presented window the originals stay in the raw record; a
+   * window that is still the record (legacy mode) removes them, and the
+   * notice says which. That isn't necessarily the content that tripped the
    * classifier. The first rewind of an episode appends one notice at the tail
    * of the context saying that earlier content was set aside, and later ones
    * update that notice in place; it carries none of that content, so it cannot

@@ -230,6 +230,18 @@ const watchRetracts = (h: Awaited<ReturnType<typeof boot>>) => {
   return { retracts, removals };
 };
 
+// A plain notice, then a system-marked row holding a host change
+// (system_change): every row between is a system row, so only the host
+// change keeps the pair from being proven. The plain notice before it is
+// what lets the store take the change after an unanswered call.
+function hostChange(h: Awaited<ReturnType<typeof boot>>): MessageId {
+  h.internals.addMessage('user', [text('notice')], { system: true });
+  const id = h.internals.addMessage('user', [{ type: 'system_change', addSystem: ['Use metric units.'] } as unknown as ContentBlock], { system: true });
+  if (h.cm('mira').ordinalOf(id) === undefined) h.cm('mira').presentRows([id]);
+  assert.equal(h.cm('mira').windowStatusOf(id), 'in', "the premise: mira's window holds the host change");
+  return id;
+}
+
 describe('a presented-window shed pairs a result with its call across system notices only when proven (#737)', () => {
   it('retracts the call and result in one retractRows, past several notices, and keeps the notices', async () => {
     const h = await boot();
@@ -309,7 +321,7 @@ describe('a presented-window shed pairs a result with its call across system not
   // What isn't proven sheds as main does: the result alone, with the call
   // and the notice left in the window. Nothing declines.
   for (const shape of ['mismatch', 'missing-id', 'incomplete', 'reused-call', 'unresolved-reuse', 'answered-earlier', 'mixed', 'other-writer',
-    'ordinary-turn', 'marker'] as const) {
+    'ordinary-turn', 'marker', 'host-change'] as const) {
     it(`a pair it can't prove sheds as before: the result alone, crossing nothing (${shape})`, async () => {
       const h = await boot(shape === 'other-writer' ? { agents: { mira: { observes: ['oren'], foreignRounds: 'raw' } } } : {});
       h.internals.addMessage('user', [text('keep-before')]);
@@ -325,6 +337,7 @@ describe('a presented-window shed pairs a result with its call across system not
       const call = own('mira', [callBlock('a'), ...(shape === 'incomplete' ? [callBlock('b')] : [])]);
       const between = shape === 'ordinary-turn' ? h.internals.addMessage('user', [text('ordinary')])
         : shape === 'marker' ? h.internals.addMessage('user', [text('marker')], { system: true, kind: 'refusal-rewind' })
+        : shape === 'host-change' ? hostChange(h)
         : h.internals.addMessage('user', [text('notice')], { system: true });
       const resultContent = [resultBlock(shape === 'missing-id' ? undefined : shape === 'mismatch' ? 'x' : 'a'),
         ...(shape === 'mixed' ? [callBlock('b')] : [])];

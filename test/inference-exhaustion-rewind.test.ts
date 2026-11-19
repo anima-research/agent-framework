@@ -7,9 +7,11 @@
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
- * breaker auto-quarantines: sheds the newest complete exchange (the same
- * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
- * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
+ * breaker auto-quarantines: sheds the newest turn (the same shedNewestTurn
+ * primitive the refusal auto-rewind and /unstick use, which takes a tool
+ * result with its call where it finds or proves the pair, and otherwise
+ * sheds the result alone, which can leave its tool_use), drops ONE
+ * consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
  * never eat the whole history.
  */

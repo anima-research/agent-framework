@@ -3394,7 +3394,8 @@ function isGapNotice(rows: readonly StoredMessage[], hasBlock: (m: StoredMessage
  * and none of those IDs is on any other call or result the agent's record
  * or window holds, so no other round there, earlier, reused or another
  * writer's, can be the one the result answers. Anything else isn't proven,
- * and the result is shed as before, without crossing the notices.
+ * and the shed goes as before, without crossing the notices: the result
+ * alone, or, where the carried row is the call, the call alone.
  */
 function gapPairProven(
   cm: { getAllMessages(): StoredMessage[] },
@@ -15130,8 +15131,9 @@ export class AgentFramework {
    * presented window, and only there, system notices between a result body
    * and the call body before them are passed over too (#737), when the pair
    * is proven (gapPairProven); the notices stay in the window. Any other
-   * shape pairs as before, and a result with no call so paired goes alone,
-   * which can leave its call in the window.
+   * shape pairs as before: a result with no call so paired goes alone,
+   * which can leave its call in the window, and a carried call whose later
+   * result isn't so paired goes alone, which leaves that result.
    *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
@@ -15182,7 +15184,8 @@ export class AgentFramework {
     // with a 400 ("thinking blocks in the latest assistant message cannot be
     // modified"). Where no pair is found or proven (callBefore returns
     // null), the result goes alone, as before #737, and the call can stay
-    // for membrane to answer with `[pending]`: a known limit. We do NOT
+    // for membrane to answer with `[pending]`; where the carried row is the
+    // call, the call goes alone and its result stays. A known limit. We do NOT
     // add a marker here; the caller keeps one consolidated marker
     // (updateRewindMarker).
     const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
@@ -15223,7 +15226,7 @@ export class AgentFramework {
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
-    // Determine the complete exchange to shed, newest first.
+    // Determine what to shed, newest first.
     const removedIds: MessageId[] = members.map((m) => m.id).reverse();
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
@@ -36280,7 +36283,8 @@ export class AgentFramework {
 
   /**
    * Automatic poison-history quarantine (the actual "breaker"). Sheds the
-   * newest complete exchange from the agent's history — reusing the same
+   * newest turn from the agent's history, with its paired call where the
+   * pair is found or proven (a result can go alone) — reusing the same
    * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
    * the single consolidated episode marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next
