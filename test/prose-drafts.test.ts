@@ -409,7 +409,7 @@ function onSecondStream(membrane: MockMembrane, response: NormalizedResponse): v
 }
 
 async function harness(opts: {
-  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
+  agents?: Array<{ name: string; /** AgentConfig.sendSilencing; on unless a test says false, since most of these read the hold. */ sendSilencing?: boolean; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
   xml?: boolean;
   roundPreamble?: boolean;
   retries?: number;
@@ -441,7 +441,7 @@ async function harness(opts: {
     return streamYielding(request, options);
   };
   const agents = (opts.agents ?? [{ name: 'scout' }]).map((a) => ({
-    name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`,
+    name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`, sendSilencing: a.sendSilencing ?? true,
     ...(a.proseRouting ? { proseRouting: a.proseRouting } : {}),
     ...(a.sameRoundThinkTextPolicy ? { sameRoundThinkTextPolicy: a.sameRoundThinkTextPolicy } : {}),
     ...(a.autoContinue ? { autoContinue: a.autoContinue } : {}),
@@ -2015,7 +2015,7 @@ describe('draft notices and turn-end settlement', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     try {
@@ -2048,7 +2048,7 @@ describe('draft notices and turn-end settlement', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     const internals = framework as unknown as {
@@ -2255,7 +2255,7 @@ describe('draft identity and risk evidence', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }, { name: 'other', model: 'test-model', systemPrompt: 'other' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', sendSilencing: true }, { name: 'other', model: 'test-model', systemPrompt: 'other', sendSilencing: true }],
       modules: [],
     });
     const internals = framework as unknown as {
@@ -2312,7 +2312,7 @@ describe('drafts resend ownership', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     const pending: Array<{ text: string; resolve: (o: unknown) => void }> = [];
@@ -3138,6 +3138,56 @@ describe('an explicit send holds plain speech only where it may have posted', ()
   const inRoom = (h: H) => h.publishes().filter((p) => p.event === 'publish' && p.channelId === ROOM).map((p) => p.text);
   const held = (h: H) => h.drafts().map((d) => [d.text, d.reason]).reverse();
   const notices = (h: H) => h.texts().filter((t) => t.startsWith('[drafts]'));
+  const draftsToolShown = (h: H) => (h.framework as unknown as {
+    getToolsForAgent(agentName: string): Array<{ name: string; description: string }>;
+  }).getToolsForAgent('scout').find((tool) => tool.name === 'drafts')!.description;
+  const SEND_REASON = 'because an explicit send in its turn may already have posted where it was going, ';
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode}: with send silencing off, a line beside a send to its own channel is posted, and so are the turn's later rounds`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode, sendSilencing: false }], sendTool: true });
+      try {
+        await h.turn([
+          createMockResponse([text(LINE), send('s1', ROOM, 'The reply, sent with the tool.')], 'tool_use'),
+          createMockResponse([text('And one more thing for you.'), call('l1', 'channel_list', {})], 'tool_use'),
+          createMockResponse([text('That is all from me.')]),
+        ]);
+        assert.deepEqual(h.sends().map((s) => [s.channelId, s.text]), [[ROOM, 'The reply, sent with the tool.']]);
+        assert.deepEqual(inRoom(h), [LINE, 'And one more thing for you.', 'That is all from me.']);
+        assert.deepEqual(held(h), []);
+        assert.deepEqual(notices(h), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('the resident turns send silencing on with agent_settings: sends made after it hold, the drafts tool names the reason, and a reset posts again', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: false }], sendTool: true });
+    try {
+      assert.ok(!draftsToolShown(h).includes(SEND_REASON), 'off: the drafts tool names no send as a reason');
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, false);
+      await h.turn([
+        createMockResponse([call('a1', 'agent_settings', { action: 'update', send_silencing: true })], 'tool_use'),
+        createMockResponse([text(LINE), send('s1', ROOM, 'The reply, sent with the tool.')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true);
+      assert.deepEqual(inRoom(h), []);
+      assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+      assert.ok(draftsToolShown(h).includes(SEND_REASON), 'on: the drafts tool names the send as a reason');
+
+      await h.restart();
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the resident's choice outlives a restart");
+
+      h.framework.resetAgentRuntimeSettings('scout', ['sendSilencing']);
+      assert.ok(!draftsToolShown(h).includes(SEND_REASON));
+      await h.turn([createMockResponse([text('Again.'), send('s2', ROOM, 'Sent again.')], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(inRoom(h), ['Again.']);
+    } finally {
+      await h.close();
+    }
+  });
 
   for (const mode of ['locus', 'hybrid'] as const) {
     it(`${mode}: a line beside a send to another channel goes to the person it was for`, async () => {
@@ -4830,8 +4880,8 @@ describe('the held-draft notice written mid-turn', () => {
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
       agents: [
-        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
-        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', observes: ['scout'] },
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true },
+        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', sendSilencing: true, observes: ['scout'] },
       ],
       modules: [],
     });

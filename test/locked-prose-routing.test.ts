@@ -166,7 +166,7 @@ describe('locked prose routing', () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', proseRouting: 'locked', ...agent }],
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', sendSilencing: true, proseRouting: 'locked', ...agent }],
       modules: [module],
       ...(options.speech ? { speech: options.speech } : {}),
     });
@@ -822,7 +822,7 @@ describe('locked prose routing', () => {
     const { routed } = stubChannelRegistry(framework);
     try {
       const created = await framework.createEphemeralAgent({
-        name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'locked', proseLock: '#main',
+        name: 'run-1', model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all', proseRouting: 'locked', proseLock: '#main',
       });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       membrane.pushResponse(createMockResponse([

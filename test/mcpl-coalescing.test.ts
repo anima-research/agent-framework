@@ -3482,6 +3482,10 @@ for (const reader of ['other', 'agent'] as const) test(`R18 (${reader} read it):
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
+// These tests read whether prose after an explicit send is withheld, so their
+// resident's sends silence (AgentConfig.sendSilencing, off by default).
+const SENDS_SILENCE = [{ name: 'agent', model: 'test', systemPrompt: 'test', primaryWaitsForAuxiliary: true, sendSilencing: true }];
+
 /**
  * A turn, started by a mention in `chat`, with one round per `during` that
  * sends explicitly (channel_publish), then a round that speaks. Each sending
@@ -3574,7 +3578,7 @@ const followUpThenEdit: Record<string, (f: Fixture) => Promise<string>> = {
 };
 
 for (const [lane, arrive] of Object.entries(followUpThenEdit)) test(`#157 (${lane}): an edit of a follow-up the agent hasn't been shown is its first view, so the reply after an explicit send routes`, async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   let outcome: string | undefined;
   const r = await sendThenSpeak(f, async () => { outcome = await arrive(f); });
   assert.equal(outcome, 'replaced');
@@ -3584,7 +3588,7 @@ for (const [lane, arrive] of Object.entries(followUpThenEdit)) test(`#157 (${lan
 });
 
 for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) test(`#157: a ${tag} occurrence that replaced an unread follow-up is still a notice about it, so the prose after an explicit send stays withheld`, async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   let outcome: string | undefined;
   const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); outcome = await pushTagged(f, [tag], 'e2', `${tag}_notice`); });
   assert.equal(outcome, 'replaced');
@@ -3594,7 +3598,7 @@ for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) tes
 });
 
 test('#157: an edit of an edit, after the agent read the message, stays a marker, so the prose after an explicit send stays withheld', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   const outcomes: string[] = [];
   const r = await sendThenSpeak(f, async () => {
     for (const [eventId, text] of [['e1', 'question_edited_once'], ['e2', 'question_edited_twice']]) {
@@ -3608,7 +3612,7 @@ test('#157: an edit of an edit, after the agent read the message, stays a marker
 });
 
 test('#157: an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => { await pushTagged(f, ['chat:edited']); });
   assert(r.injected[0].includes('follow_up_wiht_typo'), 'the first boundary showed the agent the follow-up');
   assert(r.injected[1].includes('follow_up_fixed'), 'the second boundary showed it the edit');
@@ -3617,7 +3621,7 @@ test('#157: an edit of a follow-up the agent was shown at a tool boundary stays 
 });
 
 test('#157: an edit of an edit of a follow-up the agent was shown at a tool boundary stays a marker, so the prose after the next explicit send stays withheld', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f); }, async () => {
     await pushTagged(f, ['chat:edited'], 'e2', 'follow_up_fixed');
     await pushTagged(f, ['chat:edited'], 'e3', 'follow_up_fixed_again');
@@ -3629,7 +3633,7 @@ test('#157: an edit of an edit of a follow-up the agent was shown at a tool boun
 });
 
 test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last its first view, so the reply after an explicit send routes', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   const outcomes: string[] = [];
   const r = await sendThenSpeak(f, async () => {
     await unreadFollowUp(f);
@@ -3643,7 +3647,7 @@ test('#157: two edits of a follow-up the agent hasn\'t been shown leave the last
 });
 
 test('#157: an edit of a follow-up whose producer never marked it initial stays a marker, so the prose after an explicit send stays withheld', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   let outcome: string | undefined;
   const r = await sendThenSpeak(f, async () => { await unreadFollowUp(f, false); outcome = await pushTagged(f, ['chat:edited']); });
   assert.equal(outcome, 'replaced', 'the edit replaced the unread follow-up, whose history the host can\'t know');
@@ -3665,7 +3669,7 @@ const serverMarked: Record<string, (f: Fixture) => Promise<string>> = {
 };
 
 for (const [lane, deliver] of Object.entries(serverMarked)) test(`#157 (${lane}): a server can't mark its own edit as the agent's first view`, async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   let outcome: string | undefined;
   const r = await sendThenSpeak(f, async () => { outcome = await deliver(f); });
   assert.equal(outcome, 'appended');
@@ -3737,7 +3741,7 @@ test("#157: an edit that addresses the agent, of a follow-up stored while the tu
 });
 
 test('#157: an edit of a follow-up stored at once, which a turn then read, is appended as a marker, so the prose after an explicit send stays withheld', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   // Stored at once, with no turn alive. The turn it wakes shows it to the agent in its compile.
   await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'follow_up_wiht_typo', { initial: true }, 'chat', 'm2'), tags: ['chat:ambient', 'chat:from-human'] }] });
   await f.framework.runUntilIdle();
@@ -3752,7 +3756,7 @@ test('#157: an edit of a follow-up stored at once, which a turn then read, is ap
 });
 
 test('#157: an edit admitted while a compile is assembling a message stored at once stays a marker, so the prose after an explicit send stays withheld', async (t) => {
-  const f = await fixture(); t.after(f.close); await f.register();
+  const f = await fixture({ agents: SENDS_SILENCE }); t.after(f.close); await f.register();
   // The question is stored at once and wakes the turn. The edit is admitted
   // after the compile has assembled it and before the compile returns, so
   // the question still counts as unread.

@@ -355,28 +355,51 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
 };
 
 /** Why a round's calls silence its prose: `skip_reply` deliberately keeps it
- *  private; an explicit send holds it back as resendable drafts. */
-const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send' | 'private' | null => {
+ *  private; an explicit send holds it back as resendable drafts, where the
+ *  agent's sends silence at all (AgentConfig.sendSilencing). */
+const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>, sendSilencing: boolean): 'send' | 'private' | null => {
   if (calls.some((c) => bareToolName(c.name) === 'skip_reply')) return 'private';
-  return calls.some(isSilencingCall) ? 'send' : null;
+  return sendSilencing && calls.some(isSilencingCall) ? 'send' : null;
 };
 
 /**
+ * The `drafts` tool's description for one agent: an explicit send is named
+ * as a reason speech is held only where the agent's sends silence
+ * (AgentConfig.sendSilencing).
+ */
+const draftsToolDescription = (sendSilencing: boolean): string =>
+  'Your held drafts: plain speech of yours that was NOT sent — held back ' +
+  (sendSilencing ? 'because an explicit send in its turn may already have posted where it was going, ' : '') +
+  'because a routing prefix bounced, or because it had no destination. ' +
+  `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
+  `drafts are always kept; an older one may be let go once ${Math.round(KEEP_IDLE_MS / 86_400_000)} days pass in which nothing happens to it. ` +
+  'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
+  'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
+  'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
+  'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
+  'already have been posted (its outcome is unknown), resend needs confirmDuplicate: true. dismiss: set ' +
+  'drafts aside (your history keeps the words). A field you are not using may be omitted or passed as null.';
+
+/**
  * Whether a call of one of these tools can change a round's routing
- * (routeRound): in locus and hybrid mode a silencing tool, or `drafts`,
+ * (routeRound): in locus and hybrid mode, for an agent whose sends silence
+ * (AgentConfig.sendSilencing), a silencing tool, or `drafts`,
  * whose resend is an explicit send (isSilencingCall); in
- * explicit mode, where sends don't silence, `skip_reply`, which keeps the
- * round private, and `drafts`; in either, `think` under the private same-round
- * policy, which holds the round back. Disabled mode routes nothing.
+ * explicit mode, or for an agent whose sends don't silence, `skip_reply`,
+ * which keeps the round private, and `drafts`; in either, `think` under the
+ * private same-round policy, which holds the round back. Disabled mode routes
+ * nothing.
  */
 const changesRouting = (
   named: ReadonlySet<string>,
   mode: NonNullable<AgentConfig['proseRouting']>,
   privateThink: boolean,
+  sendSilencing: boolean,
 ): boolean => {
   if (mode === 'disabled') return false;
+  const sendsSilence = sendSilencing && mode !== 'explicit';
   for (const name of named) {
-    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply' || name === 'drafts') return true;
+    if (name === 'think' ? privateThink : sendsSilence || name === 'skip_reply' || name === 'drafts') return true;
   }
   return false;
 };
@@ -2853,6 +2876,7 @@ interface RedoEntry {
 
 interface InferenceToolSnapshot {
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
+  sendSilencing: boolean;
 }
 
 /**
@@ -9347,6 +9371,7 @@ export class AgentFramework {
     'tail_tokens',
     'transition_pace_tokens',
     'same_round_think_text_policy',
+    'send_silencing',
   ];
 
   /**
@@ -9445,6 +9470,7 @@ export class AgentFramework {
   private captureInferenceToolSnapshot(agent: Agent): InferenceToolSnapshot {
     return {
       sameRoundThinkTextPolicy: agent.getEffectiveSameRoundThinkTextPolicy(),
+      sendSilencing: agent.getEffectiveSendSilencing(),
     };
   }
 
@@ -9861,6 +9887,9 @@ export class AgentFramework {
             ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
           canSkipReply,
         );
+      }
+      if (tool.name === 'drafts') {
+        return { ...tool, description: draftsToolDescription(snapshot?.sendSilencing ?? this.getAgentRuntimeSettings(agentName).sendSilencing) };
       }
       if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
       // A holder's words are the registry's, so its cached tool list doesn't change.
@@ -11718,6 +11747,11 @@ export class AgentFramework {
         `Invalid persisted sameRoundThinkTextPolicy for agent "${agentName}": ${JSON.stringify(overrides.sameRoundThinkTextPolicy)}`,
       );
     }
+    if (overrides.sendSilencing !== undefined && typeof overrides.sendSilencing !== 'boolean') {
+      throw new Error(
+        `Invalid persisted sendSilencing for agent "${agentName}": ${JSON.stringify(overrides.sendSilencing)}`,
+      );
+    }
     return overrides;
   }
 
@@ -11806,8 +11840,9 @@ export class AgentFramework {
     overrides: AgentRuntimeSettingsOverrides,
   ): void {
     const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
-    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, ...settings } = overrides;
+    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, sendSilencing, ...settings } = overrides;
     if (sameRoundThinkTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundThinkTextPolicy });
+    if (sendSilencing !== undefined) agent.restoreRuntimeSettings({ sendSilencing });
     const unapplied: string[] = [];
     /** Restore one setting, or keep it set but unapplied; true if it applied. */
     const restore = (part: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>) => {
@@ -12228,6 +12263,7 @@ export class AgentFramework {
       // think-policy override changes what it renders.
       ...(parent.contextBudgetTokens !== undefined ? { contextBudgetTokens: parent.contextBudgetTokens } : {}),
       sameRoundThinkTextPolicy: parent.getEffectiveSameRoundThinkTextPolicy(),
+      sendSilencing: parent.getEffectiveSendSilencing(),
       ...options.config,
       name: options.name,
       strategy: options.strategy,
@@ -14777,17 +14813,7 @@ export class AgentFramework {
    *  every property as required can still say "not in use" (fieldInUse). */
   private static readonly DRAFTS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'drafts',
-    description:
-      'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in its turn ' +
-      'may already have posted where it was going, because a routing prefix bounced, or because it had no destination. ' +
-      `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
-      `drafts are always kept; an older one may be let go once ${AgentFramework.DRAFT_KEEP_DAYS} days pass in which nothing happens to it. ` +
-      'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
-      'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
-      'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
-      'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
-      'already have been posted (its outcome is unknown), resend needs confirmDuplicate: true. dismiss: set ' +
-      'drafts aside (your history keeps the words). A field you are not using may be omitted or passed as null.',
+    description: draftsToolDescription(true),
     inputSchema: {
       type: 'object',
       properties: {
@@ -14920,7 +14946,7 @@ export class AgentFramework {
     name: 'agent_settings',
     description:
       'Read or change your hot runtime settings. This intentionally exposes only ' +
-      'context budget, recent raw tail size, transition pace, and same-round think text routing; model, prompts, ' +
+      'context budget, recent raw tail size, transition pace, same-round think text routing, and send silencing; model, prompts, ' +
       'folding strategy, and other restart-bound configuration are not mutable here. ' +
       'Lower context budgets converge gradually under the transition pace before ' +
       'becoming the hard live limit; increases take effect immediately.',
@@ -14944,9 +14970,17 @@ export class AgentFramework {
             'Routing policy for ordinary text emitted in the same native assistant round as think(). ' +
             "Omitted in the recipe preserves the compatibility carry-forward: public.",
         },
+        send_silencing: {
+          type: 'boolean',
+          description:
+            'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
+            'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
+            'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
+            'is posted as usual. A change applies to sends made after it.',
+        },
         settings: {
           type: 'array',
-          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy'] },
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy', 'send_silencing'] },
           description: 'For reset: settings to restore to recipe values. Omit to reset all.',
         },
       },
@@ -30497,7 +30531,7 @@ export class AgentFramework {
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
                 ? null
-                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)));
+                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)), agent.getEffectiveSendSilencing());
               const trailingSilence: TurnSilence | null = liveProseRouting
                 ? silence
                 : silence === 'private' || fallbackCause === 'private' ? 'private' : turnSends;
@@ -32133,7 +32167,8 @@ export class AgentFramework {
     const code = action === 'run'
       ? fields.code
       : action === 'wait' && typeof fields.script_id === 'string' ? ce.scripts.codeOf(agentName, fields.script_id) : undefined;
-    return typeof code === 'string' && changesRouting(routingToolsNamed(code), mode, privateThink);
+    return typeof code === 'string'
+      && changesRouting(routingToolsNamed(code), mode, privateThink, this.agents.get(agentName)?.getEffectiveSendSilencing() === true);
   }
 
   /**
@@ -33631,7 +33666,8 @@ export class AgentFramework {
   private roundCallOf(agentName: string, call: { name: string; input?: unknown; unparseableInput?: string }, refusedHere = false): RoundCall {
     const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.mayCallTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
-    return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused, permitted };
+    const cause = permitted || refused ? silenceCauseOf([call], this.agents.get(agentName)?.getEffectiveSendSilencing() === true) : null;
+    return { name: call.name, cause, refused, permitted };
   }
 
   private toolRoute(call: ToolCall, actor: string | undefined): ToolRoute {
@@ -42823,6 +42859,7 @@ export class AgentFramework {
         tail_tokens: JSON.stringify([s.tailTokens ?? null, saved.tailTokens ?? null]),
         transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
         same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
+        send_silencing: JSON.stringify([s.sendSilencing, saved.sendSilencing ?? null]),
       },
       exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
     };
@@ -42867,6 +42904,7 @@ export class AgentFramework {
         tail_tokens?: unknown;
         transition_pace_tokens?: unknown;
         same_round_think_text_policy?: unknown;
+        send_silencing?: unknown;
         immediate?: unknown;
         settings?: unknown;
       } & Record<string, unknown>;
@@ -42914,6 +42952,7 @@ export class AgentFramework {
           if (input.same_round_think_text_policy !== undefined) {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
+          if (input.send_silencing !== undefined) patch.sendSilencing = settingBoolean('send_silencing', input.send_silencing);
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
           if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
@@ -42966,6 +43005,7 @@ export class AgentFramework {
               ['tail_tokens', 'tailTokens'],
               ['transition_pace_tokens', 'transitionPaceTokens'],
               ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
+              ['send_silencing', 'sendSilencing'],
             ]);
             keys = [];
             for (const name of input.settings) {

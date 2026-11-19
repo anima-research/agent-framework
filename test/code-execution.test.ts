@@ -188,7 +188,7 @@ async function withFramework(
     storePath,
     membrane: membrane.asMembrane(),
     agents: options.resident
-      ? [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]
+      ? [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', sendSilencing: true, allowedTools: 'all' }]
       : [],
     modules: [options.module ?? new ScriptToolModule()],
     syncIntervalMs: 0,
@@ -205,7 +205,7 @@ async function withFramework(
 
 /** Run one ephemeral agent's turn to its end. */
 async function runEphemeral(framework: AgentFramework, name: string): Promise<{ speech: string; toolCallsCount: number }> {
-  const created = await framework.createEphemeralAgent({ name, model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+  const created = await framework.createEphemeralAgent({ name, model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all' });
   created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
   const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
   framework.start();
@@ -386,7 +386,7 @@ describe('code_execution through the framework', () => {
     try {
       await framework.start();
       await until(() => framework.getAllTools().some((t) => t.name === 'mcpl--echo--echo'), 'the echo server\'s tool');
-      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       await framework.runEphemeralToCompletion(created.agent, created.contextManager);
       const wire = membrane.lastStream!.receivedToolResults[0] as WireResult[];
@@ -1251,7 +1251,7 @@ describe('a round whose run or wait call watches a script that can change its ro
     const framework = await AgentFramework.create({
       storePath,
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', proseRouting: mode, ...config }],
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', sendSilencing: true, proseRouting: mode, ...config }],
       modules: [module],
       syncIntervalMs: 0,
       ...(options.codeExecution === false ? {} : { codeExecution: { enabled: true, ...(options.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: options.toolCallTimeoutMs }) } }),
@@ -2448,7 +2448,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted = true;
     });
     try {
-      const created = await h.framework.createEphemeralAgent({ name: 'eph-script', model: 'test-model', systemPrompt: 'Act.', allowedTools: 'all' });
+      const created = await h.framework.createEphemeralAgent({ name: 'eph-script', model: 'test-model', systemPrompt: 'Act.', sendSilencing: true, allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
       // The idle watchdog disposes the ephemeral while its script waits in the
       // slow call: the run is made to look idle only once the script is in the
