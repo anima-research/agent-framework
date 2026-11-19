@@ -55,7 +55,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { residents?: string[]; dir?: string; seed?: (cm: ContextManager) => void; agents?: Record<string, object> } = {}) {
+async function boot(opts: { residents?: string[]; dir?: string; seed?: (cm: ContextManager) => void; agents?: Record<string, object>; modules?: Module[] } = {}) {
   const dir = opts.dir ?? mkdtempSync(join(tmpdir(), 'af-shed-window-'));
   if (!opts.dir) dirs.push(dir);
   const storePath = join(dir, 'store.chronicle');
@@ -74,7 +74,7 @@ async function boot(opts: { residents?: string[]; dir?: string; seed?: (cm: Cont
     storePath,
     membrane: membrane.asMembrane(),
     agents: residents.map((name) => ({ name, model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', proseRouting: 'disabled', ...opts.agents?.[name] })),
-    modules: [new SurfaceModule()],
+    modules: [new SurfaceModule(), ...(opts.modules ?? [])],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
   } as never);
@@ -186,13 +186,14 @@ for (const gap of [false, true]) {
   it(`rewinds the complete ID-matched exchange on the next wire request (notice gap: ${gap})`, async () => {
     const h = await boot();
     h.internals.addMessage('user', [text('keep-before')]);
-    const call = h.internals.addMessage('mira', [
+    // The call and result as production stores them: mira's own rows.
+    const call = storeOwnRow(h.agent('mira'), 'mira', [
       { type: 'thinking', thinking: '', signature: 'exchange-signature' } as ContentBlock,
       text('exchange-narration'),
       { type: 'tool_use', id: 'exchange-call', name: 'shell', input: {} } as ContentBlock,
     ]);
     if (gap) h.internals.addMessage('user', [text('intervening-notice')], { system: true });
-    const result = h.internals.addMessage('user', [
+    const result = storeOwnRow(h.agent('mira'), 'user', [
       { type: 'tool_result', toolUseId: 'exchange-call', content: 'exchange-result' } as ContentBlock,
     ]);
     const other = await h.compiled('oren');
@@ -220,8 +221,12 @@ const watchRetracts = (h: Awaited<ReturnType<typeof boot>>) => {
   const removals: Array<[MessageId, MessageId]> = [];
   const retract = cm.retractRows.bind(cm);
   const remove = cm.removeMessages.bind(cm);
+  const removeOne = cm.removeMessage.bind(cm);
   cm.retractRows = (ids, opts) => { retracts.push([[...ids], opts]); return retract(ids, opts); };
   cm.removeMessages = (a, b) => { removals.push([a, b]); return remove(a, b); };
+  // A single row outside any body is removed by removeMessage
+  // (removeStoredMessages), so watch that too.
+  cm.removeMessage = (id) => { removals.push([id, id]); return removeOne(id); };
   return { retracts, removals };
 };
 
@@ -229,10 +234,10 @@ describe('a presented-window shed pairs a result with its call across system not
   it('retracts the call and result in one retractRows, past several notices, and keeps the notices', async () => {
     const h = await boot();
     h.internals.addMessage('user', [text('keep-before')]);
-    const call = h.internals.addMessage('mira', [callBlock('a'), callBlock('b')]);
+    const call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('a'), callBlock('b')]);
     const n1 = h.internals.addMessage('user', [text('notice-one')], { system: true });
     const n2 = h.internals.addMessage('user', [text('notice-two')], { system: true });
-    const result = h.internals.addMessage('user', [resultBlock('b'), resultBlock('a')]);
+    const result = storeOwnRow(h.agent('mira'), 'user', [resultBlock('b'), resultBlock('a')]);
     const oren = await h.compiled('oren');
     const { retracts, removals } = watchRetracts(h);
     const rec = h.internals.shedNewestTurn(h.agent('mira'));
@@ -262,7 +267,8 @@ describe('a presented-window shed pairs a result with its call across system not
       // Rows put in the window directly; the results are held, and left out
       // by the view. Stamped, as mira's own rows; unstamped, as a
       // write-down takes in rows stored before stamps, whose writer is
-      // unknown: those prove no pair, and the result goes alone, as on main.
+      // unknown: those prove no pair across the notice, so the carried call
+      // is shed alone, as on main, and the held result stays.
       const store = (h.cm('mira') as unknown as { messageStore: { append: (...args: unknown[]) => { id: MessageId } } }).messageStore;
       const own = (meta: object = {}) => (stamped ? { ...meta, audience: ['mira'], ownRowOf: 'mira' } : meta);
       const call = store.append('mira', [callBlock('a')], own()).id;
@@ -274,7 +280,6 @@ describe('a presented-window shed pairs a result with its call across system not
       h.cm('mira').presentRows([stray]);
       assert.ok(!(await h.compiled('mira')).includes('result-payload'), 'the premise: the view leaves both out');
       const rec = h.internals.shedNewestTurn(h.agent('mira'), new Set([call]));
-      // Unstamped, the carried call is shed alone, and the results stay.
       assert.deepEqual(rec?.removedIds, stamped ? [held, call] : [call]);
       assert.deepEqual([notice, stray].map((id) => h.cm('mira').windowStatusOf(id)), ['in', 'in']);
       if (!stamped) assert.equal(h.cm('mira').windowStatusOf(held), 'in');
@@ -290,10 +295,10 @@ describe('a presented-window shed pairs a result with its call across system not
     } });
     assert.ok(h.windowTexts('mira').includes('hidden-legacy-notice'), 'the premise: the window holds the reasoning-loss row');
     assert.doesNotMatch(await h.compiled('mira'), /hidden-legacy-notice/, 'and the view leaves it out');
-    const call = h.internals.addMessage('mira', [callBlock('y')]);
+    const call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('y')]);
     const held = h.internals.addMessage('user', [text('held notice')], { system: true, tuneOut: { epochId: 'held' } } as MessageMetadata);
     h.cm('mira').presentRows([held]);
-    const result = h.internals.addMessage('user', [resultBlock('y')]);
+    const result = storeOwnRow(h.agent('mira'), 'user', [resultBlock('y')]);
     assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result, call]);
     assert.equal(h.cm('mira').windowStatusOf(held), 'in');
     assert.equal(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds.length, 2, 'the seeded call and result');
@@ -324,8 +329,38 @@ describe('a presented-window shed pairs a result with its call across system not
       assert.deepEqual(rec?.removedIds, [result], 'the result body alone, as on main');
       assert.deepEqual([retracts, removals], [[[[result], { undone: true }]], []]);
       assert.deepEqual([call, between].map((id) => h.cm('mira').windowStatusOf(id)), ['in', 'in'], 'the call and what sits between stay');
+      assert.ok(h.cm('mira').getMessage(result), 'the record keeps the result');
     });
   }
+
+  // Two module writers, each writing for mira: one's tool call, a notice,
+  // then the other's result with the same ID. Both rows carry the same
+  // audience stamp and no owner stamp, so nothing says one writer wrote
+  // both: the result goes alone, as on main, and the call and notice stay.
+  it("rows two module writers stored for the same audience, with no owner stamp, prove no pair across a notice", async () => {
+    class Writer implements Module {
+      ctx!: ModuleContext;
+      constructor(readonly name: string) {}
+      async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] { return []; }
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, error: 'no tools' }; }
+      async onProcess(): Promise<EventResponse> { return {}; }
+    }
+    const one = new Writer('writer-one'), two = new Writer('writer-two');
+    const h = await boot({ modules: [one, two] });
+    await h.framework.start();
+    const call = one.ctx.addMessage('mira', [callBlock('shared-id')], undefined, { forAgent: 'mira' });
+    const notice = h.internals.addMessage('user', [text('notice')], { system: true });
+    const result = two.ctx.addMessage('user', [resultBlock('shared-id')], undefined, { forAgent: 'mira' });
+    const stamps = [call, result].map((id) => h.cm('mira').getMessage(id)?.metadata as { audience?: string[]; ownRowOf?: string } | undefined);
+    assert.deepEqual(stamps.map((m) => [m?.audience, m?.ownRowOf]), [[['mira'], undefined], [['mira'], undefined]],
+      'the premise: the same audience, and no owner');
+    const { retracts, removals } = watchRetracts(h);
+    assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result], 'the result alone, as on main');
+    assert.deepEqual([retracts, removals], [[[[result], { undone: true }]], []]);
+    assert.deepEqual([call, notice].map((id) => h.cm('mira').windowStatusOf(id)), ['in', 'in'], 'the unrelated call and the notice stay');
+  });
 
   it("the record's shed (a window that is still the record) is unchanged: the adjacent pair in one removal", async () => {
     const h = await boot();
