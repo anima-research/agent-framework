@@ -354,6 +354,10 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
   return envelopes.filter((e) => e.trim()).map((e) => e.replace(/^\s+(?=>>>)/, ''));
 };
 
+/** The words of an agent's own in a text: `{{unsent}}` stands for a bounced
+ *  draft, which a held round leaves where it was. */
+const ownWords = (text: string): string => text.replace(/\{\{unsent\}\}/g, '').trim();
+
 /**
  * Whether explicit routing would send any of a cut round's words, had they not
  * been held: a `>>` destination with words after it, or unprefixed words,
@@ -363,7 +367,7 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
 const explicitWouldSend = (cutRuns: readonly string[]): boolean =>
   cutRuns.some((run) => splitExplicitEnvelopes(run).some((envelope) => {
     const parsed = parseProsePrefix(envelope);
-    return parsed.kind === 'none' || (parsed.kind === 'target' && !!parsed.body.trim());
+    return parsed.kind !== 'private' && !!ownWords(parsed.body);
   }));
 
 /**
@@ -389,7 +393,7 @@ const hybridWouldSend = (
     if (parsed.kind === 'target') {
       // A destination with no words after it sends nothing yet.
       state = undefined;
-      return !!parsed.body.trim();
+      return !!ownWords(parsed.body);
     }
     if (envelope.startsWith('>>>')) {
       state = undefined;
@@ -30185,16 +30189,18 @@ export class AgentFramework {
             const heldUnsaid = cutThinkPrivate && !liveProseRouting && !cutPrivate && !!this.channelRegistry
               && turnProseRouting !== 'disabled'
               && !cut!.calls.some((call) => call.name === 'think')
-              && cut!.content.slice(cut!.start).some((b) => b.type === 'text' && !!(b as { text?: string }).text?.trim())
+              && cut!.content.slice(cut!.start).some((b) => b.type === 'text' && !!ownWords((b as { text?: string }).text ?? ''))
               && (turnProseRouting !== 'explicit' || explicitWouldSend(cutRuns))
               && (turnProseRouting !== 'hybrid' || hybridWouldSend(
                 streamRouting.hybridHold,
                 splitProseRuns(withoutRoundsProse(cut!.content.slice(0, cut!.start), new Set([...refusedWakeRounds, ...privateThinkRounds]))),
                 cutRuns,
               ));
+            // Explicit routing's sticky target lasts only the turn, so a resend
+            // names its destination (R5-1, the fresh reader's find).
             const HELD_UNSAID = 'What you wrote before it wasn\'t posted either: under your same-round think policy it\'s kept back ' +
               'in case it was written beside think, and nothing keeps it for you to send later. If that call wasn\'t think, ' +
-              'send what should go out again.';
+              `send what should go out again${turnProseRouting === 'explicit' ? ', with its `>>` destination' : ''}.`;
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
               generationLost = true;
