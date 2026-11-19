@@ -16,7 +16,6 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
   let next = rows.length;
   const compiles: Array<{ kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean } | undefined> = [];
   const reads = { firstChanged: 0 };
-  const windows: Array<{ offset: number; limit: number; resolveBlobs?: boolean }> = [];
   let lastCommitted: string[] | null = null;
   const branch = { id: 'main' };
   const cm = {
@@ -64,12 +63,9 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
     getPresentedMessages: () => rows.map((r) => ({ id: r.id, participant: r.participant, content: r.content, metadata: r.metadata ?? {} })),
     getAllMessages: () => rows.map((r) => ({ id: r.id, participant: r.participant, content: r.content, metadata: r.metadata ?? {} })),
     getMessageCount: () => rows.length,
-    getMessageWindow: (offset: number, limit: number, o?: { resolveBlobs?: boolean }) => {
-      windows.push({ offset, limit, resolveBlobs: o?.resolveBlobs });
-      return { messages: rows.slice(offset, offset + limit), startIndex: offset };
-    },
+    getMessageWindow: (offset: number, limit: number) => ({ messages: rows.slice(offset, offset + limit), startIndex: offset }),
   };
-  return { cm: cm as unknown as ContextManager, rows, compiles, reads, windows, branch, committed: () => lastCommitted };
+  return { cm: cm as unknown as ContextManager, rows, compiles, reads, branch, committed: () => lastCommitted };
 }
 
 const tool = (name: string, description = `${name} does a thing`): ToolDefinition => ({
@@ -252,37 +248,6 @@ describe('a change of tools or system text, declared in the context', () => {
       ['user:text', 'assistant:text', 'user:text', 'system:tool_addition'], "after the [Continue] the agent's own turn needs");
   });
 
-  it("waits where context-manager would refuse the change: after a call another's result left partly answered, or one sharded over a body; not after a cycle its own blocks answer", async () => {
-    const call = (...ids: string[]) => ids.map((id) => ({ type: 'tool_use', id, name: 'x', input: {} }) as ContentBlock);
-    const result = (...ids: string[]) => ids.map((id) => ({ type: 'tool_result', toolUseId: id, content: 'ok' }) as ContentBlock);
-    const cases: Array<[string, Row[], boolean]> = [
-      ['parallel calls, one answered', [{ id: 'c', participant: 'beta', content: call('p1', 'p2') }, { id: 'r', participant: 'user', content: result('p1') }], false],
-      ['parallel calls, both answered in messages of their own', [{ id: 'c', participant: 'beta', content: call('p1', 'p2') }, { id: 'r1', participant: 'user', content: result('p1') }, { id: 'r2', participant: 'user', content: result('p2') }], true],
-      ['a call on the first shard of a body', [
-        { id: 's0', participant: 'beta', content: call('s1'), bodyGroupId: 'g', shardIndex: 0 },
-        { id: 's1', participant: 'beta', content: [{ type: 'text', text: 'and more' }], bodyGroupId: 'g', shardIndex: 1 },
-      ], false],
-      ['a cycle its own blocks answer', [{ id: 'cycle', participant: 'beta', content: [...call('b1'), ...result('b1')] }], true],
-    ];
-    for (const [what, tail, declares] of cases) {
-      const context = fakeContext([said('user', 'hello'), ...tail]);
-      const agent = agentOn(context, { takes: true });
-      await agent.buildActivationRequest([tool('a')]);
-      await agent.buildActivationRequest([tool('a'), tool('b')]);
-      assert.equal(changeRows(context.rows).length, declares ? 1 : 0, what);
-    }
-  });
-
-  it("reads only the store's tail, blob-free, to see whether a change may go at the end", async () => {
-    const context = fakeContext(Array.from({ length: 1000 }, (_, i) => said(i % 2 ? 'agent' : 'user', `turn ${i}`)));
-    const agent = agentOn(context, { takes: true });
-    await agent.buildActivationRequest([tool('a')]);
-    context.windows.length = 0;
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.equal(changeRows(context.rows).length, 1, 'declared');
-    assert.deepEqual(context.windows, [{ offset: 984, limit: 16, resolveBlobs: false }], 'one window of the newest rows');
-  });
-
   it("keeps its recorded head as recorded when what a request carries is changed in place", async () => {
     const context = fakeContext([said('user', 'hello')]);
     const agent = agentOn(context, { takes: true });
@@ -295,19 +260,6 @@ describe('a change of tools or system text, declared in the context', () => {
     assert.equal(changeRows(context.rows).length, 1, 'with nothing declared back');
   });
 
-  it('waits for the results before declaring after calls that have none yet', async () => {
-    const call = { type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock;
-    const context = fakeContext([said('user', 'hello'), { id: 'call', participant: 'agent', content: [call] }]);
-    const agent = agentOn(context, { takes: true });
-    await agent.buildActivationRequest([tool('a')]);
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.deepEqual(changeRows(context.rows), [], 'nothing between the call and its result');
-    context.rows.push({ id: 'result', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] });
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.equal(changeRows(context.rows).length, 1, 'declared once the results are in');
-    assert.equal(context.rows.at(-1)!.participant, 'system');
-  });
-
   it('declares a second copy of a system block its head already holds', async () => {
     const context = fakeContext([said('user', 'hello')]);
     const agent = agentOn(context, { takes: true });
@@ -315,15 +267,6 @@ describe('a change of tools or system text, declared in the context', () => {
     const request = await agent.buildActivationRequest([tool('a')], [systemInjection('x'), systemInjection('x')]);
     const added = request.messages.flatMap((m) => m.content).filter((b) => (b as { type: string }).type === 'system_change').map((b) => (b as { addSystem?: string[] }).addSystem);
     assert.deepEqual(added, [['x']]);
-  });
-
-  it('declares after a call its own message answers, as context-manager counts it answered', async () => {
-    const cycle: Row = { id: 'cycle', participant: 'agent', content: [{ type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] };
-    const context = fakeContext([said('user', 'hello'), cycle]);
-    const agent = agentOn(context, { takes: true });
-    await agent.buildActivationRequest([tool('a')]);
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.equal(changeRows(context.rows).length, 1);
   });
 
   it('hashes the head that goes out for kv-unified: the recorded one, and the new one after a move', async () => {
@@ -370,21 +313,6 @@ describe('a change of tools or system text, declared in the context', () => {
     await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('one')]);
     await agent.buildActivationRequest([tool('a')], [systemInjection('one'), systemInjection('two'), systemInjection('three')]);
     assert.deepEqual(events.at(-1), { type: 'head:declared', removed: ['b'], defined: [], addedSystem: 2 });
-  });
-
-  it("waits for its own calls' results when another participant's message follows the calls", async () => {
-    const call = { type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock;
-    const context = fakeContext([said('user', 'hello'), { id: 'call', participant: 'agent', content: [call] }, said('beta', 'meanwhile')]);
-    const agent = agentOn(context, { takes: true });
-    await agent.buildActivationRequest([tool('a')]);
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.deepEqual(changeRows(context.rows), [], 'nothing between the calls and their results');
-    context.rows.push({ id: 'other-result', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't2', content: "beta's" } as ContentBlock] });
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.deepEqual(changeRows(context.rows), [], "another call's result doesn't answer the agent's");
-    context.rows.push({ id: 'result', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] });
-    await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.equal(changeRows(context.rows).length, 1, 'declared once the results are in');
   });
 
   it('sends a change an assembly stored once with the next request, when its own request never went out, and declares nothing new', async () => {
@@ -460,33 +388,6 @@ describe('a change of tools or system text, declared in the context', () => {
     assert.deepEqual(changeRows(request.messages as unknown as Row[]), [], 'and no row of its own adds that block again');
     assert.equal(changeRows(context.rows).length, 0, 'its change row taken out');
     assert.equal(context.committed()!.some((key) => key.includes('system_change')), false, 'and the compile it committed holds no row the request left out');
-  });
-
-  it("goes in the fallback form, declaring nothing, when the store refuses its change row", async () => {
-    const context = fakeContext([said('user', 'hello')]);
-    const refusing = context.cm as unknown as { addMessage: (...args: unknown[]) => string };
-    const write = refusing.addMessage;
-    refusing.addMessage = (...args: unknown[]) => {
-      if ((args[1] as Array<{ type: string }>).some((block) => block.type === 'system_change')) throw new Error("Message refused: a system change can't go between a tool call and its result");
-      return write(...args);
-    };
-    const heads = memoryHeadDeclarations(onMain);
-    heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
-    const events: HeadEvent[] = [];
-    const agent = agentOn(context, { takes: true }, heads, events);
-    const errors: string[] = [];
-    const error = console.error;
-    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-    let request: Awaited<ReturnType<Agent['buildActivationRequest']>>;
-    try { request = await agent.buildActivationRequest([tool('a'), tool('b')]); } finally { console.error = error; }
-    assert.deepEqual(request.tools, [tool('a'), tool('b')], "it goes on the agent's current tools");
-    assert.deepEqual(foldOf(request), now([tool('a'), tool('b')], SYSTEM));
-    assert.deepEqual(changeRows(context.rows), [], 'with nothing written');
-    assert.deepEqual(heads.read('agent'), { tools: [tool('a')], system: [SYSTEM] }, 'and its record as it was');
-    assert.deepEqual(events, [], 'and nothing declared');
-    assert.equal(errors.length, 1, 'and the refusal logged once');
-    assert.match(errors[0]!, /^\[head-declarations\] agent: a system change could not be stored, so the request goes on the agent's current tools and system text with no change row/);
-    assert.match(errors[0]!, /Message refused: a system change can't go between a tool call and its result/, 'with the store\'s error');
   });
 
   it("keeps a head on the branch it was recorded on, so a branch without one adopts and a switch back reads that branch's head", async () => {

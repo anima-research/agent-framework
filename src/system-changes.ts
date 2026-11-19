@@ -1,4 +1,4 @@
-import { continuesBody, type CompileResult, type MessageId } from '@animalabs/context-manager';
+import type { CompileResult, MessageId } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
 import { canonicalJson } from './stable-hash.js';
 
@@ -27,77 +27,6 @@ export function memoryHeadDeclarations(branch: () => string): HeadDeclarationSto
 // membrane renders a change by its block, whatever its participant.
 export const SYSTEM_CHANGE_PARTICIPANT = 'system';
 
-export function lastConversational<M extends { content: readonly ContentBlock[] }>(messages: readonly M[]): M | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) if (!isSystemChangeMessage(messages[i]!)) return messages[i];
-  return undefined;
-}
-
-export function endsOnUnansweredCalls(
-  messages: readonly { participant: string; content: readonly ContentBlock[] }[],
-  agentName: string,
-): boolean {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const turn = messages[i]!;
-    if (turn.participant !== agentName || isSystemChangeMessage(turn)) continue;
-    const calls = turn.content.flatMap((block) => (block.type === 'tool_use' ? [block.id] : []));
-    if (calls.length === 0) return false;
-    const answered = new Set(messages.slice(i).flatMap((m) => m.content.flatMap((block) => (block.type === 'tool_result' ? [block.toolUseId] : []))));
-    return calls.some((id) => !answered.has(id));
-  }
-  return false;
-}
-
-export interface TailRow {
-  content: readonly ContentBlock[];
-  bodyGroupId?: string;
-  shardIndex?: number;
-}
-
-// context-manager 0.22.0's MessageStore.refuseToolPairSplit refuses a change
-// written between a tool call and its result. Its walk: back over change rows
-// and rows of results, each body read whole across its shards, to the nearest
-// body that holds a call. The write splits a call of that body when neither
-// the body's own later blocks nor a result read on the way answers it. Any
-// other row, or the store's start, ends the walk with nothing split.
-export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): boolean } {
-  let body: TailRow[] = [];
-  const answered = new Set<string>();
-  let split: boolean | undefined;
-  const readBody = (): boolean => {
-    const content = body.flatMap((row) => row.content);
-    body = [];
-    if (content.some((block) => block.type === 'tool_use')) {
-      const open = new Map<string, boolean>();
-      for (const block of content) {
-        if (block.type === 'tool_use') open.set(block.id, true);
-        else if (block.type === 'tool_result' && open.has(block.toolUseId)) open.set(block.toolUseId, false);
-      }
-      split = [...open].some(([id, stillOpen]) => stillOpen && !answered.has(id));
-      return true;
-    }
-    if (content.some(isSystemChangeContent)) return false;
-    const results = content.flatMap((block) => (block.type === 'tool_result' ? [block.toolUseId] : []));
-    if (results.length === 0) {
-      split = false;
-      return true;
-    }
-    for (const id of results) answered.add(id);
-    return false;
-  };
-  return {
-    visit(row) {
-      if (split !== undefined) return true;
-      if (body.length > 0 && !continuesBody(row, body[0]) && readBody()) return true;
-      body.unshift(row);
-      return false;
-    },
-    splits() {
-      if (split === undefined && (body.length === 0 || !readBody())) split = false;
-      return split!;
-    },
-  };
-}
-
 export function isHeadDeclaration(value: unknown): value is HeadDeclaration {
   if (!value || typeof value !== 'object' || !('tools' in value) || !('system' in value)) return false;
   const { tools, system } = value;
@@ -120,7 +49,7 @@ export type HeadEvent =
   | { type: 'head:declared'; removed: string[]; defined: string[]; addedSystem: number }
   | {
       type: 'head:moved';
-      why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
+      why: 'adopted' | 'replaced' | 'consolidated' | 'unstored' | 'on-head';
       changesRemoved: number;
       changeChars?: number;
       requestChars?: number;

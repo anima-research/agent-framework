@@ -134,9 +134,10 @@ export type TraceEvent =
       agentName: string;
       /** What moved the head to what's current: the first request on a
        *  model that takes a change, a replacement of system text, a
-       *  consolidation, or a request on a model that takes none, or kept to
-       *  its head, that found change rows to take out. */
-      why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
+       *  consolidation, a change row the store didn't take (as between a
+       *  tool call and its result), or a request on a model that takes none,
+       *  or kept to its head, that found change rows to take out. */
+      why: 'adopted' | 'replaced' | 'consolidated' | 'unstored' | 'on-head';
       /** The change rows removed, since the head now holds what they
        *  declared, or what they declared is no longer current. */
       changesRemoved: number;

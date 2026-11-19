@@ -468,22 +468,22 @@ describe('a change of tools or system text in the framework', () => {
     });
   });
 
-  it("waits to declare while the shared slot ends on another resident's call, and declares after its result", async () => {
+  it("moves a resident's head when the store won't take its change row, as during another resident's tool call, and its request folds to what it has now", async () => {
     await withFramework([resident('alpha'), resident('beta')], async (framework) => {
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
       const alpha = framework.getAgent('alpha')!;
       const beta = framework.getAgent('beta')!;
-      const cm = alpha.getContextManager();
+      const heads = framework as unknown as { headDeclarations: { read(name: string): { tools: ToolDefinition[] } | null } };
       say(framework, alpha, 'user', 'hello');
       await beta.buildActivationRequest([tool('x')]);
       store(framework, alpha, 'alpha', [{ type: 'tool_use', id: 'call-1', name: 'a', input: {} } as ContentBlock]);
-      await beta.buildActivationRequest([tool('x'), tool('y')]);
-      assert.equal(cm.getAllMessages().filter(isSystemChangeMessage).length, 0, 'nothing declared while the call waits');
-      store(framework, alpha, 'user', [{ type: 'tool_result', toolUseId: 'call-1', content: 'ok' } as ContentBlock]);
-      await beta.buildActivationRequest([tool('x'), tool('y')]);
-      const all = cm.getAllMessages();
-      assert.equal(all.filter(isSystemChangeMessage).length, 1, 'declared once the result is in');
-      assert.ok(isSystemChangeMessage(all.at(-1)!), 'after the result');
-      assert.equal((all.at(-2)!.content[0] as { type?: string }).type, 'tool_result');
+      const request = await beta.buildActivationRequest([tool('x'), tool('y')]);
+      assert.deepEqual(foldOf(request), now([tool('x'), tool('y')], prompt('You are beta.')), "beta's request folds to its tools now");
+      assert.deepEqual(changesIn(request.messages), [], 'with no change row');
+      assert.equal(beta.getContextManager().getAllMessages().filter(isSystemChangeMessage).length, 0, 'none stored between the call and its result');
+      assert.deepEqual(heads.headDeclarations.read('beta')!.tools, [tool('x'), tool('y')], 'the head moved');
+      assert.deepEqual(traces.filter((t) => t.type === 'head:moved' && (t as { agentName: string }).agentName === 'beta').map((t) => (t as { why: string }).why), ['adopted', 'unstored']);
     });
   });
 

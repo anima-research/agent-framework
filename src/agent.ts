@@ -12,7 +12,7 @@ import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './
 import { carriedBlock, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
-import { removeStoredMessage, scanFromTail } from './stored-removal.js';
+import { removeStoredMessage } from './stored-removal.js';
 import { stableHash } from './stable-hash.js';
 import { contextAgentOf, hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
@@ -21,9 +21,6 @@ import {
   SYSTEM_CHANGE_PARTICIPANT,
   declarationDifference,
   effectiveDeclaration,
-  endsOnUnansweredCalls,
-  changeWriteCheck,
-  type TailRow,
   isSystemChangeMessage,
   memoryHeadDeclarations,
   declarationRowIds,
@@ -2503,12 +2500,6 @@ export class Agent {
    * array as the window's for a single slot that is still the record. */
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
 
-  private changeWouldSplitCall(): boolean {
-    const check = changeWriteCheck();
-    scanFromTail(this.contextManager, (row) => check.visit(row as unknown as TailRow));
-    return check.splits();
-  }
-
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
     const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
     const cm = this.contextManager as Partial<ContextManager>;
@@ -2986,17 +2977,16 @@ export class Agent {
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, 'replaced', dryRun, compile);
     const consolidation = this.consolidation(compiled, held, blocks, recorded, previewRows);
     if (consolidation) return this.moveHead(compiled, compiledWith, recorded, current, 'consolidated', dryRun, compile, consolidation);
-    if (difference.kind === 'none' || endsOnUnansweredCalls(compiled.messages, this.name) || this.changeWouldSplitCall()) {
-      return { compiled, head: recorded };
-    }
+    if (difference.kind === 'none') return { compiled, head: recorded };
     const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
     if (dryRun) return { compiled, head: recorded, declared };
     try {
       storeOwnRow(this, declared.participant, declared.content, systemChangeMetadata(this.name));
     } catch (error) {
+      // context-manager refuses a change between a tool call and its result:
+      // a row the store doesn't take moves the head instead.
       if (storedOfThrownWrite(error, (id) => this.contextManager.getMessage(id) !== null).length === 0) {
-        console.error(`[head-declarations] ${this.name}: a system change could not be stored, so the request goes on the agent's current tools and system text with no change row, and the first later request that can store a change declares what differs then:`, error);
-        return { compiled, head: recorded };
+        return this.moveHead(compiled, compiledWith, recorded, current, 'unstored', dryRun, compile);
       }
       console.error(`[head-declarations] ${this.name}: storing a system change threw, but the store holds it, so the request declares it:`, error);
     }
@@ -3055,7 +3045,7 @@ export class Agent {
     compiledWith: HeadDeclaration | null,
     recorded: HeadDeclaration | null,
     current: HeadDeclaration,
-    why: 'adopted' | 'replaced' | 'consolidated',
+    why: 'adopted' | 'replaced' | 'consolidated' | 'unstored',
     dryRun: boolean,
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
     sizes?: { changeChars: number; requestChars: number; forced?: 'share' },
