@@ -12,6 +12,541 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.35.0 — 2026-11-19
+
+### Breaking
+
+- **Hosts:** agent-framework now depends on `@animalabs/context-manager`
+  `^0.28.0` (was `^0.25.1`), and accepts `@animalabs/membrane`
+  `^0.8.0 || ^0.9.0 || ^0.10.0` (was `^0.8.0 || ^0.9.0`) and
+  `@animalabs/chronicle` `^0.6.0 || ^0.7.0` (was `^0.6.0`), the ranges
+  context-manager 0.28.0 declares. So beside a host's own membrane 0.10 or
+  chronicle 0.7.0, an install holds that one membrane and that one
+  chronicle, where it nested a membrane 0.9.0 and a chronicle 0.6.0 under
+  agent-framework and under context-manager, and context-manager was handed
+  a store from a chronicle it didn't load.
+  - **Who needs to act:** a host that depends on context-manager itself, and
+    a host that counted on images being stripped from a window (below). The
+    first needs `^0.28.0` too: beside a 0.25.x, 0.26.x or 0.27.x of its own, an
+    install holds two copies of context-manager, and a strategy the host
+    builds runs its own copy's code and isn't of the framework's classes.
+    So a `PassthroughStrategy` of the host's own, with
+    `subconscious.reader: 'forks'` and no `subconscious.strategyFactory`, is
+    refused where it ran before. A host that declares chronicle may stay on
+    `^0.6.0` or move to `^0.7.0`.
+  - **What a fresh install gets:** context-manager 0.28.0, membrane 0.10.4
+    and chronicle 0.7.0, unless the host's own ranges hold membrane or
+    chronicle lower. A lockfile's membrane 0.8.0 or 0.9.0, or chronicle
+    0.6.0, is still admitted.
+  - **membrane:** requests go out through the membrane the host passes. A
+    host that declares membrane sends through its own. One that doesn't
+    imports the copy this range installs, so a fresh install moves its
+    requests from membrane 0.9.0 to 0.10.4, with the changes membrane's
+    changelog for 0.10.0 to 0.10.4 lists.
+  - **chronicle:** a host with no chronicle of its own opens its existing
+    store with 0.7.0, which opens and reads a store 0.6.0 wrote. Neither
+    this package nor context-manager stores a chunked blob, so a store
+    written on 0.7.0 still opens on 0.6.0. chronicle 0.7.0 gives its errors
+    its own `ErrorCode` as `code`, where they carried napi's
+    `GenericFailure`: this package checks no chronicle error's `code` for
+    either value, and on POSIX reads an I/O failure's OS error from its
+    message, which is unchanged (on Windows it reads none, as before).
+  - **context-manager:** its changelog for 0.26.0, 0.27.0 and 0.28.0 lists
+    its changes. The framework opens every agent's context manager with its
+    own copy, and two of those changes alter what that copy does today.
+    Where a later tool call reuses an earlier call's id,
+    `stripUnpairedToolBlocks`, which the framework runs on a fork's seed,
+    now pairs each result with the nearest call before it with that id, so
+    it can drop a call or result it kept. And from 0.28.0 the memory
+    strategy and windowed passthrough strip no live image unless their
+    settings ask for it (`maxLiveImages`, `imageStripDepthTokens` and
+    `maxLiveImageBytes` default to 0, where they were 6, 30000 and 20 MiB).
+    Their ceilings are unchanged and still strip (`imageCeiling` 500 images,
+    `imageByteCeiling` 24 MiB), so a window's images stay bounded. Of the
+    strategies the framework builds itself, this reaches the persistent
+    subconscious's window, a windowed passthrough the framework passes no
+    image settings: it now keeps its images up to the ceilings. A resident
+    with no `strategy` of its own gets `PassthroughStrategy`, which never
+    stripped images. A host that passes a memory strategy and wants the old
+    limits sets the three options to their old values. 0.26.0's request limit
+    and 0.27.0's checks on a system change carrying `effort` apply only
+    where a caller passes `requestLimitTokens` or writes `effort`, and the
+    framework itself does neither. 0.28.0's `compressionFallbackModel`,
+    `carryStrandedSummaries` and kv-unified change costs are off unless a
+    strategy sets them.
+
+- **Hosts that build their own `EventGate`; hosts and modules that read an
+  `InferenceRequest`'s `wakeLines`, or a batched wake's `after` or `readsRow`;
+  and hosts whose trace tables name `gate:wake-line-omitted`:** a batched
+  wake's `[Gate: …]` line for events with a message of their own in the window
+  is no longer handed to the wake. AgentFramework's own gate wiring marks the
+  wake with the batch's rows, and a fresh start of its turn decides the line
+  from them, so a host that handles `requestInference` itself gets no such
+  line. Removed: `EventGate`'s `isNewestEntry` option, `WakeProvenance.line`,
+  `InferenceRequest.wakeLines`, the `WakeLine` and `wakeLineText` exports, and
+  the `gate:wake-line-omitted` trace. Migration: drop them. A batched wake no
+  longer passes `requestInference`'s `after`, where 0.33.0 passed the
+  placement of the line it wrote, and its `InferenceRequest` no longer carries
+  `readsRow`: the writes it is for, its line's among them, are
+  `provenance.writes`, and its rows are `readsRows` (in `.added`). 0.33.0
+  passed no placement where it handed the line to the wake instead, for a
+  batch of one message still the newest entry (`isNewestEntry`). A batch
+  with an event in the window that was given no write of its own (`evaluate`
+  without `after`) has no writes, so its wake is plain and starts its turn
+  even once the agent has answered. 0.33.0 marked such a wake by the line it
+  wrote, where it wrote one, so it could drop once that line was answered. A
+  write whose placement names no stored message (still unfilled, or held in
+  memory with no id yet) keeps the wake plain too. A host that handles
+  `requestInference` itself and wants a batched wake dropped once the agent
+  has answered it reads `provenance.writes`. Unchanged: when the gate
+  requests a wake, and a wake that isn't a batch's, which still carries
+  `readsRow` where 0.33.0 gave it one.
+
+- **Hosts:** a turn no longer waits for the agent's compression call already
+  in flight to end before it starts. Since the first slice of #114 every
+  resident's turn waited, whether or not its provider limits how fast input
+  tokens per minute may grow, so a turn that arrived during a compression
+  call started only when that call ended. The wait is now the agent's
+  `primaryWaitsForAuxiliary` (default false). A turn that starts beside a
+  compression call can compile before that call's summary lands, and its
+  request is then larger by what the summary would have folded.
+  - **Who needs to act:** a host with an agent on a model whose provider
+    refuses a large call for the rate its input tokens per minute grow at,
+    as Claude 3 Opus does (#114's case); and a host with an agent whose
+    budget leaves its model's window no room for a chunk not yet
+    summarized, which can pass the window where it fitted before.
+  - **Migration:** set `primaryWaitsForAuxiliary: true` in that agent's
+    config. Its turns then wait as before. The setting needs no sibling
+    version: it is this package's alone, and a host passes it in
+    `AgentConfig`. An agent-framework that has the wait (from #114's first
+    slice on) and predates the setting ignores the key and always waits, so
+    a host on one can set it before it raises its range. The setting is a
+    resident's: a conversation agent takes neither side of the provider
+    gate, and it does nothing there.
+  - **Unchanged:** a new compression call still waits while a turn holds
+    admission (from its start to its end, and while a released hold's turn
+    is on its way), whatever the setting. A provider's stated wait still
+    binds both kinds of call: a turn that starts beside a compression call
+    checks the waits again after its compile, so one that call's failure
+    records meanwhile holds the turn before anything is sent. That turn
+    has begun, so it traces `inference:started` and then `inference:failed`
+    with the wait's text, and its retry shows as held in
+    `providerAdmission`, as a conversation agent's does. An
+    organization-acceleration cooldown or a host's hold still holds the
+    turns and compression calls that start after it; one that a compression
+    call's failure arms while a turn beside it compiles doesn't stop that
+    turn's call, and what that call's own failure does is as for any
+    failed call.
+
+- **Hosts:** an explicit send no longer silences plain speech unless the
+  agent's config says so. Until now a `send_message`, `channel_publish`,
+  `reply_message`, `send_dm`, `reply_to_message`, `say`, `whisper` or `drafts`
+  resend held back, as drafts, the plain speech its round and later rounds
+  aimed where the send may have posted, in locus, hybrid and locked mode.
+  That is now the agent's `sendSilencing` (default false): plain speech
+  beside or after a send is routed as any other is.
+  - **Who needs to act:** a host with an agent, a resident or an ephemeral
+    one, that writes a note beside its sends ("sent", a summary of the
+    message) or repeats the message in plain speech. Those words were held
+    and are now posted, in the same channel as the send when that is where
+    the turn speaks.
+  - **Migration:** set `sendSilencing: true` in that agent's config. Its
+    sends then silence as before. An agent-framework that predates the
+    setting ignores the key and always silences. The setting needs no
+    sibling version. A host that builds `AgentConfig` from its own
+    configuration needs to pass the key: connectome-host does from the
+    release that takes `agent.sendSilencing` in a recipe, and an earlier
+    one refuses the key as unknown, so on it the setting can be turned on
+    only by the agent itself, through `agent_settings`. Either package can
+    be upgraded first.
+  - **The resident's own setting:** `agent_settings` reads `send_silencing`
+    on `get`, takes it (true or false) on `update`, and resets it when
+    `reset` names it in `settings` or names nothing, and
+    `AgentRuntimeSettingsPatch` and `AgentRuntimeSettingsSnapshot` carry
+    `sendSilencing`. A resident's choice overrides its config, persists with
+    its other runtime settings (`sendSilencing` is a required field of the
+    snapshot type, so a typed fixture or mock of one needs it), and applies
+    to sends from the agent's next
+    response on at the latest (a send made directly in the response that
+    changes it is counted under the old value). Turning it off doesn't undo
+    a hold an earlier send in the turn already set. A fork takes its
+    parent's live value.
+  - **Tool text:** the `drafts` tool's description names an explicit send
+    as a reason speech is held only for an agent whose sends silence, and
+    `agent_settings`' description and schema name the new setting. At the
+    upgrade the tool block changes for an agent that has `agent_settings`,
+    and for one that has `drafts` unless its `sendSilencing` is true (its
+    description is then the one it had). An agent with `drafts` gets a
+    changed block again each time its setting changes. A changed block
+    misses the provider's prompt cache once, and a fork whose setting
+    differs from its parent's doesn't share the parent's cached prefix.
+  - **Unchanged:** `skip_reply` keeps its round private, and `think` under
+    the private same-round policy holds its round back, whatever the
+    setting. Explicit mode never silenced on a send and disabled mode
+    routes nothing.
+  - **Timing:** with the setting off a round no longer waits for its sends'
+    answers before its plain speech is routed, and a script that names a
+    send tool doesn't make its `code_execution` round wait. One that names
+    `skip_reply` or `drafts` still does, as in explicit mode.
+
+### Added
+
+- `EventGate.evaluate(info, after)` takes where the host put the event's own
+  message (`WritePlacement`), which the host may fill in until the event's
+  batch is delivered. A debounced batch's wake carries the writes it is for
+  as `WakeProvenance.writes` (`WakeWrite`: `after`, and `replyTo`, the
+  channel a reply is owed in, absent for a message its server marked
+  `chat:ambient` or `chat:system`): the message of its own of each event that
+  has one and, where one is written, the batch's `[Gate: …]` line. They are
+  present only when every event with a message of its own was given its
+  write. `InferenceRequest.readsRows` marks a wake whose sole cause is those
+  rows, and AgentFramework's scheduler drops it once each row is done as a
+  `readsRow` is, judged with its own `replyTo`. A write whose placement
+  names no stored message for the woken agent leaves its wake unmarked, so
+  it starts its turn. `evaluate` ignores `after` for a folded render
+  (`GateEventInfo.folds`), which takes no write. EventGate's `isAnswered(after)`
+  option says whether the agent has answered a request that carried an
+  event's write, `false` only when the host knows it hasn't; the gate asks it
+  when a reply judge answers reply, and an event answered then loses its
+  write, so the wake starts its turn.
+
+- `InferenceRequest.answersMessageId`: the platform id of the one message a wake is for, in its `channelId`, as `getPendingRequests()` shows it. The framework sets it on a wake for one message from a channel or a push, the onboarding wake included, and carries it onto a rewind's retry and `/unstick`'s run. A refusal of the turn the wake opens is marked on that message, on a Discord channel, unless a rewind takes the refusal or the turn is an ephemeral run's. A wake the gate batches, even a batch of one message, and a module's wake carry none, nor does a re-armed turn that speaks in another channel than the message's. A start merged from wakes that don't all answer the same message, in the same channel, answers none: wakes for two messages, or a message's wake merged with one that answers no message, such as a timer's or a reaction's.
+
+- **`AgentConfig.sameRoundSkipReplyTextPolicy`: `'private'`, the behaviour
+  when it's omitted, or `'ask'`.** Under `'ask'`, ordinary text in a round
+  that calls `skip_reply`, which would otherwise stay private and be lost, is
+  held as a draft when it would have been posted, bounced or held had the round
+  not called `skip_reply`. The draft's cause is the new `'skip-reply'`, and it
+  notes where the text was going. Where some of a round's text would have
+  been posted or bounced without the `skip_reply`, the turn's first such
+  `skip_reply` is refused once. Its result is the held-draft notice, naming
+  the round's drafts and the `drafts` calls that resend or dismiss them, and
+  asks where they should go: to end the turn and keep the drafts, call
+  `skip_reply` again. The refused call arms no wake, and a tool-lifecycle
+  observer hears nothing of it. After that, a `skip_reply` runs, and text
+  beside it is held and named as any held draft is. Where a round's text
+  would only have been held, as in a heartbeat turn, or beside a send that
+  reached its destination for an agent whose sends silence (`sendSilencing`),
+  its `skip_reply` runs and the draft is named as any held draft is. Any other value of the policy is refused
+  when the agent is created.
+  - The `skip_reply`'s answer waits until its round's text is handled, which in
+    `hybrid` and `explicit` mode comes after the earlier rounds' deliveries. A
+    held `skip_reply` whose turn is replaced, reset or stopped before then, or
+    whose stream completes first, doesn't run and isn't refused, so it arms no
+    wake.
+  - In `hybrid` and `explicit` mode, such a round's envelopes set the sticky
+    target and the hold as they do in a round without `skip_reply`, and what
+    they would have published or bounced is held instead.
+  - Untouched: text in a `>>skip_reply` or `>>>skip_reply` envelope, text
+    beside a private `think` under `sameRoundThinkTextPolicy: 'private'`, a
+    silent turn, `proseRouting: "disabled"`, and an aside in a round whose
+    only send is a `drafts` call, where that send's hold keeps it (for an
+    agent whose sends silence). The guard
+    never refuses a script's `skip_reply`, though its round's text is held. A
+    round with no verbatim content (membrane's `roundContent`), as on the XML
+    tool path, is as under `'private'`: nothing is refused and nothing is
+    held.
+  - A derived agent and the subconscious don't take the policy from the agent.
+  - No tool's description or schema changes.
+  - After a rollback to a framework from before this release, a held
+    `'skip-reply'` draft still lists, resends and dismisses, but its cause
+    reads `undefined`.
+
+- **`healthSnapshot()` says when a turn is alive and when it is waiting to retry.** Each agent entry gains `turnAlive`
+  (a turn holds its token, or its continuation or retry is on its way, as the scheduler reads it) and `retrying`:
+  while the turn waits out its error policy's delay, `{ since, until?, nextTry, maxTries?, retryClass? }`, `until`
+  absent for a wait with no end date, otherwise `null`. A retry a provider hold keeps (a stated wait, an acceleration
+  limit or a host's hold) reads `retrying: null`, and `providerAdmission` shows the hold (`cooldownUntil`,
+  `cooldownReason`, `hostHold`). `status` is unchanged, and between a failed call and its retry it still reads `idle`,
+  since the failed call reset the agent's state; the two new fields say what it doesn't. A resident whose provider
+  answered `overloaded_error` for eight minutes read `idle` throughout, while its turn retried and a newer message
+  waited in the gate's buffer. `inference:waiting` carries the same `nextTry`, `maxTries` and `retryClass`. `nextTry`
+  is the error policy's place in its schedule, the count `maxTries` bounds: every failed start counts, whether or not
+  it reached the provider, and a provider hold that queues the turn again starts the count over. It is not a count of
+  sends.
+- **`ErrorAction` may say what the policy retries a failure as.** A retry action takes optional `retryClass` (such as
+  `overloaded`; one longer than 128 characters is shown as its start and end around a note of how much was left out)
+  and `maxTries` (the most tries that class allows, the first included, shown only as a positive whole number). They
+  are shown, not acted on. A turn re-armed after it ran out of tries ends at its second deadline expiry with no
+  completed round, transient failure or message said to it between them, whatever `maxTries` says.
+  `DefaultErrorPolicy` always fills `retryClass` with the class it decided by, and fills `maxTries` when that class's
+  schedule has a bound (`maxAttempts: null` leaves it out). An `overloaded` failure under settings with no overloaded
+  schedule takes `retryable`'s, as membrane does. A policy that leaves both out is shown with the try number alone.
+
+- **`host/command` `unstick-outcome` tells a surface how an `/unstick` came out, as labels.** It takes
+  `agentName` and answers `{ ok: true, outcome, rewinds, cause? }`. `outcome` is `cleared`, `gave-up`,
+  `turn-failed`, `agent-ended` or `host-stopped`, and `rewinds` counts the turns the session had set aside. `cause`
+  is `{ kind: 'refusal', category }` for `gave-up`, and `{ kind: 'failure', type?, status? }` for `turn-failed`: the
+  failed turn's type and HTTP status as the framework classes them, `safety` included. It never holds a provider's
+  message or explanation. Each request is answered once, at the next of the session's end or a turn of the agent
+  that runs out of retries inside the session. `turn-failed` ends no session and posts nothing. An end is kept, and
+  every request after it gets it at once, until the agent's next `unstick`. A `turn-failed` that no request waited
+  for is kept for the first request that comes, until a later answer replaces it or the agent's next `unstick` drops
+  it. A new `unstick` answers the agent's requests that still wait with `ok: false`, before its session starts. With
+  no session and nothing kept, it answers `ok: false`. While it waits it holds back no other command, and a stop
+  answers it `host-stopped`. The framework stores no row and sends
+  no request for an answer. The `unstick` acknowledgement gains `outcome: true` and `agentName`, the agent its
+  session is on, so a surface asks only a host that answers, and about the agent the session took.
+
+### Changed
+
+- **Residents:** a turn whose inference is exhausted before it got partway
+  writes no `[inference-failed]` note into the agent's context. Partway means
+  one of its rounds reached the context with its results, or had its tool
+  calls started and cut off. Everything else its failure does is as
+  before: stderr's `[inference-failed] agent=…` line, `failures.log`'s
+  `inference-exhausted` record, the consecutive-failure streak, the
+  `inference:exhausted` trace, the hard-down alert, and the poison-history
+  breaker, with its `[turns-set-aside]` note when it sheds history. So a
+  failure that comes back at every turn's first call, such as a provider
+  that's down or a context that's too long, no longer adds a note per turn
+  to the context it's sent with (#979).
+  - A turn that got partway still gets one note, which says how far it got
+    (its earlier rounds ran, or a round's tool calls were started and may
+    have taken effect) and, for a bound's cut, a stream's abort or
+    context-manager's refusal of a compile, the reason, without the advice
+    "If this recurs with the same cause, change approach rather than retrying
+    identically (e.g. drop an oversized attachment or an unsupported
+    setting)." A timed-out turn's note keeps "If a reply is still owed from
+    that turn, you can give it now."
+  - The reply judge reads the agent's context, so it no longer sees an
+    `[inference-failed]` note for a turn that did nothing. Its request tells
+    it instead: while the agent's last turn has failed and no turn has
+    started since, its `<if_you_wait>` part opens with "`X`'s last turn, `N`
+    ago, failed and may not have answered all of what woke it." That holds
+    whether the turn got partway or not, and for a start that threw before
+    its stream, such as at its turn checkpoint. The framework gives the
+    judge this through `ReplyJudgeDeps.failedLastTurn`, which is new and
+    optional and returns the new `FailedLastTurn` type (`{ at }`).
+  - `SUPPRESS_INFERENCE_FAILED_MARKER=1` now leaves out only that note, since
+    no other is written.
+  - Notes already in a store stay as they are.
+  - What this changes in what's published:
+    - README, a turn's call a bound cuts: "A fresh call that's cut too, with
+      no other failure between, ends the turn, and its `[inference-failed]`
+      note says the call timed out, that the call was made again and timed
+      out again, and, for a bound's cut, the reason" now reads that the
+      turn's note says so if the turn got partway, and that a turn that did
+      nothing gets no note.
+    - README, after the failure and stop notes: a new paragraph says when the
+      note is written, as above.
+    - `FrameworkConfig.exhaustedTurnRearmMs`'s doc: "A re-armed turn's
+      transient failure writes no `[inference-failed]` marker unless a round
+      of it ran or had its tool calls cut off; any other failure of it writes
+      one." Now a failure of a re-armed turn writes a note only when a round
+      of it ran or had its tool calls cut off, as any turn's failure does.
+    - 0.22.1: "a non-retryable failure that states a wait keeps its terminal
+      disposition (its marker and failure count)". Now such a failure keeps
+      its failure count, and its marker only when its turn got partway.
+    - 0.29.0: "A re-armed turn's transient failure writes no
+      `[inference-failed]` marker unless it got partway, so the agent's
+      context keeps the one the first exhaustion wrote; a failure of another
+      kind writes its own." Now no failure of a turn that didn't get partway
+      writes one, the first exhaustion's included, whatever its kind.
+    - 0.31.0: "A turn that ends on a timeout says so in its
+      `[inference-failed]` note: the model call timed out, or its last call
+      did … Other failures keep their wording and advice." Now only a turn
+      that got partway has the note, which says its last call timed out, and
+      no failure's note carries the advice.
+    - The `[assistant-persist]` stderr line for a thinking-only reply the
+      store refuses ended "— the turn produced no output. See the
+      refusal/inference-failed record for why.", though a turn whose earlier
+      rounds ran produced output, and a refusal never wrote an
+      `[inference-failed]` note. It now ends "(… no text and no tool_use).
+      If it was refused, see its [inference-refusal] line and failures.log
+      record."
+    - Earlier entries' wording of the note for a turn that did nothing ("the
+      model call failed … and produced no response, so nothing was sent")
+      describes only notes already in stores.
+
+- A debounced batch's `[Gate: …]` line names only the batch's events with no
+  message of their own in the window, quoting each, as it did: a module event
+  whose response stored no single message, for one. An MCPL channel message or
+  push, a message-mode heartbeat tick or a reminder, and a module event whose
+  response stored exactly one message, for every agent and not held from the
+  residents, where neither the event nor the message names a channel and the
+  event isn't console or API input, are in the window
+  already and get no line, where they were counted by channel in one ("N
+  messages in #chan (oldest ~Ns ago) — already shown above at arrival; this is
+  a batched wake, not new content"), or, for a batch's one message still the
+  newest entry, in one handed to the turn's start. A batch of such events alone
+  writes no line when it is delivered. A silent heartbeat tick stores nothing
+  and has no text to quote. It was counted in that line too, as a message
+  already shown, and now gets no line.
+  So a debounced reminder whose module stored its text no longer has that text
+  quoted again in a line, and under conversation routing the trunk, woken for
+  a fork's messages it doesn't hold, no longer gets a line saying they were
+  shown above. Such a module message is stored in the trunk's slot, so a
+  conversation fork's own window holds neither it nor, as before, a line
+  quoting it.
+- A module event whose one message a surgery's hold or an agent's recovery
+  keeps in memory when the event arrives is quoted in the line, as one with
+  no message is: its message has no stored row yet.
+- Where a row a reply could be meant for follows a batched wake's messages in an
+  agent's window when the turn the wake starts begins, such as another
+  channel's message stored during the batch's quiet period, that fresh start
+  writes one `[Gate: …]` line naming them by count and channel, or as having
+  none, as the agent's own row, before the start's own notices. A clock row,
+  a stored context injection, a row the agent's view leaves out, the batch's
+  own line quoting its other events and an unobserved co-resident's own round
+  don't count; an observed co-resident's round owed to the agent does, and so
+  does the agent's own row, such as its reply in another channel. Past the
+  window's 32 newest rows that don't count, the line is written. Each agent
+  the batch wakes decides its own line by its own window, once per wake, and
+  none is written while the host is quiesced. A window still in legacy mode
+  reads its slot's shared record, where only the delivery agent's start
+  writes the one line, so a co-resident's turn that starts before it has
+  none. A turn that
+  merges batched wakes names all their messages, and one that merges a wake
+  that isn't a batch's names none. 0.33.0 wrote such a line at the turn's
+  start only for a batch of one message still the newest entry when it fired;
+  now any batch's start does, and only where something follows its messages.
+- The reply judge, and `healthSnapshot()`'s `upcomingWakes`, are told that a
+  pending debounced batch only may wake an agent (`certain: false`) where
+  every event delivery gives that agent has a message of its own written to
+  its window, and so may the requests queued or held for it when each reads
+  rows (`readsRow`, `readsRows`), since such a wake starts no turn once the
+  agent has answered them. A batch that gives an agent an event with no
+  message of its own, or one written to another agent's window, stays
+  certain, and so does a request that reads no row.
+- `gate:judge-verdict`'s `woke` still says whether the gate goes on to deliver
+  the batch to wake the agent, and such a delivery may now start no turn.
+- Wake onboarding's offer describes a suggested `debounce` rule as
+  `debounceMs`'s description does: it wakes the agent once after a burst goes
+  quiet, unless by the time it would start the agent's turn every event in
+  the burst was written for the agent and the agent has read and answered it.
+- **Prompt cache:** `wake_add_rule`'s descriptions of `debounceMs` and of its
+  judge change, so the first request after the upgrade that carries that
+  tool misses the cache from its tool block on.
+
+- **Residents:** a heartbeat turn's notice, which says that plain speech in
+  that turn isn't posted but held as a draft, now adds "except in a round that
+  calls skip_reply, where it stays private and isn't held", which is what
+  happens to that text. An agent under `sameRoundSkipReplyTextPolicy: 'ask'`
+  gets the notice as before: on the native tool path its text in such a round
+  is held. On the XML tool path it isn't, and the notice still says it is.
+
+- **Wake onboarding doesn't ask about the servers a store already had.** A
+  host updated from a release without onboarding (0.32.0 or earlier) to
+  0.33.0 or 0.34.0 got a `[wake onboarding]` notice, and for an event that
+  waits on the agent a wake, for every MCPL server whose events one of its
+  catch-all rules lets by: all of its servers at once, on the day of the
+  update, though its agent had written its rules with those servers there.
+  Now the first start that finds a `gate.json` and no `wake-decisions.json`
+  records the servers it is configured with as predating onboarding, and each
+  is settled as `unasked` when it sends its first event, against what it
+  declares then, whatever the gate later decides about that event, with no
+  onboarding notice or wake (trace `gate:onboarding-decided` with
+  `state: "unasked"`). A server whose declarations can't be read when an
+  event comes is settled at a later event that finds them. A store that ran
+  0.33.0 or later with `gate.onboarding: false` and has a `gate.json` is
+  treated the same way when onboarding is turned on. Nothing else changes for
+  them: `event_tags` shows their suggestions, `wake_accept_suggestions` and
+  `wake_decline` answer them, and a declaration that changes after that first
+  event is asked about as any server's is; a change before it is part of what
+  the server is settled against, and brings no notice. A server added after
+  that start is offered as before, and so
+  is every server of a new store. `wake-decisions.json` is now written at the
+  first start, even with nothing decided, so that its absence means
+  onboarding has never started on the store; it gains a `predating` list
+  while any of those servers is unsettled, and `unasked` among its states. A
+  host that already started 0.33.0 or 0.34.0 and has a `wake-decisions.json`
+  is not affected; one that started either and has none yet (no server's
+  event was undecided) treats its next start as that first one. A decisions
+  file that can't be read is set aside and written anew, empty, at once:
+  onboarding had started there, so no server predates it.
+- **0.33.1, 0.33.2 and 0.33.3 have this change, and 0.34.0 doesn't.** A host
+  on one of them that went to 0.34.0 dropped its `unasked` records and its
+  `predating` list when 0.34.0 first wrote `wake-decisions.json`, such as at
+  its first offer, and those servers were offered there. This release can't
+  bring them back. Where 0.34.0 wrote no decision, this release finds the file
+  as the 0.33 release left it. A host on one of them that comes straight to
+  this release keeps them. Going back to 0.34.0 or 0.33.0 without restoring
+  the store's files drops them, and those servers are offered.
+
+### Fixed
+
+- **MCPL coalescing:** the coalescing state no longer grows with every message
+  a host admits, and an admission no longer rewrites all of it (#1028).
+  - The coalescer's cap of 4,096 subjects, which is unchanged, now reaches
+    subjects whose occurrence is placed. Over the cap, each admission walks
+    from the subject touched longest ago: it forgets a subject with nothing
+    placed, as before, and asks about one with a placed occurrence, which it
+    forgets once the agent has read it. It stops at the first subject whose
+    occurrence is unread, and passes over one whose batch is pending or
+    rendering, so the table can stay over the cap while those last. Before,
+    a subject with a placed occurrence was never forgotten, and discord-mcpl
+    gives every message its own subject.
+  - A later occurrence of a forgotten subject is answered as one of a
+    subject the host never saw: its answer names no `priorEventId`, an
+    `initial` occurrence's outcome is `first` where it was `appended`, and
+    a retraction that carries content is delivered where the host's
+    routing sends it, not to the agent that read the forgotten occurrence.
+  - Each change is appended to a new state, `mcpl/coalescing-journal`, with
+    a number. The table, `mcpl/coalescing`, is written whole, with the
+    number of the last change it holds, when the journal has grown to the
+    table's size since its last write, after a write that failed, after a
+    branch move, at a clean stop, and at a start that finds changes since.
+    A start applies only the changes numbered above its table's number.
+    Before, the whole table was written within 2 s of each admission, and
+    each admission also rewrote the list of receipts since,
+    `mcpl/coalescing-recent`, which is now only read, from a store an
+    earlier release wrote, and emptied.
+  - After a crash, a deferred batch whose render hadn't started renders at
+    the next assembly. Before, one accepted since the table's last write was
+    delivered as its fallback, since the record of its receipt couldn't say
+    whether its render had started. And after a plain occurrence displaced a
+    render that was the agent's first view, the next batch of that subject
+    is no first view after a crash, since the restored occurrence counts as
+    read. Before, the record of its receipt carried no occurrence, so that
+    batch could be one.
+  - A start refuses, naming `mcpl/coalescing-journal`, when the journal
+    after a numbered table can't be read, isn't a list, or holds an item
+    that isn't a numbered change of a subject, as it refuses for the table.
+  - Going back to an earlier release after a clean stop loses nothing,
+    unless the stop's write of the table failed, which the host logs. After
+    a crash it loses the changes since the table's last write: a retry of an
+    occurrence in that span is admitted again, and a batch accepted in it is
+    lost. A start of this release after an earlier one ignores the journal
+    that the earlier one left, since that table has no number.
+
+- A debounced gate batch's wake starts no turn for an agent that has already
+  read and answered every event in it (#814). Each event is judged as a direct
+  wake's message is: its message covered by a request the agent answered and,
+  for one a reply is owed for (a registered channel's, not marked
+  `chat:ambient` or `chat:system`), the agent's publication there since it
+  read it; or its message gone. Under `proseRouting: 'explicit'`, a
+  publication still on its way when a tool ends the turn isn't counted yet, so
+  that event's wake starts a turn: explicit mode doesn't hold a turn for its
+  deliveries. A message stored and not yet presented to the agent keeps the
+  wake. An event counts only for the agent its message was placed for: every
+  other agent the batch wakes still wakes for it, the other residents whose
+  windows hold it and, for a message routed to a conversation fork, the trunk
+  and every other fork, since a batch wakes every gate recipient (#243). The
+  scheduler judges it when the agent's turn would start. A request that fails
+  or is aborted answers nothing, though a round of the turn that came back
+  before it has answered what that round read. This covers MCPL channel
+  messages, those routed to a conversation fork included, and pushes,
+  message-mode heartbeat ticks and reminders, and module events whose response
+  stored exactly one message, for every agent, where neither the event nor the
+  message names a channel and the event isn't console or API input. A module
+  message stored only for the agents its response asked inference for, or one
+  held from the residents, is quoted, as before. An event with no message of
+  its own keeps the wake,
+  unless a turn already under way read and answered the batch's line, which
+  quotes it. A silent heartbeat tick stores nothing and isn't quoted, so it
+  keeps the wake. A judge rule's batch is judged so too where no judge decided
+  it (none wired, or one that failed, timed out or made no call, with
+  `onError: "wake"`), and on a reply verdict, except for an event the gate's
+  `isAnswered` counts as answered when the judge answers. AgentFramework's
+  counts one a request the agent had answered carried, whether or not it had
+  published there, and one whose writer or message is gone, or where it can't
+  tell. Such an event keeps the wake, so the judge's reply stands. A deferred
+  render's batched wake is unchanged.
+
+- A refused turn's reaction now goes on the message the turn answered, in that message's channel, and the failure log's `locus` names that channel. Before, both took the latest message delivered from any channel: after a mention pushed from a channel the agent hadn't opened, the reaction went on an earlier message in another channel, or on none, and `locus` named that other channel or was `null`. A turn that answers no single message marks none. That's one started from wakes that don't all answer the same message, such as several messages at once or a message's wake merged with a timer's or a reaction's, whether they were merged while the agent was busy, quiesced or waiting out its provider; one the gate's batch woke, even a batch of one message; one a module's request woke; one woken by a timer; and a turn re-armed after its retries ran out, when its speech had moved from the channel that woke it. Its `locus` names the channel it was woken for, if it was woken for one, unless the wake gave only a channel id that no single registered channel answers to, as when two servers register it. An ephemeral run's refused turn still adds no reaction anywhere and its record names no `locus`, as 0.23.0 says, even when a channel message names the run in its `targetAgents`, and a rewind's retry of that turn carries no channel. A turn woken by a reaction or a deletion marks none either, nor does one woken by an edit, unless the coalescer delivered that edit as the agent's first view of its message. A refusal that the auto-rewind or `/unstick` rewinds is still not marked, as before, since the reaction is the last resort. The refusal they give up on is.
+- The refusal auto-rewind's retry (`refusalHandling.autoRewind`, off by default) now speaks in the channel of the message the shed turn answered, as the agent's prose routing takes it, and a refusal of it that isn't rewound again is marked on that message. `/unstick`'s run, and with it its retry, and the retry of the poison-history breaker, which is on by default, answer what the agent's newest turn woken for a channel answered, in that message's channel, while that turn is unfinished, though a turn woken for no channel, such as a heartbeat's, ran after it. A refused turn is unfinished. A turn that completed, that an operator stopped, or that an operator's quiesce abandoned leaves nothing for them to continue. Where that turn is finished, or after a restart, `/unstick`'s run and the breaker's retry answer no message and have no channel. They still take the wake channels of the agent's latest turn, which `main`'s `/unstick` didn't. The rewind sheds the turn's newest exchange, which is that message when the refused round was the turn's first, and the retry sees the marker saying a turn was set aside in its place. Before, the retry had no channel. Under the default `speech.locus: 'delivery'`, a resident's retry spoke in the all-except hold's channel while one was open, and otherwise what it said stayed in the agent's archive, where the person who had written that message never saw it. So the retry's request no longer carries the notice "[routing] Your plain speech currently has no channel", and the requests after it carry a `[delivered]` receipt where they carried `[send-undeliverable]`. A later turn with no channel of its own can now be told "[routing] Your plain speech currently has no channel", since the retry's channel was the last one announced. While the message the retry answers is still in what the agent is sent, the retry ranks with addressed wakes. Once the rewind has set that message aside, any addressed wake outranks the retry, and the retry still outranks ambient wakes. A retry of a turn woken for a channel but answering no single message ranks as one whose message was set aside. An ambient wake that arrives before a retry with a channel starts doesn't take that channel, whatever the retry's rank. The refusal auto-rewind's retry of a turn woken for no channel, such as a timer's, carries no channel, as before. A conversation fork's retry spoke in its home channel, as it still does. Locked, explicit and disabled prose routing route a retry's speech as they route any turn's.
+
 ## 0.34.0 — 2026-11-09
 
 ### Breaking
