@@ -645,3 +645,46 @@ describe('the fail-safe for a refused change, with a model that binds thinking t
     });
   });
 });
+
+describe('the count that the rule for cost reads', () => {
+  it("counts each answered round of an agent's own stream, a tool loop's rounds each, and keeps the count across a restart", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-count-'));
+    const storePath = join(dir, 'store.chronicle');
+    const membrane = new MockMembrane();
+    membrane.takesChanges = true;
+    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+      membrane.calls.push(request);
+      return new MockYieldingStream([
+        { ...createMockResponse([{ type: 'tool_use', id: `call-${membrane.calls.length}`, name: 'changing--a', input: {} } as ContentBlock], 'tool_use'), usage: usageOf(0) } as NormalizedResponse,
+        { ...createMockResponse([{ type: 'text', text: 'done' }]), usage: usageOf(1) } as NormalizedResponse,
+      ]);
+    };
+    const open = () => AgentFramework.create({
+      storePath, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled' }],
+      modules: [new Input(), new ChangingTools()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    type Counting = { usageTracker: { requestCountOf(name: string): number } };
+    try {
+      const framework = await open();
+      const traces: TraceEvent[] = [];
+      framework.onTrace((event) => { traces.push(event); });
+      framework.start();
+      try {
+        framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} } as unknown as ProcessEvent);
+        assert.ok(await pollUntil(() => traces.some((t) => t.type === 'inference:completed')), 'the turn ended');
+        assert.equal((framework as unknown as Counting).usageTracker.requestCountOf('resident'), 2, 'its call and the round after its tool, each answered');
+      } finally {
+        await framework.stop();
+      }
+      const again = await open();
+      try {
+        assert.equal((again as unknown as Counting).usageTracker.requestCountOf('resident'), 2, 'restored with the usage state');
+      } finally {
+        await again.stop();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

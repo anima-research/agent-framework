@@ -12,7 +12,7 @@ import type { ContentBlock, ModelPricing, NormalizedMessage, ToolDefinition } fr
 import { AgentFramework, audienceOf, residentContextOptions, subconsciousContextOptions, taskForkSpec, type Agent, type AgentSpec } from '../src/index.js';
 import { storeOwnRow } from '../src/dendrite/audience.js';
 import { removeSystemChangesOffline, type RemoveSystemChangesResult } from '../src/recovery/remove-system-changes.js';
-import { isDeclarationRow, isSystemChangeMessage, pricedCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
+import { isDeclarationRow, isSystemChangeMessage, pricedTokens, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { foldOf, now } from './helpers/declared.js';
@@ -175,31 +175,30 @@ describe('a change of tools or system text in the framework', () => {
     });
   });
 
-  it("moves a resident's head for cost by the framework's count of its inferences, and never an ephemeral run's", async () => {
+  it("moves a resident's head for cost by the framework's count of its answered requests, and never an ephemeral run's", async () => {
     const prices = { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.5, cacheWrite1hPerMillion: 20, cacheReadPerMillion: 1, currency: 'USD' };
     const old = { ...tool('a'), description: 'a does a thing. '.repeat(5_000) };
     await withFramework([{ ...resident('alpha'), systemPrompt: 'You are alpha.' }], async (framework) => {
       const traces: TraceEvent[] = [];
       framework.onTrace((event) => { traces.push(event); });
-      const counted = (name: string, ephemeral = false) => (framework as unknown as { usageTracker: { onInferenceCompleted(name: string, usage: { inputTokens: number; outputTokens: number }, cost: undefined, ephemeral: boolean): void } })
-        .usageTracker.onInferenceCompleted(name, { inputTokens: 1, outputTokens: 1 }, undefined, ephemeral);
+      const counted = (name: string) => (framework as unknown as { usageTracker: { onRequestAnswered(name: string): void } }).usageTracker.onRequestAnswered(name);
       const moves = (name: string) => traces.filter((t) => t.type === 'head:moved' && (t as { agentName: string }).agentName === name).map((t) => (t as { why: string }).why);
       const alpha = framework.getAgent('alpha')!;
       say(framework, alpha, 'user', 'hello');
       await alpha.buildActivationRequest([old]);
       await alpha.buildActivationRequest([tool('a')]);
-      assert.deepEqual((await alpha.buildActivationRequest([tool('a')])).tools, [old], 'no inference counted since the change: the recorded head');
+      assert.deepEqual((await alpha.buildActivationRequest([tool('a')])).tools, [old], 'no request counted since the change: the recorded head');
       counted('alpha');
       assert.deepEqual((await alpha.buildActivationRequest([tool('a')])).tools, [tool('a')], 'one counted: the head moves');
       assert.deepEqual(moves('alpha'), ['adopted', 'cost']);
       const moved = traces.filter((t) => t.type === 'head:moved').at(-1) as unknown as { estimated: { carried: number } };
-      assert.equal(moved.estimated.carried, pricedCharacters(old), "carried: the old definition, for the one inference the tracker counted");
+      assert.equal(moved.estimated.carried, pricedTokens(old), "carried: the old definition, for the one request the tracker counted");
 
       const { agent: run } = await framework.createEphemeralAgent({ ...resident('run'), systemPrompt: 'You are the run.' } as never);
       say(framework, run, 'user', 'hello');
       await run.buildActivationRequest([old]);
       await run.buildActivationRequest([tool('a')]);
-      for (let n = 0; n < 100; n++) { counted('run', true); counted('run'); }
+      for (let n = 0; n < 100; n++) counted('run');
       assert.deepEqual((await run.buildActivationRequest([tool('a')])).tools, [old], 'an ephemeral run: the recorded head');
       assert.deepEqual(moves('run'), ['adopted']);
     }, undefined, {}, prices);

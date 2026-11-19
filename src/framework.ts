@@ -107,6 +107,7 @@ import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMess
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
 import { copyHead, isDeclarationRow, isHeadDeclaration, memoryHeadDeclarations, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from './system-changes.js';
+import { mediaBlockTokens } from './media-tokens.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -529,7 +530,7 @@ function malformedResponseContent(response: EventResponse): { where: string; pla
  * flat per-image cost for its native image blocks (provider vision tokens
  * are resolution-dependent; 1600 ≈ one image at Anthropic's largest size), a
  * mid-turn message's text at chars/4 and its other blocks about as
- * context-manager's store prices them (injectedBlockTokens), and a small
+ * context-manager's store prices them (mediaBlockTokens), and a small
  * per-block envelope allowance. On membrane's native tool path a mid-turn
  * message rides into the next round as the boundary injects it, which is as
  * the strategy renders it for the next compile, cut and with its images
@@ -572,7 +573,7 @@ function estimateAppendedRoundTokens(
       if (block.type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
         chars += (block as { text: string }).text.length;
       } else {
-        injectedTokens += injectedBlockTokens(block);
+        injectedTokens += mediaBlockTokens(block);
       }
     }
   }
@@ -580,39 +581,6 @@ function estimateAppendedRoundTokens(
   return Math.ceil(chars / 4) + images * 1600 + injectedTokens + blockCount * 20;
 }
 
-/**
- * A mid-turn message's non-text block, priced about as context-manager's store
- * prices it (MessageStore's raw estimate at 0.14.1): an image at its
- * `tokenEstimate` stamp, or 1600 without one, and a document, audio or video
- * at 1000. These are the store's flat estimates, not ceilings: a PDF's pages
- * can cost more than 1000. Of the writers in agent-framework, channel
- * messages and MCPL bring images, MCPL push events and channel messages
- * bring audio, and none writes a document or a video; a host module's
- * addMessage can write any of them. Two departures err high. A generated
- * image, which the store prices at 0, is priced as an image, since
- * membrane's Anthropic formatter sends it as one. A stamp that isn't a
- * finite number, 0 or more, is priced at 1600, where the store takes it as
- * given: a NaN would make the whole projection NaN, and the round would
- * never restart. Thinking and other blocks are priced at 0: they come from
- * provider responses, stored as the agent's own messages, and nothing in
- * agent-framework writes them under another participant, though a host
- * module's addMessage could.
- */
-function injectedBlockTokens(block: ContentBlock): number {
-  switch (block.type) {
-    case 'image':
-    case 'generated_image': {
-      const stamp = (block as { tokenEstimate?: unknown }).tokenEstimate;
-      return typeof stamp === 'number' && Number.isFinite(stamp) && stamp >= 0 ? stamp : 1600;
-    }
-    case 'document':
-    case 'audio':
-    case 'video':
-      return 1000;
-    default:
-      return 0;
-  }
-}
 
 /**
  * What a notice says in place of "your plain speech lands there" when the
@@ -19040,8 +19008,8 @@ export class AgentFramework {
           { data: { changesRemoved: event.changesRemoved } });
       }
     }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'),
-    // Ephemeral runs share one count in the tracker, so theirs never moves for cost.
-    () => (this.ephemeralAgents.has(agent) ? undefined : this.usageTracker.inferenceCountOf(agent.name)));
+    // An ephemeral run's requests aren't counted (the 'usage' case), so its head never moves for cost.
+    () => (this.ephemeralAgents.has(agent) ? undefined : this.usageTracker.requestCountOf(agent.name)));
   }
 
   /**
@@ -31287,6 +31255,8 @@ export class AgentFramework {
             this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
+            // membrane reports each round's usage once: one request answered, which read the head.
+            if (!this.ephemeralAgents.has(agent)) this.usageTracker.onRequestAnswered(agent.name);
             // The stream's accumulated fresh input, which is what the
             // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;

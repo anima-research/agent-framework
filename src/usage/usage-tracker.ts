@@ -66,6 +66,8 @@ export interface PersistedUsageState {
   totals: SessionUsage;
   byAgent: Array<{ agentName: string; usage: SessionUsage; inferenceCount: number; ephemeral?: true }>;
   inferenceCount: number;
+  /** Each agent's count of answered requests (UsageTracker.requestCountOf); absent in a record from before it. */
+  requestCounts?: Array<{ agentName: string; requestCount: number }>;
 }
 
 /** The name the entry for every ephemeral agent's usage together goes by. */
@@ -100,6 +102,7 @@ export class UsageTracker {
    *  agent named EPHEMERAL_USAGE_NAME has an entry of its own. */
   private ephemeral: Tally | undefined;
   private inferenceCount = 0;
+  private readonly requestCounts = new Map<string, number>();
   private emitTrace: (event: UsageUpdatedEvent) => void;
 
   /** `wasEphemeral` names the stored unmarked entries that belong in the
@@ -122,6 +125,13 @@ export class UsageTracker {
     if (!totals) return;
     this.totals = totals;
     this.inferenceCount = typeof state.inferenceCount === 'number' ? state.inferenceCount : 0;
+    for (const item of Array.isArray(state.requestCounts) ? state.requestCounts as unknown[] : []) {
+      const entry = item && typeof item === 'object' ? item as { agentName?: unknown; requestCount?: unknown } : {};
+      const count = entry.requestCount;
+      if (typeof entry.agentName === 'string' && typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) {
+        this.requestCounts.set(entry.agentName, count);
+      }
+    }
     if (Array.isArray(state.byAgent)) {
       for (const item of state.byAgent as unknown[]) {
         if (!item || typeof item !== 'object') continue;
@@ -151,7 +161,8 @@ export class UsageTracker {
   }
 
   toJSON(): PersistedUsageState {
-    return this.getSnapshot();
+    const requestCounts = [...this.requestCounts].map(([agentName, requestCount]) => ({ agentName, requestCount }));
+    return { ...this.getSnapshot(), ...(requestCounts.length > 0 ? { requestCounts } : {}) };
   }
 
   /** `ephemeral`: the agent is an ephemeral one, whose usage counts in the
@@ -189,10 +200,19 @@ export class UsageTracker {
     });
   }
 
-  /** The inferences counted for `agentName`'s own entry, restored ones
-   *  included; an ephemeral agent's count in the shared entry, not here. */
-  inferenceCountOf(agentName: string): number {
-    return this.byAgent.get(agentName)?.inferenceCount ?? 0;
+  /** A provider request of `agentName`'s own stream was answered: one round,
+   *  as membrane reports each round's usage once. Counted in memory, and
+   *  stored with the usage state at the stream's end. The judge's and the
+   *  suppression review's calls aren't counted, and its caller counts no
+   *  ephemeral agent's. */
+  onRequestAnswered(agentName: string): void {
+    this.requestCounts.set(agentName, (this.requestCounts.get(agentName) ?? 0) + 1);
+  }
+
+  /** `agentName`'s count of answered requests (onRequestAnswered), restored
+   *  ones included: 0 where none was counted. */
+  requestCountOf(agentName: string): number {
+    return this.requestCounts.get(agentName) ?? 0;
   }
 
   getSnapshot(): SessionUsageSnapshot {

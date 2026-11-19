@@ -29,9 +29,9 @@ import {
   systemChangeMetadata,
   systemTextOf,
   copyHead,
-  carriedCharacters,
-  inferenceCountOf,
-  requestCharacters,
+  carriedTokens,
+  requestTokens,
+  storedRequestCount,
   type CostFigures,
   type DeclarationDifference,
   type HeadDeclaration,
@@ -2928,7 +2928,7 @@ export class Agent {
     return !this.headUntilBuiltAgain && membrane.takesToolOrSystemChanges?.(this.model) === true;
   }
 
-  /** The framework's record of heads, its traces of what moved them, where the change rows a move takes out go (the removal funnel, #291), and the agent's count of finished inferences, which the rule for cost reads: undefined for an agent whose head never moves for cost.
+  /** The framework's record of heads, its traces of what moved them, where the change rows a move takes out go (the removal funnel, #291), and the agent's count of answered requests, which the rule for cost reads: undefined for an agent whose head never moves for cost.
    *  @internal For the framework's head store; not a host API. */
   attachHeadDeclarations(
     store: HeadDeclarationStore,
@@ -3063,7 +3063,7 @@ export class Agent {
   }
 
   // What carrying the definitions a move would take out has cost by the
-  // agent's count of finished inferences (carriedCharacters), read from the
+  // agent's count of answered requests (carriedTokens), read from the
   // rows the compile holds: undefined for an agent with no count, whose head
   // never moves for cost. A row's count is in its mark, which the agent's
   // context reads back for a row of its own slot.
@@ -3079,10 +3079,10 @@ export class Agent {
       return {
         changes: compiled.messages[index]?.content.filter(isSystemChangeContent) ?? [],
         removable: stored !== undefined && stored !== null,
-        inferenceCount: stored ? inferenceCountOf(stored.metadata) : undefined,
+        requestCount: stored ? storedRequestCount(stored.metadata) : undefined,
       };
     });
-    return carriedCharacters(recorded, rows, count);
+    return carriedTokens(recorded, rows, count);
   }
 
   // The rule for cost (report:acorn-2386-design): the head moves when
@@ -3102,7 +3102,7 @@ export class Agent {
     if (firstChanged == null) return undefined;
     const before = this.rowsAsSent(compiled.messages).slice(0, firstChanged).filter((m) => m.content.length > 0);
     if (this.mayBindThinking && before.some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'))) return undefined;
-    const extraNow = requestCharacters(current, before);
+    const extraNow = requestTokens(current, before);
     return carried >= k * extraNow ? { carried, k, extraNow } : undefined;
   }
 

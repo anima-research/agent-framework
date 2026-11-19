@@ -1,5 +1,6 @@
-import type { CompileResult, MessageId } from '@animalabs/context-manager';
+import { jsonTokenEstimator, type CompileResult, type MessageId } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
+import { mediaBlockTokens } from './media-tokens.js';
 import { canonicalJson } from './stable-hash.js';
 
 export interface HeadDeclaration {
@@ -43,28 +44,28 @@ export const SYSTEM_CHANGE_KIND = 'system-change';
 /** The metadata a change row is stored with: agent-framework's marker for a
  *  row that isn't conversation, the agent it declares for, whose context it
  *  is (contextAgentOf), as a stored injection's mark names its agent, and the
- *  agent's count of finished inferences when it was stored, which the rule
- *  for cost reads (carriedCharacters). An agent with no count stores none. */
+ *  agent's count of answered requests when it was stored, which the rule for
+ *  cost reads (carriedTokens). An agent with no count stores none. */
 export function systemChangeMetadata(
   agentName: string,
-  inferenceCount?: number,
-): { system: true; kind: typeof SYSTEM_CHANGE_KIND; agent: string; inferenceCount?: number } {
-  return { system: true, kind: SYSTEM_CHANGE_KIND, agent: agentName, ...(inferenceCount === undefined ? {} : { inferenceCount }) };
+  requestCount?: number,
+): { system: true; kind: typeof SYSTEM_CHANGE_KIND; agent: string; requestCount?: number } {
+  return { system: true, kind: SYSTEM_CHANGE_KIND, agent: agentName, ...(requestCount === undefined ? {} : { requestCount }) };
 }
 
-/** A change row's count of finished inferences at its storing, from its mark
+/** A change row's count of answered requests at its storing, from its mark
  *  (systemChangeMetadata). Undefined for a row with none: a copy of a
  *  context's row, which carries no metadata of its own, and a host's row. */
-export function inferenceCountOf(metadata: unknown): number | undefined {
+export function storedRequestCount(metadata: unknown): number | undefined {
   if (metadata === null || typeof metadata !== 'object' || !('kind' in metadata) || metadata.kind !== SYSTEM_CHANGE_KIND) return undefined;
-  const count = 'inferenceCount' in metadata ? metadata.inferenceCount : undefined;
+  const count = 'requestCount' in metadata ? metadata.requestCount : undefined;
   return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : undefined;
 }
 
-/** A move for cost's figures, each an estimate: what carrying has cost
- *  (`carried`), the cache write price over the read price less one (`k`), and
- *  what the move writes that the request would otherwise read (`extraNow`),
- *  both in characters. The head moves when `carried >= k * extraNow`. */
+/** A move for cost's figures, each an estimate in tokens: what carrying has
+ *  cost (`carried`), the cache write price over the read price less one
+ *  (`k`), and what the move writes that the request would otherwise read
+ *  (`extraNow`). The head moves when `carried >= k * extraNow`. */
 export interface CostFigures {
   carried: number;
   k: number;
@@ -128,24 +129,24 @@ export function copyHead(head: HeadDeclaration): HeadDeclaration {
 }
 
 /** What carrying the tool definitions that a move would take out has cost
- *  by the agent's count of finished inferences (`count`), in characters read.
- *  A definition is dead once a row removes or replaces it, if the head
- *  carries it or a row that the agent's context can remove carries it. Each
- *  dead definition counts once for each inference since the row that killed
- *  it was stored (inferenceCountOf). A row adds nothing that has no count:
+ *  by the agent's count of answered requests (`count`), in tokens read. A
+ *  definition is dead once a row removes or replaces it, if the head carries
+ *  it or a row that the agent's context can remove carries it. Each dead
+ *  definition counts once for each request since the row that killed it was
+ *  stored (storedRequestCount). A row adds nothing that has no count:
  *  one that the agent's context can't read back, which its caller gives none,
  *  a copy's row and a host's row. Nor does one whose count is above `count`,
  *  as after a usage state that was reset. An addition, a row's own wrapping
  *  and system text add nothing. */
-export function carriedCharacters(
+export function carriedTokens(
   head: HeadDeclaration,
-  rows: readonly { changes: readonly SystemChangeContent[]; removable: boolean; inferenceCount: number | undefined }[],
+  rows: readonly { changes: readonly SystemChangeContent[]; removable: boolean; requestCount: number | undefined }[],
   count: number,
 ): number {
-  const live = new Map(head.tools.map((tool) => [tool.name, pricedCharacters(tool)] as const));
+  const live = new Map(head.tools.map((tool) => [tool.name, pricedTokens(tool)] as const));
   let carried = 0;
-  for (const { changes, removable, inferenceCount } of rows) {
-    const since = inferenceCount !== undefined && inferenceCount <= count ? count - inferenceCount : 0;
+  for (const { changes, removable, requestCount } of rows) {
+    const since = requestCount !== undefined && requestCount <= count ? count - requestCount : 0;
     for (const change of changes) {
       for (const name of change.removeTools ?? []) {
         carried += (live.get(name) ?? 0) * since;
@@ -153,19 +154,33 @@ export function carriedCharacters(
       }
       for (const tool of change.defineTools ?? []) {
         carried += (live.get(tool.name) ?? 0) * since;
-        live.set(tool.name, removable ? pricedCharacters(tool) : 0);
+        live.set(tool.name, removable ? pricedTokens(tool) : 0);
       }
     }
   }
   return carried;
 }
 
-export function requestCharacters(head: HeadDeclaration, messages: readonly unknown[]): number {
-  return pricedCharacters({ system: head.system, tools: head.tools, messages });
+/** A request's tokens, as context-manager estimates JSON's (jsonTokenEstimator)
+ *  over what a provider prices by its characters, and each media block, a tool
+ *  result's included, at its own price (mediaBlockTokens). */
+export function requestTokens(head: HeadDeclaration, messages: readonly { content: readonly unknown[] }[]): number {
+  return pricedTokens({ system: head.system, tools: head.tools, messages })
+    + messages.reduce((tokens, message) => tokens + mediaTokens(message.content), 0);
 }
 
-export function pricedCharacters(value: unknown): number {
-  return JSON.stringify(value, unpricedLeftOut).length;
+export function pricedTokens(value: unknown): number {
+  return jsonTokenEstimator(JSON.stringify(value, unpricedLeftOut));
+}
+
+function mediaTokens(blocks: readonly unknown[]): number {
+  let tokens = 0;
+  for (const block of blocks) {
+    if (!block || typeof block !== 'object' || !('type' in block)) continue;
+    if (block.type === 'tool_result' && 'content' in block && Array.isArray(block.content)) tokens += mediaTokens(block.content);
+    else tokens += mediaBlockTokens(block as ContentBlock);
+  }
+  return tokens;
 }
 
 const UNPRICED_BLOCK_FIELDS = new Set(['rawItem', 'rawXml', 'rawXmlImagesAt', 'unparseableInput', 'tokenEstimate']);

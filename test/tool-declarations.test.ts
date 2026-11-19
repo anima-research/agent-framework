@@ -6,7 +6,7 @@ import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, Membrane, ModelPricing, NormalizedMessage, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 
 import { Agent } from '../src/agent.js';
-import { memoryHeadDeclarations, pricedCharacters, requestCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
+import { memoryHeadDeclarations, pricedTokens, requestTokens, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { AgentConfig } from '../src/types/index.js';
 import { foldOf, now } from './helpers/declared.js';
 
@@ -762,8 +762,8 @@ describe('a change of tools or system text, declared in the context', () => {
     const NEW = tool('a', 'a does a thing');
     const NOW: HeadDeclaration = { tools: [NEW], system: [SHORT] };
     // A move at a compile that rewrites from the first message writes the head alone.
-    const EXTRA = requestCharacters(NOW, []);
-    const DEAD = pricedCharacters(OLD);
+    const EXTRA = requestTokens(NOW, []);
+    const DEAD = pricedTokens(OLD);
     // The count at which carrying OLD reaches k times EXTRA, from a count of 0.
     const BAR = Math.ceil((19 * EXTRA) / DEAD);
 
@@ -803,8 +803,8 @@ describe('a change of tools or system text, declared in the context', () => {
     it('counts as dead what a move would take out: a removed tool, and a tool that dropped and came back, as its head copy', async () => {
       const BIG = tool('b', 'b does a thing. '.repeat(400));
       for (const [what, steps, dead] of [
-        ['a removed tool', [[NEW, BIG], [NEW]], pricedCharacters(BIG)],
-        ['a tool that dropped and came back', [[NEW, BIG], [NEW], [NEW, BIG]], pricedCharacters(BIG)],
+        ['a removed tool', [[NEW, BIG], [NEW]], pricedTokens(BIG)],
+        ['a tool that dropped and came back', [[NEW, BIG], [NEW], [NEW, BIG]], pricedTokens(BIG)],
       ] as const) {
         const count = { n: 0 };
         const context = fakeContext([said('user', 'hello')], { firstChanged: () => 0 });
@@ -853,7 +853,7 @@ describe('a change of tools or system text, declared in the context', () => {
       const request = await agent.buildActivationRequest([NEW]);
       assert.deepEqual(request.tools, [OLD], 'no move for cost: the recorded head');
       assert.deepEqual(events.at(-1)?.type, 'head:declared', 'the change is declared again');
-      assert.equal(changeRows(context.rows)[0]!.metadata?.inferenceCount, 10 * BAR, 'by a row that counts from now');
+      assert.equal(changeRows(context.rows)[0]!.metadata?.requestCount, 10 * BAR, 'by a row that counts from now');
     });
 
     it("never moves for cost on a model membrane can't price, with a membrane that gives no prices, or for an agent with no count", async () => {
@@ -906,7 +906,7 @@ describe('a change of tools or system text, declared in the context', () => {
 
     it("counts each inference since the row was stored, by the count in the row's mark, across a restart; a row whose count is above the agent's adds nothing", async () => {
       const { context, heads, count } = await replaced({}, [said('user', 'hello')], 10);
-      assert.equal(changeRows(context.rows)[0]!.metadata?.inferenceCount, 10, "the premise: the row's mark holds the count it was stored at");
+      assert.equal(changeRows(context.rows)[0]!.metadata?.requestCount, 10, "the premise: the row's mark holds the count it was stored at");
       const events: HeadEvent[] = [];
       const config = { systemPrompt: SHORT, takes: true, pricing: () => PRICES, counted: () => count.n };
       count.n = 3;
@@ -934,7 +934,7 @@ describe('a change of tools or system text, declared in the context', () => {
 
     it("counts nothing for a row that its context can't read back: not what it kills, and not what it defines", async () => {
       // Each carries a count, so only the read back decides.
-      const shared = (id: string, definition: ToolDefinition): Row => ({ id, participant: 'system', content: [{ type: 'system_change', defineTools: [definition] } as never], metadata: { system: true, kind: 'system-change', inferenceCount: 0 } });
+      const shared = (id: string, definition: ToolDefinition): Row => ({ id, participant: 'system', content: [{ type: 'system_change', defineTools: [definition] } as never], metadata: { system: true, kind: 'system-change', requestCount: 0 } });
       const between = tool('a', 'a does a thing, as it was written next');
       const rows = [said('user', 'hello'), shared('s1', between), shared('s2', NEW)];
       const context = fakeContext(rows, { firstChanged: () => 0, readOnly: new Set(['s1', 's2']) });

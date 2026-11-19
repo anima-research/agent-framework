@@ -2,7 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock, ToolDefinition } from '@animalabs/membrane';
 
-import { requestCharacters, type HeadDeclaration } from '../src/system-changes.js';
+import { jsonTokenEstimator } from '@animalabs/context-manager';
+import { requestTokens, type HeadDeclaration } from '../src/system-changes.js';
 import { isSystemChangeMessage } from '../src/index.js';
 
 const tool = (name: string, description = `${name} does a thing`, properties: Record<string, unknown> = {}): ToolDefinition => ({
@@ -11,8 +12,8 @@ const tool = (name: string, description = `${name} does a thing`, properties: Re
   inputSchema: { type: 'object', properties: properties as never },
 });
 
-describe('requestCharacters', () => {
-  it("counts the head and the messages as JSON, leaving out what a provider doesn't price by its characters", () => {
+describe('requestTokens', () => {
+  it("counts the head and the messages as context-manager estimates JSON, leaving out what a provider doesn't price by its characters, and adds each media block at its price", () => {
     const head: HeadDeclaration = { tools: [tool('a')], system: ['You are an agent.'] };
     const source = (data: string) => ({ type: 'base64', mediaType: 'image/png', data });
     const messages = (opaque: boolean) => [
@@ -26,11 +27,13 @@ describe('requestCharacters', () => {
       { participant: 'user', content: [{ type: 'tool_result', toolUseId: 't', content: [{ type: 'image', source: source(opaque ? 'T'.repeat(1000) : '') }] }] },
     ];
     const strip = (value: unknown): unknown => JSON.parse(JSON.stringify(value), (key, v) => (key === 'data' || key === 'signature' || key === 'rawItem' ? undefined : v));
-    const expected = JSON.stringify({ system: head.system, tools: head.tools, messages: strip(messages(false)) }).length;
-    assert.equal(requestCharacters(head, messages(true)), expected, 'every opaque payload left out, nested ones included');
-    assert.equal(requestCharacters(head, []), JSON.stringify({ system: head.system, tools: head.tools, messages: [] }).length, 'the head alone');
+    // An image, a generated image and the image in a tool result at 1600 each, and a document at 1000.
+    const media = 3 * 1600 + 1000;
+    const expected = jsonTokenEstimator(JSON.stringify({ system: head.system, tools: head.tools, messages: strip(messages(false)) })) + media;
+    assert.equal(requestTokens(head, messages(true)), expected, 'every opaque payload left out, nested ones included, and each media block at its price');
+    assert.equal(requestTokens(head, []), jsonTokenEstimator(JSON.stringify({ system: head.system, tools: head.tools, messages: [] })), 'the head alone');
     const said = [{ participant: 'user', content: [{ type: 'text', text: 'x'.repeat(100) }] }];
-    assert.equal(requestCharacters(head, said) - requestCharacters(head, [{ participant: 'user', content: [{ type: 'text', text: '' }] }]), 100, 'text counts character for character');
+    assert.equal(requestTokens(head, said), jsonTokenEstimator(JSON.stringify({ system: head.system, tools: head.tools, messages: said })), 'text as the JSON that carries it');
   });
 
   it("leaves out the fields a request on the native formatter doesn't send: a parsed block's raw text, a call's unparsed arguments and a block's estimate", () => {
@@ -42,8 +45,8 @@ describe('requestCharacters', () => {
       { participant: 'agent', content: [{ ...call, rawXml: '<function_calls>'.repeat(100), unparseableInput: '{"a": '.repeat(100) }, { type: 'thinking', thinking: 'why', tokenEstimate: 123456 }] },
       { participant: 'user', content: [{ ...result, rawXml: '<function_results>'.repeat(100), rawXmlImagesAt: 12345, content: [{ type: 'text', text: 'done', tokenEstimate: 7 }] }] },
     ];
-    assert.equal(requestCharacters(head, carrying), requestCharacters(head, plain), 'none of them counts');
-    assert.equal(requestCharacters(head, []), JSON.stringify({ system: head.system, tools: head.tools, messages: [] }).length, "a tool's parameters of those names still count");
+    assert.equal(requestTokens(head, carrying), requestTokens(head, plain), 'none of them counts');
+    assert.equal(requestTokens(head, []), jsonTokenEstimator(JSON.stringify({ system: head.system, tools: head.tools, messages: [] })), "a tool's parameters of those names still count");
   });
 });
 

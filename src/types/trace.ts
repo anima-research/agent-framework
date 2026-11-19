@@ -171,10 +171,10 @@ export type TraceEvent =
       why: 'cost';
       changesRemoved: number;
       /** The rule's figures, each an estimate: what carrying had cost, in
-       *  characters read (`carried`); the cache write price over the read
-       *  price, less one (`k`); and what the move writes that the request
-       *  would otherwise read, in characters (`extraNow`). The head moved as
-       *  `carried` reached `k * extraNow`. */
+       *  tokens read (`carried`); the cache write price over the read price,
+       *  less one (`k`); and what the move writes that the request would
+       *  otherwise read, in tokens (`extraNow`). The head moved as `carried`
+       *  reached `k * extraNow`. */
       estimated: { carried: number; k: number; extraNow: number };
     })
   | (TraceEventBase & {
