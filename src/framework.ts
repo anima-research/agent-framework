@@ -304,7 +304,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  *     "stay silent" signal).
  *   - explicit delivery tools (send-tools.ts's silencing sends, such as
  *     channel_publish and *send_message) — already sent the message, so
- *     routing the prose again would double-post.
+ *     routing the prose again would double-post. Only for an agent whose
+ *     sends silence (AgentConfig.sendSilencing, off by default): for any
+ *     other, a send suppresses nothing (silenceCauseOf).
  * `think` is deliberately NOT here: it is silent *reasoning*, and same-round
  * prose beside it is governed separately by same_round_think_text_policy.
  *
@@ -321,9 +323,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  */
 const SILENCING_TOOLS = new Set(['skip_reply', ...SILENCING_SENDS]);
 
-/** True when a tool call (possibly MCPL-prefixed) is an explicit delivery
- *  that silences the round's auto-routed prose where it may have posted,
- *  regardless of mode. */
+/** True when a tool call (possibly MCPL-prefixed) is skip_reply or an
+ *  explicit delivery, which silences the round's auto-routed prose where it
+ *  may have posted for an agent whose sends silence. */
 const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
   return SILENCING_TOOLS.has(bare);
@@ -1876,8 +1878,9 @@ const carriedSends = (sends: SendsReached | null): SendsReached | null => sends 
  * effect can come after the round's prose. It counts toward the round of the
  * call watching the script when it arrives, such as a later round's wait,
  * and toward none if no call does. A call returns at its script's end or at
- * its yield, which bounds the wait. In locus and hybrid mode a round also
- * waits for its own sends to answer.
+ * its yield, which bounds the wait. In locus and hybrid mode a round of an
+ * agent whose sends silence (AgentConfig.sendSilencing) also waits for its
+ * own sends to answer.
  */
 interface ScriptRound {
   /** The agent and stream that dispatched the round. */
@@ -14976,7 +14979,8 @@ export class AgentFramework {
             'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
             'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
             'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
-            'is posted as usual. A change applies from your next response on, not to a send made in the same response as the change.',
+            'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
+            'that an earlier send in the turn already set.',
         },
         settings: {
           type: 'array',

@@ -1600,16 +1600,18 @@ describe('a round whose run or wait call watches a script that can change its ro
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ], { sendSilencing: false });
+    // The send is held open: a round that waited for its script would never
+    // post its prose while the send is out.
+    h.module.holdSend = true;
+    const posted = (words: string) => h.log.some((e) => (e.startsWith('publish:') || e.startsWith('chunk:')) && e.includes(words));
     try {
-      await h.run();
-      const order = h.log.filter((e) => e === 'tool:send_message' || e.startsWith('publish:') || e.startsWith('chunk:'));
-      assert.ok(order.includes('tool:send_message'), 'the script sent');
-      assert.ok(order.some((e) => e.includes('posting the summary')), `the round's prose is posted: ${JSON.stringify(order)}`);
-      assert.ok(order.some((e) => e.includes('done')), `and so is the turn's later prose: ${JSON.stringify(order)}`);
-      assert.ok(order.findIndex((e) => e.includes('posting the summary')) < order.indexOf('tool:send_message'),
-        `the prose is routed at once, before the script's send runs: ${JSON.stringify(order)}`);
+      const run = h.run();
+      await until(() => h.log.includes('tool:send_message') && posted('posting the summary'), "the round's prose, posted while the script's send is still out");
+      h.module.releaseGate();
+      await run;
+      assert.ok(posted('done'), `the turn's later prose is posted too: ${JSON.stringify(h.log)}`);
       assert.deepStrictEqual(heldDrafts(h.framework), []);
-    } finally { await h.done(); }
+    } finally { h.module.releaseGate(); await h.done(); }
   });
 
   // A drafts resend is an explicit send, decided by what it posted, as

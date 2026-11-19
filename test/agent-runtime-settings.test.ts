@@ -57,7 +57,8 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
           'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
           'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
           'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
-          'is posted as usual. A change applies from your next response on, not to a send made in the same response as the change.',
+          'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
+          'that an earlier send in the turn already set.',
       },
     );
     assert.ok(

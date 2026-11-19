@@ -3210,11 +3210,16 @@ describe('an explicit send holds plain speech only where it may have posted', ()
 
       await h.restart();
       assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the resident's choice outlives a restart");
+      // What a request carries, not only what a fresh tool list says.
+      const draftsToolSent = () => h.membrane.calls.at(-1)!.tools!.find((tool) => tool.name === 'drafts')!.description;
+      await h.turn([createMockResponse([text('Hello.')])]);
+      assert.ok(draftsToolSent().includes(SEND_REASON), 'on: the request carries the send as a reason');
 
       h.framework.resetAgentRuntimeSettings('scout', ['sendSilencing']);
       assert.ok(!draftsToolShown(h).includes(SEND_REASON));
       await h.turn([createMockResponse([text('Again.'), send('s2', ROOM, 'Sent again.')], 'tool_use'), createMockResponse([])]);
-      assert.deepEqual(inRoom(h), ['Again.']);
+      assert.ok(!draftsToolSent().includes(SEND_REASON), 'off: the request carries none');
+      assert.deepEqual(inRoom(h), ['Hello.', 'Again.']);
     } finally {
       await h.close();
     }
