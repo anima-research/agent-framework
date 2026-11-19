@@ -68,7 +68,7 @@ import { audienceOf, heldFromResidents, observedRowFor, suppressedRow } from './
 import { sameSlot, type AgentRegistry } from './dendrite/registry.js';
 import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
 import type { WindowOrdinal } from './read-marks.js';
-import { isAnotherAgentsInjection } from './stored-injections.js';
+import { isAnotherAgentsContext } from './stored-injections.js';
 import { nameAsStored } from './text-as-stored.js';
 import type { PresentationRetractReason, TraceEventInput } from './types/trace.js';
 
@@ -275,15 +275,15 @@ export function bearingOf(
   if (stamp) {
     if (stamp.ownRowOf !== undefined) {
       if (stamp.ownRowOf === reader.name) return 'own';
-      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsInjection(metadata, reader.name) ? 'arrival' : 'elsewhere';
+      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsContext(metadata, reader.name) ? 'arrival' : 'elsewhere';
     }
     if (!stamp.audience.includes(reader.name)) return 'elsewhere';
-    if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
+    if (isAnotherAgentsContext(metadata, reader.name)) return 'elsewhere';
     return reader.hidesHeld && heldFromResidents(metadata) ? 'elsewhere' : 'arrival';
   }
   if (reader.derivedAt !== undefined && row.sequence <= reader.derivedAt) return 'elsewhere';
   if (reader.hidesHeld && heldFromResidents(metadata)) return 'elsewhere';
-  if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
+  if (isAnotherAgentsContext(metadata, reader.name)) return 'elsewhere';
   return 'arrival';
 }
 
@@ -1025,7 +1025,19 @@ export class AgentPresentation {
     }
   }
 
-  handOff(agent: PresentedAgent, sent: ReadonlyArray<MessageId | undefined>, carried: (row: StoredMessage) => boolean): { vouched: boolean } {
+  /**
+   * The check before a tool boundary hands the stream its rows: `sent` (the
+   * round's reply, its results and the injected rows, in the order the
+   * stream is given them) not yet in the window are presented, in order,
+   * and the window's newest bodies must then be exactly those rows. On a
+   * mismatch it traces presentation:hand-off-mismatch and the rows are not
+   * vouched for, so the stream's later thinking is left out at the next
+   * compile rather than sent under a prefix its window doesn't hold. An
+   * agent the module doesn't present for is vouched for as before. A read
+   * of the window that throws is traced as presentation:failed, and the
+   * rows are not vouched for: the check couldn't be made. Never throws.
+   */
+  handOff(agent: PresentedAgent, sent: ReadonlyArray<MessageId | undefined>): { vouched: boolean } {
     try {
       if (!this.presenting(agent)) return { vouched: true };
       const cm = agent.getContextManager();
@@ -1033,10 +1045,10 @@ export class AgentPresentation {
       if (expected.length === 0) return { vouched: true };
       const missing = expected.filter((id) => cm.ordinalOf(id) === undefined);
       if (missing.length > 0 && this.present(agent, missing, 'hand-off').error !== undefined) {
-        this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail: lastBodyHeads(cm.getPresentedMessages().filter(carried), expected.length) });
+        this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail: lastBodyHeads(cm.getPresentedMessages(), expected.length) });
         return { vouched: false };
       }
-      const tail = lastBodyHeads(cm.getPresentedMessages().filter(carried), expected.length);
+      const tail = lastBodyHeads(cm.getPresentedMessages(), expected.length);
       if (tail.length !== expected.length || tail.some((id, i) => id !== expected[i])) {
         this.host.emitTrace({ type: 'presentation:hand-off-mismatch', agentName: agent.name, expected, tail });
         return { vouched: false };

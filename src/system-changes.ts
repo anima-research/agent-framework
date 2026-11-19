@@ -1,4 +1,4 @@
-import { continuesBody, type CompileResult } from '@animalabs/context-manager';
+import { continuesBody, type CompileResult, type MessageId } from '@animalabs/context-manager';
 import { isSystemChangeContent, type ContentBlock, type SystemChangeContent, type ToolDefinition } from '@animalabs/membrane';
 import { canonicalJson } from './stable-hash.js';
 
@@ -16,10 +16,11 @@ export interface HeadDeclarationStore {
 export function memoryHeadDeclarations(branch: () => string): HeadDeclarationStore {
   const heads = new Map<string, HeadDeclaration>();
   const key = (agentName: string) => JSON.stringify([branch(), agentName]);
+  // An agent that has recorded nothing asks no branch of its context.
   return {
-    read: (agentName) => heads.get(key(agentName)) ?? null,
+    read: (agentName) => (heads.size === 0 ? null : heads.get(key(agentName)) ?? null),
     write: (agentName, head) => { heads.set(key(agentName), head); return true; },
-    delete: (agentName) => { heads.delete(key(agentName)); return true; },
+    delete: (agentName) => { if (heads.size > 0) heads.delete(key(agentName)); return true; },
   };
 }
 
@@ -97,34 +98,22 @@ export function changeWriteCheck(): { visit(row: TailRow): boolean; splits(): bo
   };
 }
 
-function changeStampOf(row: { metadata?: unknown }): string | undefined {
-  const metadata = row.metadata as { kind?: unknown; agent?: unknown } | undefined;
-  return metadata?.kind === 'system-change' && typeof metadata.agent === 'string' ? metadata.agent : undefined;
-}
-
-export function isOthersSystemChange(message: { content: readonly ContentBlock[]; metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
-  const stamp = changeStampOf(message);
-  return isSystemChangeMessage(message) && stamp !== undefined && !isOwn(stamp);
-}
-
-export function isSystemChangeNotOwn(message: { content: readonly ContentBlock[]; metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
-  const stamp = changeStampOf(message);
-  return isSystemChangeMessage(message) && (stamp === undefined || !isOwn(stamp));
-}
-
 export function isHeadDeclaration(value: unknown): value is HeadDeclaration {
-  if (!value || typeof value !== 'object') return false;
-  const { tools, system } = value as { tools?: unknown; system?: unknown };
+  if (!value || typeof value !== 'object' || !('tools' in value) || !('system' in value)) return false;
+  const { tools, system } = value;
   return Array.isArray(tools)
-    && tools.every((tool) => !!tool && typeof tool === 'object' && typeof (tool as { name?: unknown }).name === 'string')
-    && Array.isArray(system) && system.every((block) => typeof block === 'string');
+    && tools.every((tool: unknown) => !!tool && typeof tool === 'object' && 'name' in tool && typeof tool.name === 'string')
+    && Array.isArray(system) && system.every((block: unknown) => typeof block === 'string');
 }
+
+/** The `kind` a change row's metadata carries beside `system: true`. */
+export const SYSTEM_CHANGE_KIND = 'system-change';
 
 /** The metadata a change row is stored with: agent-framework's marker for a
- *  row that isn't conversation, and the agent it declares for, which the
- *  residents' shared slot needs to keep each agent's changes its own. */
-export function systemChangeMetadata(agentName: string): { system: true; kind: 'system-change'; agent: string } {
-  return { system: true, kind: 'system-change', agent: agentName };
+ *  row that isn't conversation, and the agent it declares for, whose context
+ *  it is (contextAgentOf), as a stored injection's mark names its agent. */
+export function systemChangeMetadata(agentName: string): { system: true; kind: typeof SYSTEM_CHANGE_KIND; agent: string } {
+  return { system: true, kind: SYSTEM_CHANGE_KIND, agent: agentName };
 }
 
 export type HeadEvent =
@@ -147,28 +136,37 @@ export type DeclarationDifference =
  *  them with other blocks, so its content is changes alone. Recognised by its
  *  block, which is what membrane sends, whatever metadata a stored copy carries:
  *  what a request on the head leaves out, and what readers of the
- *  conversation's tail look past, are every change row. Folding onto the head
- *  and consolidating read only the agent's own (ownSystemChanges). */
+ *  conversation's tail look past, are every change row. */
 export function isSystemChangeMessage(message: { content: readonly ContentBlock[] }): boolean {
   return Array.isArray(message.content) && message.content.some(isSystemChangeContent);
 }
 
-function isOwnChangeRow(row: { metadata?: unknown }, isOwn: (agentName: string) => boolean): boolean {
-  const stamp = changeStampOf(row);
-  return stamp !== undefined && isOwn(stamp);
+/** A message that declares tools or system text: one whose system changes
+ *  remove or define a tool, or add system text. One whose changes carry only
+ *  `effort` declares none. */
+export function isDeclarationRow(message: { content: readonly ContentBlock[] }): boolean {
+  return Array.isArray(message.content) && message.content.some((block) => isSystemChangeContent(block)
+    && ((block.removeTools?.length ?? 0) > 0 || (block.defineTools?.length ?? 0) > 0 || (block.addSystem?.length ?? 0) > 0));
 }
 
-export function ownSystemChanges(compiled: Pick<CompileResult, 'messages' | 'provenance' | 'rawBodies'>, isOwn: (agentName: string) => boolean): Set<number> {
-  const own = new Set<number>();
-  const sources = compiled.provenance?.messages;
+/** The compiled messages that are declaration rows, by index: every one the
+ *  compile holds, whoever stored it. */
+export function heldDeclarations(compiled: Pick<CompileResult, 'messages'>): Set<number> {
+  const held = new Set<number>();
   compiled.messages.forEach((message, index) => {
-    if (!isSystemChangeMessage(message)) return;
-    const source = sources?.[index];
-    if (source?.kind !== 'raw') return;
-    const rows = source.bodies.flatMap((body) => compiled.rawBodies?.get(body.messageId) ?? []);
-    if (rows.length > 0 && rows.every((row) => isOwnChangeRow(row, isOwn))) own.add(index);
+    if (isDeclarationRow(message)) held.add(index);
   });
-  return own;
+  return held;
+}
+
+/** The stored rows the compile's declaration rows came from, by its own
+ *  account of each message's source. */
+export function declarationRowIds(compiled: Pick<CompileResult, 'messages' | 'provenance'>): MessageId[] {
+  const sources = compiled.provenance?.messages;
+  return [...heldDeclarations(compiled)].flatMap((index) => {
+    const source = sources?.[index];
+    return source?.kind === 'raw' ? source.bodies.map((body) => body.messageId) : [];
+  });
 }
 
 export function copyHead(head: HeadDeclaration): HeadDeclaration {
@@ -186,7 +184,7 @@ export function pricedCharacters(value: unknown): number {
 const UNPRICED_BLOCK_FIELDS = new Set(['rawItem', 'rawXml', 'rawXmlImagesAt', 'unparseableInput', 'tokenEstimate']);
 
 function unpricedLeftOut(this: unknown, key: string, value: unknown): unknown {
-  const type = (this as { type?: unknown } | null)?.type;
+  const type = this !== null && typeof this === 'object' && 'type' in this ? this.type : undefined;
   if (typeof type === 'string' && UNPRICED_BLOCK_FIELDS.has(key)) return undefined;
   if (key === 'data' && (type === 'base64' || type === 'generated_image' || type === 'redacted_thinking')) return undefined;
   if (key === 'signature' && type === 'thinking') return undefined;
@@ -244,35 +242,3 @@ export function declarationDifference(
   };
 }
 
-export function withoutCarried(
-  difference: DeclarationDifference,
-  own: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
-  carried: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
-): DeclarationDifference {
-  if (difference.kind !== 'change') return difference;
-  const { block } = difference;
-  const defineTools = (block.defineTools ?? []).filter((tool) => {
-    const held = carried.tools.get(tool.name);
-    return !held || wireJson(held) !== wireJson(tool);
-  });
-  const removeTools = (block.removeTools ?? []).filter((name) => carried.tools.has(name));
-  const othersAdded = new Map<string, number>();
-  for (const text of carried.system) othersAdded.set(text, (othersAdded.get(text) ?? 0) + 1);
-  for (const text of own.system) othersAdded.set(text, (othersAdded.get(text) ?? 0) - 1);
-  const addSystem = (block.addSystem ?? []).filter((text) => {
-    const left = othersAdded.get(text) ?? 0;
-    if (left <= 0) return true;
-    othersAdded.set(text, left - 1);
-    return false;
-  });
-  if (defineTools.length === 0 && removeTools.length === 0 && addSystem.length === 0) return { kind: 'none' };
-  return {
-    kind: 'change',
-    block: {
-      type: 'system_change',
-      ...(removeTools.length > 0 ? { removeTools } : {}),
-      ...(defineTools.length > 0 ? { defineTools } : {}),
-      ...(addSystem.length > 0 ? { addSystem } : {}),
-    },
-  };
-}

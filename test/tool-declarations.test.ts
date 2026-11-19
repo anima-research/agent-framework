@@ -8,6 +8,7 @@ import type { ContentBlock, Membrane, NormalizedMessage, NormalizedRequest, Tool
 import { Agent } from '../src/agent.js';
 import { memoryHeadDeclarations, pricedCharacters, requestCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { AgentConfig } from '../src/types/index.js';
+import { foldOf, now } from './helpers/declared.js';
 
 interface Row { id: string; participant: string; content: ContentBlock[]; metadata?: Record<string, unknown>; bodyGroupId?: string; shardIndex?: number }
 
@@ -60,6 +61,7 @@ function fakeContext(rows: Row[] = [], opts: { kvUnified?: boolean; firstChanged
       if (at >= 0) rows.splice(at, 1);
     },
     getStrategy: () => ({ isKvUnifiedEnabled: () => opts.kvUnified === true }),
+    getPresentedMessages: () => rows.map((r) => ({ id: r.id, participant: r.participant, content: r.content, metadata: r.metadata ?? {} })),
     getAllMessages: () => rows.map((r) => ({ id: r.id, participant: r.participant, content: r.content, metadata: r.metadata ?? {} })),
     getMessageCount: () => rows.length,
     getMessageWindow: (offset: number, limit: number, o?: { resolveBlobs?: boolean }) => {
@@ -83,13 +85,18 @@ const SYSTEM = `${SHORT}\n${'Follow the task, and say what you did. '.repeat(200
 
 const systemInjection = (text: string) => ({ namespace: 'module', position: 'system' as const, content: [{ type: 'text' as const, text }] });
 
+/** A membrane whose answer to whether a model takes a change in its context is `takes`. */
+const taking = (takes: boolean): Membrane => ({ takesToolOrSystemChanges: () => takes }) as unknown as Membrane;
+
+/** An agent on the fake context; `takes` is the membrane's answer for its model, no when left out. */
 function agentOn(
   context: ReturnType<typeof fakeContext>,
-  config: Partial<AgentConfig> = {},
+  config: Partial<AgentConfig> & { takes?: boolean } = {},
   heads: HeadDeclarationStore = memoryHeadDeclarations(onMain),
   events: HeadEvent[] = [],
 ): Agent {
-  const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM, ...config }, context.cm, {} as Membrane);
+  const { takes = false, ...settings } = config;
+  const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM, ...settings }, context.cm, taking(takes));
   agent.attachHeadDeclarations(heads, (event) => events.push(event));
   return agent;
 }
@@ -124,8 +131,8 @@ function digest(wire: unknown): string {
 const changesIn = (messages: readonly NormalizedMessage[]) =>
   messages.filter((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')).map((m) => m.content);
 
-describe('toolDeclarations', () => {
-  it("leaves out of 'head' requests every change row, and sends the current tools and system text as before", async () => {
+describe('a change of tools or system text, declared in the context', () => {
+  it("sends no change row on a model that takes none, on the current tools and system text, and a record left from before goes with its rows", async () => {
     const context = fakeContext([
       said('user', 'hello'),
       { id: 'c1', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('old')] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } },
@@ -142,11 +149,11 @@ describe('toolDeclarations', () => {
     assert.deepEqual(events, [{ type: 'head:moved', why: 'on-head', changesRemoved: 1 }]);
   });
 
-  it("adopts the current head at an 'entries' agent's first request, appending nothing", async () => {
+  it("adopts the current head at its first request on a model that takes a change, appending nothing", async () => {
     const context = fakeContext([said('user', 'hello')]);
     const heads = memoryHeadDeclarations(onMain);
     const events: HeadEvent[] = [];
-    const request = await agentOn(context, { toolDeclarations: 'entries' }, heads, events).buildActivationRequest([tool('a')], [systemInjection('injected')]);
+    const request = await agentOn(context, { takes: true }, heads, events).buildActivationRequest([tool('a')], [systemInjection('injected')]);
     assert.deepEqual(request.tools, [tool('a')]);
     assert.equal(request.system, `${SYSTEM}\ninjected`);
     assert.deepEqual(heads.read('agent'), { tools: [tool('a')], system: [SYSTEM, 'injected'] });
@@ -158,7 +165,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello')]);
     const heads = memoryHeadDeclarations(onMain);
     const events: HeadEvent[] = [];
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const agent = agentOn(context, { takes: true }, heads, events);
     await agent.buildActivationRequest([tool('a')]);
     context.rows.push(said('agent', 'hi'), said('user', 'go on'));
 
@@ -172,7 +179,7 @@ describe('toolDeclarations', () => {
     assert.deepEqual(changeRows(context.rows)[0]!.metadata, { system: true, kind: 'system-change', agent: 'agent', audience: ['agent'], ownRowOf: 'agent' });
     assert.deepEqual(events.at(-1), { type: 'head:declared', removed: [], defined: ['b'], addedSystem: 0 });
 
-    const restarted = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('b'), tool('a')]);
+    const restarted = await agentOn(context, { takes: true }, heads).buildActivationRequest([tool('b'), tool('a')]);
     assert.deepEqual(restarted.tools, [tool('a')]);
     assert.deepEqual(restarted.messages, request.messages);
     assert.equal(changeRows(context.rows).length, 1);
@@ -182,7 +189,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello')]);
     const heads = memoryHeadDeclarations(onMain);
     const events: HeadEvent[] = [];
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const agent = agentOn(context, { takes: true }, heads, events);
     await agent.buildActivationRequest([tool('a')], [systemInjection('instructions v1')]);
 
     const added = await agent.buildActivationRequest([tool('a')], [systemInjection('instructions v1'), systemInjection('a server joined')]);
@@ -199,19 +206,9 @@ describe('toolDeclarations', () => {
     assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'replaced', changesRemoved: 1 });
   });
 
-  it('compiles once for a replacement that removed nothing, where the compile hashed no head', async () => {
-    const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
-    await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
-    const compiles = context.compiles.length;
-    const request = await agent.buildActivationRequest([tool('a')], [systemInjection('v2')]);
-    assert.equal(request.system, `${SYSTEM}\nv2`);
-    assert.equal(context.compiles.length - compiles, 1);
-  });
-
   it('declares nothing for the same tools in another order', async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a'), tool('b')]);
     const request = await agent.buildActivationRequest([tool('b'), tool('a')]);
     assert.deepEqual(request.tools, [tool('a'), tool('b')]);
@@ -222,7 +219,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello')]);
     const heads = memoryHeadDeclarations(onMain);
     const events: HeadEvent[] = [];
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const agent = agentOn(context, { takes: true }, heads, events);
     await agent.buildActivationRequest([tool('a')]);
     const preview = await agent.buildActivationRequest([tool('a'), tool('b')], undefined, undefined, undefined, { dryRun: true });
     assert.deepEqual(lastMessage(preview.messages).content, [{ type: 'system_change', defineTools: [tool('b')] }]);
@@ -232,7 +229,7 @@ describe('toolDeclarations', () => {
 
   it("keeps a request ending on the agent's own turn ending there, with its [Continue], past a change", async () => {
     const context = fakeContext([said('user', 'hello'), said('agent', 'thinking aloud')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
     const roles = request.messages.map((m) => (m.content.some((b) => (b as { type: string }).type === 'system_change') ? 'change' : m.participant));
@@ -244,12 +241,12 @@ describe('toolDeclarations', () => {
       participantMode: 'simple', assistantParticipant: 'agent', humanParticipant: 'user', tools: request.tools,
     }).messages.map((m) => `${m.role}:${(m.content as Array<{ type: string }>).map((b) => b.type).join('+')}`);
     const asked = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(asked, { toolDeclarations: 'entries' });
+    const agent = agentOn(asked, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     assert.deepEqual(wire(await agent.buildActivationRequest([tool('a'), tool('b')])), ['user:text', 'system:tool_addition']);
 
     const answered = fakeContext([said('user', 'hello'), said('agent', 'thinking aloud')]);
-    const own = agentOn(answered, { toolDeclarations: 'entries' });
+    const own = agentOn(answered, { takes: true });
     await own.buildActivationRequest([tool('a')]);
     assert.deepEqual(wire(await own.buildActivationRequest([tool('a'), tool('b')])),
       ['user:text', 'assistant:text', 'user:text', 'system:tool_addition'], "after the [Continue] the agent's own turn needs");
@@ -269,7 +266,7 @@ describe('toolDeclarations', () => {
     ];
     for (const [what, tail, declares] of cases) {
       const context = fakeContext([said('user', 'hello'), ...tail]);
-      const agent = agentOn(context, { toolDeclarations: 'entries' });
+      const agent = agentOn(context, { takes: true });
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(changeRows(context.rows).length, declares ? 1 : 0, what);
@@ -278,7 +275,7 @@ describe('toolDeclarations', () => {
 
   it("reads only the store's tail, blob-free, to see whether a change may go at the end", async () => {
     const context = fakeContext(Array.from({ length: 1000 }, (_, i) => said(i % 2 ? 'agent' : 'user', `turn ${i}`)));
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     context.windows.length = 0;
     await agent.buildActivationRequest([tool('a'), tool('b')]);
@@ -288,7 +285,7 @@ describe('toolDeclarations', () => {
 
   it("keeps its recorded head as recorded when what a request carries is changed in place", async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     const first = await agent.buildActivationRequest([tool('a'), tool('b')]);
     first.tools![0]!.description = 'changed in place, as a hook might';
@@ -301,7 +298,7 @@ describe('toolDeclarations', () => {
   it('waits for the results before declaring after calls that have none yet', async () => {
     const call = { type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock;
     const context = fakeContext([said('user', 'hello'), { id: 'call', participant: 'agent', content: [call] }]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.deepEqual(changeRows(context.rows), [], 'nothing between the call and its result');
@@ -313,7 +310,7 @@ describe('toolDeclarations', () => {
 
   it('declares a second copy of a system block its head already holds', async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')], [systemInjection('x')]);
     const request = await agent.buildActivationRequest([tool('a')], [systemInjection('x'), systemInjection('x')]);
     const added = request.messages.flatMap((m) => m.content).filter((b) => (b as { type: string }).type === 'system_change').map((b) => (b as { addSystem?: string[] }).addSystem);
@@ -323,44 +320,15 @@ describe('toolDeclarations', () => {
   it('declares after a call its own message answers, as context-manager counts it answered', async () => {
     const cycle: Row = { id: 'cycle', participant: 'agent', content: [{ type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock, { type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] };
     const context = fakeContext([said('user', 'hello'), cycle]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.equal(changeRows(context.rows).length, 1);
   });
 
-  it("hashes a head for kv-unified as the wire carries it, so a tool field left undefined hashes the same after adoption", async () => {
-    const context = fakeContext([said('user', 'hello')], { kvUnified: true });
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
-    const withUndefined = { ...tool('a'), extra: undefined } as unknown as ToolDefinition;
-    await agent.buildActivationRequest([withUndefined]);
-    await agent.buildActivationRequest([withUndefined]);
-    const [adopted, next] = context.compiles.map((o) => o?.kvUnifiedImmutablePrefixHash);
-    assert.ok(adopted);
-    assert.equal(next, adopted, "the recorded head's hash is the adopted one's");
-  });
-
-  it("compares a tool field left undefined as the wire carries it alike in the difference, the binding's digests and kv-unified's hash", async () => {
-    const withUndefined = { ...tool('a'), extra: undefined } as unknown as ToolDefinition;
-    const adopt = async (tools: ToolDefinition[]) => {
-      const context = fakeContext([said('user', 'hello')], { kvUnified: true });
-      const agent = agentOn(context, { toolDeclarations: 'entries', thinkingBinding: { binds: true } });
-      await agent.buildActivationRequest(tools);
-      return { context, agent, compile: context.compiles.at(-1) as { identity?: Record<string, string>; kvUnifiedImmutablePrefixHash?: string } };
-    };
-    const plain = await adopt([tool('a')]);
-    const left = await adopt([withUndefined]);
-    assert.ok(plain.compile.identity && plain.compile.kvUnifiedImmutablePrefixHash, 'the premise: the compile was told both');
-    assert.deepEqual(left.compile.identity, plain.compile.identity, "the binding's digests");
-    assert.equal(left.compile.kvUnifiedImmutablePrefixHash, plain.compile.kvUnifiedImmutablePrefixHash, "kv-unified's hash");
-    await plain.agent.buildActivationRequest([withUndefined]);
-    await left.agent.buildActivationRequest([tool('a')]);
-    assert.equal(changeRows(plain.context.rows).length + changeRows(left.context.rows).length, 0, 'the difference: no change to declare, either way');
-  });
-
   it('hashes the head that goes out for kv-unified: the recorded one, and the new one after a move', async () => {
     const context = fakeContext([said('user', 'hello')], { kvUnified: true });
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
     const [adopted] = context.compiles.map((o) => o?.kvUnifiedImmutablePrefixHash);
     assert.ok(adopted);
@@ -371,7 +339,7 @@ describe('toolDeclarations', () => {
     assert.notEqual(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, adopted, 'and the compile after the move hashes the new head');
   });
 
-  it('deletes a record on the head whenever one is there, as after a branch switch brings it back', async () => {
+  it('deletes a record whenever one is there on a model that takes no change, as after a branch switch brings it back', async () => {
     const context = fakeContext([said('user', 'hello')]);
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('old')], system: [SYSTEM] });
@@ -385,7 +353,7 @@ describe('toolDeclarations', () => {
 
   it('records a copy of the head, so a tool changed in place is declared rather than changing the head', async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     const tools = [tool('a')];
     await agent.buildActivationRequest(tools);
     (tools[0]!.inputSchema as { properties: Record<string, unknown> }).properties.city = { type: 'string' };
@@ -398,7 +366,7 @@ describe('toolDeclarations', () => {
   it("says in head:declared what a change removed and how many blocks of system text it added", async () => {
     const context = fakeContext([said('user', 'hello')]);
     const events: HeadEvent[] = [];
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, memoryHeadDeclarations(onMain), events);
+    const agent = agentOn(context, { takes: true }, memoryHeadDeclarations(onMain), events);
     await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('one')]);
     await agent.buildActivationRequest([tool('a')], [systemInjection('one'), systemInjection('two'), systemInjection('three')]);
     assert.deepEqual(events.at(-1), { type: 'head:declared', removed: ['b'], defined: [], addedSystem: 2 });
@@ -407,7 +375,7 @@ describe('toolDeclarations', () => {
   it("waits for its own calls' results when another participant's message follows the calls", async () => {
     const call = { type: 'tool_use', id: 't1', name: 'a', input: {} } as ContentBlock;
     const context = fakeContext([said('user', 'hello'), { id: 'call', participant: 'agent', content: [call] }, said('beta', 'meanwhile')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.deepEqual(changeRows(context.rows), [], 'nothing between the calls and their results');
@@ -421,7 +389,7 @@ describe('toolDeclarations', () => {
 
   it('sends a change an assembly stored once with the next request, when its own request never went out, and declares nothing new', async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     await agent.buildActivationRequest([tool('a')]);
     await agent.buildActivationRequest([tool('a'), tool('b')]);
     const next = await agent.buildActivationRequest([tool('a'), tool('b')]);
@@ -437,7 +405,7 @@ describe('toolDeclarations', () => {
       { id: 'call', participant: 'agent', content: [call], metadata: { promptedBy: prompt } },
       { id: 'result', participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', content: 'ok' } as ContentBlock] },
     ]);
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
+    const agent = agentOn(context, { takes: true });
     const assemble = (tools: ToolDefinition[]) => (agent as unknown as { assembleActivationRequest(t: ToolDefinition[]): Promise<{ request: NormalizedRequest; continuePrompt?: unknown }> }).assembleActivationRequest(tools);
     await assemble([tool('a')]);
     const { request, continuePrompt } = await assemble([tool('a'), tool('b')]);
@@ -445,7 +413,7 @@ describe('toolDeclarations', () => {
     assert.deepEqual(continuePrompt, prompt, 'and the reply still continues the loop the results answer');
   });
 
-  it("moves nothing while its head isn't stored, and keeps its changes with the recorded head", async () => {
+  it("goes in the fallback form while its head isn't stored, its record and its change kept, and moves once it stores", async () => {
     const context = fakeContext([said('user', 'hello')]);
     const real = memoryHeadDeclarations(onMain);
     let failWrites = false;
@@ -454,14 +422,15 @@ describe('toolDeclarations', () => {
       write: (name, head) => !failWrites && real.write(name, head),
       delete: (name) => real.delete(name),
     };
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const agent = agentOn(context, { takes: true }, heads);
     await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
     await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
     failWrites = true;
     const held = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
-    assert.deepEqual(held.tools, [tool('a')], 'the recorded head goes out');
-    assert.deepEqual(changesIn(held.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'with its change');
+    assert.deepEqual(foldOf(held), now([tool('a'), tool('b')], `${SYSTEM}\nv2`), 'what goes out is what the agent has now');
+    assert.deepEqual(changesIn(held.messages), [], 'on its current tools and system text, with no change row');
     assert.deepEqual(real.read('agent'), { tools: [tool('a')], system: [SYSTEM, 'v1'] }, 'the record is as it was');
+    assert.equal(changeRows(context.rows).length, 1, 'and so is its change');
     failWrites = false;
     const next = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
     assert.deepEqual(next.tools, [tool('a'), tool('b')], 'once it stores, the replacement moves the head');
@@ -473,7 +442,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])]);
     const real = memoryHeadDeclarations(onMain);
     const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => false, delete: (name) => real.delete(name) };
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const agent = agentOn(context, { takes: true }, heads);
     const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
     assert.deepEqual(request.tools, [tool('a'), tool('b')], 'what it advertises now goes out');
     assert.equal(changeRows(context.rows).length, 0, 'and its change row is taken out');
@@ -485,7 +454,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello'), added], { firstChanged: 'compare' });
     const real = memoryHeadDeclarations(onMain);
     const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => false, delete: (name) => real.delete(name) };
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const agent = agentOn(context, { takes: true }, heads);
     const request = await agent.buildActivationRequest([tool('a')], [systemInjection('a server joined')]);
     assert.equal(request.system, `${SYSTEM}\na server joined`, 'what is current goes out');
     assert.deepEqual(changeRows(request.messages as unknown as Row[]), [], 'and no row of its own adds that block again');
@@ -493,7 +462,7 @@ describe('toolDeclarations', () => {
     assert.equal(context.committed()!.some((key) => key.includes('system_change')), false, 'and the compile it committed holds no row the request left out');
   });
 
-  it("goes on its recorded head, declaring nothing, when the store refuses its change row", async () => {
+  it("goes in the fallback form, declaring nothing, when the store refuses its change row", async () => {
     const context = fakeContext([said('user', 'hello')]);
     const refusing = context.cm as unknown as { addMessage: (...args: unknown[]) => string };
     const write = refusing.addMessage;
@@ -504,24 +473,25 @@ describe('toolDeclarations', () => {
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
     const events: HeadEvent[] = [];
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const agent = agentOn(context, { takes: true }, heads, events);
     const errors: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
     let request: Awaited<ReturnType<Agent['buildActivationRequest']>>;
     try { request = await agent.buildActivationRequest([tool('a'), tool('b')]); } finally { console.error = error; }
-    assert.deepEqual(request.tools, [tool('a')], 'it goes on its recorded head');
+    assert.deepEqual(request.tools, [tool('a'), tool('b')], "it goes on the agent's current tools");
+    assert.deepEqual(foldOf(request), now([tool('a'), tool('b')], SYSTEM));
     assert.deepEqual(changeRows(context.rows), [], 'with nothing written');
     assert.deepEqual(heads.read('agent'), { tools: [tool('a')], system: [SYSTEM] }, 'and its record as it was');
     assert.deepEqual(events, [], 'and nothing declared');
     assert.equal(errors.length, 1, 'and the refusal logged once');
-    assert.match(errors[0]!, /^\[head-declarations\] agent: a system change could not be stored, so the request goes on the recorded head/);
+    assert.match(errors[0]!, /^\[head-declarations\] agent: a system change could not be stored, so the request goes on the agent's current tools and system text with no change row/);
     assert.match(errors[0]!, /Message refused: a system change can't go between a tool call and its result/, 'with the store\'s error');
   });
 
   it("keeps a head on the branch it was recorded on, so a branch without one adopts and a switch back reads that branch's head", async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM, toolDeclarations: 'entries' }, context.cm, {} as Membrane);
+    const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM }, context.cm, taking(true));
     assert.deepEqual((await agent.buildActivationRequest([tool('a')])).tools, [tool('a')], 'the premise: it adopts on main');
     context.branch.id = 'elsewhere';
     const there = await agent.buildActivationRequest([tool('a'), tool('b')]);
@@ -537,7 +507,7 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello')]);
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const agent = agentOn(context, { takes: true }, heads);
     const hostChange: NormalizedMessage = { participant: 'system', content: [{ type: 'system_change', defineTools: [tool('b')] } as never] };
     const preview = await agent.buildActivationRequest([tool('a'), tool('b')], undefined, undefined, undefined, { dryRun: true, appendedMessages: [hostChange] });
     assert.deepEqual(changeRows(preview.messages as unknown as Row[]).map((r) => r.content), [hostChange.content], "the host's change, and no declaration of the same tool");
@@ -555,7 +525,7 @@ describe('toolDeclarations', () => {
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
     const events: HeadEvent[] = [];
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+    const agent = agentOn(context, { takes: true }, heads, events);
     const errors: string[] = [];
     const error = console.error;
     console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
@@ -588,34 +558,11 @@ describe('toolDeclarations', () => {
     assert.ok(heads.read('agent'), 'its record stays');
   });
 
-  it("removes an earlier period's change rows on the head with nothing tracing it", async () => {
+  it("removes the change rows its context holds on a model that takes no change, with no record or trace attached", async () => {
     const context = fakeContext([said('user', 'hello'), changeRow([tool('old')])]);
-    const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM }, context.cm, {} as Membrane);
+    const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM }, context.cm, taking(false));
     await agent.buildActivationRequest([tool('a')]);
     assert.deepEqual(changeRows(context.rows), []);
-  });
-
-  it("counts only its own change rows: one a host stored without the agent's metadata is neither folded, priced nor taken", async () => {
-    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x'), tool('y'), tool('z')] } as never] };
-    const context = fakeContext([said('user', 'hello'), host, changeRow([tool('b')])]);
-    const heads = memoryHeadDeclarations(onMain);
-    heads.write('agent', { tools: [tool('a')], system: [SHORT, 'v1'] });
-    const events: HeadEvent[] = [];
-    const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
-    const first = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
-    assert.deepEqual(first.tools, [tool('a')], 'the recorded head');
-    assert.deepEqual(changesIn(first.messages), [host.content, changeRow([tool('b')]).content], "the host's row goes out as stored, beside the agent's own");
-    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host', 'c-b'], "nothing declared: the agent's own row says its difference, and the host's isn't counted");
-    const [own, hosts] = [priceOf(changeRow([tool('b')]).content[0]), priceOf(host.content[0])];
-    assert.ok(hosts * 5 >= own * 10 + 1);
-    sizeRequest(context.rows, heads.read('agent')!, own * 10 + 1);
-    await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
-    assert.deepEqual(events, [], "no consolidation priced from the host's row");
-    const preview = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')], undefined, undefined, { dryRun: true });
-    assert.deepEqual(changesIn(preview.messages), [host.content]);
-    await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
-    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host']);
-    assert.deepEqual(events, [{ type: 'head:moved', why: 'replaced', changesRemoved: 1 }]);
   });
 
   it("doesn't declare again a change a host's row already carries, though the row isn't its own", async () => {
@@ -623,41 +570,9 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello'), host]);
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
-    const request = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('a'), tool('b')]);
+    const request = await agentOn(context, { takes: true }, heads).buildActivationRequest([tool('a'), tool('b')]);
     assert.deepEqual(changesIn(request.messages), [host.content]);
     assert.deepEqual(changeRows(context.rows).map((r) => r.metadata), [undefined]);
-  });
-
-  it("doesn't declare again a removal a host's row already carries", async () => {
-    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', removeTools: ['b'] } as never] };
-    const context = fakeContext([said('user', 'hello'), host]);
-    const heads = memoryHeadDeclarations(onMain);
-    heads.write('agent', { tools: [tool('a'), tool('b')], system: [SYSTEM] });
-    const request = await agentOn(context, { toolDeclarations: 'entries' }, heads).buildActivationRequest([tool('a')]);
-    assert.deepEqual(changesIn(request.messages), [host.content]);
-    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host']);
-  });
-
-  it("doesn't declare again system text a host's row already adds, and declares each further copy the agent holds", async () => {
-    for (const [copies, declared] of [[1, []], [2, ['joined']]] as const) {
-      const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', addSystem: ['joined'] } as never] };
-      const context = fakeContext([said('user', 'hello'), host]);
-      const heads = memoryHeadDeclarations(onMain);
-      heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
-      const request = await agentOn(context, { toolDeclarations: 'entries' }, heads)
-        .buildActivationRequest([tool('a')], Array.from({ length: copies }, () => systemInjection('joined')));
-      assert.deepEqual(changesIn(request.messages), [host.content, ...(declared.length > 0 ? [[{ type: 'system_change', addSystem: [...declared] }]] : [])], `${copies} held`);
-    }
-  });
-
-  it("traces nothing on the head for a change row a host stored without the agent's metadata, and leaves it out of the request", async () => {
-    const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x')] } as never] };
-    const context = fakeContext([said('user', 'hello'), host]);
-    const events: HeadEvent[] = [];
-    const request = await agentOn(context, {}, memoryHeadDeclarations(onMain), events).buildActivationRequest([tool('a')]);
-    assert.deepEqual(changesIn(request.messages), []);
-    assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host'], 'the host\'s row stays');
-    assert.deepEqual(events, []);
   });
 
   it("keeps its own change rows on the head while its record can't be cleared, and takes both out once it can", async () => {
@@ -683,14 +598,14 @@ describe('toolDeclarations', () => {
       const context = fakeContext([said('user', 'hello')]);
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      await agentOn(context, { toolDeclarations: 'entries' }, heads, events).buildActivationRequest([tool('a')], undefined, undefined, undefined, dry);
+      await agentOn(context, { takes: true }, heads, events).buildActivationRequest([tool('a')], undefined, undefined, undefined, dry);
       assert.deepEqual([heads.read('agent'), events], [null, []], 'adoption');
     }
     {
       const context = fakeContext([said('user', 'hello')]);
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { takes: true }, heads, events);
       await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
       await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v1')]);
       const preview = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')], undefined, undefined, dry);
@@ -717,25 +632,12 @@ describe('toolDeclarations', () => {
     const context = fakeContext([said('user', 'hello'), changeRow([tool('b')]), said('user', 'go on')]);
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('a')], system: [SYSTEM, 'v1'] });
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const agent = agentOn(context, { takes: true }, heads);
     const { compiled } = await (agent as unknown as {
       assembleActivationRequest(t: ToolDefinition[], i: unknown[], b: undefined, c: undefined, o: { dryRun: boolean }): Promise<{ compiled: { messages: unknown[]; provenance?: { messages: Array<{ bodies?: Array<{ messageId: string }> }> } } }>;
     }).assembleActivationRequest([tool('a'), tool('b')], [systemInjection('v2')], undefined, undefined, { dryRun: true });
     assert.equal(compiled.messages.length, 2, 'the change row left out');
     assert.deepEqual(compiled.provenance?.messages.map((source) => source.bodies?.[0]?.messageId), ['user:hello', 'user:go on'], 'and its source with it');
-  });
-
-  it("compiles a dry move again for a head that differs from the record only in a field set to null against one left out, and tells the digests of the head it shows, with `binds: true`", async () => {
-    const withExtra = (extra: unknown) => ({ ...tool('x'), extra }) as unknown as ToolDefinition;
-    const stored: Row = { id: 'c-x', participant: 'system', content: [{ type: 'system_change', defineTools: [JSON.parse(JSON.stringify(withExtra(undefined)))] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } };
-    const context = fakeContext([said('user', 'hello'), stored]);
-    const heads = memoryHeadDeclarations(onMain);
-    heads.write('agent', { tools: [withExtra(null)], system: [SHORT] });
-    const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries', thinkingBinding: { binds: true } }, heads);
-    const before = context.compiles.length;
-    const preview = await agent.buildActivationRequest([withExtra(undefined)], undefined, undefined, undefined, { dryRun: true });
-    assert.equal(context.compiles.length - before, 2, 'compiled again for the new head');
-    assert.equal((context.compiles.at(-1) as { identity?: Record<string, string> }).identity!.tools, digest(preview.tools ?? []), "told the digests of the head it shows");
   });
 
   it('takes only rows holding a change when it moves the head, not a message stored with change metadata that holds none', async () => {
@@ -744,7 +646,7 @@ describe('toolDeclarations', () => {
     const heads = memoryHeadDeclarations(onMain);
     heads.write('agent', { tools: [tool('a')], system: [SYSTEM, 'v1'] });
     const events: HeadEvent[] = [];
-    await agentOn(context, { toolDeclarations: 'entries' }, heads, events).buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
+    await agentOn(context, { takes: true }, heads, events).buildActivationRequest([tool('a'), tool('b')], [systemInjection('v2')]);
     assert.deepEqual(context.rows.map((r) => r.id), ['user:hello', 'marked'], 'the change row went, the other stayed');
     assert.deepEqual(events, [{ type: 'head:moved', why: 'replaced', changesRemoved: 1 }]);
   });
@@ -752,7 +654,7 @@ describe('toolDeclarations', () => {
   it("shows a dry run at a replacement the head the request would go out on, compiled again for kv-unified's hash", async () => {
     const context = fakeContext([said('user', 'hello')], { kvUnified: true });
     const heads = memoryHeadDeclarations(onMain);
-    const agent = agentOn(context, { toolDeclarations: 'entries' }, heads);
+    const agent = agentOn(context, { takes: true }, heads);
     await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
     const adopted = context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash;
     const compiles = context.compiles.length;
@@ -764,21 +666,11 @@ describe('toolDeclarations', () => {
     assert.deepEqual(heads.read('agent')!.system, [SYSTEM, 'v1'], 'storing nothing');
   });
 
-  it('compiles again after a replacement that removed nothing when kv-unified hashed the old head, whose hash covers its system text', async () => {
-    const context = fakeContext([said('user', 'hello')], { kvUnified: true });
-    const agent = agentOn(context, { toolDeclarations: 'entries' });
-    await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
-    const compiles = context.compiles.length;
-    await agent.buildActivationRequest([tool('a')], [systemInjection('v2')]);
-    assert.equal(context.compiles.length - compiles, 2, 'once at the recorded head, once at the new one');
-    assert.notEqual(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, context.compiles.at(-2)?.kvUnifiedImmutablePrefixHash, 'the system text alone changed the hash');
-  });
-
   it("leaves the agent's own changes out of the direct API's request where it has no recorded head", async () => {
     let sent: NormalizedRequest | undefined;
-    const membrane = { stream: async (request: NormalizedRequest) => { sent = request; return { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } }; } };
+    const membrane = { takesToolOrSystemChanges: () => true, stream: async (request: NormalizedRequest) => { sent = request; return { content: [{ type: 'text', text: 'ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } }; } };
     const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])]);
-    const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM, toolDeclarations: 'entries' }, context.cm, membrane as unknown as Membrane);
+    const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM }, context.cm, membrane as unknown as Membrane);
     await agent.runInference([tool('a')]).catch(() => undefined);
     assert.ok(sent, 'a request went');
     assert.equal(sent!.messages.some((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')), false);
@@ -789,7 +681,7 @@ describe('toolDeclarations', () => {
       const context = fakeContext(rows, { firstChanged: at });
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries', ...config }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true, ...config }, heads, events);
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(changeRows(context.rows).length, 1, 'the premise: the change is stored');
@@ -816,19 +708,6 @@ describe('toolDeclarations', () => {
       assert.equal(moved.requestChars, tenth);
       assert.equal(moved.changeChars, price);
       assert.equal(moved.forced, undefined, 'a free move');
-    });
-
-    it("starts the changes at its own first one, past a host's change row before it", async () => {
-      const host: Row = { id: 'host', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('x')] } as never] };
-      const context = fakeContext([said('user', 'hello'), host, changeRow([tool('b')])], { firstChanged: () => 2 });
-      const heads = memoryHeadDeclarations(onMain);
-      heads.write('agent', { tools: [tool('a')], system: [SHORT] });
-      const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
-      sizeRequest(context.rows, heads.read('agent')!, short);
-      await agent.buildActivationRequest([tool('a'), tool('b')]);
-      assert.deepEqual(events.map((e) => e.type === 'head:moved' && [e.why, e.changesRemoved, e.forced]), [['consolidated', 1, undefined]], 'a free move at a tenth');
-      assert.deepEqual(changeRows(context.rows).map((r) => r.id), ['host']);
     });
 
     it('moves them anyway once they reach a fifth of the request with no free compile, and not below a fifth', async () => {
@@ -867,7 +746,7 @@ describe('toolDeclarations', () => {
       const context = fakeContext(rows, { overBudget: (r) => refuse && r.some((row) => row.participant === 'system') });
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads, events);
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       refuse = true;
@@ -880,37 +759,6 @@ describe('toolDeclarations', () => {
       assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
     });
 
-    it("takes a derived agent's source's change rows out when it's kept to its head, and when such a compile is refused over budget", async () => {
-      for (const refused of [false, true]) {
-        const rows = [said('user', 'hello')];
-        const context = fakeContext(rows, refused ? { overBudget: (r) => r.some((row) => row.participant === 'system') } : {});
-        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' });
-        await agent.buildActivationRequest([tool('a')]);
-        agent.setSourceChangeOwners(['source']);
-        context.cm.addMessage('system', [{ type: 'system_change', defineTools: [tool('s')] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
-        agent.keepToHeadUntilBuiltAgain();
-        const request = await agent.buildActivationRequest([tool('a')]);
-        assert.deepEqual(request.messages.filter((m) => m.content.some((b) => (b as { type: string }).type === 'system_change')), [], `refused ${refused}: its request carries none`);
-        assert.deepEqual(changeRows(rows), [], `refused ${refused}: its branch holds none`);
-      }
-    });
-
-    it("moves a derived agent's head when the compile is refused over budget with only its source's change rows kept, and takes them off its branch", async () => {
-      const rows = [said('user', 'hello')];
-      const context = fakeContext(rows, { overBudget: (r) => r.some((row) => row.participant === 'system') });
-      const heads = memoryHeadDeclarations(onMain);
-      const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
-      await agent.buildActivationRequest([tool('a')]);
-      agent.setSourceChangeOwners(['source']);
-      context.cm.addMessage('system', [{ type: 'system_change', defineTools: [tool('s')] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
-      assert.equal(changeRows(rows).length, 1, "the premise: its source's change is stored, and none of its own");
-      const request = await agent.buildActivationRequest([tool('a')]);
-      assert.deepEqual(request.tools, [tool('a')], 'its own head');
-      assert.deepEqual(changeRows(rows), [], "its source's change taken off its branch");
-      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, forced: 'budget' });
-    });
-
     it('moves the head the same way when the compile is refused for dropping messages no summary covers', async () => {
       const rows = [said('user', 'hello')];
       let refuse = false;
@@ -920,7 +768,7 @@ describe('toolDeclarations', () => {
       const context = fakeContext(rows, { fail: uncovered });
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads, events);
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(changeRows(rows).length, 1, 'the premise: the change is stored');
@@ -941,7 +789,7 @@ describe('toolDeclarations', () => {
         write: (name, head) => !refuse && real.write(name, head),
         delete: (name) => real.delete(name),
       };
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads);
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
       refuse = true;
@@ -951,7 +799,7 @@ describe('toolDeclarations', () => {
     });
 
     it("takes its own change rows out of a compile refused over budget with no head recorded, or on the head, and compiles once more", async () => {
-      for (const [config, why] of [[{ toolDeclarations: 'entries' as const }, 'adopted'], [{}, 'on-head']] as const) {
+      for (const [config, why] of [[{ takes: true as const }, 'adopted'], [{}, 'on-head']] as const) {
         const rows = [said('user', 'hello'), changeRow([tool('b')])];
         const context = fakeContext(rows, { overBudget: (r) => r.some((row) => row.participant === 'system') });
         const heads = memoryHeadDeclarations(onMain);
@@ -970,7 +818,7 @@ describe('toolDeclarations', () => {
       const context = fakeContext(rows, { kvUnified: true, overBudget: (r) => r.some((row) => row.participant === 'system') });
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads, events);
       await agent.buildActivationRequest([tool('a')]);
       const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the head took the change just declared');
@@ -979,37 +827,21 @@ describe('toolDeclarations', () => {
       assert.deepEqual(events.slice(1).map((e) => (e.type === 'head:moved' ? [e.type, e.why, e.changesRemoved, e.forced] : [e.type])),
         [['head:declared'], ['head:moved', 'consolidated', 1, 'budget']]);
       const fresh = fakeContext([said('user', 'hello')], { kvUnified: true });
-      await agentOn(fresh, { systemPrompt: SHORT, toolDeclarations: 'entries' }).buildActivationRequest([tool('a'), tool('b')]);
+      await agentOn(fresh, { systemPrompt: SHORT, takes: true }).buildActivationRequest([tool('a'), tool('b')]);
       assert.equal(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, fresh.compiles[0]?.kvUnifiedImmutablePrefixHash);
-    });
-
-    it("compiles once more after a move forced by the budget for the head that goes out, as kv-unified hashes it", async () => {
-      const rows = [said('user', 'hello')];
-      let refuse = false;
-      const context = fakeContext(rows, { kvUnified: true, overBudget: (r) => refuse && r.some((row) => row.participant === 'system') });
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' });
-      await agent.buildActivationRequest([tool('a')]);
-      await agent.buildActivationRequest([tool('a'), tool('b')]);
-      refuse = true;
-      await agent.buildActivationRequest([tool('a'), tool('b')]);
-      const hashes = context.compiles.slice(-2).map((o) => o?.kvUnifiedImmutablePrefixHash);
-      const fresh = fakeContext([said('user', 'hello')], { kvUnified: true });
-      await agentOn(fresh, { systemPrompt: SHORT, toolDeclarations: 'entries' }).buildActivationRequest([tool('a'), tool('b')]);
-      assert.notEqual(hashes[0], hashes[1], 'the refused compile hashed the recorded head');
-      assert.equal(hashes[1], fresh.compiles[0]?.kvUnifiedImmutablePrefixHash, 'and the one after the move hashes the new one');
     });
 
     it('lets a refusal over budget go on when no change is kept, when the compile after the move is refused too, or in a dry run', async () => {
       const refusal = /over budget/;
       {
         const context = fakeContext([said('user', 'hello')], { overBudget: () => true });
-        await assert.rejects(agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }).buildActivationRequest([tool('a')]), refusal, 'nothing recorded, nothing kept');
+        await assert.rejects(agentOn(context, { systemPrompt: SHORT, takes: true }).buildActivationRequest([tool('a')]), refusal, 'nothing recorded, nothing kept');
       }
       {
         let refuse = false;
         const context = fakeContext([said('user', 'hello')], { overBudget: () => refuse });
         const heads = memoryHeadDeclarations(onMain);
-        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads);
+        const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads);
         await agent.buildActivationRequest([tool('a')]);
         refuse = true;
         const compiles = context.compiles.length;
@@ -1021,7 +853,7 @@ describe('toolDeclarations', () => {
         const rows = [said('user', 'hello')];
         let failure: Error | undefined;
         const context = fakeContext(rows, { fail: () => failure });
-        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' });
+        const agent = agentOn(context, { systemPrompt: SHORT, takes: true });
         await agent.buildActivationRequest([tool('a')]);
         await agent.buildActivationRequest([tool('a'), tool('b')]);
         failure = new Error('the store is closed');
@@ -1033,7 +865,7 @@ describe('toolDeclarations', () => {
         let refuse = false;
         const context = fakeContext(rows, { overBudget: () => refuse });
         const heads = memoryHeadDeclarations(onMain);
-        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads);
+        const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads);
         await agent.buildActivationRequest([tool('a')]);
         await agent.buildActivationRequest([tool('a'), tool('b')]);
         refuse = true;
@@ -1047,7 +879,7 @@ describe('toolDeclarations', () => {
         const rows = [said('user', 'hello')];
         let refuse = false;
         const context = fakeContext(rows, { overBudget: () => refuse });
-        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' });
+        const agent = agentOn(context, { systemPrompt: SHORT, takes: true });
         await agent.buildActivationRequest([tool('a')]);
         await agent.buildActivationRequest([tool('a'), tool('b')]);
         refuse = true;
@@ -1070,7 +902,7 @@ describe('toolDeclarations', () => {
       const heads = memoryHeadDeclarations(onMain);
       heads.write('agent', { tools: [tool('a')], system: [SHORT] });
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads, events);
       sizeRequest(context.rows, heads.read('agent')!, tenth);
       const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(request.tools, [tool('a'), tool('b')]);
@@ -1092,7 +924,7 @@ describe('toolDeclarations', () => {
       sizeRequest(rows, firstHead, short - priceOf({ participant: 'system', content: [{ type: 'system_change', defineTools: [tool('b')] }] }) - 1);
       const context = fakeContext(rows, { firstChanged: 'compare' });
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, memoryHeadDeclarations(onMain), events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, memoryHeadDeclarations(onMain), events);
       await agent.buildActivationRequest([tool('a')]);
       const declared = await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(lastMessage(declared.messages).content, [{ type: 'system_change', defineTools: [tool('b')] }], 'the change goes out');
@@ -1108,9 +940,8 @@ describe('toolDeclarations', () => {
       let at: number | null = null;
       const context = fakeContext(rows, { firstChanged: () => at });
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, memoryHeadDeclarations(onMain), events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, memoryHeadDeclarations(onMain), events);
       await agent.buildActivationRequest([tool('a')]);
-      agent.setSourceChangeOwners(['source']);
       context.cm.addMessage('system', [{ type: 'system_change', removeTools: ['z'] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
       for (const n of [1, 2, 3]) rows.push(said('user', `more ${n}`));
       await agent.buildActivationRequest([tool('a'), tool('b')]);
@@ -1124,21 +955,6 @@ describe('toolDeclarations', () => {
       assert.equal(changeRows(rows).length, 2, 'both changes stay');
     });
 
-    it("consolidates by share a derived agent that holds only its source's change rows", async () => {
-      const rows = [said('user', 'hello')];
-      const context = fakeContext(rows, { firstChanged: () => null });
-      const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, memoryHeadDeclarations(onMain), events);
-      await agent.buildActivationRequest([tool('a')]);
-      agent.setSourceChangeOwners(['source']);
-      context.cm.addMessage('system', [{ type: 'system_change', defineTools: [tool('b')] } as unknown as ContentBlock], { kind: 'system-change', agent: 'source' });
-      sizeRequest(rows, firstHead, price * 5);
-      const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
-      assert.deepEqual(request.tools, [tool('a'), tool('b')], 'its own head');
-      assert.deepEqual(changeRows(rows), [], "its source's change taken off its branch");
-      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'consolidated', changesRemoved: 1, changeChars: price, requestChars: price * 5, forced: 'share' });
-    });
-
     it('consolidates past a fifth at the first committing compile after a restart, with no response yet', async () => {
       const rows = [said('user', 'hello'), changeRow([tool('b')])];
       sizeRequest(rows, firstHead, price * 5);
@@ -1146,32 +962,10 @@ describe('toolDeclarations', () => {
       const heads = memoryHeadDeclarations(onMain);
       heads.write('agent', firstHead);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads, events);
       const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
       assert.deepEqual(request.tools, [tool('a'), tool('b')], 'the head moved at the first request');
       assert.deepEqual(events, [{ type: 'head:moved', why: 'consolidated', changesRemoved: 1, changeChars: price, requestChars: price * 5, forced: 'share' }]);
-    });
-
-    it("prices a preview's appended rows into the request, so a preview moves the head past a fifth exactly when the request with them would", async () => {
-      const b = tool('b', 'b does a thing. '.repeat(40));
-      const own = priceOf({ type: 'system_change', defineTools: [b] });
-      const hostChange: NormalizedMessage = { participant: 'system', content: [{ type: 'system_change', defineTools: [tool('c')] } as never] };
-      const priced = (rows: Array<{ participant: string; content: readonly unknown[] }>) => requestCharacters(firstHead, rows.map((r) => ({ participant: r.participant, content: r.content as ContentBlock[] })));
-      for (const moves of [false, true]) {
-        const rows = [said('user', 'hello'), changeRow([b])];
-        const hostChars = priced([...rows, hostChange]) - priced(rows);
-        sizeRequest(rows, firstHead, moves ? own * 5 - hostChars : own * 5);
-        const context = fakeContext(rows, { firstChanged: () => null });
-        const heads = memoryHeadDeclarations(onMain);
-        heads.write('agent', firstHead);
-        const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads);
-        const preview = await agent.buildActivationRequest([tool('a'), b, tool('c')], undefined, undefined, undefined, { dryRun: true, appendedMessages: [hostChange] });
-        context.cm.addMessage('system', hostChange.content as ContentBlock[], { system: true, kind: 'system-change' });
-        assert.equal(priced(context.rows), moves ? own * 5 : own * 5 + hostChars, "the premise: the request with the host's change, priced as stored");
-        const request = await agent.buildActivationRequest([tool('a'), b, tool('c')]);
-        assert.deepEqual(request.tools, moves ? [tool('a'), b, tool('c')] : [tool('a')], moves ? "at a fifth with the host's change, the head moves" : "under a fifth with the host's change, it stays");
-        assert.deepEqual(preview.tools, request.tools, 'the preview goes on the head the request does');
-      }
     });
 
     it("prices the changes and the request in characters of JSON, and moves at a tenth of the request, not below", async () => {
@@ -1205,7 +999,7 @@ describe('toolDeclarations', () => {
       const context = fakeContext(rows, { firstChanged: () => null });
       const heads = memoryHeadDeclarations(onMain);
       const events: HeadEvent[] = [];
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads, events);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads, events);
       agent.setForeignRounds('transcript');
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), wide]);
@@ -1223,7 +1017,7 @@ describe('toolDeclarations', () => {
       const rows: Row[] = [said('user', 'hello'), { id: 'foreign', participant: 'other', content: [{ type: 'thinking', thinking: 'why', signature: 's' } as ContentBlock, { type: 'text', text: 'so' }] }, said('user', 'and then')];
       const context = fakeContext(rows, { firstChanged: () => changeIndex(context.rows) });
       const heads = memoryHeadDeclarations(onMain);
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries', thinkingBinding: { binds: true } }, heads);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true, thinkingBinding: { binds: true } }, heads);
       agent.setForeignRounds('transcript');
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), tool('b')]);
@@ -1238,7 +1032,7 @@ describe('toolDeclarations', () => {
       const block = { type: 'system_change', defineTools: [pictured] };
       const context = fakeContext([said('user', 'hello')], { firstChanged: () => null });
       const heads = memoryHeadDeclarations(onMain);
-      const agent = agentOn(context, { systemPrompt: SHORT, toolDeclarations: 'entries' }, heads);
+      const agent = agentOn(context, { systemPrompt: SHORT, takes: true }, heads);
       await agent.buildActivationRequest([tool('a')]);
       await agent.buildActivationRequest([tool('a'), pictured]);
       assert.equal(changeRows(context.rows).length, 1, 'the premise: the change is stored');
@@ -1261,29 +1055,72 @@ describe('toolDeclarations', () => {
     });
   });
 
-  it('refuses a toolDeclarations or thinkingBinding.binds it can\'t read', () => {
+  describe('what a change declares', () => {
+    it('declares an added, a removed and a redefined tool as one change, a tool whose schema alone changed among them', async () => {
+      const typed = (type: string): ToolDefinition => ({ ...tool('typed'), inputSchema: { type: 'object', properties: { x: { type } } } });
+      const before = [tool('keep'), tool('gone'), tool('changed', 'old words'), typed('string')];
+      const after = [tool('keep'), tool('changed', 'new words'), typed('number'), tool('new')];
+      const context = fakeContext([said('user', 'hello')]);
+      const agent = agentOn(context, { takes: true });
+      await agent.buildActivationRequest(before);
+      const request = await agent.buildActivationRequest(after);
+      assert.deepEqual(changesIn(request.messages), [[{ type: 'system_change', removeTools: ['gone'], defineTools: [tool('changed', 'new words'), typed('number'), tool('new')] }]]);
+      assert.deepEqual(foldOf(request), now(after, SYSTEM), 'what goes out folds to what the agent has now');
+      assert.equal(changeRows(context.rows).length, 1);
+    });
+
+    it('declares system text that continues the head\'s as an addition beside a tool change, and moves the head for a block inserted among the ones before', async () => {
+      const context = fakeContext([said('user', 'hello')]);
+      const heads = memoryHeadDeclarations(onMain);
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { takes: true }, heads, events);
+      await agent.buildActivationRequest([tool('a')], [systemInjection('kept')]);
+      const continued = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('kept'), systemInjection('new one'), systemInjection('new two')]);
+      assert.equal(continued.system, `${SYSTEM}\nkept`, 'the recorded head');
+      assert.deepEqual(changesIn(continued.messages), [[{ type: 'system_change', defineTools: [tool('b')], addSystem: ['new one', 'new two'] }]], 'one block for both');
+      assert.deepEqual(foldOf(continued), now([tool('a'), tool('b')], `${SYSTEM}\nkept\nnew one\nnew two`));
+      const inserted = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('kept'), systemInjection('between'), systemInjection('new one'), systemInjection('new two')]);
+      assert.equal(inserted.system, `${SYSTEM}\nkept\nbetween\nnew one\nnew two`, 'a block in the middle is no addition: the head moves');
+      assert.deepEqual(changesIn(inserted.messages), []);
+      assert.deepEqual(foldOf(inserted), now([tool('a'), tool('b')], `${SYSTEM}\nkept\nbetween\nnew one\nnew two`));
+      assert.deepEqual(changeRows(context.rows), [], 'and takes the change it now holds');
+      assert.deepEqual(events.at(-1), { type: 'head:moved', why: 'replaced', changesRemoved: 1 });
+    });
+
+    it('compares a tool as the wire carries it: a Date in its schema, or a field left undefined, declares nothing', async () => {
+      const dated = { ...tool('a'), inputSchema: { type: 'object', properties: { when: { type: 'string', default: new Date('2026-01-01T00:00:00Z') } } } } as unknown as ToolDefinition;
+      const withUndefined = { ...tool('b'), extra: undefined } as unknown as ToolDefinition;
+      const context = fakeContext([said('user', 'hello')]);
+      const heads = memoryHeadDeclarations(onMain);
+      heads.write('agent', JSON.parse(JSON.stringify({ tools: [dated, tool('b')], system: [SYSTEM] })));
+      const request = await agentOn(context, { takes: true }, heads).buildActivationRequest([dated, withUndefined]);
+      assert.deepEqual(changesIn(request.messages), [], 'as recorded, the Date is the text the wire carries');
+      assert.deepEqual(changeRows(context.rows), []);
+    });
+
+    it('moves the head for an addition the head already holds, as after a rewind past a move brings a change row back', async () => {
+      const brought: Row = { id: 'c-back', participant: 'system', content: [{ type: 'system_change', defineTools: [tool('a')], addSystem: ['added'] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } };
+      const context = fakeContext([said('user', 'hello'), brought]);
+      const heads = memoryHeadDeclarations(onMain);
+      heads.write('agent', { tools: [tool('a')], system: [SYSTEM, 'added'] });
+      const events: HeadEvent[] = [];
+      const request = await agentOn(context, { takes: true }, heads, events).buildActivationRequest([tool('a')], [systemInjection('added')]);
+      assert.deepEqual(foldOf(request), now([tool('a')], `${SYSTEM}\nadded`), 'the text goes out once');
+      assert.deepEqual(changesIn(request.messages), []);
+      assert.deepEqual(changeRows(context.rows), [], 'the row brought back is taken');
+      assert.deepEqual(events, [{ type: 'head:moved', why: 'replaced', changesRemoved: 1 }]);
+    });
+  });
+
+  it('refuses a thinkingBinding.binds it can\'t read', () => {
     const context = fakeContext();
-    assert.throws(() => agentOn(context, { toolDeclarations: 'sk-pasted-secret' as never }), (e: Error) => /Agent "agent" toolDeclarations must be 'head' or 'entries', not another string:/.test(e.message) && !e.message.includes('sk-pasted-secret'));
     assert.throws(() => agentOn(context, { thinkingBinding: true as never }), /Agent "agent" thinkingBinding/);
     assert.throws(() => agentOn(context, { thinkingBinding: { binds: 'false' as never } }), /Agent "agent" thinkingBinding.binds must be true or false, unquoted, not a string/);
   });
 
-  it('reads `thinkingBinding.binds` in three states: left out, a model that may bind with nothing declared', () => {
-    const context = fakeContext();
-    const read = (thinkingBinding: unknown) => {
-      const agent = agentOn(context, { thinkingBinding: thinkingBinding as never });
-      return [agent.mayBindThinking, agent.thinkingBindingOption() !== undefined];
-    };
-    assert.deepEqual(read({ binds: true }), [true, true], 'true: may bind, and declared');
-    assert.deepEqual(read({ binds: false }), [false, false], 'false: neither');
-    for (const left of [undefined, null, {}, { dropBlock: true }]) {
-      assert.deepEqual(read(left), [true, false], `${JSON.stringify(left)}: may bind, nothing declared`);
-    }
-  });
-
-  it("tells a compile with `binds: true` the head the request carries under 'entries': a declared change keeps its digests, a move changes them", async () => {
+  it("tells a compile with `binds: true` the head the request carries: a declared change keeps its digests, a move changes them", async () => {
     const context = fakeContext([said('user', 'hello')]);
-    const agent = agentOn(context, { toolDeclarations: 'entries', thinkingBinding: { binds: true } });
+    const agent = agentOn(context, { takes: true, thinkingBinding: { binds: true } });
     type Identity = Record<'system' | 'tools' | 'model' | 'request', string>;
     const assemble = (tools: ToolDefinition[], system: string) => (agent as unknown as {
       assembleActivationRequest(t: ToolDefinition[], i: unknown[]): Promise<{ request: NormalizedRequest; binding: { identity?: Identity } }>;

@@ -67,7 +67,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import { WriteLandedError, WriteOutcomeUnknownError } from '../context-manager-errors.js';
 import { suppressionRecordOf } from '../gate/suppression-stats.js';
-import { isAnotherAgentsInjection } from '../stored-injections.js';
+import { isAnotherAgentsContext } from '../stored-injections.js';
 import type { AgentName, ObserveEdge } from './types.js';
 
 /** The metadata key listing who a row is for. */
@@ -183,7 +183,7 @@ export function observedRowFor(
   row: { participant: string; metadata?: unknown },
   context: { observer: AgentName; owners: readonly AgentName[] },
 ): boolean {
-  if (isAnotherAgentsInjection(row.metadata, context.observer)) return false;
+  if (isAnotherAgentsContext(row.metadata, context.observer)) return false;
   if (row.participant === context.observer) return false;
   if (suppressedRow(row.metadata as Record<string, unknown> | undefined)) return false;
   if (heldFromResidents(row.metadata as Record<string, unknown> | undefined)) return edge.includeHeld === true;

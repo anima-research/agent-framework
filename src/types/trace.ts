@@ -132,9 +132,10 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'head:moved';
       agentName: string;
-      /** What moved the head to what's current: the first request under
-       *  'entries', a replacement of system text, a consolidation, or a
-       *  request on the head that found changes left from an earlier period. */
+      /** What moved the head to what's current: the first request on a
+       *  model that takes a change, a replacement of system text, a
+       *  consolidation, or a request on a model that takes none, or kept to
+       *  its head, that found change rows to take out. */
       why: 'adopted' | 'replaced' | 'consolidated' | 'on-head';
       /** The change rows removed, since the head now holds what they
        *  declared, or what they declared is no longer current. */
@@ -1613,8 +1614,8 @@ export type TraceEvent =
        * at its own place, so no other row's place moves (`hide`, `suppress` on its
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
        * a start finished, `resume`, a refusal rewind's shed from a window
-       * that is still the record, `rewind`, and an agent's own system changes
-       * a move of its head took out, `head-moved`, the `head:moved` trace
+       * that is still the record, `rewind`, and the system changes a move of
+       * an agent's head took out, `head-moved`, the `head:moved` trace
        * after it saying why, or none where the head couldn't be stored and
        * none was recorded), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an

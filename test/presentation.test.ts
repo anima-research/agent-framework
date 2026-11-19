@@ -18,7 +18,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import {
   AgentRegistry, audienceOf, residentSpec, storeOwnRow, subconsciousSpec, taskForkSpec, withAudience, workerSpec,
 } from '../src/index.js';
-import { isAnotherAgentsInjection } from '../src/stored-injections.js';
+import { isAnotherAgentsContext } from '../src/stored-injections.js';
 import {
   AgentPresentation, heldFromResidents, type PresentationHost, type PresentationTrace, type PresentedAgent, type Position,
 } from '../src/presentation.js';
@@ -27,7 +27,6 @@ const text = (t: string): ContentBlock[] => [{ type: 'text', text: t } as Conten
 const toolUse = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'test--echo', input: {} }) as ContentBlock;
 const toolResult = (id: string): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: 'ok' }) as ContentBlock;
 const textOf = (m: StoredMessage) => m.content.map((b) => (b.type === 'text' ? (b as { text: string }).text : `<${b.type}>`)).join('');
-const carriesEvery = (): boolean => true;
 
 /** An agent as the module presents to it, which storeOwnRow writes through. */
 class TestAgent implements PresentedAgent {
@@ -51,7 +50,7 @@ afterEach(() => {
 });
 
 const residentFilter = (name: string) => (m: StoredMessage) =>
-  !heldFromResidents(m.metadata as Record<string, unknown> | undefined) && !isAnotherAgentsInjection(m.metadata, name);
+  !heldFromResidents(m.metadata as Record<string, unknown> | undefined) && !isAnotherAgentsContext(m.metadata, name);
 
 async function openResident(store: JsStore, name: string, strategy = new PassthroughStrategy()): Promise<ContextManager> {
   const cm = await ContextManager.open({ store, namespace: `agents/${name}`, strategy, viewFilter: residentFilter(name) });
@@ -75,7 +74,7 @@ async function rig(options: { beforeOpen?: (store: JsStore) => void } = {}) {
   const oren = new TestAgent('oren', await openResident(store, 'oren', orenStrategy));
   const subCm = await ContextManager.open({
     store, namespace: 'subconscious/mira', isolate: true, auxiliaryMessageViews: [{}],
-    viewFilter: (m) => !isAnotherAgentsInjection(m.metadata, 'Subconscious'), strategy: new PassthroughStrategy(),
+    viewFilter: (m) => !isAnotherAgentsContext(m.metadata, 'Subconscious'), strategy: new PassthroughStrategy(),
   });
   closers.push(() => subCm.close());
   const sub = new TestAgent('Subconscious', subCm);
@@ -384,20 +383,20 @@ describe('the presentation module', () => {
     const results = storeOwnRow(r.mira, 'user', [toolResult('c1')], undefined, undefined, false);
     const arrival = r.write(r.oren, 'someone', text('heard'), ['mira']);
     const { heard } = r.presentation.presentAtBoundary(r.mira, [reply, results], { injects: true });
-    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, ...heard.map((h) => h.id)], carriesEvery), { vouched: true });
-    assert.deepEqual(r.presentation.handOff(r.mira, [reply, undefined, results, arrival], carriesEvery), { vouched: true }, 'an undefined id is skipped');
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, ...heard.map((h) => h.id)]), { vouched: true });
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, undefined, results, arrival]), { vouched: true }, 'an undefined id is skipped');
 
     const reply2 = storeOwnRow(r.mira, 'mira', [...text('again'), toolUse('c2')]);
     const results2 = storeOwnRow(r.mira, 'user', [toolResult('c2')]);
     storeOwnRow(r.mira, 'user', text('a notice the stream is not given'));
-    assert.deepEqual(r.presentation.handOff(r.mira, [reply2, results2], carriesEvery), { vouched: false });
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply2, results2]), { vouched: false });
     const mismatch = ofType(r.traces, 'presentation:hand-off-mismatch');
     assert.equal(mismatch.length, 1);
     assert.deepEqual(mismatch[0]!.expected, [reply2, results2]);
     assert.equal(mismatch[0]!.tail.at(-1), r.mira.cm.getPresentedMessages().at(-1)!.id);
 
     const notice = storeOwnRow(r.mira, 'user', text('a notice it is given'), undefined, undefined, false);
-    assert.deepEqual(r.presentation.handOff(r.mira, [notice], carriesEvery), { vouched: true }, 'a row sent and not yet in the window is presented first');
+    assert.deepEqual(r.presentation.handOff(r.mira, [notice]), { vouched: true }, 'a row sent and not yet in the window is presented first');
     assert.equal(r.mira.has(notice), true);
   });
 
@@ -584,7 +583,7 @@ describe('the presentation module', () => {
     const results = storeOwnRow(r.mira, 'user', [toolResult('c1')]);
     const { heard } = r.presentation.presentAtBoundary(r.mira, [reply, results], { injects: true });
     assert.deepEqual(heard.map((h) => h.id), [question], 'the assistant hears it at its boundary');
-    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, question], carriesEvery), { vouched: true });
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, question]), { vouched: true });
   });
 
   it('an unstamped row is presented to the owners and observers, and counted in the trace', async () => {
@@ -800,7 +799,7 @@ describe('the presentation module when a store call fails', () => {
     // then the hand-off of all of them in that order.
     const { heard } = r.presentation.presentAtBoundary(r.mira, [reply, results], { injects: true });
     assert.deepEqual(heard.map((h) => h.id), [held]);
-    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, ...heard.map((h) => h.id)], carriesEvery), { vouched: true });
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results, ...heard.map((h) => h.id)]), { vouched: true });
     assert.deepEqual(ofType(r.traces, 'presentation:hand-off-mismatch'), []);
     const compiled = await r.mira.cm.compile(undefined, undefined, { dryRun: true });
     assert.deepEqual(compiled.messages.slice(-3).map((m) => m.content.map((b) => b.type).join(',')), ['text,tool_use', 'tool_result', 'text'],
@@ -897,11 +896,11 @@ describe('the presentation module when a store call fails', () => {
     assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary']]);
 
     cm.getPresentedMessages = () => { throw new Error('the store could not be read'); };
-    const handOff = quietly(() => r.presentation.handOff(r.mira, [reply, results], carriesEvery));
+    const handOff = quietly(() => r.presentation.handOff(r.mira, [reply, results]));
     delete (cm as { getPresentedMessages?: unknown }).getPresentedMessages;
     assert.deepEqual(handOff, { vouched: false }, 'the check could not be made');
     assert.deepEqual(ofType(r.traces, 'presentation:failed').map((t) => [t.agentName, t.occasion]), [['mira', 'tool-boundary'], ['mira', 'hand-off']]);
-    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results], carriesEvery), { vouched: true }, 'and the window it checks is as it was');
+    assert.deepEqual(r.presentation.handOff(r.mira, [reply, results]), { vouched: true }, 'and the window it checks is as it was');
     r.alive.delete('mira');
     assert.deepEqual(r.presentation.presentAtEnd(r.mira).map((m) => m.id), [arrival], "the arrival at the turn's end");
   });

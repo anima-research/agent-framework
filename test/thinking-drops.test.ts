@@ -102,7 +102,6 @@ describe('the stream start\'s placeDrops', () => {
   it('reads a call\'s dropped blocks against the request the stream sends and the compile it was built from', async () => {
     const contextManager = {
       compile: async () => ({ messages: compiledMessages, systemInjections: [], provenance: compiled.provenance }),
-      currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
     } as unknown as ContextManager;
     const membrane = new MockMembrane();
     const agent = new Agent({ name: 'agent', model: 'claude-opus-5-5', systemPrompt: 'test' } as never, contextManager, membrane.asMembrane());
@@ -119,7 +118,6 @@ describe('the stream start\'s placeDrops', () => {
     const start = async (thinkingRecordedAfter: number | undefined) => {
       const contextManager = {
         compile: async () => ({ messages: compiledMessages, systemInjections: [], provenance: compiled.provenance, thinkingRecordedAfter }),
-        currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
       } as unknown as ContextManager;
       const agent = new Agent({ name: 'agent', model: 'claude-opus-5-5', systemPrompt: 'test' } as never, contextManager, new MockMembrane().asMembrane());
       const result = await agent.startStreamWithInjections([]);

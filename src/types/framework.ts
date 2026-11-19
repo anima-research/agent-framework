@@ -411,8 +411,8 @@ export interface FrameworkConfig {
    * provider hold takes. A wake for the agent while it waits starts its turn
    * at once, with the re-armed trigger merged in. That turn is the
    * wake's: the error policy retries its failures. A completed turn starts the
-   * count again, and so does a message said to the agent: not a system message,
-   * notice or system change; not an edit, reaction or deletion, unless an edit is the first
+   * count again, and so does a message said to the agent: not a system message
+   * or notice; not an edit, reaction or deletion, unless an edit is the first
    * version of a message the agent sees; not a message its own view leaves
    * out, such as one a tune-out holds from it; and not the agent's own
    * schedule, the heartbeat's tick or reminder, a self-wake timer it set, or a

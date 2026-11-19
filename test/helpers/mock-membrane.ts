@@ -228,6 +228,14 @@ export class MockMembrane {
     return stream;
   }
 
+  /** What `takesToolOrSystemChanges` answers for every model: whether an
+   *  agent declares a later change of its tools or system text in its context. */
+  takesChanges = false;
+
+  takesToolOrSystemChanges(_model: string): boolean {
+    return this.takesChanges;
+  }
+
   asMembrane(): import('@animalabs/membrane').Membrane {
     return this as unknown as import('@animalabs/membrane').Membrane;
   }

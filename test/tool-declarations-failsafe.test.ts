@@ -118,6 +118,7 @@ const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCre
 async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; refuseLater?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
+  membrane.takesChanges = true;
   let turn = 0;
   membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
     const n = membrane.calls.push(request) - 1;
@@ -132,7 +133,7 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
     agents: [{
       name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled',
-      toolDeclarations: 'entries', thinkingBinding: { binds: opts.binds },
+      thinkingBinding: { binds: opts.binds },
     }],
     modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     errorPolicy: { maxRetries: 0, onInferenceError: (_e: Error, _name: string, attempt: number) => { policyCalls.push(attempt); return { retry: false }; } },
@@ -164,7 +165,7 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     tools.names = opts.second ?? ['a', 'b'];
     await send('second', 2);
     const afterSecond = {
-      onHead: !agent.declaresEntries(),
+      onHead: !agent.takesChanges(),
       undoDepth: framework.getUndoRedoState('resident').undoDepth,
       waitRecorded: internals.providerWaits.active('resident', 'test-model') !== undefined,
     };
@@ -183,7 +184,7 @@ const B = 'changing--b';
 const toolNames = (request: NormalizedRequest) => (request.tools ?? []).map((t) => t.name);
 const resends = (traces: TraceEvent[]) => traces.filter((t) => t.type === 'head:resend').length;
 
-describe("toolDeclarations' fail-safe", () => {
+describe('the fail-safe for a refused change', () => {
   it('resends a refused system change at once on the head, as the same turn, and keeps to its head after', async () => {
     const run = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(true) : undefined), third: true });
     assert.equal(run.calls.length, 4, 'the adopting turn, the refused request, its resend, the third turn');
@@ -253,7 +254,7 @@ describe("toolDeclarations' fail-safe", () => {
     assert.equal(alerts.length, 1, 'one operator line for the build');
     assert.match(alerts[0]!.message, /membrane refused a system change, so it goes again on the agent's head/);
     assert.match(alerts[0]!.message, /keeps to its head until it's built again/);
-    assert.match(alerts[0]!.message, /set toolDeclarations: 'head' on it; where membrane refused the change before sending it, send through a formatter and an adapter that send system changes/);
+    assert.match(alerts[0]!.message, /belongs on membrane's list of models that refuse them \(Membrane\.takesToolOrSystemChanges\); where membrane refused the change before sending it, send through a formatter and an adapter that send system changes/);
     assert.equal(alerts[0]!.data?.httpStatus, undefined, 'naming no 400 of its own');
   });
 
@@ -265,7 +266,7 @@ describe("toolDeclarations' fail-safe", () => {
   });
 
   for (const [type, message] of [['context_length', 'prompt is too long: 210000 tokens > 200000 maximum'], ['auth', 'your credit balance is too low']] as const) {
-    it(`leaves a 400 membrane files as ${type} to the error policy, though the request carried a change, and stays on 'entries'`, async () => {
+    it(`leaves a 400 membrane files as ${type} to the error policy, though the request carried a change, and keeps declaring changes`, async () => {
       const run = await turns({ binds: false, refuse: (r) => (carriesChange(r) ? filed400(type, message) : undefined) });
       assert.equal(run.calls.length, 2, 'no resend on the head');
       assert.equal(resends(run.traces), 0);
@@ -300,6 +301,7 @@ const overloaded = () => Object.assign(
 async function rearmed(later: () => Error | undefined) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-rearm-'));
   const membrane = new MockMembrane();
+  membrane.takesChanges = true;
   membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
     const n = membrane.calls.push(request) - 1;
     const error = n === 0 ? undefined : n === 1 ? overloaded() : later();
@@ -313,7 +315,7 @@ async function rearmed(later: () => Error | undefined) {
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
     agents: [{
       name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled',
-      toolDeclarations: 'entries', thinkingBinding: { binds: true },
+      thinkingBinding: { binds: true },
     }],
     modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0, exhaustedTurnRearmMs: [50, 50],
     errorPolicy: {
@@ -344,7 +346,7 @@ async function rearmed(later: () => Error | undefined) {
   }
 }
 
-describe("toolDeclarations' fail-safe in a re-armed turn", () => {
+describe('the fail-safe for a refused change in a re-armed turn', () => {
   it('resends a re-armed send refused for its system change once, at once, on the head, and the resend answers the turn', async () => {
     let refused = 0;
     const run = await rearmed(() => (refused++ === 0 ? refusal(true) : undefined));
@@ -371,6 +373,7 @@ describe("toolDeclarations' fail-safe in a re-armed turn", () => {
   it("resends at once on the head when the refused request is a later round, given a host's change at a tool boundary", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
     const membrane = new MockMembrane();
+    membrane.takesChanges = true;
     let refusedRound: RefusedAfterChange | undefined;
     membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
       const n = membrane.calls.push(request) - 1;
@@ -386,7 +389,6 @@ describe("toolDeclarations' fail-safe in a re-armed turn", () => {
       storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
       agents: [{
         name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled',
-        toolDeclarations: 'entries',
       }],
       modules: [new Input(), new HostChangeAtTool()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       errorPolicy: { maxRetries: 0, onInferenceError: (_e: Error, _name: string, attempt: number) => { policyCalls.push(attempt); return { retry: false }; } },
@@ -407,7 +409,7 @@ describe("toolDeclarations' fail-safe in a re-armed turn", () => {
       assert.equal(resends(traces), 1);
       assert.deepEqual(policyCalls, [], 'the refusal never reached the error policy');
       assert.equal(traces.filter((t) => t.type === 'inference:completed').length, 2, 'and the turn the resend continued ended well');
-      assert.equal(framework.getAgent('resident')!.declaresEntries(), false, 'the agent keeps to its head');
+      assert.equal(framework.getAgent('resident')!.takesChanges(), false, 'the agent keeps to its head');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
@@ -415,7 +417,7 @@ describe("toolDeclarations' fail-safe in a re-armed turn", () => {
   });
 });
 
-describe("toolDeclarations' fail-safe with a model that binds thinking to its prefix", () => {
+describe('the fail-safe for a refused change, with a model that binds thinking to its prefix', () => {
   class HostChange implements Module {
     readonly name = 'host';
     ctx: ModuleContext | null = null;
@@ -444,6 +446,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
   async function refusedAtALaterRound(noteLands: boolean) {
     const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-rounds-'));
     const membrane = new MockMembrane();
+    membrane.takesChanges = true;
     const outcomes: string[] = [];
     const carriesMisbound = (request: NormalizedRequest) => request.messages.some((m) => m.content.some((b) => (b as { signature?: string }).signature === 'signed-over-the-change'));
     membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
@@ -468,7 +471,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     if (!noteLands) proto.noteThinkingDropped = () => false;
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', thinkingBinding: { binds: true } }],
+      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', thinkingBinding: { binds: true } }],
       modules: [new Input(), new HostChangeAtTool()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
     });
@@ -501,154 +504,11 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
     assert.doesNotMatch(alerts[0]!.message, /didn't land/, 'whose note landed');
   });
 
-  it("says, when its note can't land, that where its head didn't move its requests can carry that thinking until those replies leave its window or it's built again, which an account that enforces the binding refuses without the drop control", async () => {
-    const { traces, outcomes } = await refusedAtALaterRound(false);
-    assert.deepEqual(outcomes.slice(2), ['refused: thinking signed over the change', 'refused: thinking signed over the change'], 'the resend and the next turn carry that thinking, and are refused');
-    assert.equal((traces.find((t) => t.type === 'head:resend') as { thinkingSetAside: number }).thinkingSetAside, 0, 'nothing set aside');
-    const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string; data?: { noted?: boolean } }>;
-    assert.equal(alerts.length, 1, 'an operator line, though the refusal was recognised');
-    assert.match(alerts[0]!.message, /didn't land, so, where its head didn't move with the refusal \(a move sets every earlier reply's thinking aside\), its requests can carry that thinking until those replies leave its window or it's built again, and without thinkingBinding\.dropBlock an account that enforces the binding refuses them/);
-    assert.equal(alerts[0]!.data?.noted, false);
-  });
-
-  for (const recognised of [false, true]) {
-    it(`recovers after a refusal (${recognised ? 'recognised' : 'an unrecognised 400'}) keeps it to its head: no request sends thinking signed under a prefix that held a host's change row`, async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-binds-'));
-      const membrane = new MockMembrane();
-      let turn = 0;
-      let refused = false;
-      const outcomes: string[] = [];
-      membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
-        membrane.calls.push(request);
-        if (misboundThinking(request)) {
-          outcomes.push('refused: thinking under another prefix');
-          return new RefusedStream(Object.assign(new MembraneError({ type: 'invalid_request', retryable: false, message: 'thinking signature not valid for this prefix', rawError: { status: 400 } }), { httpStatus: 400 }));
-        }
-        if (turn === 2 && !refused && carriesChange(request)) {
-          refused = true;
-          outcomes.push('refused: the change');
-          return new RefusedStream(refusal(recognised));
-        }
-        outcomes.push('answered');
-        return new MockYieldingStream([createMockResponse([{ type: 'thinking', thinking: 'why', signature: prefixHash(request, request.messages.length) } as ContentBlock, { type: 'text', text: 'done' }])]);
-      };
-      const host = new HostChange();
-      const framework = await AgentFramework.create({
-        storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', thinkingBinding: { binds: true } }],
-        modules: [new Input(), host], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-        errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
-      });
-      const traces: TraceEvent[] = [];
-      framework.onTrace((event) => { traces.push(event); });
-      framework.start();
-      const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted' || t.type === 'inference:failed').length;
-      try {
-        assert.ok(await pollUntil(() => host.ctx !== null));
-        host.ctx!.addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock]);
-        for (const [text, n] of [['first', 1], ['second', 2], ['third', 3]] as const) {
-          turn = n;
-          const before = ended();
-          framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
-          assert.ok(await pollUntil(() => ended() > before), `turn ${n} ended`);
-        }
-        assert.equal(carriesChange(membrane.calls[0]!), true, "the premise: the first turn sent the host's change, and its reply's thinking was signed under it");
-        assert.equal(outcomes[1], 'refused: the change', 'the premise: the second turn was refused for carrying it');
-        assert.equal(framework.getAgent('resident')!.declaresEntries(), false, 'the agent keeps to its head');
-        assert.deepEqual(outcomes.slice(2), ['answered', 'answered'], "the resend and the next turn go out on the head with no thinking signed under the host's row");
-      } finally {
-        await framework.stop();
-        rmSync(dir, { recursive: true, force: true });
-      }
-    });
-  }
-  it("sends a host's change row through the direct API on an 'entries' agent, so thinking signed after it goes out under its prefix", async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-binds-'));
-    const membrane = new MockMembrane();
-    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
-      membrane.calls.push(request);
-      return new MockYieldingStream([createMockResponse([{ type: 'thinking', thinking: 'why', signature: prefixHash(request, request.messages.length) } as ContentBlock, { type: 'text', text: 'done' }])]);
-    };
-    const direct: string[] = [];
-    let directSent: NormalizedRequest | undefined;
-    membrane.stream = async (request: NormalizedRequest): Promise<NormalizedResponse> => {
-      directSent = request;
-      if (misboundThinking(request)) {
-        direct.push('refused');
-        throw Object.assign(new MembraneError({ type: 'invalid_request', retryable: false, message: 'thinking signature not valid for this prefix', rawError: { status: 400 } }), { httpStatus: 400 });
-      }
-      direct.push(carriesChange(request) ? 'answered, carrying the change' : 'answered');
-      return createMockResponse([{ type: 'text', text: 'direct' }]);
-    };
-    const host = new HostChange();
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', thinkingBinding: { binds: true } }],
-      modules: [new Input(), host], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
-    });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((event) => { traces.push(event); });
-    framework.start();
-    try {
-      assert.ok(await pollUntil(() => host.ctx !== null));
-      host.ctx!.addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock]);
-      framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} } as unknown as ProcessEvent);
-      assert.ok(await pollUntil(() => traces.some((t) => t.type === 'inference:completed')), 'the first turn ended');
-      assert.equal(carriesChange(membrane.calls[0]!), true, "the premise: the turn sent the host's change, and its reply's thinking was signed under it");
-      const agent = framework.getAgent('resident')!;
-      await agent.runInference(membrane.calls[0]!.tools ?? []).catch(() => undefined);
-      assert.deepEqual(direct, ['answered, carrying the change'], "the direct API carries the host's row, as the agent's requests do");
-      assert.equal(thinkingIn(directSent!), 1, "and the reply's thinking, signed after it");
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("sends a host's change row through the direct API on an 'entries' agent whose caller passes tools other than its head", async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-other-'));
-    const membrane = new MockMembrane();
-    membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
-      membrane.calls.push(request);
-      return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
-    };
-    let directSent: NormalizedRequest | undefined;
-    membrane.stream = async (request: NormalizedRequest): Promise<NormalizedResponse> => {
-      directSent = request;
-      return createMockResponse([{ type: 'text', text: 'direct' }]);
-    };
-    const host = new HostChange();
-    const framework = await AgentFramework.create({
-      storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries' }],
-      modules: [new Input(), host], syncIntervalMs: 0, maintenanceIntervalMs: 0,
-      errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
-    });
-    const traces: TraceEvent[] = [];
-    framework.onTrace((event) => { traces.push(event); });
-    framework.start();
-    try {
-      assert.ok(await pollUntil(() => host.ctx !== null));
-      host.ctx!.addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock]);
-      framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} } as unknown as ProcessEvent);
-      assert.ok(await pollUntil(() => traces.some((t) => t.type === 'inference:completed')), 'the first turn ended');
-      assert.equal(carriesChange(membrane.calls[0]!), true, "the premise: the turn sent the host's change");
-      const other = { name: 'yy_tool', description: 'YY', inputSchema: { type: 'object' as const, properties: {} } };
-      await framework.getAgent('resident')!.runInference([...(membrane.calls[0]!.tools ?? []), other]).catch(() => undefined);
-      assert.ok(directSent, 'the direct request went out');
-      assert.ok((directSent!.tools ?? []).some((t) => t.name === 'yy_tool'), "the premise: it went on the caller's tools, not the recorded head");
-      assert.equal(carriesChange(directSent!), true, "and it carries the host's change row, as the agent's requests do");
-    } finally {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  describe("the direct API on an 'entries' agent, by what its caller passes against its head and own change rows", () => {
+  describe("the direct API on a model that takes a change, by what its caller passes against its head and own change rows", () => {
     async function directAfter(turns: string[][], passed: (calls: readonly NormalizedRequest[]) => unknown[], binds = true) {
       const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-direct-own-'));
       const membrane = new MockMembrane();
+      membrane.takesChanges = true;
       const misbound: boolean[] = [];
       membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
         membrane.calls.push(request);
@@ -669,7 +529,7 @@ describe("toolDeclarations' fail-safe with a model that binds thinking to its pr
       const tools = new ChangingTools();
       const framework = await AgentFramework.create({
         storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', toolDeclarations: 'entries', ...(binds ? { thinkingBinding: { binds: true } } : {}) }],
+        agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', ...(binds ? { thinkingBinding: { binds: true } } : {}) }],
         modules: [new Input(), tools], syncIntervalMs: 0, maintenanceIntervalMs: 0,
         errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
       });

@@ -22,7 +22,6 @@ test('agent wires immutable-prefix and exact wire receipt only for kv-unified', 
         systemInjections: [],
       };
     },
-    currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
   } as unknown as ContextManager;
   const membrane = {
     streamYielding: () => ({}) as never,
@@ -57,7 +56,6 @@ test('agent leaves marker ownership unchanged for non-kv strategies', async () =
       compileOptions = options;
       return { messages: [], systemInjections: [] };
     },
-    currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
   } as unknown as ContextManager;
   const agent = new Agent(
     { name: 'resident', model: 'test', systemPrompt: 'system' },
@@ -83,7 +81,6 @@ test('a new activation closes the receipt flight its predecessor left open befor
       messages: [{ participant: 'user', content: [{ type: 'text', text: 'hello' }] }],
       systemInjections: [],
     }),
-    currentBranch: () => ({ id: 'main', name: 'main', head: 0 }),
   } as unknown as ContextManager;
   const membrane = { streamYielding: () => ({}) as never } as unknown as Membrane;
   const agent = new Agent({ name: 'devops', model: 'test', systemPrompt: 'system' }, cm, membrane);
