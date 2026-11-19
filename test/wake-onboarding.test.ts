@@ -261,7 +261,7 @@ describe('wake onboarding: the servers a store already had', () => {
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).predating, ['games']);
     // A later start: the file is there, so the servers configured now are not taken.
     const again = new WakeDecisions(path, undefined, ['docs', 'games']);
-    assert.equal(again.predates('games'), true, 'still waiting for its first undecided event');
+    assert.equal(again.predates('games'), true, 'still waiting for its first event');
     assert.equal(again.predates('docs'), false, 'added since: offered as before');
     assert.deepEqual(again.get('discord'), { digest: 'a', state: 'unasked', at: new Date(t0).toISOString() });
     // A new store: nothing predates, and the file still says onboarding has started.
@@ -330,42 +330,72 @@ describe('wake onboarding: the servers a store already had', () => {
       try {
         assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
         await h.push('Your move.', ['surface:turn']);
+        assert.ok(h.traces.some((e) => e.type === 'gate:decision' && e.matchedPolicy === rule.name), `premise: ${rule.name} decided the event`);
+        if (rule.suppress) assert.ok(h.traces.some((e) => e.type === 'gate:suppressed'), 'premise: the event was suppressed');
+        assert.equal(h.woke(), rule.behavior === 'always', 'premise: the agent woke only for the rule that wakes on it');
         assert.equal(h.decisions().get('editor')?.state, 'unasked', 'the rule decided the event, and the server is settled all the same');
         assert.equal(h.stored().length, 0);
       } finally { await h.f.close(); }
     });
   }
 
-  it('a predating server whose declarations cannot be read at its event stays unsettled, rather than settled against nothing', { timeout: 60_000 }, async (t) => {
-    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-undeclared-'));
+  type FeatureSets = { servers: Map<string, unknown>; removeServer(id: string): void };
+  const featureSets = (h: Awaited<ReturnType<typeof games>>) => (h.f.framework as unknown as { featureSetManager: FeatureSets }).featureSetManager;
+  const predatingStore = async (t: { after(fn: () => void): void }, framework?: Partial<FrameworkConfig>) => {
+    const gateDir = mkdtempSync(join(tmpdir(), 'onboarding-predating-'));
     t.after(() => rmSync(gateDir, { recursive: true, force: true }));
     const earlier = await games({ gateDir, onboarding: false });
     earlier.f.framework.addGatePolicy({ name: 'cli-input', match: { scope: ['external-message'] }, behavior: 'always' });
     await earlier.f.close();
-    const h = await games({ gateDir });
+    const h = await games({ gateDir, ...(framework ? { framework } : {}) });
+    assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
+    return h;
+  };
+
+  it('a predating server is settled against what it declared when its event came, though its feature sets are gone when the loop takes the event', { timeout: 60_000 }, async (t) => {
+    const h = await predatingStore(t);
     try {
-      assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
-      await h.f.send('push/event', { featureSet: 'games', eventId: 'undeclared-1', timestamp: TS, tags: ['surface:turn'], payload: { content: [{ type: 'text', text: 'Your move.' }] } });
-      // The connection's feature sets go, as at a close the server reconnects from, before the loop takes the event.
-      (h.f.framework as unknown as { featureSetManager: { removeServer(id: string): void } }).featureSetManager.removeServer('editor');
+      const declared = (h.f.framework as unknown as { wakeOffer(id: string): { digest: string } }).wakeOffer('editor').digest;
+      assert.notEqual(declared, 'none', 'premise: the server declares its feature sets');
+      await h.f.send('push/event', { featureSet: 'games', eventId: 'gone-1', timestamp: TS, tags: ['surface:turn'], payload: { content: [{ type: 'text', text: 'Your move.' }] } });
+      await eventually(() => !h.decisions().predates('editor'), 'settled as the event came');
+      featureSets(h).removeServer('editor');
       await h.f.framework.runUntilIdle();
-      assert.equal(h.decisions().get('editor'), undefined, 'no record against a declaration it could not read');
-      assert.equal(h.decisions().predates('editor'), true, 'still the store\'s own server, for its next event');
+      const record = h.decisions().get('editor');
+      assert.deepEqual([record?.state, record?.digest], ['unasked', declared]);
       assert.deepEqual(h.stored(), [], 'and no notice');
     } finally { await h.f.close(); }
   });
 
-  it('an unasked server whose declaration has changed: accepting takes the current suggestions, with no word of having been told', { timeout: 60_000 }, async () => {
-    const h = await games();
+  it('a predating server whose feature sets cannot be read when its event comes stays unsettled, and is settled at an event that finds them', { timeout: 60_000 }, async (t) => {
+    const h = await predatingStore(t);
     try {
-      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'unasked' });
-      const taken = await h.tool('wake_accept_suggestions', { server: 'editor' });
-      assert.equal(taken.success, true, taken.error);
-      assert.equal(h.decisions().get('editor')!.state, 'accepted');
-      // An offered one in the same place is shown the list again first, as before.
-      h.decisions().set('editor', { digest: 'an-older-ontology', state: 'offered' });
-      const refused = await h.tool('wake_accept_suggestions', { server: 'editor' });
-      assert.match(refused.error ?? '', /changed since you were told about them/);
+      const declared = (h.f.framework as unknown as { wakeOffer(id: string): { digest: string } }).wakeOffer('editor').digest;
+      const kept = featureSets(h).servers.get('editor');
+      featureSets(h).removeServer('editor');
+      await h.push('Your move.', ['surface:turn']);
+      assert.equal(h.decisions().get('editor'), undefined, 'no record against a declaration it could not read');
+      assert.equal(h.decisions().predates('editor'), true);
+      featureSets(h).servers.set('editor', kept);
+      await h.push('White played D4. Your move.', ['surface:turn']);
+      const record = h.decisions().get('editor');
+      assert.deepEqual([record?.state, record?.digest], ['unasked', declared], 'settled at the event that found them');
+      assert.deepEqual(h.stored(), [], 'and no notice');
+    } finally { await h.f.close(); }
+  });
+
+  it('a predating server whose first event is a channel message held for a tune-out is settled at it', { timeout: 60_000 }, async (t) => {
+    const h = await predatingStore(t, { subconscious: SUB } as Partial<FrameworkConfig>);
+    try {
+      await registerOpen(h.f, 'noisy');
+      enter(h.f, 'noisy');
+      await incoming(h.f, 'noisy', 'n1', 'noise', MENTION);
+      await h.f.framework.runUntilIdle();
+      const row = (h.f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ metadata?: Record<string, unknown> }>)
+        .find((m) => m.metadata?.messageId === 'n1');
+      assert.ok(row?.metadata?.tuneOut, 'premise: the message was held for the tune-out');
+      assert.equal(h.decisions().get('editor')?.state, 'unasked');
+      assert.deepEqual(h.stored(), [], 'and no notice');
     } finally { await h.f.close(); }
   });
 
@@ -462,6 +492,7 @@ describe('wake onboarding: the host', () => {
     const h = await games({ policies: [{ name: 'editor-quiet', match: { source: 'editor' }, behavior: 'defer' }, CATCH_ALL] });
     try {
       await h.push('Your move.', ['surface:turn']);
+      assert.ok(h.traces.some((e) => e.type === 'gate:decision' && e.matchedPolicy === 'editor-quiet'), 'premise: the rule decided the event');
       assert.equal(h.stored().length, 0);
       // The file is there from the first start, and holds no decision.
       assert.deepEqual(JSON.parse(readFileSync(h.decisionsPath, 'utf8')), { servers: {} });
