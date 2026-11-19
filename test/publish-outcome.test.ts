@@ -450,9 +450,9 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     const [uncertain, failed] = markers();
     assert.match(uncertain!, /was not confirmed/);
     assert.match(uncertain!, /may or may not have been posted/);
-    assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted/);
+    assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted|posted nothing/);
     assert.match(failed!, /could not be delivered/);
-    assert.match(failed!, /Nothing was posted/);
+    assert.match(failed!, /The framework posted nothing there/);
     // About 10 KB, long enough for a poll to read it half written.
     await turn('error', 3, { posted: ['111'], note: 'x'.repeat(10_000) }, true);
     const partial = markers()[2]!;
