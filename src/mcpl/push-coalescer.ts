@@ -261,11 +261,10 @@ interface SubjectState<E> {
   /** The agent's first view of the subject has ended: an occupant that may
    *  have been shown left it without handing a first view on
    *  (occupantLeaves, endFirstView). No later batch or birth of the subject
-   *  is a first view while the coalescer keeps this record. An idle
-   *  subject's record can be evicted (prune), and an `initial` occurrence
-   *  after that starts the subject afresh. */
+   *  is a first view while the coalescer keeps this record. A subject's
+   *  record can be evicted (prune), and an `initial` occurrence after that
+   *  starts the subject afresh. */
   firstViewEnded?: true;
-  touchedAt: number;
 }
 
 interface ReceiptEntry {
@@ -736,7 +735,7 @@ export class PushCoalescer<E = unknown> {
     if (occurrence.scope.kind === 'channel' && occurrence.identity && !occurrence.retract) {
       state.identity = mergeIdentity(state.identity, occurrence.identity);
     }
-    state.touchedAt = this.now();
+    this.touch(subject, state);
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
     // The effects are done, so the receipt is kept whatever its record's
@@ -789,7 +788,7 @@ export class PushCoalescer<E = unknown> {
     if (!state) {
       // §3.3: an untracked subject is `unknown` unless the producer marks the
       // birth of the subject. A retraction is never a birth.
-      state = { history: occurrence.initial && !occurrence.retract ? 'none' : 'unknown', touchedAt: this.now() };
+      state = { history: occurrence.initial && !occurrence.retract ? 'none' : 'unknown' };
       this.subjects.set(subject, state);
     }
     return state;
@@ -1381,7 +1380,6 @@ export class PushCoalescer<E = unknown> {
         identity: s.identity,
         audienceAgent: s.audienceAgent ?? s.occupant?.placement.agent,
         ...(s.firstViewEnded ? { firstViewEnded: true as const } : {}),
-        touchedAt: now,
       };
       if (s.batch) {
         // An interrupted render is not replayed (§3.2): a batch that was
@@ -1424,7 +1422,7 @@ export class PushCoalescer<E = unknown> {
       const fresh = now - r.at <= this.retryWindowMs;
       if (fresh) {
         this.receipts.set(r.key, { result: r.result, at: r.at, committed: true });
-        if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born, touchedAt: now });
+        if (r.born && !this.subjects.has(r.subject)) this.subjects.set(r.subject, { history: r.born });
       }
       // A first view's end is a fact about the subject, which holds while the
       // coalescer keeps it, not about the receipt, whose retry window says
@@ -1436,7 +1434,7 @@ export class PushCoalescer<E = unknown> {
       if (r.firstViewEnded) {
         const ended = this.subjects.get(r.subject);
         if (ended) this.endFirstView(ended);
-        else this.subjects.set(r.subject, { history: 'unknown', touchedAt: now, firstViewEnded: true });
+        else this.subjects.set(r.subject, { history: 'unknown', firstViewEnded: true });
       }
       if (!fresh) continue;
       // A birth fact is not proof the subject is still unread: the plain
@@ -1445,7 +1443,7 @@ export class PushCoalescer<E = unknown> {
       let eventId: string | undefined;
       try { eventId = JSON.parse(r.key)[2]; } catch { /* malformed key: no settlement */ }
       if (eventId && this.host.wasPublished?.(r.subject, eventId)) {
-        const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
+        const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const };
         state.history = 'some';
         state.consumedEventId = eventId;
         this.subjects.set(r.subject, state);
@@ -1456,7 +1454,7 @@ export class PushCoalescer<E = unknown> {
       // replacement that cleared it. Its render may have started before the
       // record was written (a retry's record) or after, and the snapshot
       // cannot say whether it ran: take the fallback.
-      const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
+      const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const };
       state.batch = r.batch
         ? { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true }
         : undefined;
@@ -1498,15 +1496,24 @@ export class PushCoalescer<E = unknown> {
 
   private persist(): void { this.host.save(() => this.snapshot()); }
 
+  private touch(subject: string, state: SubjectState<E>): void {
+    this.subjects.delete(subject);
+    this.subjects.set(subject, state);
+  }
+
   private prune(): void {
     const now = this.now();
-    if (this.receipts.size > 4 * this.maxSubjects) {
-      for (const [key, entry] of this.receipts) if (now - entry.at > this.retryWindowMs) this.receipts.delete(key);
+    for (const [key, entry] of this.receipts) {
+      if (now - entry.at <= this.retryWindowMs) break;
+      this.receipts.delete(key);
     }
-    if (this.subjects.size <= this.maxSubjects) return;
-    // Evict the oldest idle subjects; their history degrades to `unknown`
-    // (an untracked subject) which is the conservative outcome (§3.3).
-    const idle = [...this.subjects].filter(([, s]) => !s.occupant && !s.batch && !s.rendering).sort((a, b) => a[1].touchedAt - b[1].touchedAt);
-    for (const [key] of idle.slice(0, Math.max(0, this.subjects.size - this.maxSubjects))) this.subjects.delete(key);
+    let over = this.subjects.size - this.maxSubjects;
+    for (const [subject, state] of this.subjects) {
+      if (over <= 0) return;
+      if (state.batch || state.rendering) continue;
+      if (state.occupant && this.refreshOccupant(state)) { this.touch(subject, state); return; }
+      this.subjects.delete(subject);
+      over--;
+    }
   }
 }
