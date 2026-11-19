@@ -474,7 +474,7 @@ export async function createOfflineRecoveryBranch(
   }
 }
 
-const RECOVERY_SCAN_WINDOW = 1_000;
+export const RECOVERY_SCAN_WINDOW = 1_000;
 type StoredWindowMessage = ReturnType<ContextManager['getMessageWindow']>['messages'][number];
 
 interface SuppressionInterval {
@@ -740,10 +740,10 @@ function validateAnchorBoundary(
   }
 }
 
-function validateRemovalIntegrity(
-  contextManager: ContextManager,
+export function validateRemovalIntegrity(
+  contextManager: Pick<ContextManager, 'getMessageWindow'>,
   total: number,
-  intervals: SuppressionInterval[],
+  intervals: ReadonlyArray<Pick<SuppressionInterval, 'start' | 'end'>>,
 ): void {
   if (intervals.length === 0) return;
   // Sorted starts with each one's running furthest end, searched per row: a

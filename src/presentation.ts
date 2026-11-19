@@ -68,7 +68,8 @@ import { audienceOf, heldFromResidents, observedRowFor, suppressedRow } from './
 import { sameSlot, type AgentRegistry } from './dendrite/registry.js';
 import type { AgentName, AgentRecord, MessageSlotRef, ObserveEdge } from './dendrite/types.js';
 import type { WindowOrdinal } from './read-marks.js';
-import { isAnotherAgentsInjection } from './stored-injections.js';
+import { isAnotherAgentsContext } from './stored-injections.js';
+import { isDeclarationRow } from './system-changes.js';
 import { nameAsStored } from './text-as-stored.js';
 import type { PresentationRetractReason, TraceEventInput } from './types/trace.js';
 
@@ -79,15 +80,19 @@ export { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 // ============================================================================
 
 /** Whether a stored row can join a live stream at a tool boundary: no tool
- *  blocks (the membrane's tool cycle) and not named as the agent itself (it
- *  would render as an assistant turn, a prefill). The #286 cut. */
+ *  blocks (the membrane's tool cycle), not named as the agent itself (it
+ *  would render as an assistant turn, a prefill), and no change of tools or
+ *  system text, which the next start's request folds with its head
+ *  (isDeclarationRow), where the live stream would carry it beside a head it
+ *  doesn't fold to. The #286 cut. */
 export function isInjectableMidTurn(msg: { participant: string; content: ContentBlock[] }, agent: { isOwnParticipant(participant: string): boolean }): boolean {
   // Exact, as membrane's role test is: a participant the request assigns
   // the assistant role (the agent's name, and for a derived agent the
   // voice it inherited) renders as the assistant. It's the name as sent,
   // which the boundary takes as the store keeps it.
   return !agent.isOwnParticipant(nameAsStored(msg.participant))
-    && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result');
+    && !msg.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result')
+    && !isDeclarationRow(msg);
 }
 
 /** What later compiles render from the store for the copies of one write
@@ -275,15 +280,15 @@ export function bearingOf(
   if (stamp) {
     if (stamp.ownRowOf !== undefined) {
       if (stamp.ownRowOf === reader.name) return 'own';
-      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsInjection(metadata, reader.name) ? 'arrival' : 'elsewhere';
+      return observesInOwnSlot(reader, stamp.ownRowOf) && !isAnotherAgentsContext(metadata, reader.name) ? 'arrival' : 'elsewhere';
     }
     if (!stamp.audience.includes(reader.name)) return 'elsewhere';
-    if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
+    if (isAnotherAgentsContext(metadata, reader.name)) return 'elsewhere';
     return reader.hidesHeld && heldFromResidents(metadata) ? 'elsewhere' : 'arrival';
   }
   if (reader.derivedAt !== undefined && row.sequence <= reader.derivedAt) return 'elsewhere';
   if (reader.hidesHeld && heldFromResidents(metadata)) return 'elsewhere';
-  if (isAnotherAgentsInjection(metadata, reader.name)) return 'elsewhere';
+  if (isAnotherAgentsContext(metadata, reader.name)) return 'elsewhere';
   return 'arrival';
 }
 
@@ -929,7 +934,7 @@ export class AgentPresentation {
    * the stream can't carry injected rows (`injects` false), the agent's own
    * rows not in its window and its arrivals, by bodies in record order, up
    * to the first body the stream can't carry (isInjectableMidTurn: a tool
-   * block, or a row named as the agent), presented in one call: each body
+   * block, a row named as the agent, or a change of tools or system text), presented in one call: each body
    * whole, named by its first shard not in the window. Those are what the
    * stream carries next (`heard`); the cut body and those after it wait for
    * the turn's end. A presentation cut short hears only the bodies wholly in

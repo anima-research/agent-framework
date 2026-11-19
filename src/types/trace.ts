@@ -121,6 +121,74 @@ export type TraceEvent =
       stack?: string;
     })
   | (TraceEventBase & {
+      type: 'head:declared';
+      agentName: string;
+      /** Tools the change withdrew and offered, by name. */
+      removed: string[];
+      defined: string[];
+      /** Blocks of system text it added. */
+      addedSystem: number;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** What moved the head to what's current: the first request on a
+       *  model that takes a change, or the first after a rewind to before a
+       *  head was recorded ('adopted'); a replacement of system text
+       *  ('replaced'); a compile refused over budget, or
+       *  for dropping messages no summary covers, with change rows kept
+       *  ('budget'); or a request on a model that takes none, or kept to its
+       *  head, that found change rows to take out ('on-head'). A move other
+       *  than 'on-head' is one whole write, unless the provider's cache
+       *  holds the new head already, as at the first request after an
+       *  upgrade. At 'budget', with
+       *  `thinkingBinding.binds: true`, the request's thinking is left out.
+       *  With `binds` left out, the requests after it still carry it: with
+       *  `dropBlock` the provider drops it, and without it an account that
+       *  enforces the binding refuses them, and one that doesn't decides for
+       *  itself. */
+      why: 'adopted' | 'replaced' | 'budget' | 'on-head';
+      /** The change rows removed, since the head now holds what they
+       *  declared, or what they declared is no longer current. */
+      changesRemoved: number;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** A change row the store didn't take, as between a tool call and its result: one whole write. */
+      why: 'unstored';
+      changesRemoved: number;
+      /** Why the store didn't take it: the write's message, bounded as every trace event's `error` is (2,000
+       *  characters). context-manager's refusal of a change between a tool call and its result is one such message. */
+      error: string;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** A move for cost: carrying the tool definitions a move takes out had
+       *  cost about as much in cache reads as the move costs at this compile.
+       *  It never sets kept thinking aside. */
+      why: 'cost';
+      changesRemoved: number;
+      /** The rule's figures, each an estimate: what carrying had cost, in
+       *  characters read (`carried`); the cache write price over the read
+       *  price, less one (`k`); and what the move writes that the request
+       *  would otherwise read, in characters (`extraNow`). The head moved as
+       *  `carried` reached `k * extraNow`. */
+      estimated: { carried: number; k: number; extraNow: number };
+    })
+  | (TraceEventBase & {
+      /** A request that carried a system change was refused, so the agent keeps to its head until it is built again. */
+      type: 'head:resend';
+      agentName: string;
+      /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
+      error: string;
+      /** What took the change as the cause: membrane, which marked the refusal as the change's, so the request goes
+       *  again on the head; or a retry of the request in the fallback form, its change rows left out, which was
+       *  accepted after a 400 membrane didn't mark. */
+      diagnosis: 'membrane' | 'retry';
+    })
+  | (TraceEventBase & {
       /**
        * A turn waiting out its error policy's delay before a retry says so:
        * as the wait begins, with when it is due to end, and again every 60
@@ -1572,8 +1640,10 @@ export type TraceEvent =
        * window only: the rows it removed leave this agent's window too, each
        * at its own place, so no other row's place moves (`hide`, `suppress` on its
        * fork, a coalescer's `coalescer`, a module's `module`, a suppression
-       * a start finished, `resume`, and a refusal rewind's shed from a
-       * window that is still the record, `rewind`), or that no live context
+       * a start finished, `resume`, a refusal rewind's shed from a window
+       * that is still the record, `rewind`, and the system changes a move of
+       * an agent's head took out, `head-moved`, the `head:moved` trace
+       * after it saying why), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
        * agent's own window as an undone turn's do, and stay in the record.
@@ -1629,7 +1699,7 @@ export type TraceEvent =
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */
-export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection';
+export type PresentationRetractReason = 'hide' | 'suppress' | 'coalescer' | 'module' | 'resume' | 'rewind' | 'shed' | 'boot' | 'elsewhere' | 'unsent-injection' | 'head-moved';
 
 /**
  * Listener for trace events.

@@ -83,6 +83,12 @@ export class RoutedMembrane {
     return createMockResponse([{ type: 'text', text: this.completion }]);
   }
 
+  takesChanges = false;
+
+  takesToolOrSystemChanges(_model: string): boolean {
+    return this.takesChanges;
+  }
+
   asMembrane(): import('@animalabs/membrane').Membrane {
     return this as unknown as import('@animalabs/membrane').Membrane;
   }

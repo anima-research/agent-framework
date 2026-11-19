@@ -116,6 +116,12 @@ export class WireMembrane {
     return this.complete(request);
   }
 
+  takesChanges = false;
+
+  takesToolOrSystemChanges(_model: string): boolean {
+    return this.takesChanges;
+  }
+
   asMembrane(): Membrane {
     return this as unknown as Membrane;
   }

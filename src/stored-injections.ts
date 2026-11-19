@@ -24,11 +24,13 @@
  * naming the agent whose context it is and its source's namespace, so a
  * reader can tell it from conversation, and so another agent reading the
  * same slot leaves it out (AgentFramework's view filters). All three are
- * keys only the host writes.
+ * keys only the host writes. A system change row (system-changes.ts) is its
+ * agent's context too, and contextAgentOf names that agent for both.
  */
 
 import type { ContextInjection } from '@animalabs/context-manager';
 import { stableHash } from './stable-hash.js';
+import { SYSTEM_CHANGE_KIND } from './system-changes.js';
 import { injectionsAsStored } from './text-as-stored.js';
 
 /** The metadata key a stored injection's row is marked with. */
@@ -77,18 +79,20 @@ export function storedInjectionMarkOf(metadata: unknown): StoredInjectionMark | 
     : undefined;
 }
 
-/** Whether a row is another agent's stored injection, which `agentName`'s
- *  view leaves out: it's that agent's context, not conversation. */
-export function isAnotherAgentsInjection(metadata: unknown, agentName: string): boolean {
-  const mark = storedInjectionMarkOf(metadata);
-  return mark !== undefined && mark.agent !== agentName;
+export function contextAgentOf(metadata: unknown): string | undefined {
+  const injection = storedInjectionMarkOf(metadata);
+  if (injection) return injection.agent;
+  if (metadata === null || typeof metadata !== 'object' || !('kind' in metadata) || metadata.kind !== SYSTEM_CHANGE_KIND) return undefined;
+  return 'agent' in metadata && typeof metadata.agent === 'string' ? metadata.agent : undefined;
 }
 
-/** Whether a row is `agentName`'s own stored injection: its context, which
- *  its view keeps however the rest is read, as a shared fork's does, whose
- *  view is otherwise its source's (AgentFramework's deriveSharedContext). */
-export function isOwnInjection(metadata: unknown, agentName: string): boolean {
-  return storedInjectionMarkOf(metadata)?.agent === agentName;
+export function isAnotherAgentsContext(metadata: unknown, agentName: string): boolean {
+  const agent = contextAgentOf(metadata);
+  return agent !== undefined && agent !== agentName;
+}
+
+export function isOwnContext(metadata: unknown, agentName: string): boolean {
+  return contextAgentOf(metadata) === agentName;
 }
 
 /**

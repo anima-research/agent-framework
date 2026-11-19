@@ -1,20 +1,43 @@
 import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
-import { isAbortedResponse } from '@animalabs/membrane';
+import type { Membrane, ModelPricing, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
+import { isAbortedResponse, isSystemChangeContent } from '@animalabs/membrane';
+import { createHash } from 'node:crypto';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
-import { storeOwnRow } from './dendrite/audience.js';
+import { storeOwnRow, storedOfThrownWrite } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
 import { carriedBlock, type SentRow } from './sent-rows.js';
 import { foreignRowAsSent, transcribeForeignRounds } from './foreign-rounds.js';
 import { injectionsAsStored } from './text-as-stored.js';
+import { removeStoredMessage } from './stored-removal.js';
 import { stableHash } from './stable-hash.js';
-import { hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
+import { contextAgentOf, hasRenderedContent, storedInjectionMarkOf } from './stored-injections.js';
 import { covers, markAtOrAfter, readMarkOf, storeHeadOf, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
+import {
+  SYSTEM_CHANGE_PARTICIPANT,
+  declarationDifference,
+  effectiveDeclaration,
+  isSystemChangeMessage,
+  memoryHeadDeclarations,
+  declarationRowIds,
+  heldDeclarations,
+  isDeclarationRow,
+  systemChangeMetadata,
+  systemTextOf,
+  copyHead,
+  carriedCharacters,
+  requestCharacters,
+  storedRequestCount,
+  type CostFigures,
+  type DeclarationDifference,
+  type HeadDeclaration,
+  type HeadDeclarationStore,
+  type HeadEvent,
+} from './system-changes.js';
 import {
   CONTINUE_ROW,
   continueTurn,
@@ -58,6 +81,11 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
+  /** The request goes in the fallback form, on the agent's current tools and
+   *  system text with every declaration row left out of its messages, and
+   *  declares nothing: it stores no row and moves no head for its changes.
+   *  @internal For the framework's fail-safe; not a host API. */
+  changesLeftOut?: true;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -93,7 +121,7 @@ export interface StartStreamResult {
   /** The request-only `[Continue]` prompt this request's reply follows, if
    *  any, read from the request: a new one when it ends on `[Continue]`;
    *  else, when it ends on tool results, or on tool results and then
-   *  stored context injections alone, the prompt of the reply that called
+   *  stored context injections and system changes alone, the prompt of the reply that called
    *  those tools (`toolLoopPrompt`); else none. The framework stamps the
    *  reply's rows with it (`metadata.promptedBy`), for later compiles to
    *  render it before them. */
@@ -155,15 +183,36 @@ import type {
 } from './types/index.js';
 
 
-/**
- * Whether a request's messages, as sanitized, end on `agentName`'s own
- * message, apart from `injectionTail` stored context injections after it
- * (counted over the messages the sanitizer keeps).
- */
-function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, injectionTail: number): boolean {
-  const own = messages[messages.length - 1 - injectionTail];
+function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, contextTail: number): boolean {
+  const own = messages[messages.length - 1 - contextTail];
   return own !== undefined && own.participant === agentName
-    && messages.slice(messages.length - injectionTail).every((m) => m.participant.startsWith('system_context:'));
+    && messages.slice(messages.length - contextTail).every((m) => m.participant.startsWith('system_context:') || isSystemChangeMessage(m));
+}
+
+// membrane answers from 0.10.4 on. An earlier membrane, which this package's
+// range admits, has no answer, and its agents take no change. membrane
+// gives its prices from 0.10.4 on too, with a 1-hour write rate: before
+// that, no agent's head moves for cost.
+type ChangeAnswering = Pick<Membrane, 'stream'> & {
+  takesToolOrSystemChanges?(model: string): boolean;
+  pricingFor?(model: string): (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined;
+};
+
+type Move = { why: 'adopted' | 'replaced' } | { why: 'unstored'; error: string } | { why: 'cost'; estimated: CostFigures };
+
+type ChangesIn = 'declared' | 'on-head' | 'left-out';
+
+type Settled = { compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage; leftOut?: true };
+
+type Compiles = {
+  compile(head: HeadDeclaration, leftOut?: boolean): Promise<CompileResult>;
+  onHead(compiled: CompileResult, head: HeadDeclaration): Promise<CompileResult>;
+};
+
+// membrane's request leaves out a tool field whose value is undefined.
+function headHash(head: HeadDeclaration): string {
+  const tools = head.tools.length > 0 ? JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[] : undefined;
+  return stableHash({ tools, system: systemTextOf(head.system) });
 }
 
 /** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
@@ -189,7 +238,8 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
       `${setting}.binds`,
       value.binds,
       'true says the model binds its signed thinking to the conversation before it, so each compile tells the context manager so, ' +
-        'and false or leaving it out compiles as before',
+        'false says it doesn\'t, and leaving it out declares neither: compiles are as before, and a choice that could set kept ' +
+        'thinking aside is made as for a model that binds',
     );
   }
 }
@@ -392,6 +442,14 @@ export class Agent {
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
   readonly promptCaching: boolean;
+  /** Whether the model may bind its thinking, as a choice that could set kept
+   *  thinking aside reads it: true unless `thinkingBinding.binds` is false. */
+  readonly mayBindThinking: boolean;
+  private headUntilBuiltAgain = false;
+  private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations(() => this.contextManager.currentBranch().id);
+  private onHeadEvent: ((event: HeadEvent) => void) | undefined;
+  private onChangesRemoved: ((ids: readonly MessageId[]) => void) | undefined;
+  private requestsCounted: (() => number | undefined) | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
   readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
@@ -534,6 +592,7 @@ export class Agent {
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching !== false;
     this.pinsTurnInputs = config.turnInputsPin !== false;
+    this.mayBindThinking = config.thinkingBinding?.binds !== false;
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
@@ -652,6 +711,11 @@ export class Agent {
   private foreignRoundsAsSent(messages: NormalizedMessage[]): NormalizedMessage[] {
     if (this.foreignRounds !== 'transcript') return messages;
     return transcribeForeignRounds(messages, (participant) => this.isOwnParticipant(participant));
+  }
+
+  private rowsAsSent(messages: readonly NormalizedMessage[]): NormalizedMessage[] {
+    const carried = this.foreignRoundsAsSent([...messages]).map((m) => ({ ...m, content: m.content.filter(carriedBlock) }));
+    return this.presentOwnTurns(withoutTokenEstimates(carried));
   }
 
   /**
@@ -1746,7 +1810,7 @@ export class Agent {
   /** Record which of this agent's stored injections a compile built to send
    *  rendered. Another agent's stored rows never reach this agent's compile,
    *  since every compile of a shared store leaves them out by its view
-   *  filter (isAnotherAgentsInjection): a compile of a shared store without
+   *  filter (isAnotherAgentsContext): a compile of a shared store without
    *  that filter would mix them in here. */
   private noteRenderedInjections(result: CompileResult): void {
     // The host's look at what this request carries (onCompiledToSend).
@@ -1999,28 +2063,40 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const binding = this.bindingCompileOptions(tools, (injections ?? [])
-      .filter((injection) => injection.position === 'system')
-      .flatMap((injection) => injection.content));
+    const recorded = this.takesChanges() ? this.headDeclarations.read(this.name) : null;
+    const compileBound = (binding: BindingCompileOptions) => this.toolResultGuard.afterAnnotations(
+      () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
     const assemble = async (): Promise<NormalizedRequest> => {
-      const compiled = await this.toolResultGuard.afterAnnotations(
-        () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
+      let compiled = await compileBound(this.bindingCompileOptions(recorded ?? this.currentHead(tools, (injections ?? [])
+        .filter((injection) => injection.position === 'system')
+        .flatMap((injection) => injection.content))));
+      let current = this.currentHead(tools, compiled.systemInjections);
+      let held = heldDeclarations(compiled);
+      const onRecorded = recorded !== null && this.declaredDifference(compiled, held, recorded, current).difference.kind === 'none';
+      if (!onRecorded && (recorded !== null || held.size > 0) && this.thinkingBindingOption()) {
+        compiled = await compileBound(this.bindingCompileOptions(current, true));
+        current = this.currentHead(tools, compiled.systemInjections);
+        held = heldDeclarations(compiled);
+      }
       // What it holds of the stored injections is what the agent last saw.
       this.noteRenderedInjections(compiled);
-      const { systemInjections } = compiled;
       // The framework's own pricing stamp never goes out (thinking-token-stamp.ts);
       // the agent's own turns are then presented under its name (presentOwnTurns).
-      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(compiled.messages)));
+      const carried = onRecorded ? compiled.messages
+        : compiled.messages.filter((_, i) => !held.has(i));
+      const messages = this.presentOwnTurns(this.foreignRoundsAsSent(withoutTokenEstimates(carried)));
       // Read once, after the first compile, since results may have become
       // ready while it ran; the refusal retry, assembled while the agent is
       // inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
       appendAll(messages, unguardedResults);
+      const recordedHead = onRecorded && recorded ? copyHead(recorded) : undefined;
+      const sentTools = recordedHead ? recordedHead.tools : tools;
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
-        system: this.buildSystemPrompt(systemInjections),
-        tools: tools.length > 0 ? tools : undefined,
+        system: recordedHead ? systemTextOf(recordedHead.system) : this.buildSystemPrompt(compiled.systemInjections),
+        tools: sentTools.length > 0 ? sentTools : undefined,
         ...this.requestSettings(),
         assistantParticipant: this.presentAs,
       };
@@ -2175,35 +2251,62 @@ export class Agent {
     const prospectiveSystemInjections = (injections ?? [])
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
-    const immutablePrefixHash = kvUnified
-      ? stableHash({
-          tools: availableTools.length > 0 ? availableTools : undefined,
-          system: this.buildSystemPrompt(prospectiveSystemInjections),
-        })
-      : undefined;
-    const binding = this.bindingCompileOptions(availableTools, prospectiveSystemInjections);
-    const compiledResult = await this.compileWithInjections(
-      budget,
-      injections,
-      immutablePrefixHash || options.dryRun || binding.thinkingBinding
-        ? {
-            ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
-            ...(options.dryRun ? { dryRun: true } : {}),
-            ...binding,
-          }
-        : undefined,
+    const takes = this.takesChanges();
+    let record = takes ? this.headDeclarations.read(this.name) : null;
+    const compiledFor = new WeakMap<CompileResult, HeadDeclaration>();
+    const compile = async (head: HeadDeclaration, leftOut = false) => {
+      const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
+      const binding = this.bindingCompileOptions(head, leftOut);
+      const result = await this.compileWithInjections(
+        budget,
+        injections,
+        immutablePrefixHash || options.dryRun || binding.thinkingBinding
+          ? {
+              ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
+              ...(options.dryRun ? { dryRun: true } : {}),
+              ...binding,
+            }
+          : undefined,
+      );
+      compiledFor.set(result, head);
+      return result;
+    };
+    // kv-unified's hash, and with `binds: true` the thinking-binding record, are of the head a compile was told.
+    const onHead = async (compiled: CompileResult, head: HeadDeclaration) => {
+      const told = compiledFor.get(compiled);
+      return !(kvUnified || this.thinkingBinds) || (told !== undefined && headHash(told) === headHash(head)) ? compiled : compile(head);
+    };
+    const changes: ChangesIn = options.changesLeftOut ? 'left-out' : takes ? 'declared' : 'on-head';
+    let compiledWith = (changes === 'left-out' ? null : record) ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    let first: CompileResult;
+    try {
+      first = await compile(compiledWith);
+    } catch (error) {
+      if (options.dryRun) throw error;
+      compiledWith = this.takeChangesOverBudget(error, takes, record, this.currentHead(availableTools, prospectiveSystemInjections));
+      if (takes) record = this.headDeclarations.read(this.name);
+      first = await compile(compiledWith);
+    }
+    const settled = await this.settleHead(
+      first,
+      availableTools,
+      record,
+      changes,
+      options.dryRun === true,
+      { compile, onHead },
+      options.appendedMessages ?? [],
     );
+    const compiledResult = settled.compiled;
     let { messages } = compiledResult;
-    const { systemInjections } = compiledResult;
     // It counts what the compile selected, so a preview's stand-ins
     // (appendedMessages, below) aren't in it.
     const { renderStats } = compiledResult;
     // What the request is built from, as the compile returned it: a block the provider drops is found again in
     // it, through the copies below, by its signature (placeThinkingDrops).
-    const recordedAfter = compiledResult.thinkingRecordedAfter;
+    const recordedAfter = settled.compiled.thinkingRecordedAfter;
     const compiled: CompiledForRequest = {
-      messages: compiledResult.messages,
-      ...(compiledResult.provenance ? { provenance: compiledResult.provenance } : {}),
+      messages: settled.compiled.messages,
+      ...(settled.compiled.provenance ? { provenance: settled.compiled.provenance } : {}),
       ...(recordedAfter !== undefined ? { recordedAfter } : {}),
     };
     // Each message's place in the compile, or a preview's stand-in (null),
@@ -2225,18 +2328,16 @@ export class Agent {
       origin = [...origin.slice(0, at), ...appended.map(() => null), ...origin.slice(at)];
       messages = [...messages.slice(0, at), ...appended, ...messages.slice(at)];
     }
-    // The stored context injections the request ends on, counted over the
-    // messages the sanitizer below keeps (hasRenderedContent), since it drops
-    // a message it leaves empty, a placed blank injection among them.
-    // [Continue] goes after them, and a tool loop's prompt is read from
-    // before them: they're context, not what woke the agent. An injection
-    // compile() places ends the tail, as on main, where every one was placed.
-    let injectionTail = 0;
+    let contextTail = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (!hasRenderedContent(messages[i]!.content)) continue;
+      if (isSystemChangeMessage(messages[i]!)) {
+        if (!settled.leftOut || !isDeclarationRow(messages[i]!)) contextTail++;
+        continue;
+      }
       const from = origin[i] ?? null;
       if (from !== null && !this.isStoredInjectionRow(compiledResult, from)) break;
-      injectionTail++;
+      contextTail++;
     }
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
@@ -2251,15 +2352,12 @@ export class Agent {
     // compression path.)
     // The same pass a tool boundary applies to what it notes as sent
     // (sent-rows.ts), so the two can't drift.
-    // Another agent's rounds go out as this agent is sent them (setForeignRounds).
-    messages = this.foreignRoundsAsSent(messages);
-    messages = messages
-      .map((m) => ({ ...m, content: m.content.filter(carriedBlock) }))
-      .filter((m) => m.content.length > 0);
-    // The framework's own pricing stamp never goes out (thinking-token-stamp.ts).
-    messages = withoutTokenEstimates(messages);
-
-    messages = this.presentOwnTurns(messages);
+    messages = this.rowsAsSent(messages).filter((m) => m.content.length > 0);
+    if (settled.leftOut) messages = messages.filter((m) => !isDeclarationRow(m));
+    if (settled.declared) {
+      messages = [...messages, settled.declared];
+      contextTail++;
+    }
 
     // Silent heartbeat ticks and replies to a [Continue] turn store no
     // prompt row. Render each request-only turn before its response's first
@@ -2282,15 +2380,15 @@ export class Agent {
 
     // The [Continue] prompt this request's reply follows, read from the
     // request itself: a new one when it ends on [Continue]; else, when it
-    // ends on tool results (apart from stored context injections after
-    // them), the prompt of the reply that called those tools, whose tool
+    // ends on tool results (apart from stored context injections and system
+    // changes after them), the prompt of the reply that called those tools, whose tool
     // loop this reply continues; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.
     let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
-    } else if (endsOnOwnMessage(messages, this.presentAs, injectionTail)) {
+    } else if (endsOnOwnMessage(messages, this.presentAs, contextTail)) {
       // Safety: ensure messages don't end with an assistant message.
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
@@ -2302,19 +2400,18 @@ export class Agent {
       messages = [...messages, continueTurn()];
       continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
     } else {
-      // What the request ends on apart from the stored injections after it,
-      // which aren't something the reply answers.
-      continuePrompt = toolLoopPrompt(messages.at(-1 - injectionTail), index);
+      continuePrompt = toolLoopPrompt(messages.at(-1 - contextTail), index);
     }
 
     const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
-      system: this.buildSystemPrompt(systemInjections),
-      tools: availableTools.length > 0 ? availableTools : undefined,
+      system: systemTextOf(settled.head.system),
+      tools: settled.head.tools.length > 0 ? copyHead(settled.head).tools : undefined,
       ...this.requestSettings(),
       ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
     };
     if (options.dryRun) dryCompileStats.set(request, renderStats);
+    const binding = this.bindingCompileOptions(settled.head, settled.leftOut === true);
     return { request, ...(continuePrompt ? { continuePrompt } : {}), compiled, binding };
   }
 
@@ -2389,25 +2486,22 @@ export class Agent {
    * (`thinkingBinding.binds`): the binding as set, with the agent's own name as the participant whose messages
    * are its replies (an agent stores its replies under its name), and a digest of each part of the request ahead of
    * its messages, so a changed one can stand for a first difference where the context manager keeps a
-   * thinking-binding record. The system text is the one the request will carry, built from the system-position
-   * injections given to the compile as the kv-unified prefix hash builds it; the tools are the ones it will carry, in
-   * their order; `request` covers the thinking config, `maxTokens` and `providerParams`, where a host puts its own
-   * thinking config and `tool_choice`, and `prefillUserMessage`, which membrane sends as a leading user turn ahead
-   * of a conversation that would begin with the assistant. Nothing without `binds`: the compile is as it was.
+   * thinking-binding record. Nothing without `binds`: the compile is as it was.
    */
-  private bindingCompileOptions(tools: readonly ToolDefinition[], systemInjections: ContentBlock[]): BindingCompileOptions {
+  private bindingCompileOptions(head: HeadDeclaration, changesLeftOut = false): BindingCompileOptions {
     const thinkingBinding = this.thinkingBindingOption();
     if (!thinkingBinding) return {};
     const { config, providerParams, prefillUserMessage } = this.requestSettings();
     return {
       thinkingBinding,
       identity: {
-        system: wireDigest(this.buildSystemPrompt(systemInjections)),
-        tools: wireDigest(tools),
+        system: wireDigest(systemTextOf(head.system)),
+        tools: wireDigest(head.tools),
         model: wireDigest(this.model),
         request: wireDigest({
           thinking: config.thinking ?? null, maxTokens: config.maxTokens, providerParams: providerParams ?? null,
           prefillUserMessage: prefillUserMessage ?? null,
+          ...(changesLeftOut ? { changesLeftOut } : {}),
         }),
       },
     };
@@ -2797,16 +2891,270 @@ export class Agent {
    * and the module registry tells a module's once per module and namespace.
    */
   private buildSystemPrompt(systemInjections: ContentBlock[]): string {
-    if (systemInjections.length === 0) {
-      return this.systemPrompt;
+    return systemTextOf(this.systemBlocks(systemInjections));
+  }
+
+  private systemBlocks(systemInjections: ContentBlock[]): string[] {
+    return [
+      this.systemPrompt,
+      ...systemInjections.map((block) =>
+        block.type === 'text'
+          ? block.text
+          : `[${NOTICE_TAG.blockNotShown}: ${/^[aeiou]/i.test(block.type) ? 'an' : 'a'} ${block.type} block; the system prompt carries text only.]`),
+    ];
+  }
+
+  private currentHead(tools: ToolDefinition[], systemInjections: ContentBlock[]): HeadDeclaration {
+    return { tools, system: this.systemBlocks(systemInjections) };
+  }
+
+  /** Whether this agent's request may declare a change in its context:
+   *  membrane takes one for its model (Membrane.takesToolOrSystemChanges),
+   *  and no refusal keeps it to its head (keepToHeadUntilBuiltAgain).
+   *  @internal For the framework's turns and fail-safe; not a host API. */
+  takesChanges(): boolean {
+    const membrane: ChangeAnswering = this.membrane;
+    return !this.headUntilBuiltAgain && membrane.takesToolOrSystemChanges?.(this.model) === true;
+  }
+
+  /** The framework's record of heads, its traces of what moved them, where the change rows a move takes out go (the removal funnel, #291), and the agent's count of answered requests, which the rule for cost reads: undefined for an agent whose head never moves for cost.
+   *  @internal For the framework's head store; not a host API. */
+  attachHeadDeclarations(
+    store: HeadDeclarationStore,
+    onEvent?: (event: HeadEvent) => void,
+    onChangesRemoved?: (ids: readonly MessageId[]) => void,
+    requestsCounted?: () => number | undefined,
+  ): void {
+    this.headDeclarations = store;
+    this.onHeadEvent = onEvent;
+    this.onChangesRemoved = onChangesRemoved;
+    this.requestsCounted = requestsCounted;
+  }
+
+  /** The fail-safe: declare on the head until this agent is built again.
+   *  @internal For the framework's fail-safe; not a host API. */
+  keepToHeadUntilBuiltAgain(): void {
+    this.headUntilBuiltAgain = true;
+  }
+
+  private async settleHead(
+    compiled: CompileResult,
+    availableTools: ToolDefinition[],
+    record: HeadDeclaration | null,
+    changes: ChangesIn,
+    dryRun: boolean,
+    compiles: Compiles,
+    previewRows: readonly NormalizedMessage[],
+  ): Promise<Settled> {
+    const current = this.currentHead(availableTools, compiled.systemInjections);
+    if (changes === 'left-out') return this.withoutDeclarationRows(compiled, current, compiles, previewRows);
+    if (changes === 'on-head') return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compiles), current, compiles, previewRows);
+    const settled = await this.settleOnRecord(compiled, current, record, dryRun, compiles, previewRows);
+    const out = effectiveDeclaration(settled.head, [...settled.compiled.messages, ...previewRows, ...(settled.declared ? [settled.declared] : [])]
+      .filter(isDeclarationRow).flatMap((message) => message.content.filter(isSystemChangeContent)));
+    if (declarationDifference(out, current).kind === 'none') return settled;
+    return this.withoutDeclarationRows(settled.compiled, current, compiles, previewRows);
+  }
+
+  // context-manager's comparison baseline for `firstChanged`, and with
+  // `binds: true` its thinking-binding record, are the last committing
+  // compile's, so a removal compiles again.
+  private async leaveHead(
+    compiled: CompileResult,
+    current: HeadDeclaration,
+    dryRun: boolean,
+    { compile }: Compiles,
+  ): Promise<CompileResult> {
+    const held = heldDeclarations(compiled);
+    if (dryRun || (held.size === 0 && !this.headDeclarations.read(this.name)) || !this.headDeclarations.delete(this.name)) return compiled;
+    const changesRemoved = this.removeDeclarationRows(declarationRowIds(compiled));
+    if (changesRemoved === 0) return compiled;
+    this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved });
+    return compile(current);
+  }
+
+  private async withoutDeclarationRows(
+    compiled: CompileResult,
+    current: HeadDeclaration,
+    { compile, onHead }: Compiles,
+    previewRows: readonly NormalizedMessage[],
+  ): Promise<Settled> {
+    if (heldDeclarations(compiled).size === 0 && !previewRows.some(isDeclarationRow)) return { compiled: await onHead(compiled, current), head: current };
+    return { compiled: await compile(current, true), head: current, leftOut: true };
+  }
+
+  private async settleOnRecord(
+    compiled: CompileResult,
+    current: HeadDeclaration,
+    recorded: HeadDeclaration | null,
+    dryRun: boolean,
+    compiles: Compiles,
+    previewRows: readonly NormalizedMessage[],
+  ): Promise<Settled> {
+    if (!recorded) return this.moveHead(compiled, null, current, { why: 'adopted' }, dryRun, compiles);
+    const held = heldDeclarations(compiled);
+    const { difference } = this.declaredDifference(compiled, held, recorded, current, previewRows);
+    if (difference.kind === 'replace') return this.moveHead(compiled, recorded, current, { why: 'replaced' }, dryRun, compiles);
+    const carried = dryRun ? undefined : this.carriedOf(compiled, held, recorded);
+    const estimated = carried !== undefined && this.costOfCarrying(compiled, carried, current);
+    if (estimated) return this.moveHead(compiled, recorded, current, { why: 'cost', estimated }, dryRun, compiles);
+    if (difference.kind === 'none') return { compiled, head: recorded };
+    const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
+    if (dryRun) return { compiled, head: recorded, declared };
+    try {
+      storeOwnRow(this, declared.participant, declared.content, systemChangeMetadata(this.name, this.requestsCounted?.()));
+    } catch (error) {
+      // context-manager refuses a change between a tool call and its result.
+      if (storedOfThrownWrite(error, (id) => this.contextManager.getMessage(id) !== null).length === 0) {
+        return this.moveHead(compiled, recorded, current, { why: 'unstored', error: error instanceof Error ? error.message : String(error) }, dryRun, compiles);
+      }
+      console.error(`[head-declarations] ${this.name}: storing a system change threw, but the store holds it, so the request declares it:`, error);
     }
+    this.onHeadEvent?.({
+      type: 'head:declared',
+      removed: difference.block.removeTools ?? [],
+      defined: (difference.block.defineTools ?? []).map((tool) => tool.name),
+      addedSystem: difference.block.addSystem?.length ?? 0,
+    });
+    // context-manager's comparison baseline for `firstChanged`, and with
+    // `binds: true` its thinking-binding record, are the last committing compile's.
+    try {
+      return { compiled: await compiles.compile(recorded), head: recorded };
+    } catch (error) {
+      const moved = this.takeChangesOverBudget(error, true, recorded, current);
+      return { compiled: await compiles.compile(moved), head: moved };
+    }
+  }
 
-    const injectedText = systemInjections.map((block) =>
-      block.type === 'text'
-        ? block.text
-        : `[${NOTICE_TAG.blockNotShown}: ${/^[aeiou]/i.test(block.type) ? 'an' : 'a'} ${block.type} block; the system prompt carries text only.]`);
+  private declaredDifference(
+    compiled: CompileResult,
+    held: ReadonlySet<number>,
+    recorded: HeadDeclaration,
+    current: HeadDeclaration,
+    previewRows: readonly NormalizedMessage[] = [],
+  ): { difference: DeclarationDifference } {
+    const blocks = [...compiled.messages.filter((_, index) => held.has(index)), ...previewRows.filter(isDeclarationRow)]
+      .flatMap((message) => message.content.filter(isSystemChangeContent));
+    return { difference: declarationDifference(effectiveDeclaration(recorded, blocks), current) };
+  }
 
-    return this.systemPrompt + '\n' + injectedText.join('\n');
+  // The agent's context reads back a row of its own slot alone.
+  private carriedOf(compiled: CompileResult, held: ReadonlySet<number>, recorded: HeadDeclaration): number | undefined {
+    const count = this.requestsCounted?.();
+    if (count === undefined) return undefined;
+    const sources = compiled.provenance?.messages;
+    const rows = [...held].map((index) => {
+      const source = sources?.[index];
+      const stored = source?.kind === 'raw'
+        ? source.bodies.map((body) => this.contextManager.getMessage(body.messageId)).find((row) => row !== null)
+        : undefined;
+      return {
+        changes: compiled.messages[index]?.content.filter(isSystemChangeContent) ?? [],
+        removable: stored !== undefined && stored !== null,
+        requestCount: stored ? storedRequestCount(stored.metadata) : undefined,
+      };
+    });
+    return carriedCharacters(recorded, rows, count);
+  }
+
+  private costOfCarrying(compiled: CompileResult, carried: number, current: HeadDeclaration): CostFigures | undefined {
+    if (carried === 0) return undefined;
+    const k = this.writeOverRead();
+    if (k === undefined) return undefined;
+    // context-manager compares `firstChanged` when it's read.
+    const { firstChanged } = compiled;
+    if (firstChanged == null) return undefined;
+    const before = this.rowsAsSent(compiled.messages).slice(0, firstChanged).filter((m) => m.content.length > 0);
+    if (this.mayBindThinking && before.some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'))) return undefined;
+    const extraNow = requestCharacters(current, before);
+    return carried >= k * extraNow ? { carried, k, extraNow } : undefined;
+  }
+
+  private writeOverRead(): number | undefined {
+    const membrane: ChangeAnswering = this.membrane;
+    const pricing = membrane.pricingFor?.(this.model);
+    const read = pricing?.cacheReadPerMillion;
+    const fiveMinute = pricing?.cacheWritePerMillion;
+    const write = fiveMinute !== undefined && this.cacheTtl === '1h' ? pricing?.cacheWrite1hPerMillion ?? fiveMinute : fiveMinute;
+    return read !== undefined && read > 0 && write !== undefined ? write / read - 1 : undefined;
+  }
+
+  private takeChangesOverBudget(error: unknown, takes: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
+    const refusal = error instanceof Error ? error.name : undefined;
+    if (refusal !== 'OverBudgetError' && refusal !== 'UncoveredDropError') throw error;
+    if (!takes) {
+      const rows = this.windowDeclarationRows();
+      if (rows.length === 0 || !this.headDeclarations.delete(this.name)) throw error;
+      const removed = this.removeDeclarationRows(rows);
+      this.onHeadEvent?.({ type: 'head:moved', why: 'on-head', changesRemoved: removed });
+      return current;
+    }
+    const rows = this.windowDeclarationRows();
+    if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
+    const removed = this.removeDeclarationRows(rows);
+    this.onHeadEvent?.({ type: 'head:moved', why: recorded ? 'budget' : 'adopted', changesRemoved: removed });
+    return current;
+  }
+
+  private async moveHead(
+    compiled: CompileResult,
+    recorded: HeadDeclaration | null,
+    current: HeadDeclaration,
+    move: Move,
+    dryRun: boolean,
+    { compile, onHead }: Compiles,
+  ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
+    if (dryRun) return { compiled: this.withoutDeclarations(await onHead(compiled, current)), head: current };
+    if (recorded && this.moveChangesNothing(compiled, recorded, current)) return { compiled, head: recorded };
+    if (!this.headDeclarations.write(this.name, copyHead(current))) {
+      const head = recorded ?? current;
+      return { compiled: await onHead(compiled, head), head };
+    }
+    const removed = this.removeDeclarationRows(this.removableDeclarationRows(compiled));
+    this.onHeadEvent?.({ type: 'head:moved', changesRemoved: removed, ...move });
+    return { compiled: removed > 0 ? await compile(current) : await onHead(compiled, current), head: current };
+  }
+
+  private moveChangesNothing(compiled: CompileResult, recorded: HeadDeclaration, current: HeadDeclaration): boolean {
+    return declarationDifference(effectiveDeclaration(recorded, []), current).kind === 'none' && this.removableDeclarationRows(compiled).length === 0;
+  }
+
+  private removableDeclarationRows(compiled: CompileResult): MessageId[] {
+    return declarationRowIds(compiled).filter((id) => this.contextManager.getMessage(id) !== null);
+  }
+
+  private withoutDeclarations(compiled: CompileResult): CompileResult {
+    const held = heldDeclarations(compiled);
+    const kept = (_: unknown, index: number) => !held.has(index);
+    const provenance = compiled.provenance && { ...compiled.provenance, messages: compiled.provenance.messages.filter(kept) };
+    return { ...compiled, messages: compiled.messages.filter(kept), ...(provenance ? { provenance } : {}) };
+  }
+
+  // The window is read before the view filter, so another agent's context
+  // rows, which the view leaves out, are left out here.
+  private windowDeclarationRows(): MessageId[] {
+    return this.contextManager.getPresentedMessages().flatMap((row) => {
+      if (!isDeclarationRow(row) || this.contextManager.getMessage(row.id) === null) return [];
+      const agent = contextAgentOf(row.metadata);
+      return agent === undefined || this.isOwnParticipant(agent) ? [row.id] : [];
+    });
+  }
+
+  // The agent's context can't remove a row of a slot that it only reads, such
+  // as the residents' slot that the subconscious merges.
+  private removeDeclarationRows(ids: readonly MessageId[]): number {
+    const removed: MessageId[] = [];
+    let rows = 0;
+    try {
+      for (const id of new Set(ids)) {
+        if (this.contextManager.getMessage(id) === null) continue;
+        removed.push(...removeStoredMessage(this.contextManager, id));
+        rows++;
+      }
+    } finally {
+      if (removed.length > 0) this.onChangesRemoved?.(removed);
+    }
+    return rows;
   }
 
   abortInference(reason?: string): { aborted: true; durationMs: number } | false {

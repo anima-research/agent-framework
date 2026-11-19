@@ -348,6 +348,23 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     assert.deepEqual([withInjection.messagesRemoved, withInjection.neverPresented], [4, 2], "another agent's injection is never presented to scout");
   });
 
+  it('the refusal of a rollback the rows presented with its target make empty counts a system change row among them, a host\'s and the agent\'s own, as any row', async () => {
+    const h = await boot();
+    const x = h.store('x');
+    const y = h.store('y');
+    const change = h.cm().addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] }], { source: 'api' });
+    const own = h.cm().addMessage('system', [{ type: 'system_change', defineTools: [{ name: 'zz_own', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] }], { system: true, kind: 'system-change', agent: 'scout' } as never);
+    h.cm().presentRows([x, y, change, own]);
+    await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {
+      assert.ok(e instanceof OperatorActionError && e.code === 'invalid', String(e));
+      assert.match(e.message, /in one write with the 3 messages after it/, e.message);
+      assert.ok(e.message.endsWith(
+        `suppress them (suppressMessages for ${y}, ${change}, ${own}), or hide those with a Discord message id by it (the host's hide command: on scout for d-y)`,
+      ), e.message);
+      return true;
+    });
+  });
+
   it("a host's message-granular undo counts back in the window, whose order isn't the record's", async () => {
     const h = await boot();
     const [a, b, c] = ['a', 'b', 'c'].map(h.store);
