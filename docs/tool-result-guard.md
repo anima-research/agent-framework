@@ -65,7 +65,8 @@ after the response completed) is admitted immediately, recorded as
 from the request is recorded as `withheld` with `reason: "unsubmitted"` when
 a refusal arrives; that refusal then goes through ordinary refusal handling
 (`refusalHandling.retries`/`autoRewind`), since the guarded output was never
-on the wire.
+on the wire. Ordinary auto-rewind still requires settled guard annotation;
+if annotation is pending, recovery declines unchanged without retry.
 
 Turn-ended admission also requires a durable audit. If staging or sync failed,
 the result remains withheld with `reason: "audit_not_durable"`, including on

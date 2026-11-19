@@ -249,10 +249,15 @@ test("a failed turn's type safety goes to the person, and no request the agent s
 test("an agent that ends while a request waits answers agent-ended, and so does a request after its end", async () => {
   const rig = await unstickRig([], ['scout', 'aide']);
   try {
+    // /unstick now needs a read-only eligible target before opening a session.
+    const cm = rig.framework.getAgent('aide')!.getContextManager();
+    const target = cm.addMessage('user', [text('eligible target')]);
+    cm.presentRows([target]);
     await rig.framework.quiesce({ reason: 'zz: park the unstick' });
     const ack = await rig.host({ command: 'unstick', agentName: 'aide', channelId: 'zz-chan' });
     assert.equal(ack.quiesced, true, 'the premise: the unstick is parked, so its session is live and runs nothing');
     const waiting = rig.host({ command: 'unstick-outcome', agentName: 'aide' });
+    await until(() => rig.waiting('aide') === 1, 'outcome request registered before agent stop');
     rig.framework.stopAgent('aide');
     const ended = { ok: true, outcome: 'agent-ended', rewinds: 0 };
     assert.deepEqual(await within(waiting, 'the waiting request'), ended);

@@ -331,6 +331,7 @@ class RoundThenEnd implements YieldingStream {
     private readonly usage: DetailedUsage,
     private readonly ending: StreamEvent | Error | 'close',
     private readonly cancelledAs: 'aborted' | 'error' | 'close' = 'aborted',
+    private readonly callId = 'echo-1',
   ) {}
   provideToolResults(): void {
     this.isWaitingForTools = false;
@@ -344,7 +345,7 @@ class RoundThenEnd implements YieldingStream {
   }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     yield { type: 'usage', usage: this.usage } as StreamEvent;
-    const call = { type: 'tool_use' as const, id: 'echo-1', name: 'test--echo', input: {} };
+    const call = { type: 'tool_use' as const, id: this.callId, name: 'test--echo', input: {} };
     this.isWaitingForTools = true;
     this.pendingToolCallIds = [call.id];
     yield {
@@ -767,52 +768,91 @@ describe('a tool-ended turn ends what a successful turn ends', () => {
     }
   });
 
-  it('turns that each fail after an answered call reach the hard-down threshold and run the breaker: an answered call is not a completed turn', async () => {
-    // Each turn's first call answers (its round's usage arrives) and the
-    // call after its tool result is refused as the provider can't take it,
-    // which shedMayHelp matches.
-    const refused = (): StreamEvent => ({
-      type: 'error',
-      error: new MembraneError({
-        type: 'invalid_request', retryable: false, httpStatus: 400,
-        message: 'zz the provider could not process the tool result', rawError: { status: 400 },
-      }),
-    }) as StreamEvent;
-    const r = await resident([1, 2, 3].map(() => () => new RoundThenEnd(firstUsage, refused())));
-    const internal = r.framework as unknown as { consecutiveInferenceFailures: Map<string, number> };
-    const streaks: number[] = [];
-    const answeredBefore: number[] = [];
-    let answered = 0;
-    // emitTrace counts the failure before listeners hear it.
-    r.framework.onTrace((event) => {
-      if (event.type === 'inference:usage') answered++;
-      if (event.type === 'inference:exhausted') {
-        streaks.push(internal.consecutiveInferenceFailures.get('resident') ?? 0);
-        answeredBefore.push(answered);
+  for (const reusedIds of [false, true]) {
+    it(`turns that each fail after an answered call reach hard-down: ${reusedIds ? 'reused IDs' : 'unique IDs'} recover after the failed stream settles`, async () => {
+      // Each turn's first call answers (its round's usage arrives) and the
+      // call after its tool result is refused as the provider can't take it,
+      // which shedMayHelp matches.
+      const refused = (): StreamEvent => ({
+        type: 'error',
+        error: new MembraneError({
+          type: 'invalid_request', retryable: false, httpStatus: 400,
+          message: 'zz the provider could not process the tool result', rawError: { status: 400 },
+        }),
+      }) as StreamEvent;
+      // Both ID layouts are complete. Unlike the published pre-stream-only
+      // behavior, the finished terminal recovers the exact failed request.
+      // Its just-submitted round is carried too: shed that newest exchange,
+      // not the older input from the initial compile.
+      const r = await resident([1, 2, 3].map((n) => () =>
+        new RoundThenEnd(firstUsage, refused(), 'aborted', `echo-${reusedIds ? 1 : n}`)));
+      const internal = r.framework as unknown as {
+        consecutiveInferenceFailures: Map<string, number>;
+        exhaustionRewinds: Map<string, number>;
+        pendingRequests: Array<{ reason: string }>;
+      };
+      let retryBudget: number | undefined;
+      const streamYielding = r.membrane.streamYielding.bind(r.membrane);
+      r.membrane.streamYielding = (request) => {
+        if (r.membrane.calls.length === 3) retryBudget = internal.exhaustionRewinds.get('resident');
+        return streamYielding(request);
+      };
+      const streaks: number[] = [];
+      const answeredBefore: number[] = [];
+      let answered = 0;
+      // emitTrace counts the failure before listeners hear it.
+      r.framework.onTrace((event) => {
+        if (event.type === 'inference:usage') answered++;
+        if (event.type === 'inference:exhausted') {
+          streaks.push(internal.consecutiveInferenceFailures.get('resident') ?? 0);
+          answeredBefore.push(answered);
+        }
+      });
+      const lines: string[] = [];
+      const original = console.error;
+      console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+      r.framework.start();
+      try {
+        for (const [turn, text] of ['first', 'second', 'third'].entries()) {
+          r.framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
+          await r.framework.runUntilIdle();
+          assert.ok(await pollUntil(() => streaks.length === turn + 1 && !(r.framework as any).logicalTurnAlive(r.framework.getAgent('resident'))), `turn ${turn + 1} tore down`);
+        }
+        assert.deepEqual(answeredBefore, [1, 2, 3], 'each failed turn had a call that answered');
+        assert.deepEqual(streaks, [1, 2, 3], 'an answered call leaves the streak standing');
+        const alerts = r.traces.filter((e) => e.type === 'ops:alert' && (e as { kind?: string }).kind === 'hard-down');
+        assert.equal(alerts.length, 1, 'the third failed turn raises the hard-down alert');
+        const shed = lines.some((line) => /^\[inference-rewind\] agent=resident auto-quarantined /.test(line));
+        const cm = r.framework.getAgent('resident')!.getContextManager();
+        const rows = cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages();
+        const calls = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_use'));
+        const results = rows.flatMap((row) => row.content.filter((b) => b.type === 'tool_result'));
+        assert.equal(shed, true, 'quarantine runs only after terminal settlement with the failed request');
+        assert.equal(internal.exhaustionRewinds.get('resident') ?? 0, 0);
+        assert.equal(rows.some((row) => row.metadata?.kind === 'refusal-rewind'), true);
+        assert.equal(r.membrane.calls.length, 4, 'one repaired retry was run');
+        assert.equal(retryBudget, 1, 'the confirmed removal spent a step before the retry began');
+        const repaired = JSON.stringify(r.membrane.calls[3].messages);
+        assert.match(repaired, /"text":"third"/, 'the older compiled input stays: the newest submitted exchange was quarantined');
+        const raw = cm.getAllMessages();
+        for (const kind of ['tool_use', 'tool_result']) {
+          const bodies = raw.filter((row) => row.content.some((block) => block.type === kind));
+          assert.equal(bodies.length, 3, 'all three exchanges remain in the raw record');
+          assert.equal(cm.windowStatusOf(bodies[2].id), 'undone', 'only the newest failed-request exchange leaves the window');
+          for (const body of bodies.slice(0, 2)) assert.equal(cm.windowStatusOf(body.id), 'in');
+        }
+        assert.match(repaired, /The 1 most recent/, 'the repaired request carries the rewind notice');
+
+        assert.equal(internal.pendingRequests.some((r) => r.reason === 'inference-failure-rewind-retry'), false);
+        assert.equal(calls.length, 2, 'the two older call endpoints stay in the window');
+        assert.equal(results.length, 2, 'the two older result endpoints stay in the window');
+      } finally {
+        console.error = original;
+        await r.framework.stop();
+        rmSync(r.dir, { recursive: true, force: true });
       }
     });
-    const lines: string[] = [];
-    const original = console.error;
-    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
-    r.framework.start();
-    try {
-      for (const [turn, text] of ['first', 'second', 'third'].entries()) {
-        r.framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
-        await r.framework.runUntilIdle();
-        assert.ok(await pollUntil(() => streaks.length === turn + 1), `turn ${turn + 1} failed`);
-      }
-      assert.deepEqual(answeredBefore, [1, 2, 3], 'each failed turn had a call that answered');
-      assert.deepEqual(streaks, [1, 2, 3], 'an answered call leaves the streak standing');
-      const alerts = r.traces.filter((e) => e.type === 'ops:alert' && (e as { kind?: string }).kind === 'hard-down');
-      assert.equal(alerts.length, 1, 'the third failed turn raises the hard-down alert');
-      assert.ok(lines.some((line) => /^\[inference-rewind\] agent=resident auto-quarantined /.test(line)),
-        'and the poison-history breaker sheds the newest exchange');
-    } finally {
-      console.error = original;
-      await r.framework.stop();
-      rmSync(r.dir, { recursive: true, force: true });
-    }
-  });
+  }
 });
 
 /** A completion the stream would yield next; these tests end it before it's handled. */

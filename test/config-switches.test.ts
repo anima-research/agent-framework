@@ -79,7 +79,7 @@ const WATCHDOG_ENABLED = 'true arms the liveness watchdog, which ends the proces
 const PERSIST = 'true writes each process event and its responses to Chronicle, ' + doesnt;
 const PROMPT_CACHING = 'true or leaving it out marks requests for prompt caching, and false leaves the markers off, for transports that refuse them';
 const THINKING_ENABLED = 'true asks the provider for extended thinking, ' + doesnt;
-const AUTO_REWIND = 'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' + doesnt;
+const AUTO_REWIND = 'true removes the newest eligible complete body on refusal and retries only supported plans, ' + doesnt;
 const TOOL_RESULT_GUARD = 'true turns on tool-output admission, with one guarded retry after a provider refusal, ' + doesnt;
 const TOOL_WRAPPER_PROSE_GUARD = 'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' + doesnt;
 const PRIMARY_WAITS_FOR_AUXILIARY = 'true holds a turn\'s start until the agent\'s compression call in flight ends, ' +
@@ -118,6 +118,15 @@ describe('config switches', () => {
       refused({ autoContinue: 'true' }, 'autoContinue must be true, false or an object such as { maxConsecutive: 3 }, not a string (true and false go unquoted)'),
       refused({ autoContinue: { maxConsecutive: 0 } }, `autoContinue.maxConsecutive must be a whole number from 1 to 20, not a number below 1: ${AUTO_CONTINUE_MAX}`),
     ]);
+  });
+
+  it('refuses non-finite or nonnumeric rewind budgets before opening a store or constructing an Agent', async () => {
+    for (const maxRewinds of [NaN, Infinity, -Infinity, '2', 'nonnumeric']) {
+      const settings = { refusalHandling: { autoRewind: true, maxRewinds } };
+      const message = 'Agent "agent" refusalHandling.maxRewinds must be a finite number';
+      assert.throws(() => newAgent(settings), { message });
+      await assertRefused([[{ agents: [agentWith(settings)] }, message]]);
+    }
   });
 
   it('createEphemeralAgent refuses an agent switch that is not true or false, before it registers anything for the name', async () => {

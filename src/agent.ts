@@ -37,6 +37,13 @@ import {
 } from './tool-result-history.js';
 import { appendAll } from './append-all.js';
 
+/** Request-history witness: initially the real compile's stored bodies and branch;
+ * the framework extends the body set at each verified tool hand-off. */
+export interface CompiledHistory {
+  carriedBodies: ReadonlySet<MessageId>;
+  branch: string;
+}
+
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
@@ -58,6 +65,10 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
+  /** Capture this attempt's history before membrane creation, which can throw
+   * synchronously. Not called without compile provenance; the caller must
+   * then decline failed-request recovery rather than read current history. */
+  onCompiledHistory?: (history: CompiledHistory) => void;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -228,9 +239,13 @@ export function assertAgentSwitches(config: AgentConfig): void {
     assertBooleanSetting(
       `${agent} refusalHandling.autoRewind`,
       config.refusalHandling.autoRewind,
-      'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' +
+      'true removes the newest eligible complete body on refusal and retries only supported plans, ' +
         'and false or leaving it out doesn\'t',
     );
+    const maxRewinds = config.refusalHandling.maxRewinds;
+    if (maxRewinds != null && (typeof maxRewinds !== 'number' || !Number.isFinite(maxRewinds))) {
+      throw new Error(`${agent} refusalHandling.maxRewinds must be a finite number`);
+    }
   }
   assertBooleanSetting(
     `${agent} toolResultGuard`,
@@ -2529,6 +2544,12 @@ export class Agent {
       };
     }
 
+    const history: CompiledHistory | undefined = compiled.provenance ? {
+      carriedBodies: new Set(compiled.provenance.messages.flatMap((m) => m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : [])),
+      branch: branchKey(compiled.provenance.branch),
+    } : undefined;
+    if (history) options.onCompiledHistory?.(history);
+
     const agent = this;
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
@@ -2563,9 +2584,7 @@ export class Agent {
       // Read against the messages the stream sends, which membrane's report indexes (RoundReport's coordinates).
       placeDrops: (entries) => placeThinkingDrops(entries, request.messages, compiled),
       ...this.requestNotes(binding, compiled),
-      ...(compiled.provenance
-        ? { carriedBodies: new Set(compiled.provenance.messages.flatMap((m) => m.kind === 'raw' ? m.bodies.map((b) => b.messageId) : [])) }
-        : {}),
+      ...(history ? { carriedBodies: history.carriedBodies } : {}),
       ...(compiled.recordedAfter !== undefined ? { thinkingRecordedAfter: compiled.recordedAfter } : {}),
       ...(compiled.provenance ? { thinkingBranch: branchKey(compiled.provenance.branch) } : {}),
       ...(kvEnabled

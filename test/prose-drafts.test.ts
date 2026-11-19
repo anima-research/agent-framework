@@ -4951,3 +4951,28 @@ describe('the held-draft notice written mid-turn', () => {
     }
   });
 });
+
+// A qualifying error defers logical settlement until the iterator and sends finish.
+it('an exhausted settled stream records held drafts before a later catch-up', async () => {
+  const h = await harness({ retries: 0 });
+  try {
+    breakAfterToolRound(h.membrane, 'error', {
+      failure: () => new MembraneError({
+        type: 'invalid_request', retryable: false, httpStatus: 400,
+        message: 'provider rejected the request', rawError: { status: 400 },
+      }),
+    });
+    await h.turn([createMockResponse([text('held before exhaustion'), explicitSend('held-send')], 'tool_use')]);
+    const [draft] = h.drafts();
+    assert.equal(draft?.text, 'held before exhaustion');
+    assert.ok(h.texts().some((t) => t.includes(draft!.id)), 'a stored notice names the draft');
+    assert.ok(draft!.noticedIn?.length, 'exhaustion records that notice at turn end, not at the next catch-up');
+    const cm = h.framework.getAgent('scout')!.getContextManager();
+    for (let i = 0; i < 501; i++) cm.addMessage('user', [text(`later notice ${i}`)], { system: true });
+    const before = cm.getMessageCount();
+    (h.framework as any).noticeUnnoticedDrafts(h.framework.getAgent('scout'));
+    assert.equal(cm.getMessageCount(), before, 'catch-up does not repeat a notice beyond its recent-history scan');
+  } finally {
+    await h.close();
+  }
+});
