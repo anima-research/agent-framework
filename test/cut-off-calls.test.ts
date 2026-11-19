@@ -934,6 +934,19 @@ describe("the private think policy without a channel registry, across a restart,
     });
   }
 
+  // A destination whose only words are `{{unsent}}` sends none of the
+  // agent's own, though an aside beside it wrote some (kept private).
+  for (const [label, settings, xml] of [
+    ["proseRouting: 'explicit'", { proseRouting: 'explicit' }, '>>skip_reply An aside.\n>>world:commons {{unsent}}\n\n<function_calls>\n<invoke name="'],
+    ["proseRouting: 'hybrid'", { proseRouting: 'hybrid' }, '>>>skip_reply An aside.\n>>>world:commons {{unsent}}\n\n<function_calls>\n<invoke name="'],
+  ] as const) {
+    it(`says nothing of held words when the cut round's only destination wrote {{unsent}} beside an aside (${label})`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml, stop: 'max_tokens' }], { ...PRIVATE, ...settings }, { targets: ['world:commons'] });
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
+    });
+  }
+
   for (const [label, xml] of [
     ['a >> destination with no words', '>>world:commons\n\n<function_calls>\n<invoke name="'],
     ['a >>skip_reply aside', '>>skip_reply Just a note to myself.\n\n<function_calls>\n<invoke name="'],
