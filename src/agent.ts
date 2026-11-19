@@ -251,6 +251,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'and false or leaving it out starts the turn beside it',
   );
   assertBooleanSetting(
+    `${agent} sendSilencing`,
+    config.sendSilencing,
+    'true makes an explicit send hold back, as drafts, the plain speech aimed where it may have posted, ' +
+      'and false or leaving it out posts that speech as any other',
+  );
+  assertBooleanSetting(
     `${agent} turnInputsPin`,
     config.turnInputsPin,
     'true or leaving it out pins the rows that open a turn raw until it ends, and false places no pin',
@@ -541,7 +547,7 @@ export class Agent {
     this.configuredTailTokens = hot?.tailTokens;
     this.configuredTransitionPaceTokens = hot?.transitionPaceTokens;
     this.configuredSameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
-    this.configuredSendSilencing = config.sendSilencing === true;
+    this.configuredSendSilencing = config.sendSilencing ?? false;
   }
 
   /**

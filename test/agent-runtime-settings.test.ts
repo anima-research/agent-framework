@@ -49,6 +49,21 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
           "Omitted in the recipe preserves the compatibility carry-forward: public.",
       },
     );
+    assert.deepEqual(
+      (tool!.inputSchema as { properties: Record<string, unknown> }).properties.send_silencing,
+      {
+        type: 'boolean',
+        description:
+          'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
+          'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
+          'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
+          'is posted as usual. A change applies from your next response on, not to a send made in the same response as the change.',
+      },
+    );
+    assert.ok(
+      (tool!.inputSchema as unknown as { properties: { settings: { items: { enum: string[] } } } }).properties.settings.items.enum.includes('send_silencing'),
+      'a reset can name it',
+    );
     assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
       effectiveContextBudgetTokens: 100_000,
@@ -93,6 +108,28 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       sendSilencing: false,
       transition: 'stable',
     });
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("sendSilencing: the agent's own false overrides a recipe's true, and a reset restores the recipe's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-send-silencing-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: strategy(), sendSilencing: true }],
+    modules: [],
+  });
+  try {
+    assert.equal(framework.getAgentRuntimeSettings('agent').sendSilencing, true);
+    assert.equal(framework.updateAgentRuntimeSettings('agent', { sendSilencing: false }).sendSilencing, false);
+    assert.equal(framework.resetAgentRuntimeSettings('agent', ['sendSilencing']).sendSilencing, true);
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', { sendSilencing: 'false' as never }),
+      /sendSilencing must be true or false/,
+    );
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

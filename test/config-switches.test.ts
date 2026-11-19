@@ -112,6 +112,9 @@ describe('config switches', () => {
       refused({ toolResultGuard: 0 }, `toolResultGuard must be true or false, not a number: ${TOOL_RESULT_GUARD}`),
       refused({ toolWrapperProseGuard: { on: true } }, `toolWrapperProseGuard must be true or false, not an object: ${TOOL_WRAPPER_PROSE_GUARD}`),
       refused({ primaryWaitsForAuxiliary: 'true' }, `primaryWaitsForAuxiliary must be true or false, unquoted, not a string: ${PRIMARY_WAITS_FOR_AUXILIARY}`),
+      refused({ sendSilencing: 'true' }, 'sendSilencing must be true or false, unquoted, not a string: ' +
+        'true makes an explicit send hold back, as drafts, the plain speech aimed where it may have posted, ' +
+        'and false or leaving it out posts that speech as any other'),
       refused({ autoContinue: 'true' }, 'autoContinue must be true, false or an object such as { maxConsecutive: 3 }, not a string (true and false go unquoted)'),
       refused({ autoContinue: { maxConsecutive: 0 } }, `autoContinue.maxConsecutive must be a whole number from 1 to 20, not a number below 1: ${AUTO_CONTINUE_MAX}`),
     ]);

@@ -3162,6 +3162,37 @@ describe('an explicit send holds plain speech only where it may have posted', ()
     });
   }
 
+  it('with send silencing off, XML tool mode posts the prose before and after a send', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', sendSilencing: false }] });
+    try {
+      await h.turn([
+        createMockResponse([text('Narration before the send.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
+      ]);
+      const posted = h.publishes().filter((p) => p.event === 'publish').map((p) => p.text).join('\n');
+      assert.match(posted, /Narration before the send\./);
+      assert.match(posted, /And after it\./);
+      assert.deepEqual(held(h), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('with send silencing off, skip_reply and a private think still keep their rounds out of the room', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: false, sameRoundThinkTextPolicy: 'private' }], sendTool: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Working it out.'), call('t1', 'think', { content: 'private' }), send('s1', GENERAL)], 'tool_use'),
+        createMockResponse([text('The answer.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('Not for the room.'), call('k1', 'skip_reply', { reason: 'done' })], 'tool_use'),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL], 'the send ran');
+      assert.deepEqual(inRoom(h), ['The answer.']);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('the resident turns send silencing on with agent_settings: sends made after it hold, the drafts tool names the reason, and a reset posts again', async () => {
     const h = await harness({ agents: [{ name: 'scout', sendSilencing: false }], sendTool: true });
     try {

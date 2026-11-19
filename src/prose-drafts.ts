@@ -1,7 +1,8 @@
 /**
  * Held prose drafts: a resident's plain speech that was not sent.
  *
- * Plain speech is held back for reasons that are right in themselves: an
+ * Plain speech is held back for reasons that are right in themselves: for an
+ * agent whose sends silence (AgentConfig.sendSilencing, off by default), an
  * explicit send suppresses plain speech aimed where it may have posted, in
  * its round and the turn's later ones (so a "sent it" postscript is not
  * posted twice), a turn may have no destination, and a

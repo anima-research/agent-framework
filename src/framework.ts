@@ -14976,7 +14976,7 @@ export class AgentFramework {
             'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
             'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
             'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
-            'is posted as usual. A change applies to sends made after it.',
+            'is posted as usual. A change applies from your next response on, not to a send made in the same response as the change.',
         },
         settings: {
           type: 'array',
@@ -29614,7 +29614,8 @@ export class AgentFramework {
             // does. So a round whose watched script can call such a tool is
             // routed once those calls have returned (ScriptRound,
             // scriptMayRoute), at the script's end or its yield, and its
-            // prose goes out then. In locus and hybrid mode a round that sends
+            // prose goes out then. In locus and hybrid mode a round that sends,
+            // of an agent whose sends silence (AgentConfig.sendSilencing),
             // is routed once its sends have answered. Any other round is routed now, a round
             // with a script that can't call one included, so narration beside
             // a script isn't held for the call's yield. The turn's locus and

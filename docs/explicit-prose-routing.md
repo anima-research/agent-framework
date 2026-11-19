@@ -72,7 +72,8 @@ or hold for lack of a destination is held as a draft with no notice instead of
 bouncing: a later `drafts` listing shows it, and the turn's receipt or, in
 `explicit` mode, which writes none, a later turn's catch-up notice names it,
 but nothing offers it for resend while the turn runs. In a `locus` or `hybrid`
-turn a send has silenced, the round's plain speech aimed where a send may have
+turn a send has silenced (a send silences only for an agent with
+`sendSilencing: true`), the round's plain speech aimed where a send may have
 posted stays in the agent's context instead, counted in the receipt as kept
 private, and what a `>>>` envelope addressed there is held with no notice. A
 round that also makes a send of its own, other than a `drafts` resend, holds

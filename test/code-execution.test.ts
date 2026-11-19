@@ -1233,7 +1233,7 @@ describe('a round whose run or wait call watches a script that can change its ro
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {},
+    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[]; sendSilencing?: false } = {},
     options: { codeExecution?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean } = {}) {
     const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
@@ -1589,6 +1589,26 @@ describe('a round whose run or wait call watches a script that can change its ro
         { text: 'posting the summary', reason: 'explicit-send' },
         { text: 'done', reason: 'explicit-send' },
       ], 'and holds their words as drafts, as a direct send does');
+    } finally { await h.done(); }
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: with send silencing off, a send inside the script holds nothing, and its round's prose doesn't wait for the script`, async () => {
+    const h = await scriptRound(mode, [
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'await tools["test--send_message"]({});' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], { sendSilencing: false });
+    try {
+      await h.run();
+      const order = h.log.filter((e) => e === 'tool:send_message' || e.startsWith('publish:') || e.startsWith('chunk:'));
+      assert.ok(order.includes('tool:send_message'), 'the script sent');
+      assert.ok(order.some((e) => e.includes('posting the summary')), `the round's prose is posted: ${JSON.stringify(order)}`);
+      assert.ok(order.some((e) => e.includes('done')), `and so is the turn's later prose: ${JSON.stringify(order)}`);
+      assert.ok(order.findIndex((e) => e.includes('posting the summary')) < order.indexOf('tool:send_message'),
+        `the prose is routed at once, before the script's send runs: ${JSON.stringify(order)}`);
+      assert.deepStrictEqual(heldDrafts(h.framework), []);
     } finally { await h.done(); }
   });
 
