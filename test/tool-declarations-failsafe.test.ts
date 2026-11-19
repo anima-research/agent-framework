@@ -9,6 +9,7 @@ import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, 
 
 import { AgentFramework, type EventResponse, type Module, type ModuleContext, type ProcessEvent, type ToolCall, type TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { foldOf } from './helpers/declared.js';
 import { ContextManager } from '@animalabs/context-manager';
 
 class ChangingTools implements Module {
@@ -35,6 +36,19 @@ class RefusedStream implements YieldingStream {
   cancel(): void { this.isCancelled = true; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     yield { type: 'error', error: this.error } as StreamEvent;
+  }
+}
+
+// A stream stopped before its first event: membrane's first event for it says so.
+class AbortedStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  provideToolResults(): void { throw new Error('not waiting'); }
+  cancel(): void { this.isCancelled = true; }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'aborted', reason: 'user' } as StreamEvent;
   }
 }
 
@@ -115,13 +129,14 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
 
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
 
-async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; effort?: 'high'; third?: boolean; refuseLater?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
+async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; effort?: 'high'; third?: boolean; refuseLater?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean; abortRetry?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
   membrane.takesChanges = true;
   let turn = 0;
   membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
     const n = membrane.calls.push(request) - 1;
+    if (opts.abortRetry && n === 2) return new AbortedStream();
     const error = turn === 2 || (opts.refuseLater && turn > 2) ? opts.refuse(request) : undefined;
     return error
       ? new RefusedStream(error)
@@ -153,7 +168,7 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
   const traces: TraceEvent[] = [];
   framework.onTrace((event) => { traces.push(event); });
   framework.start();
-  const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted').length;
+  const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted' || t.type === 'inference:aborted').length;
   const send = async (text: string, n: number) => {
     turn = n;
     framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
@@ -244,13 +259,21 @@ describe('the fail-safe for a refused change', () => {
       assert.equal(alerts.length, 1, `binds ${binds}: one operator line`);
       const alert = alerts[0] as { message: string; data?: { httpStatus?: number } };
       assert.match(alert.message, /role system not accepted here/, 'quoting the 400');
-      assert.match(alert.message, /went again in the fallback form, on the agent's current tools and system text with no system change, and was accepted/);
+      assert.match(alert.message, /went again in the fallback form, on the agent's current tools and system text with its change rows left out, and was accepted/);
       assert.match(alert.message, /That is an inference from one retry: the 400 may not be about the change/);
       assert.match(alert.message, /keeps to its head until it's built again/);
       assert.equal(/can set aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it can be paid`);
       assert.equal(alert.data?.httpStatus, 400);
       assert.deepEqual(run.traces.filter((t) => t.type === 'head:resend').map((t) => (t as { diagnosis: string }).diagnosis), ['retry']);
     }
+  });
+
+  it("leaves the agent declaring its changes when its retry in the fallback form stops before its first event", async () => {
+    const run = await turns({ binds: true, refuse: (r) => (carriesChange(r) ? refusal(false) : undefined), abortRetry: true });
+    assert.equal(run.calls.length, 3, 'the adopting turn, the refused request, its retry');
+    assert.equal(carriesChange(run.calls[2]!), false, 'the retry, in the fallback form');
+    assert.equal(run.onHead, false, 'the agent still declares its changes: a retry stopped before its first event was not accepted');
+    assert.equal(resends(run.traces), 0);
   });
 
   it("leaves the agent as it was when its retry in the fallback form is refused too, and the error policy has that refusal", async () => {
@@ -271,7 +294,7 @@ describe('the fail-safe for a refused change', () => {
     assert.equal(carriesChange(run.calls.at(-1)!), false, 'the premise: the third turn, after its tools changed again, carried no change to refuse');
     const alerts = run.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string; data?: { httpStatus?: number } }>;
     assert.equal(alerts.length, 1, 'one operator line for the build');
-    assert.match(alerts[0]!.message, /membrane refused a system change, and the request went again on the agent's head/);
+    assert.match(alerts[0]!.message, /membrane refused a system change, and the request goes again on the agent's head/);
     assert.match(alerts[0]!.message, /keeps to its head until it's built again/);
     assert.match(alerts[0]!.message, /belongs on membrane's list of models that refuse them \(Membrane\.takesToolOrSystemChanges\); where membrane refused the change before sending it, send through a formatter and an adapter that send system changes/);
     assert.equal(alerts[0]!.data?.httpStatus, undefined, 'naming no 400 of its own');
@@ -394,14 +417,13 @@ describe('the fail-safe for a refused change in a re-armed turn', () => {
     assert.equal(run.held, 0, 'a refusal is no transient failure, so nothing is re-armed');
   });
 
-  it("leaves a later round refused after a host's change handed at a tool boundary to the error policy, and acts at the next start, whose request carries the row", async () => {
+  it("keeps a host's change stored during a turn out of the turn's later rounds, and the next start's request folds it with the head", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
     const membrane = new MockMembrane();
     membrane.takesChanges = true;
     let refusedRound: RefusedAfterChange | undefined;
     membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
       const n = membrane.calls.push(request) - 1;
-      if (n === 2) return new RefusedStream(refusal(true));
       if (n !== 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
       refusedRound = new RefusedAfterChange([
         createMockResponse([{ type: 'tool_use', id: 'look-1', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
@@ -428,13 +450,12 @@ describe('the fail-safe for a refused change in a re-armed turn', () => {
         assert.ok(await pollUntil(() => ended() === n), `turn ${n} ended`);
       }
       assert.equal(carriesChange(membrane.calls[1]!), false, "the second turn's first request carried no change");
-      assert.equal(refusedRound?.handedChange, true, 'its next round was handed the change, and refused');
-      assert.deepEqual(policyCalls, [0], 'the error policy had that refusal');
-      assert.equal(carriesChange(membrane.calls[2]!), true, "the third turn's request carries the host's row");
-      assert.equal(membrane.calls.length, 4, 'the adopting turn, the refused stream, the third turn, its resend');
-      assert.equal(carriesChange(membrane.calls[3]!), false, 'the resend went out on the head');
-      assert.equal(resends(traces), 1);
-      assert.equal(framework.getAgent('resident')!.takesChanges(), false, 'the agent keeps to its head');
+      assert.equal(refusedRound?.handedChange, false, "its next round wasn't handed the change, which a round would carry beside a head it doesn't fold to");
+      assert.deepEqual(policyCalls, [], 'so nothing was refused');
+      const third = membrane.calls[2]!;
+      assert.equal(carriesChange(third), true, "the third turn's request carries the host's row");
+      assert.deepEqual(foldOf(third).tools.map((t) => t.name), toolNames(membrane.calls[0]!).sort((a, b) => a.localeCompare(b)), "and folds to the agent's own tools");
+      assert.equal(membrane.calls.length, 3, 'the adopting turn, the second turn, the third turn');
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

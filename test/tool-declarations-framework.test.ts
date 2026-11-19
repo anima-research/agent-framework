@@ -6,11 +6,12 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type { ContentBlock, ModelPricing, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
 
 import { AgentFramework, audienceOf, residentContextOptions, subconsciousContextOptions, taskForkSpec, type Agent, type AgentSpec } from '../src/index.js';
-import type { RemoveSystemChangesResult } from '../src/recovery/remove-system-changes.js';
+import { storeOwnRow } from '../src/dendrite/audience.js';
+import { removeSystemChangesOffline, type RemoveSystemChangesResult } from '../src/recovery/remove-system-changes.js';
 import { isDeclarationRow, isSystemChangeMessage, pricedCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -206,9 +207,9 @@ describe('a change of tools or system text in the framework', () => {
 
   it('raises an operator line for a move the budget forced, naming the thinking it sets aside as `binds` says', async () => {
     for (const [binding, clause] of [
-      [undefined, /: one whole write, and the thinking the request held set aside only with thinkingBinding\.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding\.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself$/],
-      [{ binds: true, dropBlock: true }, /: one whole write, and the thinking the request held set aside$/],
-      [{ binds: false }, /: one whole write$/],
+      [undefined, /, and the request then writes the cache whole, and the thinking the request held set aside only with thinkingBinding\.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding\.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself$/],
+      [{ binds: true, dropBlock: true }, /, and the request then writes the cache whole, and the thinking the request held set aside$/],
+      [{ binds: false }, /, and the request then writes the cache whole$/],
     ] as const) {
       await withFramework([{ ...resident('alpha'), ...(binding ? { thinkingBinding: binding } : {}) }], async (framework) => {
         const traces: TraceEvent[] = [];
@@ -217,7 +218,7 @@ describe('a change of tools or system text in the framework', () => {
         (alpha as unknown as { onHeadEvent(e: HeadEvent): void }).onHeadEvent({ type: 'head:moved', why: 'budget', changesRemoved: 2 });
         const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-consolidated') as { message: string; data?: Record<string, unknown> }[];
         assert.equal(alerts.length, 1, JSON.stringify(binding));
-        assert.match(alerts[0]!.message, /^a compile was refused over budget, or for dropping messages no summary covers, with 2 system changes kept, so the head took them and the compile ran again: one whole write/);
+        assert.match(alerts[0]!.message, /^a compile was refused over budget, or for dropping messages no summary covers, with 2 system changes kept, so the head takes them and the compile runs again, and the request then writes the cache whole/);
         assert.match(alerts[0]!.message, clause, JSON.stringify(binding));
         assert.deepEqual(alerts[0]!.data, { changesRemoved: 2 });
       });
@@ -462,6 +463,22 @@ describe('a change of tools or system text in the framework', () => {
     });
   });
 
+  it("keeps an agent's change row out of the window of an agent that observes it, as that agent's context and no arrival", async () => {
+    await withFramework([resident('alpha'), { ...resident('beta'), observes: ['alpha'] }], async (framework) => {
+      const alpha = framework.getAgent('alpha')!;
+      const beta = framework.getAgent('beta')!;
+      adopt(framework, beta);
+      const said = storeOwnRow(alpha, 'alpha', [{ type: 'text', text: 'a word of its own' } as ContentBlock]);
+      assert.notEqual(beta.getContextManager().ordinalOf(said), undefined, "the premise: beta hears alpha's own rows");
+      say(framework, alpha, 'user', 'hello');
+      await alpha.buildActivationRequest([tool('a')]);
+      await alpha.buildActivationRequest([tool('a'), tool('b')]);
+      const changes = alpha.getContextManager().getAllMessages().filter(isSystemChangeMessage);
+      assert.equal(changes.length, 1, 'the premise: alpha stored its change row');
+      assert.equal(beta.getContextManager().ordinalOf(changes[0]!.id), undefined, "beta's window doesn't take it");
+    });
+  });
+
   it("moves a resident's head when the store won't take its change row, as during another resident's tool call, and its request folds to what it has now", async () => {
     await withFramework([resident('alpha'), resident('beta')], async (framework) => {
       const traces: TraceEvent[] = [];
@@ -477,7 +494,10 @@ describe('a change of tools or system text in the framework', () => {
       assert.deepEqual(changesIn(request.messages), [], 'with no change row');
       assert.equal(beta.getContextManager().getAllMessages().filter(isSystemChangeMessage).length, 0, 'none stored between the call and its result');
       assert.deepEqual(heads.headDeclarations.read('beta')!.tools, [tool('x'), tool('y')], 'the head moved');
-      assert.deepEqual(traces.filter((t) => t.type === 'head:moved' && (t as { agentName: string }).agentName === 'beta').map((t) => (t as { why: string }).why), ['adopted', 'unstored']);
+      const moved = traces.flatMap((t) => (t.type === 'head:moved' && t.agentName === 'beta' ? [t] : []));
+      assert.deepEqual(moved.map((t) => t.why), ['adopted', 'unstored']);
+      const unstored = moved.at(-1)!;
+      assert.match(unstored.why === 'unstored' ? unstored.error : '', /can't go between a tool call and its result/, "and the trace says why the store didn't take it");
     });
   });
 
@@ -581,7 +601,7 @@ describe('a change of tools or system text in the framework', () => {
       });
     });
 
-    it("says, when an agent's first head can't be stored, that its requests go on its current head without its own change rows", async () => {
+    it("says, when an agent's first head can't be stored, that its requests go on its current tools with its change rows left out, and kept", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as Internals;
         const alpha = framework.getAgent('alpha')!;
@@ -600,7 +620,7 @@ describe('a change of tools or system text in the framework', () => {
           console.error = error;
           internals.store.setStateJson = set;
         }
-        assert.ok(errors.some((e) => e.startsWith('[head-declarations] alpha: the head could not be stored, and none is recorded, so its requests go on its current head with no change row until a later request stores it:')), errors.join('\n'));
+        assert.ok(errors.some((e) => e.startsWith('[head-declarations] alpha: the head could not be stored, and none is recorded, so its requests go on its current tools and system text with its change rows left out of the request, and kept in the store, until a later request stores it:')), errors.join('\n'));
         assert.ok(!errors.some((e) => e.includes('what was recorded stays')), 'and not that a recorded head stays');
       });
     });
@@ -632,7 +652,7 @@ describe('a change of tools or system text in the framework', () => {
           console.error = error;
           internals.store.getStateJson = get;
         }
-        assert.deepEqual(errors, ['[head-declarations] alpha: the recorded head could not be read, so its requests go on its current head with no change row, and it records that head once it can; a record that reads again before then is the head its next request declares from:'], 'said once on the branch');
+        assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head could not be read, so the agent records its current tools and system text as its head; while the store doesn't take that, its requests go on them with its change rows left out of the request, and kept in the store, and a record that reads again before then is the head its next request declares from:"], 'said once on the branch');
         assert.deepEqual((get('framework/head-declarations/alpha') as HeadDeclaration).tools, [tool('a'), tool('c')], 'the record is written again');
         assert.deepEqual(internals.headDeclarations.read('beta')!.tools, [tool('b')], "beta's is read as before");
       });
@@ -822,6 +842,90 @@ describe('the way back to an earlier release', () => {
         assert.deepEqual(foldOf(await alpha.buildActivationRequest([tool('a'), tool('b')])), now([tool('a'), tool('b')], prompt('You are alpha.')));
         assert.deepEqual(foldOf(await subconscious.buildActivationRequest([tool('think'), tool('ponder')])), now([tool('think'), tool('ponder')], prompt('You attend.')));
       }, storePath, withSubconscious);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('selects the source branch again when a removal fails partway, and keeps the partly cleaned branch for diagnosis', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-back-fail-'));
+    const storePath = join(tempDir, 'store.chronicle');
+    const { removeMessage, removeMessages } = ContextManager.prototype;
+    try {
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        const subconscious = framework.getAgent('Subconscious')!;
+        say(framework, alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        await alpha.buildActivationRequest([tool('a'), tool('b')]);
+        await subconscious.buildActivationRequest([tool('think')]);
+        await subconscious.buildActivationRequest([tool('think'), tool('ponder')]);
+      }, storePath, { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } });
+      const plan = await removeSystemChangesOffline({ storePath, dryRun: true });
+      const first = plan.slots.find((slot) => slot.rows > 0)!;
+      assert.ok(plan.slots.filter((slot) => slot.rows > 0).length >= 2, `the premise: two slots hold change rows: ${JSON.stringify(plan.slots)}`);
+      // The removals go slot by slot: the first slot's go through, and the next one's fails.
+      let removals = 0;
+      const failing = <Args extends unknown[], Out>(remove: (this: ContextManager, ...args: Args) => Out) =>
+        function (this: ContextManager, ...args: Args): Out {
+          if (++removals > first.rows) throw new Error('injected removal failure');
+          return remove.apply(this, args);
+        };
+      ContextManager.prototype.removeMessage = failing(removeMessage);
+      ContextManager.prototype.removeMessages = failing(removeMessages);
+      await assert.rejects(removeSystemChangesOffline({ storePath, branchName: 'back/fail' }),
+        (error: Error) => /^injected removal failure; branch back\/fail is kept for diagnosis: it may be partly cleaned/.test(error.message));
+      assert.ok(removals > first.rows, 'the premise: a removal failed after the first slot was cleaned');
+      ContextManager.prototype.removeMessage = removeMessage;
+      ContextManager.prototype.removeMessages = removeMessages;
+      const store = JsStore.openOrCreate({ path: storePath });
+      try {
+        assert.equal(store.currentBranch().name, plan.sourceBranch, 'the source branch is selected again');
+        assert.ok(store.listBranches().some((branch) => branch.name === 'back/fail'), 'and the new one is kept');
+      } finally {
+        store.close();
+      }
+      assert.deepEqual((await removeSystemChangesOffline({ storePath, dryRun: true })).slots, plan.slots, 'the source keeps every row');
+    } finally {
+      ContextManager.prototype.removeMessage = removeMessage;
+      ContextManager.prototype.removeMessages = removeMessages;
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('takes a change row stored in shards out whole', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-back-shards-'));
+    const storePath = join(tempDir, 'store.chronicle');
+    try {
+      const seeded = JsStore.openOrCreate({ path: storePath });
+      const strategy = new PassthroughStrategy();
+      // As a strategy's ingress chunking does: one shard for each block of a row of changes.
+      (strategy as unknown as { chunkIngressMessage: unknown }).chunkIngressMessage = (_participant: string, content: ContentBlock[]) =>
+        content.every((block) => block.type === 'system_change')
+          ? { bodyGroupId: 'changes', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) }
+          : null;
+      const context = await ContextManager.open({ store: seeded, ...residentContextOptions('alpha'), strategy });
+      context.addMessage('user', [{ type: 'text', text: 'hello' }]);
+      context.addMessage('system', [
+        { type: 'system_change', defineTools: [tool('a')] },
+        { type: 'system_change', defineTools: [tool('b')] },
+      ] as unknown as ContentBlock[], { system: true, kind: 'system-change' });
+      assert.equal(context.getAllMessages().filter((row) => (row as { bodyGroupId?: string }).bodyGroupId === 'changes').length, 2, 'the premise: two shards');
+      context.close();
+      seeded.close();
+      const result = await removeSystemChangesOffline({ storePath, branchName: 'back/shards' });
+      assert.equal(result.rowsRemoved, 1, 'one change row, in two shards');
+      const store = JsStore.openOrCreate({ path: storePath });
+      try {
+        const reopened = await ContextManager.open({ store, ...residentContextOptions('alpha') });
+        try {
+          assert.deepEqual(reopened.getAllMessages().map((row) => row.content.map((block) => block.type)), [['text']], 'both shards taken out');
+        } finally {
+          reopened.close();
+        }
+      } finally {
+        store.close();
+      }
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }

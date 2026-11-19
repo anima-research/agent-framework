@@ -199,7 +199,7 @@ type ChangeAnswering = Pick<Membrane, 'stream'> & {
 };
 
 /** How a move of the head came about, as its trace says it (HeadEvent). */
-type Move = { why: 'adopted' | 'replaced' | 'unstored' } | { why: 'cost'; estimated: CostFigures };
+type Move = { why: 'adopted' | 'replaced' } | { why: 'unstored'; error: string } | { why: 'cost'; estimated: CostFigures };
 
 /** How a request carries the agent's changes: declared on its recorded head;
  *  on its current head, its record gone (a model that takes no change, or an
@@ -211,6 +211,14 @@ type ChangesIn = 'declared' | 'on-head' | 'left-out';
  *  it appends, if any, and whether it goes in the fallback form, every
  *  declaration row left out of its messages. */
 type Settled = { compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage; leftOut?: true };
+
+/** The compiles that one request settles with: `compile` is one told a head, and with `leftOut`, that the request
+ *  leaves its declaration rows out; `onHead` is the compile for a request on a head, the one given where it was told
+ *  that head or where nothing in it depends on the head. */
+type Compiles = {
+  compile(head: HeadDeclaration, leftOut?: boolean): Promise<CompileResult>;
+  onHead(compiled: CompileResult, head: HeadDeclaration): Promise<CompileResult>;
+};
 
 // membrane's request leaves out a tool field whose value is undefined.
 function headHash(head: HeadDeclaration): string {
@@ -2256,10 +2264,11 @@ export class Agent {
       .flatMap((injection) => injection.content);
     const takes = this.takesChanges();
     let record = takes ? this.headDeclarations.read(this.name) : null;
-    const compile = (head: HeadDeclaration, leftOut = false) => {
+    const compiledFor = new WeakMap<CompileResult, HeadDeclaration>();
+    const compile = async (head: HeadDeclaration, leftOut = false) => {
       const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
       const binding = this.bindingCompileOptions(head, leftOut);
-      return this.compileWithInjections(
+      const result = await this.compileWithInjections(
         budget,
         injections,
         immutablePrefixHash || options.dryRun || binding.thinkingBinding
@@ -2270,6 +2279,13 @@ export class Agent {
             }
           : undefined,
       );
+      compiledFor.set(result, head);
+      return result;
+    };
+    // kv-unified's hash, and with `binds: true` the thinking-binding record, are of the head a compile was told.
+    const onHead = async (compiled: CompileResult, head: HeadDeclaration) => {
+      const told = compiledFor.get(compiled);
+      return !(kvUnified || this.thinkingBinds) || (told !== undefined && headHash(told) === headHash(head)) ? compiled : compile(head);
     };
     const changes: ChangesIn = options.changesLeftOut ? 'left-out' : takes ? 'declared' : 'on-head';
     let compiledWith = (changes === 'left-out' ? null : record) ?? this.currentHead(availableTools, prospectiveSystemInjections);
@@ -2284,12 +2300,11 @@ export class Agent {
     }
     const settled = await this.settleHead(
       first,
-      kvUnified || this.thinkingBinds ? compiledWith : null,
       availableTools,
       record,
       changes,
       options.dryRun === true,
-      compile,
+      { compile, onHead },
       options.appendedMessages ?? [],
     );
     const compiledResult = settled.compiled;
@@ -2935,25 +2950,24 @@ export class Agent {
 
   private async settleHead(
     compiled: CompileResult,
-    compiledWith: HeadDeclaration | null,
     availableTools: ToolDefinition[],
     record: HeadDeclaration | null,
     changes: ChangesIn,
     dryRun: boolean,
-    compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
+    compiles: Compiles,
     previewRows: readonly NormalizedMessage[],
   ): Promise<Settled> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
-    if (changes === 'left-out') return this.withoutDeclarationRows(compiled, current, compile);
-    if (changes === 'on-head') return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compile), current, compile);
-    const settled = await this.settleOnRecord(compiled, compiledWith, current, record, dryRun, compile, previewRows);
+    if (changes === 'left-out') return this.withoutDeclarationRows(compiled, current, compiles, previewRows);
+    if (changes === 'on-head') return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compiles), current, compiles, previewRows);
+    const settled = await this.settleOnRecord(compiled, current, record, dryRun, compiles, previewRows);
     // What goes out folds to what the agent has now: the head it carries, with
     // every declaration row in its messages. Otherwise it goes in the
     // fallback form, which is right, and the next request tries again.
     const out = effectiveDeclaration(settled.head, [...settled.compiled.messages, ...previewRows, ...(settled.declared ? [settled.declared] : [])]
       .filter(isDeclarationRow).flatMap((message) => message.content.filter(isSystemChangeContent)));
     if (declarationDifference(out, current).kind === 'none') return settled;
-    return this.withoutDeclarationRows(settled.compiled, current, compile);
+    return this.withoutDeclarationRows(settled.compiled, current, compiles, previewRows);
   }
 
   // A model that takes no change, or an agent kept to its head: its record
@@ -2965,7 +2979,7 @@ export class Agent {
     compiled: CompileResult,
     current: HeadDeclaration,
     dryRun: boolean,
-    compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
+    { compile }: Compiles,
   ): Promise<CompileResult> {
     const held = heldDeclarations(compiled);
     if (dryRun || (held.size === 0 && !this.headDeclarations.read(this.name)) || !this.headDeclarations.delete(this.name)) return compiled;
@@ -2982,28 +2996,28 @@ export class Agent {
   private async withoutDeclarationRows(
     compiled: CompileResult,
     current: HeadDeclaration,
-    compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
+    { compile, onHead }: Compiles,
+    previewRows: readonly NormalizedMessage[],
   ): Promise<Settled> {
-    if (heldDeclarations(compiled).size === 0) return { compiled, head: current };
+    if (heldDeclarations(compiled).size === 0 && !previewRows.some(isDeclarationRow)) return { compiled: await onHead(compiled, current), head: current };
     return { compiled: await compile(current, true), head: current, leftOut: true };
   }
 
   private async settleOnRecord(
     compiled: CompileResult,
-    compiledWith: HeadDeclaration | null,
     current: HeadDeclaration,
     recorded: HeadDeclaration | null,
     dryRun: boolean,
-    compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
+    compiles: Compiles,
     previewRows: readonly NormalizedMessage[],
   ): Promise<Settled> {
-    if (!recorded) return this.moveHead(compiled, compiledWith, null, current, { why: 'adopted' }, dryRun, compile);
+    if (!recorded) return this.moveHead(compiled, null, current, { why: 'adopted' }, dryRun, compiles);
     const held = heldDeclarations(compiled);
     const { difference } = this.declaredDifference(compiled, held, recorded, current, previewRows);
-    if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, { why: 'replaced' }, dryRun, compile);
+    if (difference.kind === 'replace') return this.moveHead(compiled, recorded, current, { why: 'replaced' }, dryRun, compiles);
     const carried = dryRun ? undefined : this.carriedOf(compiled, held, recorded);
-    const estimated = carried !== undefined && this.costOfCarrying(compiled, carried, recorded, current);
-    if (estimated) return this.moveHead(compiled, compiledWith, recorded, current, { why: 'cost', estimated }, dryRun, compile);
+    const estimated = carried !== undefined && this.costOfCarrying(compiled, carried, current);
+    if (estimated) return this.moveHead(compiled, recorded, current, { why: 'cost', estimated }, dryRun, compiles);
     if (difference.kind === 'none') return { compiled, head: recorded };
     const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
     if (dryRun) return { compiled, head: recorded, declared };
@@ -3013,7 +3027,7 @@ export class Agent {
       // context-manager refuses a change between a tool call and its result:
       // a row the store doesn't take moves the head instead.
       if (storedOfThrownWrite(error, (id) => this.contextManager.getMessage(id) !== null).length === 0) {
-        return this.moveHead(compiled, compiledWith, recorded, current, { why: 'unstored' }, dryRun, compile);
+        return this.moveHead(compiled, recorded, current, { why: 'unstored', error: error instanceof Error ? error.message : String(error) }, dryRun, compiles);
       }
       console.error(`[head-declarations] ${this.name}: storing a system change threw, but the store holds it, so the request declares it:`, error);
     }
@@ -3026,10 +3040,10 @@ export class Agent {
     // context-manager's comparison baseline for `firstChanged`, and with
     // `binds: true` its thinking-binding record, are the last committing compile's.
     try {
-      return { compiled: await compile(recorded), head: recorded };
+      return { compiled: await compiles.compile(recorded), head: recorded };
     } catch (error) {
       const moved = this.takeChangesOverBudget(error, true, recorded, current);
-      return { compiled: await compile(moved), head: moved };
+      return { compiled: await compiles.compile(moved), head: moved };
     }
   }
 
@@ -3079,8 +3093,8 @@ export class Agent {
   // committing compile with a `firstChanged`, and on a model that may bind
   // its thinking only where no kept thinking comes before it. With nothing
   // dead, or a model membrane can't price, it never moves for cost.
-  private costOfCarrying(compiled: CompileResult, carried: number, recorded: HeadDeclaration, current: HeadDeclaration): CostFigures | undefined {
-    if (carried === 0 || this.moveChangesNothing(compiled, recorded, current)) return undefined;
+  private costOfCarrying(compiled: CompileResult, carried: number, current: HeadDeclaration): CostFigures | undefined {
+    if (carried === 0) return undefined;
     const k = this.writeOverRead();
     if (k === undefined) return undefined;
     // context-manager compares `firstChanged` when it's read.
@@ -3124,29 +3138,27 @@ export class Agent {
 
   private async moveHead(
     compiled: CompileResult,
-    compiledWith: HeadDeclaration | null,
     recorded: HeadDeclaration | null,
     current: HeadDeclaration,
     move: Move,
     dryRun: boolean,
-    compile: (head: HeadDeclaration) => Promise<CompileResult>,
+    { compile, onHead }: Compiles,
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
-    if (dryRun) {
-      const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
-      return { compiled: this.withoutDeclarations(shown), head: current };
-    }
+    if (dryRun) return { compiled: this.withoutDeclarations(await onHead(compiled, current)), head: current };
     if (recorded && this.moveChangesNothing(compiled, recorded, current)) return { compiled, head: recorded };
-    const stored = this.headDeclarations.write(this.name, copyHead(current));
-    if (!stored && recorded) return { compiled, head: recorded };
+    // A move that can't record the head takes no row out.
+    if (!this.headDeclarations.write(this.name, copyHead(current))) {
+      const head = recorded ?? current;
+      return { compiled: await onHead(compiled, head), head };
+    }
     const removed = this.removeDeclarationRows(this.removableDeclarationRows(compiled));
-    if (stored) this.onHeadEvent?.({ type: 'head:moved', changesRemoved: removed, ...move });
-    const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
-    return { compiled: again ? await compile(current) : compiled, head: current };
+    this.onHeadEvent?.({ type: 'head:moved', changesRemoved: removed, ...move });
+    return { compiled: removed > 0 ? await compile(current) : await onHead(compiled, current), head: current };
   }
 
-  // A move that changes neither the record's head nor a row is no move.
+  // A move that changes neither what the record declares nor a row is no move.
   private moveChangesNothing(compiled: CompileResult, recorded: HeadDeclaration, current: HeadDeclaration): boolean {
-    return headHash(recorded) === headHash(current) && this.removableDeclarationRows(compiled).length === 0;
+    return declarationDifference(effectiveDeclaration(recorded, []), current).kind === 'none' && this.removableDeclarationRows(compiled).length === 0;
   }
 
   // The declaration rows a move takes out: those the compile holds that the

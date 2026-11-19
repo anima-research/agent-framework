@@ -98,8 +98,11 @@ function agentOn(
   events: HeadEvent[] = [],
 ): Agent {
   const { takes = false, pricing, counted, ...settings } = config;
-  const membrane = { takesToolOrSystemChanges: () => takes, ...(pricing ? { pricingFor: pricing } : {}) } as unknown as Membrane;
-  const agent = new Agent({ name: 'agent', model: 'test-model', systemPrompt: SYSTEM, ...settings }, context.cm, membrane);
+  const model = settings.model ?? 'test-model';
+  // membrane prices the model it's asked for: here the agent's own alone.
+  const pricingFor = pricing && ((asked: string) => (asked === model ? pricing() : undefined));
+  const membrane = { takesToolOrSystemChanges: () => takes, ...(pricingFor ? { pricingFor } : {}) } as unknown as Membrane;
+  const agent = new Agent({ name: 'agent', model, systemPrompt: SYSTEM, ...settings }, context.cm, membrane);
   agent.attachHeadDeclarations(heads, (event) => events.push(event), undefined, counted);
   return agent;
 }
@@ -365,28 +368,33 @@ describe('a change of tools or system text, declared in the context', () => {
     assert.deepEqual(real.read('agent'), { tools: [tool('a'), tool('b')], system: [SYSTEM, 'v2'] });
   });
 
-  it("sends what's current and takes its own change rows out while it can't store a head with none recorded", async () => {
-    const context = fakeContext([said('user', 'hello'), changeRow([tool('b')])]);
+  it("takes no change row out while it can't store a head with none recorded, or none that it can read: it goes in the fallback form", async () => {
+    const context = fakeContext([said('user', 'hello'), changeRow([tool('b', 'b as it was')])]);
     const real = memoryHeadDeclarations(onMain);
-    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => false, delete: (name) => real.delete(name) };
+    let tried = 0;
+    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => { tried++; return false; }, delete: (name) => real.delete(name) };
     const agent = agentOn(context, { takes: true }, heads);
-    const request = await agent.buildActivationRequest([tool('a'), tool('b')]);
-    assert.deepEqual(request.tools, [tool('a'), tool('b')], 'what it advertises now goes out');
-    assert.equal(changeRows(context.rows).length, 0, 'and its change row is taken out');
-    assert.deepEqual(changeRows(request.messages as unknown as Row[]), [], 'so the request carries none');
+    const request = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('a server joined')]);
+    assert.equal(tried, 1, 'the premise: it tried to record its head');
+    assert.deepEqual(foldOf(request), now([tool('a'), tool('b')], `${SYSTEM}\na server joined`), 'what goes out is what the agent has now');
+    assert.deepEqual(changesIn(request.messages), [], 'with its change rows left out');
+    assert.equal(changeRows(context.rows).length, 1, 'and kept in the store');
   });
 
-  it("sends what's current while it can't store a head with none recorded, its own change rows taken out and compiled again, so the compile it commits is what it sends", async () => {
-    const added: Row = { id: 'c-added', participant: 'system', content: [{ type: 'system_change', addSystem: ['a server joined'] } as never], metadata: { system: true, kind: 'system-change', agent: 'agent' } };
-    const context = fakeContext([said('user', 'hello'), added], { firstChanged: 'compare' });
+  it("compiles the fallback form for the head it carries, though the compile holds no change row, as when a replacement can't be stored", async () => {
+    const context = fakeContext([said('user', 'hello')], { kvUnified: true });
     const real = memoryHeadDeclarations(onMain);
-    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: () => false, delete: (name) => real.delete(name) };
+    let failWrites = false;
+    const heads: HeadDeclarationStore = { read: (name) => real.read(name), write: (name, head) => !failWrites && real.write(name, head), delete: (name) => real.delete(name) };
     const agent = agentOn(context, { takes: true }, heads);
-    const request = await agent.buildActivationRequest([tool('a')], [systemInjection('a server joined')]);
-    assert.equal(request.system, `${SYSTEM}\na server joined`, 'what is current goes out');
-    assert.deepEqual(changeRows(request.messages as unknown as Row[]), [], 'and no row of its own adds that block again');
-    assert.equal(changeRows(context.rows).length, 0, 'its change row taken out');
-    assert.equal(context.committed()!.some((key) => key.includes('system_change')), false, 'and the compile it committed holds no row the request left out');
+    await agent.buildActivationRequest([tool('a')], [systemInjection('v1')]);
+    failWrites = true;
+    const request = await agent.buildActivationRequest([tool('a')], [systemInjection('v2')]);
+    assert.equal(request.system, `${SYSTEM}\nv2`, 'the fallback form: what is current');
+    const fresh = fakeContext([said('user', 'hello')], { kvUnified: true });
+    await agentOn(fresh, { takes: true }).buildActivationRequest([tool('a')], [systemInjection('v2')]);
+    assert.equal(context.compiles.at(-1)?.kvUnifiedImmutablePrefixHash, fresh.compiles.at(-1)?.kvUnifiedImmutablePrefixHash,
+      'and the compile that it commits hashes that head, not the recorded one');
   });
 
   it("keeps a head on the branch it was recorded on, so a branch without one adopts and a switch back reads that branch's head", async () => {
@@ -411,6 +419,16 @@ describe('a change of tools or system text, declared in the context', () => {
     const hostChange: NormalizedMessage = { participant: 'system', content: [{ type: 'system_change', defineTools: [tool('b')] } as never] };
     const preview = await agent.buildActivationRequest([tool('a'), tool('b')], undefined, undefined, undefined, { dryRun: true, appendedMessages: [hostChange] });
     assert.deepEqual(changeRows(preview.messages as unknown as Row[]).map((r) => r.content), [hostChange.content], "the host's change, and no declaration of the same tool");
+  });
+
+  it("leaves a preview's appended change row out where the preview goes in the fallback form, though its compile holds none", async () => {
+    const context = fakeContext([said('user', 'hello')]);
+    const heads = memoryHeadDeclarations(onMain);
+    heads.write('agent', { tools: [tool('a')], system: [SYSTEM] });
+    const appended: NormalizedMessage = { participant: 'system', content: [{ type: 'system_change', addSystem: ["no text of the agent's"] } as never] };
+    const preview = await agentOn(context, { takes: true }, heads).buildActivationRequest([tool('a')], undefined, undefined, undefined, { dryRun: true, appendedMessages: [appended] });
+    assert.deepEqual(changesIn(preview.messages), [], 'the appended row left out');
+    assert.deepEqual(foldOf(preview), now([tool('a')], SYSTEM), 'so the preview folds to what the agent has now');
   });
 
   it("declares its change row when the store holds it though the write threw, compiling again with it", async () => {
@@ -934,14 +952,19 @@ describe('a change of tools or system text, declared in the context', () => {
       for (const refuses of [false, true]) {
         const rows = [said('user', 'hello'), { id: 'gone', participant: 'system', content: [{ type: 'system_change', removeTools: ['a'] } as never], metadata: { system: true, kind: 'system-change' } }];
         const context = fakeContext(rows, { firstChanged: () => 0, readOnly: new Set(['gone']) });
-        if (refuses) context.cm.addMessage = () => { throw new Error("a system change can't go between a tool call and its result"); };
+        let tried = 0;
+        if (refuses) context.cm.addMessage = () => { tried++; throw new Error("a system change can't go between a tool call and its result"); };
         const heads = memoryHeadDeclarations(onMain);
         const record = { tools: [tool('a')], system: [SHORT] };
         heads.write('agent', record);
+        const writes: HeadDeclaration[] = [];
+        const watched: HeadDeclarationStore = { read: (name) => heads.read(name), write: (name, head) => { writes.push(head); return heads.write(name, head); }, delete: (name) => heads.delete(name) };
         const events: HeadEvent[] = [];
-        const request = await agentOn(context, { systemPrompt: SHORT, takes: true, pricing: () => PRICES, counted: () => 10 * BAR }, heads, events).buildActivationRequest([tool('a')]);
+        const request = await agentOn(context, { systemPrompt: SHORT, takes: true, pricing: () => PRICES, counted: () => 10 * BAR }, watched, events).buildActivationRequest([tool('a')]);
         assert.deepEqual(foldOf(request), now([tool('a')], SHORT), `refuses ${refuses}: what goes out folds to what the agent has now`);
+        assert.deepEqual(writes, [], 'no record written');
         if (refuses) {
+          assert.equal(tried, 1, 'the premise: it tried to store the change');
           assert.deepEqual(changesIn(request.messages), [], 'with no change row');
           assert.deepEqual(events, [], 'nothing traced');
           assert.deepEqual(heads.read('agent'), record, 'and the record as it was');
@@ -954,6 +977,21 @@ describe('a change of tools or system text, declared in the context', () => {
   });
 
   describe('what a change declares', () => {
+    it("declares nothing where the system text is split into other blocks with the same text, which the request carries joined", async () => {
+      const context = fakeContext([said('user', 'hello')]);
+      const events: HeadEvent[] = [];
+      const agent = agentOn(context, { takes: true }, memoryHeadDeclarations(onMain), events);
+      await agent.buildActivationRequest([tool('a')], [systemInjection('one\ntwo')]);
+      await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('one\ntwo')]);
+      const split = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('one'), systemInjection('two')]);
+      assert.deepEqual(split.tools, [tool('a')], 'on the recorded head');
+      assert.deepEqual(changesIn(split.messages), [[{ type: 'system_change', defineTools: [tool('b')] }]], 'with its change row, so not in the fallback form');
+      assert.deepEqual(foldOf(split), now([tool('a'), tool('b')], `${SYSTEM}\none\ntwo`));
+      const added = await agent.buildActivationRequest([tool('a'), tool('b')], [systemInjection('one'), systemInjection('two'), systemInjection('three')]);
+      assert.deepEqual(changesIn(added.messages).at(-1), [{ type: 'system_change', addSystem: ['three'] }], 'and a block after them is an addition');
+      assert.deepEqual(events.flatMap((event) => (event.type === 'head:moved' ? [event.why] : [])), ['adopted'], 'nothing moved the head after its adoption');
+    });
+
     it('declares an added, a removed and a redefined tool as one change, a tool whose schema alone changed among them', async () => {
       const typed = (type: string): ToolDefinition => ({ ...tool('typed'), inputSchema: { type: 'object', properties: { x: { type } } } });
       const before = [tool('keep'), tool('gone'), tool('changed', 'old words'), typed('string')];

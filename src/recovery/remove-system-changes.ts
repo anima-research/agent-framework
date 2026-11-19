@@ -1,5 +1,5 @@
 import { JsStore } from '@animalabs/chronicle';
-import { ContextManager, MessageStore } from '@animalabs/context-manager';
+import { ContextManager, MessageStore, continuesBody } from '@animalabs/context-manager';
 import { isDeclarationRow } from '../system-changes.js';
 import { removeStoredMessages } from '../stored-removal.js';
 import { firstFreeBranchName } from '../branch-names.js';
@@ -42,12 +42,17 @@ interface Slot {
  * Take every row that changes tools or system text out of every message slot
  * of the store, onto a new branch made at the head of the current one, while
  * the host is stopped. A release before head declarations sends such a row as
- * stored, beside its own tools, so this is run before a step back to one; it
- * also mends a store after a step back made without it. Other branches keep
- * their rows. A row is picked by its content, as a request counts it, since a
- * host's own rows carry no mark. The branch is selected only once every slot's
- * removals succeed; otherwise the store goes back to the source branch, and the
- * new one is kept for diagnosis.
+ * stored, beside its own tools, or, with membrane 0.10.0 or later and a
+ * formatter or adapter that can't send one, has membrane refuse the request,
+ * so this is run before a step back to one; it also mends a store after a
+ * step back made without it. Other
+ * branches keep their rows. A row is picked by its content, as a request
+ * counts it, a body of shards whole, since a host's own rows carry no mark.
+ * The store writes to the branch it has selected, so the new branch is
+ * selected for its removals. A failure that the command meets selects the
+ * source branch again and keeps the new one for diagnosis. A run stopped
+ * partway can leave the new branch selected and partly cleaned: the command
+ * run again takes the rest out, onto a branch of its own.
  */
 export async function removeSystemChangesOffline(options: RemoveSystemChangesOptions): Promise<RemoveSystemChangesResult> {
   const store = JsStore.openOrCreate({ path: options.storePath });
@@ -57,9 +62,18 @@ export async function removeSystemChangesOffline(options: RemoveSystemChangesOpt
     const counts: number[] = [];
     for (const slot of slots) {
       counts.push(await throughSlot(store, slot, (reader) => {
-        const rows = declarationRows(reader);
-        validateRemovalIntegrity(reader, reader.getMessageCount(), rows.map(({ index }) => ({ start: index, end: index })));
-        return rows.length;
+        const bodies = declarationBodies(reader);
+        try {
+          validateRemovalIntegrity(reader, reader.getMessageCount(), bodies.map(({ from, to }) => ({ start: from, end: to })));
+        } catch (error) {
+          throw new Error(
+            `${slot.id}: a row there that changes tools or system text can't be taken out on its own ` +
+              `(${error instanceof Error ? error.message : String(error)}). This command takes no anchor or ` +
+              'suppression boundary, and it changed nothing.',
+            { cause: error },
+          );
+        }
+        return bodies.length;
       }));
     }
     const rowsRemoved = counts.reduce((sum, n) => sum + n, 0);
@@ -76,26 +90,29 @@ export async function removeSystemChangesOffline(options: RemoveSystemChangesOpt
     result.targetBranch = targetBranch;
     if (options.dryRun) return result;
 
-    store.createBranchAt(targetBranch, sourceBranch, store.currentSequence());
-    store.switchBranch(targetBranch);
+    let created = false;
     try {
+      store.createBranchAt(targetBranch, sourceBranch, store.currentSequence());
+      created = true;
+      store.switchBranch(targetBranch);
       for (const [i, slot] of slots.entries()) {
         if (counts[i] === 0) continue;
         await throughSlot(store, slot, (reader, removals) => {
-          for (const { row } of declarationRows(reader)) removeStoredMessages(removals, row, row);
+          for (const { first, last } of declarationBodies(reader)) removeStoredMessages(removals, first, last);
         });
       }
     } catch (error) {
       let restore = '';
       try {
-        store.switchBranch(sourceBranch);
+        if (store.currentBranch().name !== sourceBranch) store.switchBranch(sourceBranch);
       } catch (restoreError) {
         restore = `; restoring ${sourceBranch} failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`;
       }
       throw new Error(
-        `${error instanceof Error ? error.message : String(error)}${restore}; branch ${targetBranch} is kept for diagnosis: ` +
-          "it may be partly cleaned, so don't start on it, and delete it once it has been looked at (the host API's " +
-          'branch.delete, once the host runs)',
+        `${error instanceof Error ? error.message : String(error)}${restore}` + (created
+          ? `; branch ${targetBranch} is kept for diagnosis: it may be partly cleaned, so don't start on it, and ` +
+            "delete it once it has been looked at (the host API's branch.delete, once the host runs)"
+          : ''),
         { cause: error },
       );
     }
@@ -140,12 +157,29 @@ async function throughSlot<T>(store: JsStore, slot: Slot, use: (reader: Reader, 
   }
 }
 
-function declarationRows(reader: Reader): Array<{ index: number; row: StoredRow }> {
+// Each body whose rows change tools or system text, read whole as a compile
+// renders it, a body of shards included: its places in the slot, its first
+// row and its last.
+function declarationBodies(reader: Reader): Array<{ from: number; to: number; first: StoredRow; last: StoredRow }> {
   const total = reader.getMessageCount();
-  const rows: Array<{ index: number; row: StoredRow }> = [];
+  const bodies: Array<{ from: number; to: number; first: StoredRow; last: StoredRow }> = [];
+  let body: { from: number; rows: StoredRow[] } | undefined;
+  const close = () => {
+    if (body && isDeclarationRow({ content: body.rows.flatMap((row) => row.content) })) {
+      bodies.push({ from: body.from, to: body.from + body.rows.length - 1, first: body.rows[0]!, last: body.rows.at(-1)! });
+    }
+  };
   for (let offset = 0; offset < total; offset += RECOVERY_SCAN_WINDOW) {
     const { messages } = reader.getMessageWindow(offset, Math.min(RECOVERY_SCAN_WINDOW, total - offset), { resolveBlobs: false });
-    for (const [i, row] of messages.entries()) if (isDeclarationRow(row)) rows.push({ index: offset + i, row });
+    for (const [i, row] of messages.entries()) {
+      if (body && continuesBody(body.rows.at(-1), row)) {
+        body.rows.push(row);
+        continue;
+      }
+      close();
+      body = { from: offset + i, rows: [row] };
+    }
   }
-  return rows;
+  close();
+  return bodies;
 }

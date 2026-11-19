@@ -73,7 +73,8 @@ export interface CostFigures {
 
 export type HeadEvent =
   | { type: 'head:declared'; removed: string[]; defined: string[]; addedSystem: number }
-  | { type: 'head:moved'; why: 'adopted' | 'replaced' | 'unstored' | 'budget' | 'on-head'; changesRemoved: number }
+  | { type: 'head:moved'; why: 'adopted' | 'replaced' | 'budget' | 'on-head'; changesRemoved: number }
+  | { type: 'head:moved'; why: 'unstored'; changesRemoved: number; error: string }
   | { type: 'head:moved'; why: 'cost'; changesRemoved: number; estimated: CostFigures };
 
 export type DeclarationDifference =
@@ -185,6 +186,18 @@ function wireJson(value: unknown): string {
   return canonicalJson(JSON.parse(JSON.stringify(value) ?? 'null'));
 }
 
+// System text is a sequence, and a request carries a head's as one text, its
+// blocks joined (systemTextOf). The current blocks continue the effective
+// ones where their first blocks, one or more, join to the effective text;
+// the blocks after those are an addition. -1 where they don't: the current
+// blocks replace the effective ones.
+function continuedAt(effective: readonly string[], current: readonly string[]): number {
+  if (effective.length === 0) return 0;
+  const text = systemTextOf(effective);
+  for (let at = 1; at <= current.length; at++) if (systemTextOf(current.slice(0, at)) === text) return at;
+  return -1;
+}
+
 export function effectiveDeclaration(
   head: HeadDeclaration,
   changes: readonly SystemChangeContent[],
@@ -203,11 +216,9 @@ export function declarationDifference(
   effective: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
   current: HeadDeclaration,
 ): DeclarationDifference {
-  // System text is a sequence: the current blocks either continue the
-  // effective ones, and the blocks after them are an addition, or they
-  // replace them.
-  if (!effective.system.every((block, i) => block === current.system[i])) return { kind: 'replace' };
-  const addSystem = current.system.slice(effective.system.length);
+  const at = continuedAt(effective.system, current.system);
+  if (at < 0) return { kind: 'replace' };
+  const addSystem = current.system.slice(at);
 
   const currentNames = new Set(current.tools.map((tool) => tool.name));
   const removeTools = [...effective.tools.keys()].filter((name) => !currentNames.has(name));

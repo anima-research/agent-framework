@@ -135,8 +135,7 @@ export type TraceEvent =
       /** What moved the head to what's current: the first request on a
        *  model that takes a change, or the first after a rewind to before a
        *  head was recorded ('adopted'); a replacement of system text
-       *  ('replaced'); a change row the store didn't take, as between a tool
-       *  call and its result ('unstored'); a compile refused over budget, or
+       *  ('replaced'); a compile refused over budget, or
        *  for dropping messages no summary covers, with change rows kept
        *  ('budget'); or a request on a model that takes none, or kept to its
        *  head, that found change rows to take out ('on-head'). A move other
@@ -148,10 +147,20 @@ export type TraceEvent =
        *  `dropBlock` the provider drops it, and without it an account that
        *  enforces the binding refuses them, and one that doesn't decides for
        *  itself. */
-      why: 'adopted' | 'replaced' | 'unstored' | 'budget' | 'on-head';
+      why: 'adopted' | 'replaced' | 'budget' | 'on-head';
       /** The change rows removed, since the head now holds what they
        *  declared, or what they declared is no longer current. */
       changesRemoved: number;
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** A change row the store didn't take, as between a tool call and its result: one whole write. */
+      why: 'unstored';
+      changesRemoved: number;
+      /** Why the store didn't take it: the write's message, bounded as every trace event's `error` is (2,000
+       *  characters). context-manager's refusal of a change between a tool call and its result is one such message. */
+      error: string;
     })
   | (TraceEventBase & {
       type: 'head:moved';
@@ -174,9 +183,9 @@ export type TraceEvent =
       agentName: string;
       /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
-      /** What took the change as the cause: membrane, which marked the refusal as the change's, so the request went
-       *  again on the head; or a retry of the request in the fallback form, with no system change, which was accepted
-       *  after a 400 membrane didn't mark. */
+      /** What took the change as the cause: membrane, which marked the refusal as the change's, so the request goes
+       *  again on the head; or a retry of the request in the fallback form, its change rows left out, which was
+       *  accepted after a 400 membrane didn't mark. */
       diagnosis: 'membrane' | 'retry';
     })
   | (TraceEventBase & {
@@ -1632,8 +1641,7 @@ export type TraceEvent =
        * a start finished, `resume`, a refusal rewind's shed from a window
        * that is still the record, `rewind`, and the system changes a move of
        * an agent's head took out, `head-moved`, the `head:moved` trace
-       * after it saying why, or none where the head couldn't be stored and
-       * none was recorded), or that no live context
+       * after it saying why), or that no live context
        * heard, found at boot (`boot`). `shed` is a refusal rewind's or an
        * inference failure's shed on a presented window: the rows leave the
        * agent's own window as an undone turn's do, and stay in the record.

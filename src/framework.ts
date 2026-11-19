@@ -18931,7 +18931,7 @@ export class AgentFramework {
     try {
       stored = this.store.getStateJson(headDeclarationId(agentName));
     } catch (error) {
-      this.sayHeadLineOnce(agentName, 'unreadable', () => console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so its requests go on its current head with no change row, and it records that head once it can; a record that reads again before then is the head its next request declares from:`, error));
+      this.sayHeadLineOnce(agentName, 'unreadable', () => console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so the agent records its current tools and system text as its head; while the store doesn't take that, its requests go on them with its change rows left out of the request, and kept in the store, and a record that reads again before then is the head its next request declares from:`, error));
       return { kind: 'unreadable' };
     }
     if (stored == null) return { kind: 'none' };
@@ -18949,7 +18949,7 @@ export class AgentFramework {
       console.error(head === null
         ? `[head-declarations] ${agentName}: the recorded head could not be cleared, so it stays, with the change rows its context holds, until a later request clears it:`
         : recorded.kind !== 'head'
-          ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded.kind === 'unreadable' ? ' that can be read' : ''}, so its requests go on its current head with no change row until a later request stores it:`
+          ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded.kind === 'unreadable' ? ' that can be read' : ''}, so its requests go on its current tools and system text with its change rows left out of the request, and kept in the store, until a later request stores it:`
           : `[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
       return false;
     }
@@ -18991,8 +18991,8 @@ export class AgentFramework {
   private keepToHead(agent: Agent, error: Error, diagnosis: 'membrane' | 'retry'): void {
     agent.keepToHeadUntilBuiltAgain();
     const cause = diagnosis === 'membrane'
-      ? "membrane refused a system change, and the request went again on the agent's head"
-      : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one, and the request went again in the fallback form, on the agent's current tools and system text with no system change, and was accepted";
+      ? "membrane refused a system change, and the request goes again on the agent's head"
+      : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one, and the request went again in the fallback form, on the agent's current tools and system text with its change rows left out, and was accepted";
     console.error(`[head-declarations] ${agent.name}: ${cause}, so it keeps to its head until it's built again, by a restart of the host or by creating the agent again; a model that refuses system changes belongs on membrane's list of models that refuse them (Membrane.takesToolOrSystemChanges): ${error.message}`);
     this.opsAlert('head-resend', agent.name,
       `${cause}${this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}.${diagnosis === 'membrane'
@@ -19036,7 +19036,7 @@ export class AgentFramework {
       this.emitTrace({ ...event, agentName: agent.name });
       if (event.type === 'head:moved' && event.why === 'budget') {
         this.opsAlert('head-consolidated', agent.name,
-          `a compile was refused over budget, or for dropping messages no summary covers, with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
+          `a compile was refused over budget, or for dropping messages no summary covers, with ${event.changesRemoved} system changes kept, so the head takes them and the compile runs again, and the request then writes the cache whole${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
           { data: { changesRemoved: event.changesRemoved } });
       }
     }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'),
@@ -19802,9 +19802,11 @@ export class AgentFramework {
           // carried it.
           //
           // The cut: tool blocks would corrupt the tool-cycle structure the
-          // membrane enforces, and a message named as the agent itself would
+          // membrane enforces, a message named as the agent itself would
           // render as an ASSISTANT turn on the wire (an unintended prefill the
-          // model would continue). Presented here without being heard, such a
+          // model would continue), and a change of tools or system text would
+          // go out beside a head it doesn't fold to, where the next start's
+          // request folds it (Agent's settleHead). Presented here without being heard, such a
           // message would sit in the window before the turn's later replies
           // although their requests never held it, and a reply whose signed
           // thinking the provider then refuses, since it binds thinking to
@@ -31140,8 +31142,14 @@ export class AgentFramework {
                   return;
                 }
                 if (failSafe === 'probe') this.probesNext.set(agent, err);
-                // Marked as its turn's retry, as at the start's failure.
-                await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
+                try {
+                  // Marked as its turn's retry, as at the start's failure.
+                  await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
+                } finally {
+                  // A retry that ends before its start takes the probe, as one held at admission, leaves it to no
+                  // later turn: held, it goes in the ordinary form, and a refusal there probes again.
+                  if (this.probesNext.get(agent) === err) this.probesNext.delete(agent);
+                }
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted
