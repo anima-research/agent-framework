@@ -9,6 +9,8 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { registerOpen, incoming, MENTION } from './helpers/admission.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
@@ -32,7 +34,7 @@ describe('skip_reply wake capability', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'I cannot schedule that wake.' }] as ContentBlock[]));
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true }], modules: [],
       ...(gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
     });
     const routed: string[] = [];
@@ -76,11 +78,11 @@ describe('skip_reply wake capability', () => {
   it('framework wiring exposes timer wake only when its EventGate exists', async () => {
     const noGate = await AgentFramework.create({
       storePath: join(dir, 'framework-no-gate'), membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true }], modules: [],
     });
     const withGate = await AgentFramework.create({
       storePath: join(dir, 'framework-with-gate'), membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true }], modules: [],
       gate: { configPath: join(dir, 'framework-gate.json') },
     });
     const live = (framework: AgentFramework) => framework as unknown as {
@@ -97,6 +99,25 @@ describe('skip_reply wake capability', () => {
     assert.match(present.description, /wake_in_seconds/);
     await noGate.stop();
     await withGate.stop();
+  });
+
+  it("refuses a skip_reply whose reason isn't a string, and the turn goes on in public", async () => {
+    const f = await fixture();
+    try {
+      await registerOpen(f, 'work');
+      f.membrane.responses.length = 0; // the fixture pre-scripts an `ok`
+      (f.membrane as unknown as { responseIndex: number }).responseIndex = 0;
+      f.membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'skip-number', name: 'skip_reply', input: { reason: 5 } },
+      ] as ContentBlock[], 'tool_use'));
+      f.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the turn went on' }] as ContentBlock[]));
+      await incoming(f, 'work', 'w1', 'agent, are you there?', MENTION);
+      await f.framework.runUntilIdle();
+      await eventually(() => f.published.some((p) => JSON.stringify(p.content).includes('the turn went on')), 'the next round posted');
+      const refused = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .some((m) => JSON.stringify(m.content).includes("Nothing changed: skip_reply's reason must be a string, and this call gave a number."));
+      assert.ok(refused, "the refusal is in the agent's context");
+    } finally { await f.close(); }
   });
 
   it('returns an error and does not end the turn when EventGate is absent', async () => {
@@ -121,7 +142,7 @@ describe('skip_reply wake capability', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continued' }] as ContentBlock[]));
     const framework = await AgentFramework.create({
       storePath: join(dir, 'stored-input'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true }], modules: [],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       getChannelTools: () => [], resolveLocus: () => ({ serverId: 'stub', channelId: 'channel:test' }),
@@ -149,7 +170,7 @@ describe('skip_reply wake capability', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'must remain private' }] as ContentBlock[]));
     const framework = await AgentFramework.create({
       storePath: join(dir, 'already-silent'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true }], modules: [],
     });
     const routed: string[] = [];
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
@@ -177,7 +198,7 @@ describe('skip_reply wake capability', () => {
     for (const response of streams[0] ?? []) membrane.pushResponse(response);
     const framework = await AgentFramework.create({
       storePath: join(dir, store), membrane: membrane.asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', ...(maxStreamTokens ? { maxStreamTokens } : {}) }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true, ...(maxStreamTokens ? { maxStreamTokens } : {}) }], modules: [],
     });
     let starts = 0;
     let completed = 0;
@@ -273,7 +294,7 @@ describe('refused wake: no lifecycle events; a wake_in_seconds the host can\'t s
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'next-round reply' }] as ContentBlock[]));
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', sendSilencing: true }], modules: [],
       ...(gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
     });
     // The seconds the framework asks the gate to wake after, as it asks.

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import type { Membrane, NormalizedMessage, NormalizedRequest } from '@animalabs/membrane';
-import { ReplyJudge, cut, ifYouWait, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
+import { JudgeFailure, ReplyJudge, cut, ifYouWait, parseVerdict, renderMessage } from '../src/gate/reply-judge.js';
 import type { JudgeRequest } from '../src/gate/types.js';
 
 function msg(participant: string, text: string): NormalizedMessage {
@@ -76,6 +76,17 @@ describe('reply judge: verdicts', () => {
       membraneFor: () => membrane, chooseAgent: (n) => n[0], preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
     });
     await assert.rejects(judge.judge(judgeRequest()), /no verdict/);
+  });
+
+  it("names an answer with no verdict in the framework's words, keeping its stop and text apart for the log", async () => {
+    const { membrane } = fakeMembrane('zz-judge-words-7f3a I would rather not say.');
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0], preview: async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } }),
+    });
+    const failure = await judge.judge(judgeRequest()).then(() => assert.fail('the judge should fail'), (e: unknown) => e);
+    assert.ok(failure instanceof JudgeFailure, String(failure));
+    assert.equal(failure.message, "the judge's answer held no verdict");
+    assert.equal(failure.detail, 'stop: end_turn, text: "zz-judge-words-7f3a I would rather not say."');
   });
 });
 
@@ -323,6 +334,19 @@ describe('reply judge: the document', () => {
     });
     await judge.judge(judgeRequest());
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
+  });
+
+  it("opens what waiting leaves with the agent's failed last turn, and a provider that throws counts as none", async () => {
+    const { membrane, requests } = fakeMembrane();
+    const now = Date.now();
+    const preview = async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } });
+    await new ReplyJudge({ membraneFor: () => membrane, chooseAgent: (n) => n[0], preview, failedLastTurn: () => ({ at: now - 125_000 }) })
+      .judge(judgeRequest());
+    const told = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(told.includes("<if_you_wait>\nScout's last turn, 2m ago, failed and may not have answered all of what woke it.\nNothing the host knows of is scheduled"), told);
+    await new ReplyJudge({ membraneFor: () => membrane, chooseAgent: (n) => n[0], preview, failedLastTurn: () => { throw new Error('boom'); } })
+      .judge(judgeRequest());
+    assert.doesNotMatch((requests[1]!.messages.at(-1)!.content[0] as { text: string }).text, /last turn/);
   });
 
   it('reads the primary agent its chooser names', async () => {

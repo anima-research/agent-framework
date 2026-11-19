@@ -2,9 +2,9 @@ import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
-import type { WakeLine } from '../gate/types.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
+export type SameRoundSkipReplyTextPolicy = 'private' | 'ask';
 export type SameRoundThinkTextPolicySource =
   | 'runtime_override'
   | 'recipe'
@@ -157,6 +157,22 @@ export interface AgentConfig {
    * Omitted preserves the compatibility carry-forward: public.
    */
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /**
+   * What becomes of ordinary text in a round that calls `skip_reply`.
+   * Omitted or 'private': it stays private and isn't held. 'ask': text that
+   * only the `skip_reply` keeps back is held as a draft. Where some of a
+   * round's text would have been posted or bounced without the `skip_reply`,
+   * the first such `skip_reply` of a turn, called by the model in a round
+   * with verbatim content, is refused once with a result that names the
+   * round's drafts and asks where they should go. Where the text would only
+   * have been held, the `skip_reply` runs. It acts only on rounds with verbatim
+   * content (membrane's `roundContent`). On the XML tool path nothing is
+   * refused and nothing is held, and the heartbeat notice still drops its
+   * clause, so a resident there is told its words are held when a
+   * `skip_reply` round's aren't. A derived agent and the subconscious don't
+   * take it from this agent.
+   */
+  sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks
@@ -353,6 +369,18 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
 
   /**
+   * Whether an explicit send (send_message, channel_publish, a `drafts`
+   * resend and the like) silences the plain speech its round and later
+   * rounds aim where the send may have posted, holding it as drafts.
+   * Default false: plain speech beside a send is routed as any other is.
+   * `skip_reply` and a private same-round `think` keep their rounds private
+   * either way. Explicit mode never silences on a send, and disabled mode
+   * routes nothing, so it changes nothing there. The agent can change it for
+   * itself with `agent_settings` (`send_silencing`); its choice persists.
+   */
+  sendSilencing?: boolean;
+
+  /**
    * Locked mode's destination until the agent chooses one with `prose_locus`:
    * `"#channel"`, `"@person"`, a channel id, or `"drafts"`. Resolved as a
    * `>>` target is, at each turn's start, so a channel its server hasn't
@@ -398,6 +426,20 @@ export interface AgentConfig {
    * content-free system receipt is stored instead. Default false.
    */
   toolWrapperProseGuard?: boolean;
+
+  /**
+   * Whether a turn waits for this agent's auxiliary call (context-manager
+   * compression through provider admission) already in flight to end before
+   * its own call starts. Default false: the turn starts beside it, and can
+   * compile before that call's summary lands. A new auxiliary call waits
+   * while a turn holds admission either way. Turn it
+   * on for an agent whose provider limits how fast input tokens per minute
+   * may grow, where a compression call in flight can cost the larger primary
+   * call its admission (#114). It applies to an agent that owns its provider
+   * scheduling, a resident: a conversation agent takes neither side of the
+   * gate, so the setting does nothing for it.
+   */
+  primaryWaitsForAuxiliary?: boolean;
 
   /**
    * Continue on the agent's own turn ending (off when left out): a turn the
@@ -511,6 +553,8 @@ export interface AgentRuntimeSettingsPatch {
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /** Whether an explicit send silences plain speech aimed where it posted (AgentConfig.sendSilencing). */
+  sendSilencing?: boolean;
   /**
    * Apply a `contextBudgetTokens` DECREASE immediately instead of starting a
    * paced descent: the next compile plans straight at the new budget and the
@@ -544,6 +588,7 @@ export interface AgentRuntimeSettingsSnapshot {
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
   sameRoundThinkTextPolicySource: SameRoundThinkTextPolicySource;
+  sendSilencing: boolean;
   transition: 'stable' | 'converging' | 'blocked';
   transitionReason?: 'transition_pace_too_small' | 'protected_context_exceeds_target';
 }
@@ -670,6 +715,26 @@ export interface InferenceRequest {
    *  the wake starts no turn. A row stored and not yet presented to the
    *  agent keeps its wake. */
   readsRow?: string;
+  /** The platform id of the one message this wake is for, in its channel
+   *  (`channelId`). The framework sets it on a wake for one message from a
+   *  channel or a push, the onboarding wake included, and carries it onto a
+   *  rewind's retry and `/unstick`'s run. If the turn it opens is refused,
+   *  no rewind takes the refusal and the turn isn't an ephemeral run's, the
+   *  refusal reaction goes on that message (on a Discord channel). Left out for a wake that is for no
+   *  single message: a batch, the gate's included even when it holds one
+   *  message, and a module's wake; and left off a re-armed turn that speaks
+   *  in another channel than the message's. A start merged from wakes that
+   *  don't all answer the same message, in the same channel, answers none:
+   *  wakes for two messages, or a message's wake merged with one that
+   *  answers no message, such as a timer's or a reaction's. */
+  answersMessageId?: string;
+  /** Host-owned: this wake's sole cause is these rows, a batched wake's
+   *  writes (WakeProvenance.writes): the message of its own of each event
+   *  that has one, and the batch's line where one was written. The wake starts no turn once each
+   *  row is done as a `readsRow` is, with the channel a reply to it is owed
+   *  in (`replyTo`) as that row's channel. A row stored and not yet
+   *  presented to the agent keeps its wake. */
+  readsRows?: Array<{ row: string; replyTo?: { serverId: string; channelId: string } }>;
   agentName: string;
   reason: string;
   source: string;
@@ -786,12 +851,6 @@ export interface InferenceRequest {
   wakeChannels?: Array<{ serverId: string; channelId: string }>;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
-  /** Batched-wake lines the gate handed to this wake rather than wrote
-   *  (WakeLine), decided by a fresh start of its turn as WakeLine says: each
-   *  written once into the window it names, or left for a later fresh start
-   *  of the same wake. A retry, or a start that resumes a logical turn,
-   *  decides none. */
-  wakeLines?: WakeLine[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

@@ -17,6 +17,8 @@ import { AgentFramework } from '../src/index.js';
 import type { Module } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import { jsonLines } from './helpers/json-lines.js';
@@ -282,6 +284,7 @@ function breakAfterToolRound(
   how: 'error' | 'throw' | 'abort' | 'stop',
   opts: {
     fromStart?: boolean;
+    atCompletion?: boolean;
     stopEnds?: 'aborted' | 'error' | 'silent' | 'throw';
     stream?: number;
     failure?: () => Error;
@@ -309,6 +312,7 @@ function breakAfterToolRound(
         }) as unknown as StreamEvent;
         if (opts.fromStart) { yield failure(); return; }
         for await (const event of inner) {
+          if (opts.atCompletion && event.type === 'complete') { await opts.beforeFailure?.(); yield failure(); return; }
           yield event;
           if (event.type !== 'tool-calls') continue;
           while (!resultsGiven && !cancelled) await new Promise<void>((resolve) => { wake = resolve; });
@@ -407,7 +411,8 @@ function onSecondStream(membrane: MockMembrane, response: NormalizedResponse): v
 }
 
 async function harness(opts: {
-  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
+  agents?: Array<{ name: string; /** AgentConfig.sendSilencing; on unless a test says false, since most of these read the hold. */ sendSilencing?: boolean; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; sameRoundSkipReplyTextPolicy?: 'private' | 'ask'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
+  gate?: boolean;
   xml?: boolean;
   roundPreamble?: boolean;
   retries?: number;
@@ -439,9 +444,10 @@ async function harness(opts: {
     return streamYielding(request, options);
   };
   const agents = (opts.agents ?? [{ name: 'scout' }]).map((a) => ({
-    name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`,
+    name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`, sendSilencing: a.sendSilencing ?? true,
     ...(a.proseRouting ? { proseRouting: a.proseRouting } : {}),
     ...(a.sameRoundThinkTextPolicy ? { sameRoundThinkTextPolicy: a.sameRoundThinkTextPolicy } : {}),
+    ...(a.sameRoundSkipReplyTextPolicy ? { sameRoundSkipReplyTextPolicy: a.sameRoundSkipReplyTextPolicy } : {}),
     ...(a.autoContinue ? { autoContinue: a.autoContinue } : {}),
     ...(a.toolResultGuard ? { toolResultGuard: a.toolResultGuard } : {}),
     ...(a.maxStreamTokens !== undefined ? { maxStreamTokens: a.maxStreamTokens } : {}),
@@ -473,6 +479,7 @@ async function harness(opts: {
       ...(opts.heartbeat !== undefined ? { heartbeat: opts.heartbeat as never } : {}),
       ...(opts.speech ? { speech: opts.speech } : {}),
       ...(opts.codeExecution ? { codeExecution: { enabled: true } } : {}),
+      ...(opts.gate ? { gate: { config: { policies: [], default: 'always' }, configPath: join(dir, 'gate.json') } } : {}),
       ...(opts.retries !== undefined ? {
         errorPolicy: {
           maxRetries: opts.retries,
@@ -1607,6 +1614,24 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("hybrid mode: under a send whose reach is unknown, a refused target and the line after it are held together and named in one notice", async () => {
+    const h = await harness({ sendTool: true, agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([
+        createMockResponse([text('>>>no-such-channel One.'), unplacedSend('s1'), text('Two.')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => d.text).sort(), ['One.', 'Two.']);
+      const notices = h.texts().filter((t) => t.startsWith('[drafts]'));
+      assert.equal(notices.length, 1, notices.join('\n---\n'));
+      assert.ok(held.every((d) => notices[0]!.includes(d.id)), notices[0]);
+    } finally {
+      await h.close();
+    }
+  });
+
   it("hybrid mode: in a drafts round, a line left with no destination by a refused target is held with no notice (#701)", async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
@@ -2013,7 +2038,7 @@ describe('draft notices and turn-end settlement', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     try {
@@ -2046,7 +2071,7 @@ describe('draft notices and turn-end settlement', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     const internals = framework as unknown as {
@@ -2253,7 +2278,7 @@ describe('draft identity and risk evidence', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }, { name: 'other', model: 'test-model', systemPrompt: 'other' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', sendSilencing: true }, { name: 'other', model: 'test-model', systemPrompt: 'other', sendSilencing: true }],
       modules: [],
     });
     const internals = framework as unknown as {
@@ -2310,7 +2335,7 @@ describe('drafts resend ownership', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     const pending: Array<{ text: string; resolve: (o: unknown) => void }> = [];
@@ -3136,6 +3161,95 @@ describe('an explicit send holds plain speech only where it may have posted', ()
   const inRoom = (h: H) => h.publishes().filter((p) => p.event === 'publish' && p.channelId === ROOM).map((p) => p.text);
   const held = (h: H) => h.drafts().map((d) => [d.text, d.reason]).reverse();
   const notices = (h: H) => h.texts().filter((t) => t.startsWith('[drafts]'));
+  const draftsToolShown = (h: H) => (h.framework as unknown as {
+    getToolsForAgent(agentName: string): Array<{ name: string; description: string }>;
+  }).getToolsForAgent('scout').find((tool) => tool.name === 'drafts')!.description;
+  const SEND_REASON = 'because an explicit send in its turn may already have posted where it was going, ';
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode}: with send silencing off, a line beside a send to its own channel is posted, and so are the turn's later rounds`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode, sendSilencing: false }], sendTool: true });
+      try {
+        await h.turn([
+          createMockResponse([text(LINE), send('s1', ROOM, 'The reply, sent with the tool.')], 'tool_use'),
+          createMockResponse([text('And one more thing for you.'), call('l1', 'channel_list', {})], 'tool_use'),
+          createMockResponse([text('That is all from me.')]),
+        ]);
+        assert.deepEqual(h.sends().map((s) => [s.channelId, s.text]), [[ROOM, 'The reply, sent with the tool.']]);
+        assert.deepEqual(inRoom(h), [LINE, 'And one more thing for you.', 'That is all from me.']);
+        assert.deepEqual(held(h), []);
+        assert.deepEqual(notices(h), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('with send silencing off, XML tool mode posts the prose before and after a send', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', sendSilencing: false }] });
+    try {
+      await h.turn([
+        createMockResponse([text('Narration before the send.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
+      ]);
+      const posted = h.publishes().filter((p) => p.event === 'publish').map((p) => p.text).join('\n');
+      assert.match(posted, /Narration before the send\./);
+      assert.match(posted, /And after it\./);
+      assert.deepEqual(held(h), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('with send silencing off, skip_reply and a private think still keep their rounds out of the room', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: false, sameRoundThinkTextPolicy: 'private' }], sendTool: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Working it out.'), call('t1', 'think', { content: 'private' }), send('s1', GENERAL)], 'tool_use'),
+        createMockResponse([text('The answer.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('Not for the room.'), call('k1', 'skip_reply', { reason: 'done' })], 'tool_use'),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL], 'the send ran');
+      for (const line of ['Working it out.', 'Not for the room.']) {
+        assert.ok(h.texts().includes(line), `the round that wrote ${JSON.stringify(line)} ran: its words are in the history`);
+      }
+      assert.deepEqual(inRoom(h), ['The answer.']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the resident turns send silencing on with agent_settings: sends made after it hold, the drafts tool names the reason, and a reset posts again', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: false }], sendTool: true });
+    try {
+      assert.ok(!draftsToolShown(h).includes(SEND_REASON), 'off: the drafts tool names no send as a reason');
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, false);
+      await h.turn([
+        createMockResponse([call('a1', 'agent_settings', { action: 'update', send_silencing: true })], 'tool_use'),
+        createMockResponse([text(LINE), send('s1', ROOM, 'The reply, sent with the tool.')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true);
+      assert.deepEqual(inRoom(h), []);
+      assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+      assert.ok(draftsToolShown(h).includes(SEND_REASON), 'on: the drafts tool names the send as a reason');
+
+      await h.restart();
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the resident's choice outlives a restart");
+      // What a request carries, not only what a fresh tool list says.
+      const draftsToolSent = () => h.membrane.calls.at(-1)!.tools!.find((tool) => tool.name === 'drafts')!.description;
+      await h.turn([createMockResponse([text('Hello.')])]);
+      assert.ok(draftsToolSent().includes(SEND_REASON), 'on: the request carries the send as a reason');
+
+      h.framework.resetAgentRuntimeSettings('scout', ['sendSilencing']);
+      assert.ok(!draftsToolShown(h).includes(SEND_REASON));
+      await h.turn([createMockResponse([text('Again.'), send('s2', ROOM, 'Sent again.')], 'tool_use'), createMockResponse([])]);
+      assert.ok(!draftsToolSent().includes(SEND_REASON), 'off: the request carries none');
+      assert.deepEqual(inRoom(h), ['Hello.', 'Again.']);
+    } finally {
+      await h.close();
+    }
+  });
 
   for (const mode of ['locus', 'hybrid'] as const) {
     it(`${mode}: a line beside a send to another channel goes to the person it was for`, async () => {
@@ -4324,15 +4438,40 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
-    it('a failure with no round keeps the marker saying nothing was sent', async () => {
+    it('a failure with no round writes no marker, since the turn did nothing', async () => {
       const h = await harness({ retries: 0 });
       try {
+        const exhausted: unknown[] = [];
+        h.framework.onTrace((event) => { if ((event as { type: string }).type === 'inference:exhausted') exhausted.push(event); });
         breakAfterToolRound(h.membrane, 'error', { fromStart: true });
         await h.turn([]);
-        assert.equal(markers(h).length, 1);
-        assert.match(markers(h)[0]!, /the model call failed( \([^)]*\))? and produced no response, so nothing was sent/);
+        assert.equal(exhausted.length, 1, 'premise: the turn failed');
+        assert.deepEqual(markers(h), []);
       } finally {
         await h.close();
+      }
+    });
+
+    it('locus and hybrid: plain speech streamed with no tool round, then a failure, posts nothing and writes no marker; the same turn completing posts it once', async () => {
+      for (const proseRouting of ['locus', 'hybrid'] as const) {
+        for (const fails of [true, false]) {
+          const at = `${proseRouting}, ${fails ? 'failing' : 'completing'}`;
+          const h = await harness({ agents: [{ name: 'scout', proseRouting }], retries: 0 });
+          try {
+            const exhausted: unknown[] = [];
+            h.framework.onTrace((event) => { if ((event as { type: string }).type === 'inference:exhausted') exhausted.push(event); });
+            if (fails) breakAfterToolRound(h.membrane, 'error', { atCompletion: true, beforeFailure: () => speechSettled(h) });
+            await h.turn([createMockResponse([text(SPEECH)])]);
+            if (!fails) await h.until(() => published(h, SPEECH).length === 1, `${at}: the speech is posted`);
+            await speechSettled(h);
+            assert.equal(exhausted.length, fails ? 1 : 0, `premise, ${at}: the turn ${fails ? 'failed' : 'completed'}`);
+            if (fails) assert.deepEqual(h.publishes().filter((p) => p.event === 'publish').map((p) => p.text), [], at);
+            else assert.equal(published(h, SPEECH).length, 1, at);
+            assert.deepEqual(markers(h), [], at);
+          } finally {
+            await h.close();
+          }
+        }
       }
     });
 
@@ -4803,8 +4942,8 @@ describe('the held-draft notice written mid-turn', () => {
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
       agents: [
-        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
-        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', observes: ['scout'] },
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true },
+        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', sendSilencing: true, observes: ['scout'] },
       ],
       modules: [],
     });
@@ -4829,6 +4968,489 @@ describe('the held-draft notice written mid-turn', () => {
       // to scout, as the title says.
       internals.presentAtEndOf(scout);
       assert.notEqual(scout.getContextManager().ordinalOf(notice.id), undefined, "in scout's window at its turn's end");
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('sameRoundSkipReplyTextPolicy', () => {
+  const asking = (extra: Record<string, unknown> = {}) => ({ agents: [{ name: 'scout', sameRoundSkipReplyTextPolicy: 'ask' as const, ...extra }] });
+  const endings = (h: Awaited<ReturnType<typeof harness>>): (() => number) => {
+    let ended = 0;
+    h.framework.onTrace((event) => { if (event.type === 'inference:turn_ended') ended++; });
+    return () => ended;
+  };
+  const opening = (id: string) => `[drafts] scout: not sent — a plain-speech segment held as draft ${id} — a skip_reply in its round held it back. `;
+  const asksWhere = (result: string, id: string): void => {
+    assert.ok(result.startsWith(opening(id)), result);
+    assert.ok(result.includes(`drafts(action: "resend", draftIds: ["${id}"], destination: "#room") delivers it unchanged`), result);
+    assert.ok(result.includes(`drafts(action: "dismiss", draftIds: ["${id}"]) sets it aside.`), result);
+    assert.match(result, /call skip_reply again/);
+    assert.match(result, /wake_in_seconds/);
+    assert.match(result, /\breason\b/);
+  };
+  const roundTaken = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean =>
+    h.messages().some((m) => m.content.some((b) => b.type === 'tool_use' && (b as { id?: string }).id === id));
+  const WORDS = 'Hello there, friend.\n\nGood to hear from you.';
+
+  it('a round with text and skip_reply is refused once: the text is a draft, the result asks where it goes, and nothing is posted', async () => {
+    const h = await harness(asking());
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.deepEqual(h.publishes(), [], 'nothing posted');
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => [d.text, d.reason, d.note]), [[WORDS, 'skip-reply', `written for #room (Guild One) (${ROOM})`]]);
+      const [result] = h.toolResults();
+      asksWhere(result!, held[0]!.id);
+      assert.deepEqual(h.texts().filter((t) => t.startsWith('[drafts]')), [], 'the result names the draft, and no notice follows');
+      assert.ok(roundTaken(h, 'k2'), 'the refusal let the turn go on to a second round');
+      assert.equal(ended(), 1, 'the second skip_reply ended the turn');
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1) ?? '';
+      assert.ok(receipt.startsWith('[delivered] nothing') && receipt.includes(held[0]!.id), receipt);
+
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: [held[0]!.id], destination: '#room' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, WORDS]], 'the resend posts the words byte for byte');
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const mode of ['hybrid', 'explicit'] as const) {
+    const prefix = mode === 'hybrid' ? '>>>' : '>>';
+    it(`${mode} mode: a refused round's ${prefix}target is held and still sets the destination, so the next round's plain text goes there`, async () => {
+      const h = await harness(asking({ proseRouting: mode }));
+      try {
+        await h.turn([
+          createMockResponse([text(`${prefix}${GENERAL} Goodnight.`), call('k1', 'skip_reply', {})], 'tool_use'),
+          createMockResponse([text('One more thing.')]),
+        ]);
+        const held = h.drafts();
+        assert.deepEqual(held.map((d) => [d.text, d.reason, d.note]), [['Goodnight.', 'skip-reply', `written for ${prefix}${GENERAL}`]]);
+        assert.ok(h.toolResults()[0]!.startsWith(opening(held[0]!.id)), h.toolResults()[0]);
+        assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[GENERAL, 'One more thing.']]);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it("after the guard's refusal, a skip_reply beside text runs: its text is a draft too, and the receipt names both", async () => {
+    const h = await harness(asking());
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([text('Never mind, then.'), call('k2', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.equal(ended(), 1, 'the second skip_reply ended the turn');
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => d.text).sort(), ['Never mind, then.', WORDS].sort());
+      assert.ok(held.every((d) => d.reason === 'skip-reply'));
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1) ?? '';
+      assert.ok(held.every((d) => receipt.includes(d.id)), receipt);
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("when the drafts journal can't hold the text, the guard refuses nothing: the skip_reply runs as today", async () => {
+    const h = await harness(asking());
+    const ended = endings(h);
+    const store = (h.framework as unknown as { store: { appendJson(t: string, p: unknown): unknown } }).store;
+    const real = { appendJson: store.appendJson.bind(store) };
+    store.appendJson = (type, payload) => {
+      if ((payload as { op?: string }).op === 'held') throw new Error('EIO');
+      return real.appendJson(type, payload);
+    };
+    try {
+      await h.turn([
+        createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.equal(ended(), 1, 'a skip_reply ended the turn');
+      assert.ok(!roundTaken(h, 'k2'), 'the first skip_reply ran: no second round');
+      assert.deepEqual(h.drafts(), [], "premise: the journal held nothing");
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      store.appendJson = real.appendJson;
+      await h.close();
+    }
+  });
+
+  describe("text that would only have been held is held and named, and the skip_reply runs (review R1-1)", () => {
+    const ranOnce = async (h: Awaited<ReturnType<typeof harness>>, ended: () => number): Promise<string> => {
+      assert.equal(ended(), 1, 'the skip_reply ended the turn');
+      assert.ok(!roundTaken(h, 'k2'), 'the skip_reply ran: no second round');
+      const held = h.drafts().filter((d) => d.reason === 'skip-reply');
+      assert.equal(held.length, 1, 'its text is held as a skip-reply draft');
+      const id = held[0]!.id;
+      assert.ok(!h.toolResults().some((r) => r.startsWith(opening(id))), 'nothing asked where it goes');
+      assert.ok(h.texts().some((t) => (t.startsWith('[drafts]') || t.startsWith('[delivered]')) && t.includes(id)), 'the draft is named');
+      return id;
+    };
+    const skipped = (blocks: ContentBlock[]) => [
+      createMockResponse([...blocks, call('k1', 'skip_reply', {})], 'tool_use'),
+      createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+    ];
+
+    it("a heartbeat turn's text, which has no destination", async () => {
+      const h = await harness(asking());
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(WORDS)]), 'scout', 'heartbeat');
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("hybrid mode: a heartbeat turn's text, which has no destination", async () => {
+      const h = await harness(asking({ proseRouting: 'hybrid' }));
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(WORDS)]), 'scout', 'heartbeat');
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('text beside a send that reached the locus', async () => {
+      const h = await harness(asking());
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(WORDS), explicitSend('s1')]));
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the send posted');
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("an agent whose sends don't silence: text beside a send would have been posted, so the skip_reply is refused", async () => {
+      const h = await harness(asking({ sendSilencing: false }));
+      try {
+        await h.turn(skipped([text(WORDS), explicitSend('s1')]));
+        assert.ok(roundTaken(h, 'k2'), 'refused: the turn went on');
+        assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [[WORDS, 'skip-reply']]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the send posted');
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('hybrid mode: a run under a send that reached its target', async () => {
+      const h = await harness(asking({ proseRouting: 'hybrid' }));
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(`>>>${GENERAL} Goodnight.`), call('s1', 'channel_publish', { channelId: GENERAL, content: 'an explicit note' })]));
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[GENERAL, 'an explicit note']]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('hybrid mode: one run that would have gone out is enough for the refusal, and it names each draft of the round', async () => {
+      const h = await harness(asking({ proseRouting: 'hybrid' }));
+      try {
+        await h.turn(skipped([text(`>>>${GENERAL} Goodnight.\n>>>${ROOM} See you.`), call('s1', 'channel_publish', { channelId: GENERAL, content: 'an explicit note' })]));
+        assert.ok(roundTaken(h, 'k2'), 'refused: the turn went on');
+        const held = h.drafts().filter((d) => d.reason === 'skip-reply');
+        assert.deepEqual(held.map((d) => d.text).sort(), ['Goodnight.', 'See you.']);
+        const result = h.toolResults().find((r) => r.startsWith('[drafts]')) ?? '';
+        assert.ok(held.every((d) => result.includes(d.id)), h.toolResults().join('\n'));
+        assert.match(result, /Where should they go, if anywhere\? .* to end it and keep the drafts, call skip_reply again/);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("explicit mode: a drafts round's unprefixed text with no destination", async () => {
+      const h = await harness(asking({ proseRouting: 'explicit' }));
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text('A thought for later.'), drafts('d1', { action: 'list' })]));
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+  });
+
+  it('a round with skip_reply alone is never refused', async () => {
+    const h = await harness(asking());
+    const ended = endings(h);
+    try {
+      await h.turn([createMockResponse([call('k1', 'skip_reply', { reason: 'nothing to add' })], 'tool_use')]);
+      assert.equal(ended(), 1);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a skip_reply refused for its wake leaves the guard its refusal: the next one beside text is refused by the guard', async () => {
+    const h = await harness(asking());
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([text('First, a note.'), call('k1', 'skip_reply', { wake_in_seconds: 60 })], 'tool_use'),
+        createMockResponse([text('Then the reply.'), call('k2', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([call('k3', 'skip_reply', {})], 'tool_use'),
+      ]);
+      const [wakeRefused, guarded] = h.toolResults();
+      assert.ok(!wakeRefused!.startsWith('[drafts]') && /wake/.test(wakeRefused!), wakeRefused);
+      const byText = new Map(h.drafts().map((d) => [d.text, d]));
+      assert.equal(byText.get('First, a note.')?.reason, 'skip-reply', 'the wake-refused round\'s text was kept back only by skip_reply');
+      asksWhere(guarded!, byText.get('Then the reply.')!.id);
+      assert.ok(roundTaken(h, 'k3'), 'the turn went on to a third round');
+      assert.equal(ended(), 1);
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const [what, opts, round] of [
+    ['an explicit `>>skip_reply` envelope', asking({ proseRouting: 'explicit' }), [text('>>skip_reply a note to myself'), call('k1', 'skip_reply', {})]],
+    ['a hybrid `>>>skip_reply` envelope', asking({ proseRouting: 'hybrid' }), [text('>>>skip_reply a note to myself'), call('k1', 'skip_reply', {})]],
+    ['text beside a private think', asking({ sameRoundThinkTextPolicy: 'private' }), [text('Prose beside a private think.'), call('t1', 'think', { thought: 'hmm' }), call('k1', 'skip_reply', {})]],
+  ] as const) {
+    it(`${what} is the resident's own private text: nothing is drafted or refused`, async () => {
+      const h = await harness(opts);
+      const ended = endings(h);
+      try {
+          await h.turn([createMockResponse([...round], 'tool_use')]);
+        assert.equal(ended(), 1, 'skip_reply ran');
+        assert.deepEqual(h.drafts(), []);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('a silent turn drafts nothing and refuses nothing', async () => {
+    const h = await harness(asking());
+    const ended = endings(h);
+    try {
+      await h.turn([createMockResponse([text('Thinking in a silent turn.'), call('k1', 'skip_reply', {})], 'tool_use')], 'scout', 'silent');
+      assert.equal(ended(), 1);
+      assert.deepEqual(h.drafts(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('wake_in_seconds on the refused call arms no wake; on a skip_reply that runs, it does', async () => {
+    const h = await harness({ ...asking(), gate: true });
+    const elapsed = () => h.texts().filter((t) => /your skip_reply timer \(1s\) elapsed/.test(t)).length;
+    try {
+      await h.turn([
+        createMockResponse([text('Back in a second.'), call('k1', 'skip_reply', { wake_in_seconds: 1 })], 'tool_use'),
+        createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.ok(h.toolResults()[0]!.startsWith('[drafts]'), 'premise: the guard refused the first call');
+      const calls = h.membrane.calls.length;
+      await new Promise((r) => setTimeout(r, 1_600));
+      assert.equal(elapsed(), 0, 'no self-wake fired');
+      assert.equal(h.membrane.calls.length, calls, 'and no turn started');
+
+      await h.turn([createMockResponse([call('k3', 'skip_reply', { wake_in_seconds: 1 })], 'tool_use')]);
+      await h.until(() => elapsed() === 1, 'the self-wake a running skip_reply armed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("the guard never refuses a script's skip_reply, and its round's text is a draft named in the receipt", async () => {
+    const h = await harness({ ...asking(), codeExecution: true });
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([text('Words beside a script.'), call('ce1', 'code_execution', { code: 'await tools.skip_reply({});' })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.equal(ended(), 1, 'the script\'s skip_reply ended the turn');
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => [d.text, d.reason]), [['Words beside a script.', 'skip-reply']]);
+      assert.ok(!h.toolResults().some((r) => r.includes('[drafts]')), 'no prompt reached the script');
+      const receipt = h.texts().filter((t) => t.startsWith('[delivered]')).at(-1) ?? '';
+      assert.ok(receipt.includes(held[0]!.id), receipt);
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('XML tool mode: the policy changes nothing, so nothing is refused and nothing is held', async () => {
+    const h = await harness({ ...asking(), xml: true, roundPreamble: true });
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([text('First words.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('Second words.'), call('k1', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.equal(ended(), 1, 'never refused');
+      assert.deepEqual(h.drafts(), []);
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the tools a model is shown are byte for byte the same under either value', async () => {
+    const shown = async (policy: 'private' | 'ask') => {
+      const h = await harness({ agents: [{ name: 'scout', sameRoundSkipReplyTextPolicy: policy }] });
+      try {
+        await h.turn([createMockResponse([text('hi')])]);
+        return JSON.stringify(h.membrane.calls.at(-1)!.tools);
+      } finally {
+        await h.close();
+      }
+    };
+    const asked = await shown('ask');
+    assert.ok(asked.includes('"skip_reply"'), 'premise: skip_reply is among the tools');
+    assert.equal(asked, await shown('private'));
+  });
+
+  for (const policy of [undefined, 'ask'] as const) {
+    it(`the heartbeat turn's notice ${policy === 'ask' ? 'is unchanged under ask, since a skip round\'s text is then held' : 'says that text beside skip_reply stays private and isn\'t held'}`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', ...(policy ? { sameRoundSkipReplyTextPolicy: policy } : {}) }] });
+      try {
+        await h.turn([createMockResponse([])], 'scout', 'heartbeat');
+        const notice = h.texts().find((t) => t.startsWith('[routing] This turn came from your heartbeat'));
+        assert.equal(notice, policy === 'ask'
+          ? "[routing] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: it's held as a draft you can send with the drafts tool. An explicit send reaches a channel now."
+          : "[routing] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: it's held as a draft you can send with the drafts tool, except in a round that calls skip_reply, where it stays private and isn't held. An explicit send reaches a channel now.");
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it("a derived agent doesn't take its parent's policy", async () => {
+    const h = await harness(asking());
+    try {
+      assert.equal(h.framework.getAgent('scout')!.sameRoundSkipReplyTextPolicy, 'ask', "premise: the parent's");
+      const fork = await h.framework.deriveAgent({
+        name: 'fork-1', from: 'scout', mode: 'copy',
+        framing: [{ participant: 'user', content: [{ type: 'text', text: 'You are the fork.' }] }],
+      });
+      try {
+        assert.equal(fork.agent.sameRoundSkipReplyTextPolicy, undefined);
+      } finally {
+        fork.cleanup();
+      }
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode} mode: in a drafts round, an aside the drafts rule keeps is kept, not held, and the skip_reply runs`, async () => {
+      const h = await harness(asking({ proseRouting: mode }));
+      const ended = endings(h);
+      try {
+        await h.turn([createMockResponse([text('earlier words'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+        const [draft] = h.drafts();
+        const before = ended();
+        await h.turn([
+          createMockResponse([text('a postscript'), drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM }), call('k1', 'skip_reply', {})], 'tool_use'),
+          createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+        ]);
+        assert.deepEqual(h.drafts().map((d) => d.text), [], 'the postscript is not held');
+        assert.ok(!roundTaken(h, 'k2'), 'the first skip_reply ran: no second round');
+        assert.equal(ended(), before + 1, 'and ended the turn');
+      } finally {
+        await h.close();
+      }
+    });
+
+    it(`${mode} mode: in a drafts round whose resend went elsewhere, an aside that would have been posted is held, and the skip_reply asks`, async () => {
+      const h = await harness(asking({ proseRouting: mode }));
+      try {
+        await h.turn([createMockResponse([text('earlier words'), explicitSend('s1')], 'tool_use'), createMockResponse([])]);
+        const [draft] = h.drafts();
+        await h.turn([
+          createMockResponse([text('a postscript'), drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: GENERAL }), call('k1', 'skip_reply', {})], 'tool_use'),
+          createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+        ]);
+        assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['a postscript', 'skip-reply']]);
+        assert.ok(roundTaken(h, 'k2'), 'the first skip_reply was refused: the turn went on');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('the refused call reports nothing to a tool-lifecycle observer, and a skip_reply that runs reports started and completed', async () => {
+    const h = await harness(asking());
+    const sent: ToolLifecycleParams[] = [];
+    const observer = {
+      id: 'observer', grant: new CapabilityGrant(new Set(['toolLifecycle.observe']), []), toolObserveFilter: null, transportEpoch: 0,
+      sendToolLifecycle: (p: ToolLifecycleParams) => { sent.push(p); },
+    };
+    (h.framework as unknown as { toolLifecycleEmitter: ToolLifecycleEmitter }).toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => [observer as never], configFor: () => undefined, describe: () => ({ class: [] }),
+    });
+    try {
+      await h.turn([
+        createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+        createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+      ]);
+      assert.ok(h.toolResults()[0]!.startsWith(opening(h.drafts()[0]!.id)), 'premise: k1 was refused');
+      const phases = (id: string) => sent.filter((p) => p.toolCallId.split('~')[0] === id).map((p) => p.phase);
+      assert.deepEqual(phases('k1'), [], 'the refused call reports nothing');
+      assert.deepEqual(phases('k2'), ['started', 'completed'], 'the one that ran reports its run');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("refuses a value other than 'private' or 'ask', naming both", async () => {
+    for (const value of ['Ask', 'public', 1]) {
+      const dir = mkdtempSync(join(tmpdir(), 'skip-reply-policy-value-'));
+      try {
+        await assert.rejects(
+          AgentFramework.create({
+            storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+            agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sameRoundSkipReplyTextPolicy: value }],
+            modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+          } as never),
+          /Agent "scout" sameRoundSkipReplyTextPolicy must be 'private' or 'ask', not (another string|a number)/,
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("the subconscious doesn't take the resident's policy", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'skip-reply-subconscious-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sameRoundSkipReplyTextPolicy: 'ask' }],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.' },
+      modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    } as never);
+    try {
+      assert.equal(framework.getAgent('scout')!.sameRoundSkipReplyTextPolicy, 'ask', "premise: the resident's");
+      assert.equal(framework.getAgent('Subconscious')!.sameRoundSkipReplyTextPolicy, undefined);
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

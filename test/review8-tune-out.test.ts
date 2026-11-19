@@ -1934,8 +1934,8 @@ test("review 3 #28: a hold that a listener of the run's own lost-note drop begin
       ownRunLosesNote(h);
       assert.ok(next, "premise: the drop's listener began a new hold");
       assert.equal(scope ? h.scopeInForce() : h.inForce(), next, 'premise: it is in force');
-      const timers = h.coordinator as unknown as { cadenceTimers: Map<string, unknown>; expiryTimers: Map<string, unknown> };
-      const key = scope ? '\0all-except' : 'disc\0disc:guild:a';
+      const timers = h.coordinator as unknown as { cadenceTimers: Map<string, unknown>; expiryTimers: Map<string, unknown>; key(serverId: string, channelId: string): string };
+      const key = scope ? (h.coordinator.constructor as unknown as { SCOPE_KEY: string }).SCOPE_KEY : timers.key('disc', 'disc:guild:a');
       assert.ok(timers.cadenceTimers.has(key), `${scope ? 'all-except' : 'channel'}: its cadence is not cleared by the release of the hold before it`);
       if (scope) assert.ok(timers.expiryTimers.has(key), 'nor its end time');
     } finally {

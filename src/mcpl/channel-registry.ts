@@ -43,6 +43,7 @@ import { expandCoreTags, isMarkerTagged } from './tags.js';
 import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyConversion } from './visible-content.js';
 import { logDetail, logValue } from './log-value.js';
+import { jsonKind } from '../jsonrpc-envelope.js';
 import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 import type { InboundSource } from './inbound-source.js';
@@ -2553,6 +2554,28 @@ export class ChannelRegistry {
   }
 
   /**
+   * The refusal of a channel tool's call that gives a parameter its schema
+   * declares a string as something else, before anything changes; absent and
+   * `null` pass, as each tool reads them. A number written past 2^53 has
+   * usually lost its last digits by the time the call is parsed.
+   */
+  nonStringRefusal(toolName: string, input: unknown): ToolResult | undefined {
+    if (input === null || typeof input !== 'object') return undefined;
+    const properties = this.channelTools.find((tool) => tool.name === toolName)?.inputSchema.properties ?? {};
+    for (const [field, value] of Object.entries(input)) {
+      if ((properties[field] as { type?: unknown } | undefined)?.type !== 'string') continue;
+      if (value === undefined || value === null || typeof value === 'string') continue;
+      return {
+        success: false,
+        error: `Nothing changed: ${toolName}'s ${field} must be a string, and this call gave ${jsonKind(value)}. Give it in quotes`
+          + (typeof value === 'number' ? ': a number can lose its last digits as the call is read.' : '.'),
+        isError: true,
+      };
+    }
+    return undefined;
+  }
+
+  /**
    * Handle a call to one of the synthesized channel tools.
    *
    * `origin` is TRUSTED DISPATCH CONTEXT, supplied by the framework's own
@@ -2572,6 +2595,8 @@ export class ChannelRegistry {
      *  attempted, so the caller learns where it was delivered. */
     seen?: { outcome?: PublishOutcome },
   ): Promise<ToolResult> {
+    const refused = this.nonStringRefusal(toolName, input);
+    if (refused) return refused;
     switch (toolName) {
       case 'channel_list':
         return this.handleToolList();
@@ -2627,15 +2652,15 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * The message the agent is replying to, with its channel: the most recent
-   * delivered inbound message (noteDelivered) that isn't a reaction, reaction removal, edit or deletion
+   * The message servers are told the agent is replying to, with its channel:
+   * the most recent delivered inbound message (noteDelivered) that isn't a reaction, reaction removal, edit or deletion
    * marker, apart from an edit the coalescer delivers on acceptance as the
-   * agent's first view. Left process-global: per-channel inbound tracking
+   * agent's first view. It isn't always the message a turn answers
+   * (TurnRouting.answers), which a refusal's mark reads. Left process-global: per-channel inbound tracking
    * (the right messageId for a fork's own channel) is a separate concern from
-   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback),
-   * so a subagent's refusal marks no one else's channel. Nor has a turn that
-   * deliberately has no channel (activeChannelResolver's null): woken for a
-   * channel id two servers register, it isn't replying to the latest inbound
+   * the outbound routing fix. An ephemeral run has none (takesGlobalFallback).
+   * Nor has a turn that deliberately has no channel (activeChannelResolver's
+   * null): woken for a channel id two servers register, it isn't replying to the latest inbound
    * message, which may be anywhere. A fork's turn always has a channel, its
    * home, so it's taken to be replying to the latest inbound message as every
    * fork's turn is, in explicit mode as in locus mode, where its locus is
@@ -2692,10 +2717,10 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the message the agent is replying to (incomingFor). The
+    // Incoming: the message servers are told the agent is replying to (incomingFor). The
     // anchor is independent of the speech rule: under `speech.locus:
     // 'delivery'` the latest inbound is no fallback for where prose lands,
-    // but it is still the message the agent is replying to.
+    // but servers are still told it's the message the agent is replying to.
     const incoming = this.incomingFor(agentName);
     if (incoming && incoming.channel.serverId === serverId) {
       context.incoming = {
@@ -2748,7 +2773,7 @@ export class ChannelRegistry {
     // server's channel with its id isn't taken for it. Its message and
     // thread go, as on main, so no message on a server that's gone is given
     // as the one an agent replies to (incomingFor), to that server added
-    // back or to a refusal's reaction.
+    // back.
     if (this.defaultPublishChannel?.serverId === serverId) {
       this.defaultPublishMessageId = null;
       this.defaultPublishThreadId = undefined;

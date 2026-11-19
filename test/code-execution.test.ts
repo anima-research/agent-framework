@@ -16,7 +16,10 @@ import type { ErrorAction, ErrorPolicy, EventResponse, Module, ModuleContext, Pr
 import { AgentFramework } from '../src/index.js';
 import { storableToolResult } from '../src/module-registry.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
 import type { ContentBlock, NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
 import { UNREACHED_WATCHDOG, silenceRun } from './helpers/run-watchdog.js';
 import { captureTimers, fireTimer, type CapturedTimer } from './helpers/capture-timers.js';
 
@@ -187,7 +190,7 @@ async function withFramework(
     storePath,
     membrane: membrane.asMembrane(),
     agents: options.resident
-      ? [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all' }]
+      ? [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', sendSilencing: true, allowedTools: 'all' }]
       : [],
     modules: [options.module ?? new ScriptToolModule()],
     syncIntervalMs: 0,
@@ -204,7 +207,7 @@ async function withFramework(
 
 /** Run one ephemeral agent's turn to its end. */
 async function runEphemeral(framework: AgentFramework, name: string): Promise<{ speech: string; toolCallsCount: number }> {
-  const created = await framework.createEphemeralAgent({ name, model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+  const created = await framework.createEphemeralAgent({ name, model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all' });
   created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
   const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
   framework.start();
@@ -385,7 +388,7 @@ describe('code_execution through the framework', () => {
     try {
       await framework.start();
       await until(() => framework.getAllTools().some((t) => t.name === 'mcpl--echo--echo'), 'the echo server\'s tool');
-      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all' });
+      const created = await framework.createEphemeralAgent({ name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
       await framework.runEphemeralToCompletion(created.agent, created.contextManager);
       const wire = membrane.lastStream!.receivedToolResults[0] as WireResult[];
@@ -820,6 +823,35 @@ describe('code_execution through the framework', () => {
     });
   });
 
+  for (const thrown of [false, true]) {
+    it(`a turn that ends on a provider's error${thrown ? ' thrown from its stream' : ''} tells its scripts what failed in the framework's words, not the provider's`, async () => {
+      const SENTINEL = 'zz-provider-words-7f3a';
+      const error = new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: `Bad request: ${SENTINEL}`, rawError: undefined });
+      const membrane = new MockMembrane();
+      membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
+        membrane.calls.push(request);
+        const stream = new ProviderErrorStream(error);
+        if (thrown) stream[Symbol.asyncIterator] = async function* (): AsyncGenerator<StreamEvent> { throw error; };
+        return stream;
+      };
+      const errorPolicy: ErrorPolicy = { maxRetries: 0, onInferenceError: (): ErrorAction => ({ retry: false }) };
+      await withFramework('ce-provider-words-', { membrane, errorPolicy }, async (framework) => {
+        const scripts = (framework as unknown as {
+          codeExecution: { scripts: { turnEnded(agent: string, turn: unknown, abandoned: boolean, reason?: string): void } };
+        }).codeExecution.scripts;
+        const turnEnded = scripts.turnEnded.bind(scripts);
+        const reasons: Array<string | undefined> = [];
+        scripts.turnEnded = (agent, turn, abandoned, reason) => {
+          if (agent === 'helper' && abandoned) reasons.push(reason);
+          turnEnded(agent, turn, abandoned, reason);
+        };
+        await assert.rejects(runEphemeral(framework, 'helper'));
+        assert.ok(reasons.includes('the model call failed (invalid_request, HTTP 400)'), JSON.stringify(reasons));
+        assert.ok(!reasons.some((reason) => reason?.includes(SENTINEL)), JSON.stringify(reasons));
+      });
+    });
+  }
+
   it("the Python runner's inputs are refused by name, saying what replaced each", async () => {
     await withFramework('ce-old-', {}, async (framework) => {
       framework.start();
@@ -1203,8 +1235,8 @@ describe('a round whose run or wait call watches a script that can change its ro
   ];
 
   async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private'; allowedTools?: string[] } = {},
-    options: { codeExecution?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean } = {}) {
+    config: { sameRoundThinkTextPolicy?: 'private'; sameRoundSkipReplyTextPolicy?: 'ask'; allowedTools?: string[]; sendSilencing?: false } = {},
+    options: { codeExecution?: boolean; toolCallTimeoutMs?: number; serveWakes?: boolean; gate?: boolean } = {}) {
     const { tempDir, storePath } = tempStorePath('ce-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
@@ -1221,10 +1253,11 @@ describe('a round whose run or wait call watches a script that can change its ro
     const framework = await AgentFramework.create({
       storePath,
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', proseRouting: mode, ...config }],
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', sendSilencing: true, proseRouting: mode, ...config }],
       modules: [module],
       syncIntervalMs: 0,
       ...(options.codeExecution === false ? {} : { codeExecution: { enabled: true, ...(options.toolCallTimeoutMs === undefined ? {} : { toolCallTimeoutMs: options.toolCallTimeoutMs }) } }),
+      ...(options.gate ? { gate: { config: { policies: [], default: 'always' }, configPath: join(tempDir, 'gate.json') } } : {}),
     });
     // Script ids s1-test, s2-test, …, so a later round's wait can name one.
     const scripts = (framework as unknown as { codeExecution: { scripts: { idTag: string } } | null }).codeExecution?.scripts;
@@ -1560,6 +1593,28 @@ describe('a round whose run or wait call watches a script that can change its ro
         { text: 'done', reason: 'explicit-send' },
       ], 'and holds their words as drafts, as a direct send does');
     } finally { await h.done(); }
+  });
+
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: with send silencing off, a send inside the script holds nothing, and its round's prose doesn't wait for the script`, async () => {
+    const h = await scriptRound(mode, [
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'await tools["test--send_message"]({});' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], { sendSilencing: false });
+    // The send is held open: a round that waited for its script would never
+    // post its prose while the send is out.
+    h.module.holdSend = true;
+    const posted = (words: string) => h.log.some((e) => (e.startsWith('publish:') || e.startsWith('chunk:')) && e.includes(words));
+    try {
+      const run = h.run();
+      await until(() => h.log.includes('tool:send_message') && posted('posting the summary'), "the round's prose, posted while the script's send is still out");
+      h.module.releaseGate();
+      await run;
+      assert.ok(posted('done'), `the turn's later prose is posted too: ${JSON.stringify(h.log)}`);
+      assert.deepStrictEqual(heldDrafts(h.framework), []);
+    } finally { h.module.releaseGate(); await h.done(); }
   });
 
   // A drafts resend is an explicit send, decided by what it posted, as
@@ -2418,7 +2473,7 @@ describe('a round whose run or wait call watches a script that can change its ro
       if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted = true;
     });
     try {
-      const created = await h.framework.createEphemeralAgent({ name: 'eph-script', model: 'test-model', systemPrompt: 'Act.', allowedTools: 'all' });
+      const created = await h.framework.createEphemeralAgent({ name: 'eph-script', model: 'test-model', systemPrompt: 'Act.', sendSilencing: true, allowedTools: 'all' });
       created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
       // The idle watchdog disposes the ephemeral while its script waits in the
       // slow call: the run is made to look idle only once the script is in the
@@ -2502,6 +2557,163 @@ describe('a round whose run or wait call watches a script that can change its ro
       // framework idle and the file can exit.
       (h.framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.delete('assistant');
       agent?.reset();
+      await h.done();
+    }
+  });
+
+  /** How many times a self-wake from a 1 s skip_reply timer reached the assistant's context. */
+  const elapsedWakes = (framework: AgentFramework): number => framework.getAgent('assistant')!.getContextManager().getAllMessages()
+    .flatMap((m) => m.content)
+    .filter((b) => b.type === 'text' && /your skip_reply timer \(1s\) elapsed/.test((b as { text: string }).text)).length;
+
+  it("under sameRoundSkipReplyTextPolicy 'ask', a skip_reply held for its round's text doesn't run or answer once its agent is reset while the round's script runs, so it arms no self-wake", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'Back soon.' },
+        scriptCall({ code: 'await tools["test--slow"]({});' + HOLDS }),
+        { type: 'tool_use', id: 'k1', name: 'skip_reply', input: { wake_in_seconds: 1 } },
+      ] as ContentBlock[], 'tool_use'),
+    ], { sameRoundSkipReplyTextPolicy: 'ask' }, { gate: true });
+    const lifecycle: ToolLifecycleParams[] = [];
+    const observer = {
+      id: 'observer', grant: new CapabilityGrant(new Set(['toolLifecycle.observe']), []), toolObserveFilter: null, transportEpoch: 0,
+      sendToolLifecycle: (p: ToolLifecycleParams) => { lifecycle.push(p); },
+    };
+    (h.framework as unknown as { toolLifecycleEmitter: ToolLifecycleEmitter }).toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => [observer as never], configFor: () => undefined, describe: () => ({ class: [] }),
+    });
+    let stream: { cancel(): void } | undefined;
+    let agent: { state: { stream?: { cancel(): void } }; reset(): void } | undefined;
+    try {
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      void h.framework.runUntilIdle().catch(() => {});
+      await soon(() => h.log.includes('tool:slow'));
+      assert.ok(h.log.includes('tool:slow'), 'premise: the script reached its slow call');
+      assert.ok(!h.log.includes('tool:skip_reply'), "premise: the skip_reply waits on its round's text");
+      let resulted = false;
+      const skipAnswers: string[] = [];
+      h.framework.onTrace((event) => {
+        if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'code_execution') resulted = true;
+        if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'skip_reply') skipAnswers.push(event.type);
+      });
+      agent = h.framework.getAgent('assistant')! as unknown as { state: { stream?: { cancel(): void } }; reset(): void };
+      stream = agent.state.stream;
+      agent.reset();
+      h.module.releaseSlow();
+      await soon(() => resulted);
+      assert.ok(resulted, "premise: the script's call returned after the reset");
+      await new Promise((r) => setTimeout(r, 1_500));
+      assert.ok(!h.log.includes('tool:skip_reply'), "the held skip_reply didn't run");
+      assert.deepStrictEqual(skipAnswers, [], 'and was neither answered nor refused');
+      assert.equal(elapsedWakes(h.framework), 0, 'so no self-wake fired');
+      assert.deepStrictEqual(lifecycle.filter((p) => p.tool === 'skip_reply').map((p) => p.phase), [], 'and a tool-lifecycle observer heard nothing of it');
+    } finally {
+      stream?.cancel();
+      (h.framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.delete('assistant');
+      agent?.reset();
+      await h.done();
+    }
+  });
+
+  it("under sameRoundSkipReplyTextPolicy 'ask', a skip_reply held for its round's text doesn't run or answer when its round is decided after its agent is reset, so it arms no self-wake", async () => {
+    const h = await scriptRound('hybrid', [
+      createMockResponse([
+        { type: 'text', text: '>>>skip_reply a note to myself' },
+        { type: 'tool_use', id: 's1', name: 'test--send_message', input: {} },
+        { type: 'tool_use', id: 'k1', name: 'skip_reply', input: { wake_in_seconds: 1 } },
+      ] as ContentBlock[], 'tool_use'),
+    ], { sameRoundSkipReplyTextPolicy: 'ask' }, { gate: true });
+    h.module.holdSend = true;
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); error(...args); };
+    let stream: { cancel(): void } | undefined;
+    let agent: { state: { stream?: { cancel(): void } }; reset(): void } | undefined;
+    try {
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      void h.framework.runUntilIdle().catch(() => {});
+      await soon(() => h.log.includes('tool:send_message'));
+      assert.ok(h.log.includes('tool:send_message'), 'premise: the send reached its tool and holds');
+      assert.ok(!h.log.includes('tool:skip_reply'), "premise: the skip_reply waits on its round's text");
+      const skipAnswers: string[] = [];
+      h.framework.onTrace((event) => {
+        if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'skip_reply') skipAnswers.push(event.type);
+      });
+      agent = h.framework.getAgent('assistant')! as unknown as { state: { stream?: { cancel(): void } }; reset(): void };
+      stream = agent.state.stream;
+      agent.reset();
+      h.module.releaseGate();
+      await soon(() => lines.some((l) => l.includes('-> decided early')));
+      assert.ok(lines.some((l) => l.includes('-> decided early (its turn no longer waits on it')), 'premise: the send decided the round after the reset');
+      await new Promise((r) => setTimeout(r, 1_500));
+      assert.ok(!h.log.includes('tool:skip_reply'), "the held skip_reply didn't run");
+      assert.deepStrictEqual(skipAnswers, [], 'and was neither answered nor refused');
+      assert.equal(elapsedWakes(h.framework), 0, 'so no self-wake fired');
+    } finally {
+      console.error = error;
+      stream?.cancel();
+      (h.framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.delete('assistant');
+      agent?.reset();
+      await h.done();
+    }
+  });
+
+  it("under sameRoundSkipReplyTextPolicy 'ask', a skip_reply held for its round's text gets no answer of the guard's once its stream has completed", async () => {
+    const h = await scriptRound('locus', [], { sameRoundSkipReplyTextPolicy: 'ask' }, { gate: true });
+    const first = createMockResponse([
+      { type: 'text', text: 'Back soon.' },
+      { type: 'tool_use', id: 's1', name: 'test--send_message', input: {} },
+      { type: 'tool_use', id: 'k1', name: 'skip_reply', input: { wake_in_seconds: 1 } },
+    ] as ContentBlock[], 'tool_use');
+    // A stream that completes right after its tool calls, while the framework
+    // still waits on them: the 'complete' handler then gives each an error
+    // result of its own.
+    class CompletesWhileWaiting extends MockYieldingStream {
+      constructor() { super([first]); }
+      override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {
+        const inner = super[Symbol.asyncIterator]();
+        for (let next = await inner.next(); !next.done; next = await inner.next()) {
+          yield next.value;
+          if (next.value.type === 'tool-calls') {
+            yield { type: 'complete', response: first } as StreamEvent;
+            return;
+          }
+        }
+      }
+    }
+    const membrane = (h.framework as unknown as { membrane: { streamYielding: (r: NormalizedRequest, o?: unknown) => YieldingStream } }).membrane;
+    let served = false;
+    const streamYielding = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request, opts) => {
+      if (served) return streamYielding(request, opts);
+      served = true;
+      return new CompletesWhileWaiting();
+    };
+    h.module.holdSend = true;
+    const lines: string[] = [];
+    const error = console.error;
+    const warn = console.warn;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); error(...args); };
+    console.warn = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); warn(...args); };
+    const skipAnswers: string[] = [];
+    h.framework.onTrace((event) => {
+      if ((event.type === 'tool:completed' || event.type === 'tool:failed') && event.tool === 'skip_reply') {
+        skipAnswers.push(String((event as { error?: unknown }).error ?? event.type));
+      }
+    });
+    try {
+      h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+      void h.framework.runUntilIdle().catch(() => {});
+      await soon(() => lines.some((l) => l.includes("'complete' event fired while agent 'assistant' is still waiting_for_tools")));
+      assert.ok(lines.some((l) => l.includes("'complete' event fired while agent 'assistant' is still waiting_for_tools")), 'premise: the stream completed while its tools waited');
+      await new Promise((r) => setTimeout(r, 1_500));
+      assert.ok(!skipAnswers.some((a) => a.includes('Where should it go')), `no guard refusal after the stream completed: ${JSON.stringify(skipAnswers)}`);
+      assert.ok(!h.log.includes('tool:skip_reply'), "the held skip_reply didn't run");
+      assert.equal(elapsedWakes(h.framework), 0, 'so no self-wake fired');
+    } finally {
+      console.error = error;
+      console.warn = warn;
+      h.module.releaseGate();
       await h.done();
     }
   });

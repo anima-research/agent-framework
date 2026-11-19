@@ -55,8 +55,11 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
+  fw.turnRouting = new Map();
+  fw.answeredTurns = new WeakMap();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map(); // upstream last-inference tracking; noteInferenceExhausted writes it
+  fw.failedLastTurnAt = new WeakMap();
   fw.pendingRequests = [];
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
@@ -75,7 +78,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
 }
 
 const REASON = '400 invalid_request: tool_use ids must have a corresponding tool_result';
-const isRewindMarker = (m: { content: any[] }) => /kept refusing the requests that carried them/.test(m.content[0]?.text ?? '');
+const isRewindMarker = (m: { meta?: { kind?: string } }) => m.meta?.kind === 'refusal-rewind';
 
 test('at the threshold, an invalid_request with no status (shedMayHelp) triggers an automatic rewind + retry', () => {
   const { fw, removed, added, errs, restore } = makeHarness();
@@ -90,13 +93,11 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
   // The poisoned tool exchange was shed as a COMPLETE pair (no orphans).
   assert.deepEqual([...removed].sort(), ['a1', 'r1']);
 
-  // One consolidated rewind marker, saying the API kept refusing the requests
-  // that carried the shed turns, not that the conversation was at fault.
   const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.match(marker!.content[0].text, /set aside because the model API kept refusing the requests that carried them \(/);
-  assert.match(marker!.content[0].text, /\), so that the conversation could go on\./);
-  assert.doesNotMatch(marker!.content[0].text, /rejecting the conversation/);
+  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 most recent turn\(s\) were set aside because the requests that carried them couldn't be completed\. Their content isn't shown here, and the originals remain in the raw record\. You are clear to continue/);
+  assert.doesNotMatch(marker!.content[0].text, /tool_use ids|refus|filter|rejecting the conversation/i, "the marker carries none of the provider's words");
+  assert.ok(String(marker!.meta.category).includes('tool_use ids must have a corresponding tool_result'), 'the record keeps them');
 
   // A retry was queued so the rewound history is verified immediately.
   assert.equal(fw.pendingRequests.length, 1);
@@ -114,6 +115,53 @@ test("the breaker's retry of a turn its batch gave no channel keeps the batch's 
   assert.equal(fw.pendingRequests.length, 1);
   assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
   assert.deepEqual(fw.pendingRequests[0].wakeChannels, channels);
+});
+
+test("the breaker's retry of a turn that answered a message and gathered a batch's channels keeps both", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
+  const routing = { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels };
+  fw.turnRouting = new Map([['cairn', routing]]);
+  fw.answeredTurns.set(fw.agents.get('cairn'), routing);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.equal(retry.reason, 'inference-failure-rewind-retry');
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-7'], 'the answered message and its channel');
+  assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
+});
+
+test("the breaker's retry, while a channel turn is unfinished and a later turn with other wake channels is the latest, answers that turn's message with that turn's wake channels", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const side = { serverId: 'discord', channelId: 'discord:g:side' };
+  const unfinished = { answers: { channel: room, messageId: 'm-A' }, wakeChannels: [room] };
+  fw.answeredTurns.set(fw.agents.get('cairn'), unfinished);
+  fw.turnRouting = new Map([['cairn', { wakeChannels: [side] }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-A'], "the unfinished turn's message and its channel");
+  assert.deepEqual(retry.wakeChannels, [room], "and that turn's wake channels, not the latest turn's");
+});
+
+test("the breaker's retry, where the latest turn's message is no longer the agent's unfinished turn, answers no message and keeps the turn's wake channels", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
+  fw.turnRouting = new Map([['cairn', { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], [undefined, undefined, undefined], 'no channel and no message');
+  assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
 });
 
 test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
@@ -148,7 +196,7 @@ test('non-retryable but NON-poison failures (auth/context_length/abort) NEVER sh
   // context_length, abort, safety and unsupported all non-retryable, but for
   // none of them, with no status, is shedding the newest exchange likely to
   // help. Shedding good exchanges,
-  // with a rewind marker saying the API kept refusing them, on an expired API
+  // with a rewind marker, on an expired API
   // key is exactly the category error this guards.
   for (const errorType of ['auth', 'context_length', 'abort', 'safety', 'unsupported']) {
     const { fw, removed, added, restore } = makeHarness();

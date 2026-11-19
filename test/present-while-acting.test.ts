@@ -39,7 +39,7 @@ import type {
   ToolResult,
   InferenceRequest,
 } from '../src/index.js';
-import type { ContextInjection } from '@animalabs/context-manager';
+import { ContextManager, type ContextInjection } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -205,15 +205,17 @@ describe('present while acting', () => {
     options: {
       speech?: { locus: 'delivery' | 'latest-inbound' }; maxStreamTokens?: number; proseRouting?: 'locus' | 'hybrid';
       thinkingBinding?: { binds: boolean };
+      /** false leaves `sendSilencing` out, which is the default: sends don't silence. */
+      sendsSilence?: false;
     } = {},
   ): Promise<AgentFramework> {
-    const { speech, ...agentOptions } = options;
+    const { speech, sendsSilence, ...agentOptions } = options;
     const frameworkOptions = speech ? { speech } : {};
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', ...agentOptions },
+        { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', ...(sendsSilence === false ? {} : { sendSilencing: true }), ...agentOptions },
       ],
       modules: [module],
       ...frameworkOptions,
@@ -321,6 +323,34 @@ describe('present while acting', () => {
 
     await framework.stop();
   });
+
+  for (const proseRouting of ['locus', 'hybrid'] as const) {
+    it(`${proseRouting}: by default (no sendSilencing) a send silences nothing: its round's prose and all later prose route`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'sending it directly' },
+        { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'hi' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Narrating round two.' },
+        { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'up' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Sent, and moved.' }] as ContentBlock[]));
+
+      const framework = await createFramework({ sendsSilence: false, proseRouting });
+      const routed = stubChannelRegistry(framework);
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(
+        routed.map((r) => r.text),
+        ['sending it directly', 'Narrating round two.', 'Sent, and moved.'],
+        'with sendSilencing off, prose beside and after an explicit send is routed',
+      );
+
+      await framework.stop();
+    });
+  }
 
   it('sticky silencing is forward-only: earlier rounds\' prose still routes', async () => {
     membrane.pushResponse(createMockResponse([
@@ -1184,6 +1214,52 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('a first start that waited for compression, then on a provider hold, announces an arrival from the provider wait as one while its turn waited', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered.' }] as ContentBlock[]));
+    const proto = ContextManager.prototype as unknown as Record<string, unknown>;
+    const was = { compile: proto.compile, isReady: proto.isReady };
+    let refusing = true;
+    proto.compile = async function (this: unknown, ...args: unknown[]) {
+      if (refusing) throw Object.assign(new Error('Compile plan would exceed hard budget'), { name: 'OverBudgetError', budget: 1_000, actual: 2_000 });
+      return (was.compile as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    proto.isReady = function (this: unknown, ...args: unknown[]) {
+      return refusing ? false : (was.isReady as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    const framework = await createFramework();
+    try {
+      stubChannelRegistry(framework);
+      framework.start();
+      const internals = framework as unknown as Held & {
+        budgetHolds: Map<string, unknown>;
+        releaseBudgetHold(agentName: string): void;
+        holdProviderAcceleration(agent: unknown, error: Error): boolean;
+      };
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.ok(internals.budgetHolds.has('assistant'), 'the first start waits for compression');
+      internals.holdProviderAcceleration(framework.getAgent('assistant')!, accelerationLimit({ messages: [] } as unknown as NormalizedRequest));
+      refusing = false;
+      internals.releaseBudgetHold('assistant');
+      await framework.runUntilIdle();
+      assert.equal(membrane.calls.length, 0, 'the released start waits on the provider hold');
+      await say(framework, 'a message during the provider wait', addressed('discord:dm:antra'));
+      await release(framework);
+      assert.equal(membrane.calls.length, 1, 'the turn ran once');
+      const notices = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'routing-notice')
+        .flatMap((m) => m.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text));
+      const notice = notices.find((t) => t.includes('addressed you from discord:dm:antra'));
+      assert.ok(notice, 'the arrival is announced');
+      assert.ok(notice!.includes('while your turn waited'), notice);
+      assert.ok(!notice!.includes('for compression') && !notice!.includes('on a provider hold'), `it names neither wait alone: ${notice}`);
+    } finally {
+      proto.compile = was.compile;
+      proto.isReady = was.isReady;
+      await framework.stop();
+    }
+  });
+
   it('under the default rule, a re-inference on unstreamed tool results moves nothing and announces an addressed arrival, naming the re-inference', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Carrying on.' }] as ContentBlock[]));
     const framework = await createFramework();
@@ -1807,14 +1883,18 @@ describe('present while acting', () => {
     console.error = () => {};
     try {
       const { agent, contextManager } = await framework.createEphemeralAgent({
-        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       // The default startup limit, 30 s, so only a host stalled that long
       // ends the run before its start's error does.
       const run = framework.runEphemeralToCompletion(agent, contextManager);
       framework.start();
-      await assert.rejects(run, /checkpoint store unavailable/, "the run fails with its start's error");
+      await assert.rejects(run, (rejection: Error) => {
+        assert.equal(rejection.message, 'the turn failed');
+        assert.equal((rejection.cause as Error | undefined)?.message, 'checkpoint store unavailable', "the run fails with its start's error as its cause");
+        return true;
+      });
     } finally {
       console.error = error;
       await framework.stop();
@@ -1941,7 +2021,7 @@ describe('present while acting', () => {
     const framework = await AgentFramework.create({
       store,
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' }],
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', sendSilencing: true }],
       modules: [module],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,

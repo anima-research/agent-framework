@@ -35,6 +35,7 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+import { appendAll } from './append-all.js';
 
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
@@ -195,13 +196,14 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `toolWrapperProseGuard`, `primaryWaitsForAuxiliary`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses, or whose `observes`
- * is anything but a list of names, or whose `foreignRounds` is neither of
- * its modes (assertOneOfSetting). The constructor runs it
+ * is anything but a list of names, or whose `foreignRounds` or
+ * `sameRoundSkipReplyTextPolicy` is neither of its values
+ * (assertOneOfSetting). The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
  * for each of its agents before anything opens, and `createEphemeralAgent`
  * before it reserves the name, so a refusal there leaves nothing behind.
@@ -244,6 +246,18 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'and false or leaving it out doesn\'t',
   );
   assertBooleanSetting(
+    `${agent} primaryWaitsForAuxiliary`,
+    config.primaryWaitsForAuxiliary,
+    'true holds a turn\'s start until the agent\'s compression call in flight ends, ' +
+      'and false or leaving it out starts the turn beside it',
+  );
+  assertBooleanSetting(
+    `${agent} sendSilencing`,
+    config.sendSilencing,
+    'true makes an explicit send hold back, as drafts, the plain speech aimed where it may have posted, ' +
+      'and false or leaving it out posts that speech as any other',
+  );
+  assertBooleanSetting(
     `${agent} turnInputsPin`,
     config.turnInputsPin,
     'true or leaving it out pins the rows that open a turn raw until it ends, and false places no pin',
@@ -262,6 +276,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
     ['transcript', 'raw'],
     '\'transcript\' or leaving it out sends the rounds of an agent it observes as a line per call and result, ' +
       'without their thinking, and \'raw\' sends them as stored',
+  );
+  assertOneOfSetting(
+    `${agent} sameRoundSkipReplyTextPolicy`,
+    config.sameRoundSkipReplyTextPolicy,
+    ['private', 'ask'],
+    '\'private\' or leaving it out keeps text beside skip_reply private, and \'ask\' holds it as a draft and asks once where it goes if it would have been posted or bounced',
   );
   resolveAutoContinue(config);
 }
@@ -358,6 +378,9 @@ export class Agent {
   readonly proseLock: string | undefined;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** A turn's start waits for an auxiliary call in flight (see
+   *  AgentConfig.primaryWaitsForAuxiliary). Default off. */
+  readonly primaryWaitsForAuxiliary: boolean;
   /** Continuation after a turn the model ends itself (see
    *  AgentConfig.autoContinue); undefined when off. */
   readonly autoContinue: { maxConsecutive: number } | undefined;
@@ -374,6 +397,7 @@ export class Agent {
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
+  readonly sameRoundSkipReplyTextPolicy: AgentConfig['sameRoundSkipReplyTextPolicy'];
   /** The participant name this agent's turns are presented under (see AgentConfig.presentAs). */
   readonly presentAs: string;
   /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
@@ -431,6 +455,7 @@ export class Agent {
   private readonly configuredTailTokens?: number;
   private readonly configuredTransitionPaceTokens?: number;
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  private readonly configuredSendSilencing: boolean;
   private contextBudgetTargetTokens?: number;
   private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
   /**
@@ -440,6 +465,7 @@ export class Agent {
    * the next change.
    */
   private liveBudgetEpoch = 0;
+  private contextSettingsChangeCount = 0;
   /**
    * Counts changes of the descent (each arm of one, the same target included,
    * a reset, a cancel, a settle). A settle proves its target only to a
@@ -502,6 +528,7 @@ export class Agent {
     this.proseRouting = config.proseRouting ?? 'locus';
     this.proseLock = typeof config.proseLock === 'string' && config.proseLock.trim() ? config.proseLock.trim() : undefined;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.primaryWaitsForAuxiliary = config.primaryWaitsForAuxiliary === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
@@ -510,6 +537,7 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.sameRoundSkipReplyTextPolicy = config.sameRoundSkipReplyTextPolicy;
     this.presentAs = config.presentAs ?? config.name;
     this.ownParticipants = new Set([config.name, ...(config.selfParticipants ?? [])]);
     this.deniedAtDispatch = new Set(config.denyToolsAtDispatch ?? []);
@@ -528,6 +556,7 @@ export class Agent {
     this.configuredTailTokens = hot?.tailTokens;
     this.configuredTransitionPaceTokens = hot?.transitionPaceTokens;
     this.configuredSameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.configuredSendSilencing = config.sendSilencing ?? false;
   }
 
   /**
@@ -701,7 +730,19 @@ export class Agent {
     if (typeof manager.updateHotContextSettings !== 'function') {
       throw new Error('The active context strategy does not support live context settings');
     }
-    return manager.updateHotContextSettings(update);
+    const settings = (s: HotContextSettingsStatus | null) =>
+      JSON.stringify([s?.tailTokens, s?.transitionPaceTokens, s?.preparedWindowTokens]);
+    const before = settings(this.getHotContextSettings());
+    const status = manager.updateHotContextSettings(update);
+    if (settings(status) !== before) this.contextSettingsChangeCount++;
+    return status;
+  }
+
+  /** How many times the live budget, its descent target or the hot context
+   *  settings have changed.
+   *  @internal For the framework's budget holds; not a host API. */
+  contextSettingsChanges(): number {
+    return this.contextSettingsChangeCount;
   }
 
   getRuntimeSettings(): AgentRuntimeSettingsSnapshot {
@@ -723,6 +764,7 @@ export class Agent {
         : {}),
       sameRoundThinkTextPolicy: this.getEffectiveSameRoundThinkTextPolicy(),
       sameRoundThinkTextPolicySource: this.getSameRoundThinkTextPolicySource(),
+      sendSilencing: this.getEffectiveSendSilencing(),
       transition: this.contextBudgetTargetTokens === undefined
         ? 'stable'
         : hot?.blocked
@@ -768,6 +810,7 @@ export class Agent {
   private setContextBudget(budget: number | undefined, target: number | undefined, armed = false): void {
     if (budget !== this.contextBudgetTokens) this.liveBudgetEpoch++;
     if (armed || target !== this.contextBudgetTargetTokens) this.descentEpoch++;
+    if (budget !== this.contextBudgetTokens || target !== this.contextBudgetTargetTokens) this.contextSettingsChangeCount++;
     this.contextBudgetTokens = budget;
     this.contextBudgetTargetTokens = target;
   }
@@ -807,7 +850,7 @@ export class Agent {
       return await this.compileAtLiveBudgetNoting(compile, started);
     } finally {
       this.compilesRunning.delete(started);
-      const earliest = Math.min(...this.compilesRunning);
+      const earliest = [...this.compilesRunning].reduce((min, start) => Math.min(min, start), Infinity);
       for (const [budget, start] of this.latestEndedStart) {
         if (start < earliest) this.latestEndedStart.delete(budget);
       }
@@ -993,6 +1036,11 @@ export class Agent {
       ?? DEFAULT_SAME_ROUND_THINK_TEXT_POLICY;
   }
 
+  /** Whether an explicit send silences plain speech aimed where it posted: the agent's own setting, else its config's (AgentConfig.sendSilencing, default false). */
+  getEffectiveSendSilencing(): boolean {
+    return this.runtimeSettingsOverrides.sendSilencing ?? this.configuredSendSilencing;
+  }
+
   getSameRoundThinkTextPolicySource(): SameRoundThinkTextPolicySource {
     if (this.runtimeSettingsOverrides.sameRoundThinkTextPolicy !== undefined) {
       return 'runtime_override';
@@ -1063,11 +1111,12 @@ export class Agent {
     if (patch.sameRoundThinkTextPolicy !== undefined) {
       this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
     }
+    if (patch.sendSilencing !== undefined) this.runtimeSettingsOverrides.sendSilencing = patch.sendSilencing;
     return this.getRuntimeSettings();
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
-    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
+    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy', 'sendSilencing']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     // A reset to a recipe budget below the live one arms a descent to it.
@@ -1118,6 +1167,7 @@ export class Agent {
     if (reset.has('sameRoundThinkTextPolicy')) {
       delete this.runtimeSettingsOverrides.sameRoundThinkTextPolicy;
     }
+    if (reset.has('sendSilencing')) delete this.runtimeSettingsOverrides.sendSilencing;
     return this.getRuntimeSettings();
   }
 
@@ -1203,6 +1253,9 @@ export class Agent {
         patch.sameRoundThinkTextPolicy !== 'public' &&
         patch.sameRoundThinkTextPolicy !== 'private') {
       throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
+    }
+    if (patch.sendSilencing !== undefined && typeof patch.sendSilencing !== 'boolean') {
+      throw new Error('sendSilencing must be true or false');
     }
   }
 
@@ -1587,8 +1640,8 @@ export class Agent {
   /**
    * A host's hook, called with each committing compile's `thinkingStrip` (never a dry run's) and the key of the
    * branch it read (`branchKey`), as the compile returns, whether or not its request is then sent, since the
-   * context manager's binding record takes the strip either way. One that throws is logged. The framework sets none
-   * of its own, and tells the agent nothing of a strip.
+   * context manager's binding record takes the strip either way. One that throws is logged. It is observational only;
+   * the framework does not write agent-facing reasoning-loss notices.
    */
   onThinkingStrip?: (strip: ThinkingStrip, branch: string) => void;
 
@@ -1616,12 +1669,9 @@ export class Agent {
   unsentInjection(namespace: string): { contentHash: string; whole: boolean } | undefined {
     let newest: { contentHash: string; parts: number; held: Set<number> } | undefined;
     try {
-      const branch = branchKey(this.contextManager.currentBranchRef());
-      const since = this.unsentSince.get(branch);
+      const since = this.unsentSince.get(branchKey(this.contextManager.currentBranchRef()));
       if (since === undefined) {
-        const count = this.contextManager.getMessageCount();
-        const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
-        this.unsentSince.set(branch, top);
+        this.markUnsentPoint();
         return undefined;
       }
       scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
@@ -1655,6 +1705,42 @@ export class Agent {
       if (!newest) return undefined;
     }
     return newest && { contentHash: newest.contentHash, whole: newest.held.size === newest.parts };
+  }
+
+  /** Set the unsent point where it isn't set, as a start's plan does: a row
+   *  stored after it counts as in no request until a compile built to send.
+   *  @internal For the framework's budget holds; not a host API. */
+  markUnsentPoint(): void {
+    const branch = branchKey(this.contextManager.currentBranchRef());
+    if (this.unsentSince.has(branch)) return;
+    const count = this.contextManager.getMessageCount();
+    const top = count > 0 ? this.contextManager.getMessageWindow(count - 1, 1, { resolveBlobs: false }).messages[0]?.sequence ?? 0 : 0;
+    this.unsentSince.set(branch, top);
+  }
+
+  /** The ids of this agent's stored injections, of every namespace, stored
+   *  on its branch since its last compile built to send and in its window
+   *  where it's presented, in the record's order, a sharded body's first
+   *  shard first: the rows unsentInjection counts, which no request has
+   *  carried. Reads only, so an unset point gives none. */
+  unsentInjectionRows(): MessageId[] {
+    const ids: MessageId[] = [];
+    const since = this.unsentSince.get(branchKey(this.contextManager.currentBranchRef()));
+    if (since === undefined) return ids;
+    const presented = this.contextManager.windowMode?.() === 'presented';
+    scan: for (let end = this.contextManager.getMessageCount(); end > 0;) {
+      const span = Math.min(end, 64);
+      const { messages } = this.contextManager.getMessageWindow(end - span, span, { resolveBlobs: false });
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const row = messages[i]!;
+        if (row.sequence <= since) break scan;
+        if (storedInjectionMarkOf(row.metadata)?.agent !== this.name) continue;
+        if (presented && this.contextManager.windowStatusOf(row.id) !== 'in') continue;
+        ids.push(row.id);
+      }
+      end -= span;
+    }
+    return ids.reverse();
   }
 
   /** Record which of this agent's stored injections a compile built to send
@@ -1930,7 +2016,7 @@ export class Agent {
       // inferring, sends the same ones.
       unguardedResults ??= this._state.status === 'ready' && !guardedResults
         ? this.buildToolResultMessages(this._state.toolResults) : [];
-      messages.push(...unguardedResults);
+      appendAll(messages, unguardedResults);
       return {
         messages: this.toolResultGuard.prepareRequest(messages, true),
         system: this.buildSystemPrompt(systemInjections),
@@ -2157,8 +2243,7 @@ export class Agent {
     // no content. The Anthropic API rejects empty text blocks with 400
     // "messages: text content blocks must be non-empty"; when such a block
     // reaches a live activation request the agent cannot complete ANY turn
-    // ([inference-failed] on every attempt) until the offending message ages
-    // out of the window. Empty text blocks occur naturally: tool-only turns,
+    // until the offending message ages out of the window. Empty text blocks occur naturally: tool-only turns,
     // delivery-failure placeholders, silent/skip turns. Non-text blocks pass
     // through unchanged, so tool pairing is unaffected. (Field-observed
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
@@ -2558,16 +2643,15 @@ export class Agent {
     // in the latest assistant message cannot be modified", unrecoverable by
     // retry (labclaude, 2026-07-27: hard down ~4h on exactly this pair).
     //
-    // Refused turns are surfaced by the refusal path (stderr, failures.log,
-    // the [inference-failed] notice); the store does not also need a
-    // content-free artifact of them. Loud, never silent.
+    // Refused turns are surfaced by the refusal path; the store does not
+    // also need a content-free artifact of them. Loud, never silent.
     if (content.length > 0 && content.every(
       (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
     )) {
       console.error(
         `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
-        `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
-        `output. See the refusal/inference-failed record for why.`,
+        `message (${content.length} block(s), no text and no tool_use). If it was refused, see ` +
+        `its [inference-refusal] line and failures.log record.`,
       );
       return undefined;
     }
