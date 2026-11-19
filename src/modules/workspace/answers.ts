@@ -96,8 +96,9 @@ export function errnoClause(code: string | undefined, again: string, then: strin
 const OS_ERRNO = new Map<number, string>();
 for (const [name, number] of Object.entries(constants.errno)) if (!OS_ERRNO.has(number)) OS_ERRNO.set(number, name);
 
-// Chronicle's store errors carry the code GenericFailure, and an I/O
-// failure's message is "IO error: " and Rust's std::io::Error, which ends
+// Chronicle's store errors carry a code that is no errno (napi's
+// GenericFailure before chronicle 0.7.0, chronicle's own ErrorCode, such as
+// Io, from it), and an I/O failure's message is "IO error: " and Rust's std::io::Error, which ends
 // with the OS error's number: an errno on POSIX, a Win32 code on Windows.
 export function errnoCode(error: unknown): string | undefined {
   const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
