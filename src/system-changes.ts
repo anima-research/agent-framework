@@ -219,15 +219,11 @@ export function declarationDifference(
   effective: { tools: ReadonlyMap<string, ToolDefinition>; system: readonly string[] },
   current: HeadDeclaration,
 ): DeclarationDifference {
-  const remaining = new Map<string, number>();
-  for (const block of effective.system) remaining.set(block, (remaining.get(block) ?? 0) + 1);
-  const addSystem: string[] = [];
-  for (const block of current.system) {
-    const left = remaining.get(block) ?? 0;
-    if (left > 0) remaining.set(block, left - 1);
-    else addSystem.push(block);
-  }
-  for (const left of remaining.values()) if (left > 0) return { kind: 'replace' };
+  // System text is a sequence: the current blocks either continue the
+  // effective ones, and the blocks after them are an addition, or they
+  // replace them.
+  if (!effective.system.every((block, i) => block === current.system[i])) return { kind: 'replace' };
+  const addSystem = current.system.slice(effective.system.length);
 
   const currentNames = new Set(current.tools.map((tool) => tool.name));
   const removeTools = [...effective.tools.keys()].filter((name) => !currentNames.has(name));

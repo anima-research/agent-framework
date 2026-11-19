@@ -105,9 +105,9 @@ describe('system changes', () => {
     assert.deepEqual(differenceFrom(before, [], now), { kind: 'change', block: { type: 'system_change', defineTools: [tool('a', 'a', { x: { type: 'number' } })] } });
   });
 
-  it('finds nothing to declare when the tools and text are the same, in any order', () => {
+  it('finds nothing to declare when the tools are the same in any order, and the text the same in its order', () => {
     const before = head([tool('a'), tool('b', 'b', { x: { type: 'string' }, y: { type: 'number' } })], ['prompt', 'one', 'two']);
-    const now = head([tool('b', 'b', { y: { type: 'number' }, x: { type: 'string' } }), tool('a')], ['prompt', 'two', 'one']);
+    const now = head([tool('b', 'b', { y: { type: 'number' }, x: { type: 'string' } }), tool('a')], ['prompt', 'one', 'two']);
     assert.deepEqual(differenceFrom(before, [], now), { kind: 'none' });
   });
 
@@ -130,12 +130,24 @@ describe('system changes', () => {
     });
   });
 
-  it('declares new system blocks as an addition, in current order, beside a tool change', () => {
+  it('declares the system blocks that continue the ones before as an addition, in order, beside a tool change', () => {
     const before = head([tool('a')], ['prompt', 'kept']);
-    const now = head([tool('a'), tool('b')], ['prompt', 'new one', 'kept', 'new two']);
+    const now = head([tool('a'), tool('b')], ['prompt', 'kept', 'new one', 'new two']);
     assert.deepEqual(differenceFrom(before, [], now), {
       kind: 'change',
       block: { type: 'system_change', defineTools: [tool('b')], addSystem: ['new one', 'new two'] },
+    });
+  });
+
+  it('reads a block inserted among the ones before, or two blocks that change places, as a replacement: system text is a sequence', () => {
+    const before = head([tool('a')], ['prompt', 'kept']);
+    assert.deepEqual(differenceFrom(before, [], head([tool('a')], ['prompt', 'new one', 'kept'])), { kind: 'replace' });
+    assert.deepEqual(differenceFrom(before, [], head([tool('a')], ['kept', 'prompt'])), { kind: 'replace' });
+    const changed: SystemChangeContent[] = [{ type: 'system_change', addSystem: ['added'] }];
+    assert.deepEqual(differenceFrom(before, changed, head([tool('a')], ['prompt', 'added', 'kept'])), { kind: 'replace' }, 'the change\'s block goes after the head\'s');
+    assert.deepEqual(differenceFrom(before, changed, head([tool('a')], ['prompt', 'kept', 'added', 'later'])), {
+      kind: 'change',
+      block: { type: 'system_change', addSystem: ['later'] },
     });
   });
 
