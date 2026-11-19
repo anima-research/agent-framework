@@ -9093,9 +9093,10 @@ export class AgentFramework {
     if (agent.streamId === myStreamId) {
       // A quiesce abandons its own stream's turn, or every turn when it
       // names none; the host stopping ends every turn. An abandoned turn
-      // stops a script its calls watch that hasn't returned, though the
-      // logical turn stays open, and lets go of one that has; a script of
-      // another turn is left to whether its own turn is live.
+      // stops a script its calls watch that hasn't returned, and lets go of
+      // one that has; a script of another turn is left to whether its own
+      // turn is live.
+      if (closes && this.answeredTurns.get(agent) === closes) this.answeredTurns.delete(agent);
       this.abandonAgentScripts(
         agent.name,
         kind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce',

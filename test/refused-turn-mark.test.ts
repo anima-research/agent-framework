@@ -959,6 +959,23 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(await breakerAfterTimerTurns(r), undefined, "m-1's turn was stopped, so no retry continues it");
   });
 
+  const abandonedByQuiesce = async (r: Awaited<ReturnType<typeof rig>>) => {
+    const fw = r.f.framework as unknown as { quiesce(o: unknown): Promise<{ quiesced: boolean }>; resume(): Promise<void> };
+    r.streams.push(() => new RunsUntilStopped());
+    await r.incoming(ROOM, 'm-1');
+    await eventually(() => r.f.membrane.calls.length === 1, "premise: m-1's turn is running");
+    assert.equal((await fw.quiesce({ timeoutMs: 50, abandon: true })).quiesced, true, "premise: the quiesce abandoned m-1's turn");
+    await fw.resume();
+    await r.f.framework.runUntilIdle();
+    assert.equal(r.f.published.length, 0, "premise: m-1's abandoned turn published nothing");
+  };
+
+  it('the poison-history breaker\'s retry, after an operator\'s quiesce abandoned a channel message\'s turn and three timer turns failed, has no channel: nothing is published', async (t) => {
+    const r = await rig(t, { framework: { gate: QUIET_AMBIENT } as never });
+    await abandonedByQuiesce(r);
+    assert.equal(await breakerAfterTimerTurns(r), undefined, "m-1's turn was abandoned, so no retry continues it");
+  });
+
   it('an /unstick right after a channel message\'s turn completed: its run answers no message, and its retry has no channel', async (t) => {
     const r = await rig(t, manual);
     const fw = r.f.framework as unknown as { rewindRetry(...args: unknown[]): Record<string, unknown> };
@@ -974,6 +991,23 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await r.f.framework.runUntilIdle();
     assert.deepEqual(made.map((x) => [x.reason, x.channelId, x.answersMessageId]), [['unstick', undefined, undefined], ['unstick-retry', undefined, undefined]],
       "m-1's turn completed, so neither the unstick's run nor its retry answers m-1");
+    assert.equal(r.f.published.find((p) => JSON.stringify(p).includes('the answer after the unstick')), undefined, 'and nothing is published');
+  });
+
+  it('an /unstick after an operator\'s quiesce abandoned a channel message\'s turn: its run answers no message, and its retry has no channel', async (t) => {
+    const r = await rig(t, manual);
+    const fw = r.f.framework as unknown as { rewindRetry(...args: unknown[]): Record<string, unknown> };
+    const rewindRetry = fw.rewindRetry.bind(fw);
+    const made: Array<Record<string, unknown>> = [];
+    t.mock.method(fw, 'rewindRetry', (...args: unknown[]) => { const retry = rewindRetry(...args); made.push(retry); return retry; });
+    await abandonedByQuiesce(r);
+    const before = r.f.membrane.calls.length;
+    r.streams.push(() => new MockYieldingStream([refusal()]), () => new MockYieldingStream([answer('the answer after the unstick')]));
+    assert.equal((await unstick(r)).ok, true, 'premise: the unstick started');
+    await eventually(() => r.f.membrane.calls.length === before + 2, "the unstick's run and its retry");
+    await r.f.framework.runUntilIdle();
+    assert.deepEqual(made.map((x) => [x.reason, x.channelId, x.answersMessageId]), [['unstick', undefined, undefined], ['unstick-retry', undefined, undefined]],
+      "m-1's turn was abandoned, so neither the unstick's run nor its retry answers m-1");
     assert.equal(r.f.published.find((p) => JSON.stringify(p).includes('the answer after the unstick')), undefined, 'and nothing is published');
   });
 
