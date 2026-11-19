@@ -369,6 +369,18 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled' | 'locked';
 
   /**
+   * Whether an explicit send (send_message, channel_publish, a `drafts`
+   * resend and the like) silences the plain speech its round and later
+   * rounds aim where the send may have posted, holding it as drafts.
+   * Default false: plain speech beside a send is routed as any other is.
+   * `skip_reply` and a private same-round `think` keep their rounds private
+   * either way. Explicit mode never silences on a send, and disabled mode
+   * routes nothing, so it changes nothing there. The agent can change it for
+   * itself with `agent_settings` (`send_silencing`); its choice persists.
+   */
+  sendSilencing?: boolean;
+
+  /**
    * Locked mode's destination until the agent chooses one with `prose_locus`:
    * `"#channel"`, `"@person"`, a channel id, or `"drafts"`. Resolved as a
    * `>>` target is, at each turn's start, so a channel its server hasn't
@@ -414,6 +426,20 @@ export interface AgentConfig {
    * content-free system receipt is stored instead. Default false.
    */
   toolWrapperProseGuard?: boolean;
+
+  /**
+   * Whether a turn waits for this agent's auxiliary call (context-manager
+   * compression through provider admission) already in flight to end before
+   * its own call starts. Default false: the turn starts beside it, and can
+   * compile before that call's summary lands. A new auxiliary call waits
+   * while a turn holds admission either way. Turn it
+   * on for an agent whose provider limits how fast input tokens per minute
+   * may grow, where a compression call in flight can cost the larger primary
+   * call its admission (#114). It applies to an agent that owns its provider
+   * scheduling, a resident: a conversation agent takes neither side of the
+   * gate, so the setting does nothing for it.
+   */
+  primaryWaitsForAuxiliary?: boolean;
 
   /**
    * Continue on the agent's own turn ending (off when left out): a turn the
@@ -527,6 +553,8 @@ export interface AgentRuntimeSettingsPatch {
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /** Whether an explicit send silences plain speech aimed where it posted (AgentConfig.sendSilencing). */
+  sendSilencing?: boolean;
   /**
    * Apply a `contextBudgetTokens` DECREASE immediately instead of starting a
    * paced descent: the next compile plans straight at the new budget and the
@@ -560,6 +588,7 @@ export interface AgentRuntimeSettingsSnapshot {
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
   sameRoundThinkTextPolicySource: SameRoundThinkTextPolicySource;
+  sendSilencing: boolean;
   transition: 'stable' | 'converging' | 'blocked';
   transitionReason?: 'transition_pace_too_small' | 'protected_context_exceeds_target';
 }

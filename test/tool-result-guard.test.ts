@@ -1558,7 +1558,7 @@ test('guard recovery keeps same-turn explicit-send suppression', async () => {
   const h = await harness([[createMockResponse([
     { type: 'tool_use', id: 'send', name: 'test--send_message', input: {} },
     { type: 'tool_use', id: 'one', name: 'test--read', input: {} },
-  ], 'tool_use'), refused()], [createMockResponse([{ type: 'text', text: 'postscript' }])]], { toolResultGuard: true });
+  ], 'tool_use'), refused()], [createMockResponse([{ type: 'text', text: 'postscript' }])]], { toolResultGuard: true, sendSilencing: true });
   const routed = fakeRegistry(h.framework);
   try {
     await h.run();

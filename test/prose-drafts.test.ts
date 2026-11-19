@@ -284,6 +284,7 @@ function breakAfterToolRound(
   how: 'error' | 'throw' | 'abort' | 'stop',
   opts: {
     fromStart?: boolean;
+    atCompletion?: boolean;
     stopEnds?: 'aborted' | 'error' | 'silent' | 'throw';
     stream?: number;
     failure?: () => Error;
@@ -311,6 +312,7 @@ function breakAfterToolRound(
         }) as unknown as StreamEvent;
         if (opts.fromStart) { yield failure(); return; }
         for await (const event of inner) {
+          if (opts.atCompletion && event.type === 'complete') { await opts.beforeFailure?.(); yield failure(); return; }
           yield event;
           if (event.type !== 'tool-calls') continue;
           while (!resultsGiven && !cancelled) await new Promise<void>((resolve) => { wake = resolve; });
@@ -409,7 +411,7 @@ function onSecondStream(membrane: MockMembrane, response: NormalizedResponse): v
 }
 
 async function harness(opts: {
-  agents?: Array<{ name: string; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; sameRoundSkipReplyTextPolicy?: 'private' | 'ask'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
+  agents?: Array<{ name: string; /** AgentConfig.sendSilencing; on unless a test says false, since most of these read the hold. */ sendSilencing?: boolean; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; sameRoundSkipReplyTextPolicy?: 'private' | 'ask'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
   gate?: boolean;
   xml?: boolean;
   roundPreamble?: boolean;
@@ -442,7 +444,7 @@ async function harness(opts: {
     return streamYielding(request, options);
   };
   const agents = (opts.agents ?? [{ name: 'scout' }]).map((a) => ({
-    name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`,
+    name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`, sendSilencing: a.sendSilencing ?? true,
     ...(a.proseRouting ? { proseRouting: a.proseRouting } : {}),
     ...(a.sameRoundThinkTextPolicy ? { sameRoundThinkTextPolicy: a.sameRoundThinkTextPolicy } : {}),
     ...(a.sameRoundSkipReplyTextPolicy ? { sameRoundSkipReplyTextPolicy: a.sameRoundSkipReplyTextPolicy } : {}),
@@ -2036,7 +2038,7 @@ describe('draft notices and turn-end settlement', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     try {
@@ -2069,7 +2071,7 @@ describe('draft notices and turn-end settlement', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     const internals = framework as unknown as {
@@ -2276,7 +2278,7 @@ describe('draft identity and risk evidence', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }, { name: 'other', model: 'test-model', systemPrompt: 'other' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', sendSilencing: true }, { name: 'other', model: 'test-model', systemPrompt: 'other', sendSilencing: true }],
       modules: [],
     });
     const internals = framework as unknown as {
@@ -2333,7 +2335,7 @@ describe('drafts resend ownership', () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true }],
       modules: [],
     });
     const pending: Array<{ text: string; resolve: (o: unknown) => void }> = [];
@@ -3159,6 +3161,95 @@ describe('an explicit send holds plain speech only where it may have posted', ()
   const inRoom = (h: H) => h.publishes().filter((p) => p.event === 'publish' && p.channelId === ROOM).map((p) => p.text);
   const held = (h: H) => h.drafts().map((d) => [d.text, d.reason]).reverse();
   const notices = (h: H) => h.texts().filter((t) => t.startsWith('[drafts]'));
+  const draftsToolShown = (h: H) => (h.framework as unknown as {
+    getToolsForAgent(agentName: string): Array<{ name: string; description: string }>;
+  }).getToolsForAgent('scout').find((tool) => tool.name === 'drafts')!.description;
+  const SEND_REASON = 'because an explicit send in its turn may already have posted where it was going, ';
+
+  for (const mode of ['locus', 'hybrid'] as const) {
+    it(`${mode}: with send silencing off, a line beside a send to its own channel is posted, and so are the turn's later rounds`, async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: mode, sendSilencing: false }], sendTool: true });
+      try {
+        await h.turn([
+          createMockResponse([text(LINE), send('s1', ROOM, 'The reply, sent with the tool.')], 'tool_use'),
+          createMockResponse([text('And one more thing for you.'), call('l1', 'channel_list', {})], 'tool_use'),
+          createMockResponse([text('That is all from me.')]),
+        ]);
+        assert.deepEqual(h.sends().map((s) => [s.channelId, s.text]), [[ROOM, 'The reply, sent with the tool.']]);
+        assert.deepEqual(inRoom(h), [LINE, 'And one more thing for you.', 'That is all from me.']);
+        assert.deepEqual(held(h), []);
+        assert.deepEqual(notices(h), []);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('with send silencing off, XML tool mode posts the prose before and after a send', async () => {
+    const h = await harness({ xml: true, agents: [{ name: 'scout', sendSilencing: false }] });
+    try {
+      await h.turn([
+        createMockResponse([text('Narration before the send.'), explicitSend('s1')], 'tool_use'),
+        { ...createMockResponse([text('Narration before the send.'), explicitSend('s1'), text('And after it.')]), toolCalls: [] },
+      ]);
+      const posted = h.publishes().filter((p) => p.event === 'publish').map((p) => p.text).join('\n');
+      assert.match(posted, /Narration before the send\./);
+      assert.match(posted, /And after it\./);
+      assert.deepEqual(held(h), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('with send silencing off, skip_reply and a private think still keep their rounds out of the room', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: false, sameRoundThinkTextPolicy: 'private' }], sendTool: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Working it out.'), call('t1', 'think', { content: 'private' }), send('s1', GENERAL)], 'tool_use'),
+        createMockResponse([text('The answer.'), call('l1', 'channel_list', {})], 'tool_use'),
+        createMockResponse([text('Not for the room.'), call('k1', 'skip_reply', { reason: 'done' })], 'tool_use'),
+      ]);
+      assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL], 'the send ran');
+      for (const line of ['Working it out.', 'Not for the room.']) {
+        assert.ok(h.texts().includes(line), `the round that wrote ${JSON.stringify(line)} ran: its words are in the history`);
+      }
+      assert.deepEqual(inRoom(h), ['The answer.']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the resident turns send silencing on with agent_settings: sends made after it hold, the drafts tool names the reason, and a reset posts again', async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: false }], sendTool: true });
+    try {
+      assert.ok(!draftsToolShown(h).includes(SEND_REASON), 'off: the drafts tool names no send as a reason');
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, false);
+      await h.turn([
+        createMockResponse([call('a1', 'agent_settings', { action: 'update', send_silencing: true })], 'tool_use'),
+        createMockResponse([text(LINE), send('s1', ROOM, 'The reply, sent with the tool.')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true);
+      assert.deepEqual(inRoom(h), []);
+      assert.deepEqual(held(h), [[LINE, 'explicit-send']]);
+      assert.ok(draftsToolShown(h).includes(SEND_REASON), 'on: the drafts tool names the send as a reason');
+
+      await h.restart();
+      assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the resident's choice outlives a restart");
+      // What a request carries, not only what a fresh tool list says.
+      const draftsToolSent = () => h.membrane.calls.at(-1)!.tools!.find((tool) => tool.name === 'drafts')!.description;
+      await h.turn([createMockResponse([text('Hello.')])]);
+      assert.ok(draftsToolSent().includes(SEND_REASON), 'on: the request carries the send as a reason');
+
+      h.framework.resetAgentRuntimeSettings('scout', ['sendSilencing']);
+      assert.ok(!draftsToolShown(h).includes(SEND_REASON));
+      await h.turn([createMockResponse([text('Again.'), send('s2', ROOM, 'Sent again.')], 'tool_use'), createMockResponse([])]);
+      assert.ok(!draftsToolSent().includes(SEND_REASON), 'off: the request carries none');
+      assert.deepEqual(inRoom(h), ['Hello.', 'Again.']);
+    } finally {
+      await h.close();
+    }
+  });
 
   for (const mode of ['locus', 'hybrid'] as const) {
     it(`${mode}: a line beside a send to another channel goes to the person it was for`, async () => {
@@ -4347,15 +4438,40 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
       }
     });
 
-    it('a failure with no round keeps the marker saying nothing was sent', async () => {
+    it('a failure with no round writes no marker, since the turn did nothing', async () => {
       const h = await harness({ retries: 0 });
       try {
+        const exhausted: unknown[] = [];
+        h.framework.onTrace((event) => { if ((event as { type: string }).type === 'inference:exhausted') exhausted.push(event); });
         breakAfterToolRound(h.membrane, 'error', { fromStart: true });
         await h.turn([]);
-        assert.equal(markers(h).length, 1);
-        assert.match(markers(h)[0]!, /the model call failed( \([^)]*\))? and produced no response, so nothing was sent/);
+        assert.equal(exhausted.length, 1, 'premise: the turn failed');
+        assert.deepEqual(markers(h), []);
       } finally {
         await h.close();
+      }
+    });
+
+    it('locus and hybrid: plain speech streamed with no tool round, then a failure, posts nothing and writes no marker; the same turn completing posts it once', async () => {
+      for (const proseRouting of ['locus', 'hybrid'] as const) {
+        for (const fails of [true, false]) {
+          const at = `${proseRouting}, ${fails ? 'failing' : 'completing'}`;
+          const h = await harness({ agents: [{ name: 'scout', proseRouting }], retries: 0 });
+          try {
+            const exhausted: unknown[] = [];
+            h.framework.onTrace((event) => { if ((event as { type: string }).type === 'inference:exhausted') exhausted.push(event); });
+            if (fails) breakAfterToolRound(h.membrane, 'error', { atCompletion: true, beforeFailure: () => speechSettled(h) });
+            await h.turn([createMockResponse([text(SPEECH)])]);
+            if (!fails) await h.until(() => published(h, SPEECH).length === 1, `${at}: the speech is posted`);
+            await speechSettled(h);
+            assert.equal(exhausted.length, fails ? 1 : 0, `premise, ${at}: the turn ${fails ? 'failed' : 'completed'}`);
+            if (fails) assert.deepEqual(h.publishes().filter((p) => p.event === 'publish').map((p) => p.text), [], at);
+            else assert.equal(published(h, SPEECH).length, 1, at);
+            assert.deepEqual(markers(h), [], at);
+          } finally {
+            await h.close();
+          }
+        }
       }
     });
 
@@ -4826,8 +4942,8 @@ describe('the held-draft notice written mid-turn', () => {
       storePath: join(dir, 'store'),
       membrane: new MockMembrane().asMembrane(),
       agents: [
-        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
-        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', observes: ['scout'] },
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true },
+        { name: 'nova', model: 'test-model', systemPrompt: 'You are nova.', sendSilencing: true, observes: ['scout'] },
       ],
       modules: [],
     });

@@ -49,6 +49,22 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
           "Omitted in the recipe preserves the compatibility carry-forward: public.",
       },
     );
+    assert.deepEqual(
+      (tool!.inputSchema as { properties: Record<string, unknown> }).properties.send_silencing,
+      {
+        type: 'boolean',
+        description:
+          'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
+          'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
+          'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
+          'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
+          'that an earlier send in the turn already set.',
+      },
+    );
+    assert.ok(
+      (tool!.inputSchema as unknown as { properties: { settings: { items: { enum: string[] } } } }).properties.settings.items.enum.includes('send_silencing'),
+      'a reset can name it',
+    );
     assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
       effectiveContextBudgetTokens: 100_000,
@@ -56,6 +72,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       transitionPaceTokens: 8_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
+      sendSilencing: false,
       transition: 'stable',
     });
 
@@ -65,6 +82,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
         tailTokens: 20_000,
         transitionPaceTokens: 4_000,
         sameRoundThinkTextPolicy: 'private',
+        sendSilencing: true,
       }),
       {
         contextBudgetTokens: 60_000,
@@ -73,6 +91,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
         transitionPaceTokens: 4_000,
         sameRoundThinkTextPolicy: 'private',
         sameRoundThinkTextPolicySource: 'runtime_override',
+        sendSilencing: true,
         transition: 'converging',
       },
     );
@@ -87,8 +106,31 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       transitionPaceTokens: 8_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
+      sendSilencing: false,
       transition: 'stable',
     });
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("sendSilencing: the agent's own false overrides a recipe's true, and a reset restores the recipe's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-send-silencing-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: strategy(), sendSilencing: true }],
+    modules: [],
+  });
+  try {
+    assert.equal(framework.getAgentRuntimeSettings('agent').sendSilencing, true);
+    assert.equal(framework.updateAgentRuntimeSettings('agent', { sendSilencing: false }).sendSilencing, false);
+    assert.equal(framework.resetAgentRuntimeSettings('agent', ['sendSilencing']).sendSilencing, true);
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', { sendSilencing: 'false' as never }),
+      /sendSilencing must be true or false/,
+    );
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -119,6 +161,7 @@ it('runtime overrides persist across framework restart', async () => {
     tailTokens: 18_000,
     transitionPaceTokens: 5_000,
     sameRoundThinkTextPolicy: 'private',
+    sendSilencing: true,
   });
   await framework.stop();
 
@@ -133,6 +176,7 @@ it('runtime overrides persist across framework restart', async () => {
       transitionPaceTokens: 5_000,
       sameRoundThinkTextPolicy: 'private',
       sameRoundThinkTextPolicySource: 'runtime_override',
+      sendSilencing: true,
       transition: 'converging',
     });
   } finally {
@@ -1213,6 +1257,7 @@ describe('a reached budget across a restart', () => {
         effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'public',
         sameRoundThinkTextPolicySource: 'compatibility_default',
+        sendSilencing: false,
         transition: 'stable',
       });
       assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [
@@ -1324,6 +1369,7 @@ it('reset-all skips tail controls unsupported by the active strategy', async () 
       effectiveContextBudgetTokens: 100_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
+      sendSilencing: false,
       transition: 'stable',
     });
   } finally {
@@ -1351,6 +1397,7 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
       effectiveContextBudgetTokens: 100_000,
       sameRoundThinkTextPolicy: 'private',
       sameRoundThinkTextPolicySource: 'recipe',
+      sendSilencing: false,
       transition: 'stable',
     });
 
@@ -1361,6 +1408,7 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
         effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'public',
         sameRoundThinkTextPolicySource: 'runtime_override',
+        sendSilencing: false,
         transition: 'stable',
       },
     );
@@ -1372,6 +1420,7 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
         effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'private',
         sameRoundThinkTextPolicySource: 'recipe',
+        sendSilencing: false,
         transition: 'stable',
       },
     );

@@ -640,7 +640,7 @@ const admission = (fw: AgentFramework): Admission => (fw.healthSnapshot() as { a
 async function framework(path: string, membrane: WaitingMembrane) {
   const fw = await AgentFramework.create({
     storePath: path, membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system', primaryWaitsForAuxiliary: true }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   return { fw, internal: fw as unknown as Internal };
@@ -762,9 +762,8 @@ test("a non-retryable failure worded as organization acceleration keeps its term
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
-      const markers = fw.getAgent('resident')!.getContextManager().queryMessages({}).messages
-        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
-      assert.equal(markers.length, 1, 'terminal: its marker is written');
+      assert.equal(log.lines.filter((l) => l.startsWith('[inference-failed] agent=resident consecutive=1 ')).length, 1,
+        'terminal: the turn ends exhausted');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'not retained for retry');
     } finally { await fw.stop(); log.restore(); }
   });
@@ -1067,9 +1066,8 @@ test('a non-retryable failure with a stated wait keeps its terminal disposition;
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       await fw.runUntilIdle();
       assert.equal(membrane.primary, 1);
-      const markers = () => fw.getAgent('resident')!.getContextManager().queryMessages({}).messages
-        .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
-      assert.equal(markers().length, 1, 'the failure is terminal: its marker is written');
+      const exhausted = () => log.lines.filter((l) => l.startsWith('[inference-failed] agent=resident consecutive=')).length;
+      assert.equal(exhausted(), 1, 'the failure is terminal: the turn ends exhausted');
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length ?? 0, 0, 'the failed request is not retained for retry');
 
       // Real time passes the wait before the later wake, as on a loaded host.
@@ -2185,6 +2183,48 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
       await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
       assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
     } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a resident's turn that starts beside an auxiliary call in flight is held, sending nothing, when that call's wait is recorded while the turn compiles", async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    const wait = 400;
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
+    const fw = await AgentFramework.create({
+      storePath: path, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    });
+    const internal = fw as unknown as Internal & {
+      withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>, model?: string): Promise<T>;
+      providerGate(name: string): { primaryDepth: number };
+    };
+    // The auxiliary call in flight fails with a stated wait on the primary model while the turn compiles.
+    let fail!: (error: Error) => void;
+    const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<void>((_, reject) => { fail = reject; }), 'zz-model').catch(() => {});
+    let depthWhileCompiling: number | undefined;
+    record = () => {
+      depthWhileCompiling = internal.providerGate('resident').primaryDepth;
+      internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the turn compiled');
+    };
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      assert.ok(log.lines.some((line) => /binds after the compile/.test(line)), 'held after the compile');
+      assert.equal(depthWhileCompiling, 1, 'the turn held its admission while it compiled');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
+      assert.equal(internal.providerGate('resident').primaryDepth, 0, 'the held start gave its admission back');
+      fail(new Error('zz the auxiliary call ended'));
+      await auxiliary;
+
+      clock.pass(wait);
+      await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
+      assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { fail(new Error('zz the auxiliary call ended')); await auxiliary; await fw.stop(); log.restore(); }
   });
 });
 

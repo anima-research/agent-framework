@@ -196,7 +196,7 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `toolWrapperProseGuard`, `primaryWaitsForAuxiliary`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
@@ -244,6 +244,18 @@ export function assertAgentSwitches(config: AgentConfig): void {
     config.toolWrapperProseGuard,
     'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' +
       'and false or leaving it out doesn\'t',
+  );
+  assertBooleanSetting(
+    `${agent} primaryWaitsForAuxiliary`,
+    config.primaryWaitsForAuxiliary,
+    'true holds a turn\'s start until the agent\'s compression call in flight ends, ' +
+      'and false or leaving it out starts the turn beside it',
+  );
+  assertBooleanSetting(
+    `${agent} sendSilencing`,
+    config.sendSilencing,
+    'true makes an explicit send hold back, as drafts, the plain speech aimed where it may have posted, ' +
+      'and false or leaving it out posts that speech as any other',
   );
   assertBooleanSetting(
     `${agent} turnInputsPin`,
@@ -366,6 +378,9 @@ export class Agent {
   readonly proseLock: string | undefined;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** A turn's start waits for an auxiliary call in flight (see
+   *  AgentConfig.primaryWaitsForAuxiliary). Default off. */
+  readonly primaryWaitsForAuxiliary: boolean;
   /** Continuation after a turn the model ends itself (see
    *  AgentConfig.autoContinue); undefined when off. */
   readonly autoContinue: { maxConsecutive: number } | undefined;
@@ -440,6 +455,7 @@ export class Agent {
   private readonly configuredTailTokens?: number;
   private readonly configuredTransitionPaceTokens?: number;
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  private readonly configuredSendSilencing: boolean;
   private contextBudgetTargetTokens?: number;
   private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
   /**
@@ -512,6 +528,7 @@ export class Agent {
     this.proseRouting = config.proseRouting ?? 'locus';
     this.proseLock = typeof config.proseLock === 'string' && config.proseLock.trim() ? config.proseLock.trim() : undefined;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.primaryWaitsForAuxiliary = config.primaryWaitsForAuxiliary === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
@@ -539,6 +556,7 @@ export class Agent {
     this.configuredTailTokens = hot?.tailTokens;
     this.configuredTransitionPaceTokens = hot?.transitionPaceTokens;
     this.configuredSameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.configuredSendSilencing = config.sendSilencing ?? false;
   }
 
   /**
@@ -746,6 +764,7 @@ export class Agent {
         : {}),
       sameRoundThinkTextPolicy: this.getEffectiveSameRoundThinkTextPolicy(),
       sameRoundThinkTextPolicySource: this.getSameRoundThinkTextPolicySource(),
+      sendSilencing: this.getEffectiveSendSilencing(),
       transition: this.contextBudgetTargetTokens === undefined
         ? 'stable'
         : hot?.blocked
@@ -1017,6 +1036,11 @@ export class Agent {
       ?? DEFAULT_SAME_ROUND_THINK_TEXT_POLICY;
   }
 
+  /** Whether an explicit send silences plain speech aimed where it posted: the agent's own setting, else its config's (AgentConfig.sendSilencing, default false). */
+  getEffectiveSendSilencing(): boolean {
+    return this.runtimeSettingsOverrides.sendSilencing ?? this.configuredSendSilencing;
+  }
+
   getSameRoundThinkTextPolicySource(): SameRoundThinkTextPolicySource {
     if (this.runtimeSettingsOverrides.sameRoundThinkTextPolicy !== undefined) {
       return 'runtime_override';
@@ -1087,11 +1111,12 @@ export class Agent {
     if (patch.sameRoundThinkTextPolicy !== undefined) {
       this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
     }
+    if (patch.sendSilencing !== undefined) this.runtimeSettingsOverrides.sendSilencing = patch.sendSilencing;
     return this.getRuntimeSettings();
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
-    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
+    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy', 'sendSilencing']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     // A reset to a recipe budget below the live one arms a descent to it.
@@ -1142,6 +1167,7 @@ export class Agent {
     if (reset.has('sameRoundThinkTextPolicy')) {
       delete this.runtimeSettingsOverrides.sameRoundThinkTextPolicy;
     }
+    if (reset.has('sendSilencing')) delete this.runtimeSettingsOverrides.sendSilencing;
     return this.getRuntimeSettings();
   }
 
@@ -1227,6 +1253,9 @@ export class Agent {
         patch.sameRoundThinkTextPolicy !== 'public' &&
         patch.sameRoundThinkTextPolicy !== 'private') {
       throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
+    }
+    if (patch.sendSilencing !== undefined && typeof patch.sendSilencing !== 'boolean') {
+      throw new Error('sendSilencing must be true or false');
     }
   }
 
@@ -2214,8 +2243,7 @@ export class Agent {
     // no content. The Anthropic API rejects empty text blocks with 400
     // "messages: text content blocks must be non-empty"; when such a block
     // reaches a live activation request the agent cannot complete ANY turn
-    // ([inference-failed] on every attempt) until the offending message ages
-    // out of the window. Empty text blocks occur naturally: tool-only turns,
+    // until the offending message ages out of the window. Empty text blocks occur naturally: tool-only turns,
     // delivery-failure placeholders, silent/skip turns. Non-text blocks pass
     // through unchanged, so tool pairing is unaffected. (Field-observed
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
@@ -2615,16 +2643,15 @@ export class Agent {
     // in the latest assistant message cannot be modified", unrecoverable by
     // retry (labclaude, 2026-07-27: hard down ~4h on exactly this pair).
     //
-    // Refused turns are surfaced by the refusal path (stderr, failures.log,
-    // the [inference-failed] notice); the store does not also need a
-    // content-free artifact of them. Loud, never silent.
+    // Refused turns are surfaced by the refusal path; the store does not
+    // also need a content-free artifact of them. Loud, never silent.
     if (content.length > 0 && content.every(
       (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
     )) {
       console.error(
         `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
-        `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
-        `output. See the refusal/inference-failed record for why.`,
+        `message (${content.length} block(s), no text and no tool_use). If it was refused, see ` +
+        `its [inference-refusal] line and failures.log record.`,
       );
       return undefined;
     }

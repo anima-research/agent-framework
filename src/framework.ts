@@ -124,9 +124,13 @@ import { readSkipReplyWake, skipReplyWakeRefusal, type SkipReplyEarlierWake } fr
 import { convertBlocks } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
-  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement,
   type CoalescingReceiptRecord, type DeliveryOptions,
 } from './mcpl/push-coalescer.js';
+import {
+  COALESCING_JOURNAL_ID, COALESCING_JOURNAL_REGISTRATION, COALESCING_RECENT_ID, COALESCING_TABLE_ID, CoalescingStore,
+  isJournalItem, journaledTable, type CoalescingJournalItem, type StoredCoalescing, type StoredCoalescingTable,
+} from './mcpl/coalescing-store.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, McpToolResultContent, PushEventResult } from './mcpl/types.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { isProseTargetToken, parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
@@ -304,7 +308,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  *     "stay silent" signal).
  *   - explicit delivery tools (send-tools.ts's silencing sends, such as
  *     channel_publish and *send_message) — already sent the message, so
- *     routing the prose again would double-post.
+ *     routing the prose again would double-post. Only for an agent whose
+ *     sends silence (AgentConfig.sendSilencing, off by default): for any
+ *     other, a send suppresses nothing (silenceCauseOf).
  * `think` is deliberately NOT here: it is silent *reasoning*, and same-round
  * prose beside it is governed separately by same_round_think_text_policy.
  *
@@ -321,9 +327,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
  */
 const SILENCING_TOOLS = new Set(['skip_reply', ...SILENCING_SENDS]);
 
-/** True when a tool call (possibly MCPL-prefixed) is an explicit delivery
- *  that silences the round's auto-routed prose where it may have posted,
- *  regardless of mode. */
+/** True when a tool call (possibly MCPL-prefixed) is skip_reply or an
+ *  explicit delivery, which silences the round's auto-routed prose where it
+ *  may have posted for an agent whose sends silence. */
 const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
   return SILENCING_TOOLS.has(bare);
@@ -355,28 +361,51 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
 };
 
 /** Why a round's calls silence its prose: `skip_reply` deliberately keeps it
- *  private; an explicit send holds it back as resendable drafts. */
-const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send' | 'private' | null => {
+ *  private; an explicit send holds it back as resendable drafts, where the
+ *  agent's sends silence at all (AgentConfig.sendSilencing). */
+const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>, sendSilencing: boolean): 'send' | 'private' | null => {
   if (calls.some((c) => bareToolName(c.name) === 'skip_reply')) return 'private';
-  return calls.some(isSilencingCall) ? 'send' : null;
+  return sendSilencing && calls.some(isSilencingCall) ? 'send' : null;
 };
 
 /**
+ * The `drafts` tool's description for one agent: an explicit send is named
+ * as a reason speech is held only where the agent's sends silence
+ * (AgentConfig.sendSilencing).
+ */
+const draftsToolDescription = (sendSilencing: boolean): string =>
+  'Your held drafts: plain speech of yours that was NOT sent — held back ' +
+  (sendSilencing ? 'because an explicit send in its turn may already have posted where it was going, ' : '') +
+  'because a routing prefix bounced, or because it had no destination. ' +
+  `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
+  `drafts are always kept; an older one may be let go once ${Math.round(KEEP_IDLE_MS / 86_400_000)} days pass in which nothing happens to it. ` +
+  'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
+  'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
+  'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
+  'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
+  'already have been posted (its outcome is unknown), resend needs confirmDuplicate: true. dismiss: set ' +
+  'drafts aside (your history keeps the words). A field you are not using may be omitted or passed as null.';
+
+/**
  * Whether a call of one of these tools can change a round's routing
- * (routeRound): in locus and hybrid mode a silencing tool, or `drafts`,
+ * (routeRound): in locus and hybrid mode, for an agent whose sends silence
+ * (AgentConfig.sendSilencing), a silencing tool, or `drafts`,
  * whose resend is an explicit send (isSilencingCall); in
- * explicit mode, where sends don't silence, `skip_reply`, which keeps the
- * round private, and `drafts`; in either, `think` under the private same-round
- * policy, which holds the round back. Disabled mode routes nothing.
+ * explicit mode, or for an agent whose sends don't silence, `skip_reply`,
+ * which keeps the round private, and `drafts`; in either, `think` under the
+ * private same-round policy, which holds the round back. Disabled mode routes
+ * nothing.
  */
 const changesRouting = (
   named: ReadonlySet<string>,
   mode: NonNullable<AgentConfig['proseRouting']>,
   privateThink: boolean,
+  sendSilencing: boolean,
 ): boolean => {
   if (mode === 'disabled') return false;
+  const sendsSilence = sendSilencing && mode !== 'explicit';
   for (const name of named) {
-    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply' || name === 'drafts') return true;
+    if (name === 'think' ? privateThink : sendsSilence || name === 'skip_reply' || name === 'drafts') return true;
   }
   return false;
 };
@@ -1098,10 +1127,6 @@ interface CoalescedChannelEvent {
 type CoalescedDelivery =
   | { lane: 'channel'; event: CoalescedChannelEvent }
   | { lane: 'push'; event: McplPushEvent };
-/** RFC-006 coalescing bookkeeping: receipts (retry window) + subject history. */
-const COALESCING_STATE_ID = 'mcpl/coalescing';
-/** Receipts written since the last snapshot flush (bridges the throttle window). */
-const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
 /** Requests that CONTINUE a turn whose token is already held — a context-
  *  budget restart, or the non-streaming path's tool-results round. The
  *  quiesce wake gate lets these through: the drain is exactly the phase
@@ -1858,8 +1883,9 @@ const carriedSends = (sends: SendsReached | null): SendsReached | null => sends 
  * effect can come after the round's prose. It counts toward the round of the
  * call watching the script when it arrives, such as a later round's wait,
  * and toward none if no call does. A call returns at its script's end or at
- * its yield, which bounds the wait. In locus and hybrid mode a round also
- * waits for its own sends to answer.
+ * its yield, which bounds the wait. In locus and hybrid mode a round of an
+ * agent whose sends silence (AgentConfig.sendSilencing) also waits for its
+ * own sends to answer.
  */
 interface ScriptRound {
   /** The agent and stream that dispatched the round. */
@@ -2858,6 +2884,7 @@ interface RedoEntry {
 
 interface InferenceToolSnapshot {
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
+  sendSilencing: boolean;
 }
 
 /**
@@ -3159,8 +3186,6 @@ const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
  *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
  *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
-const FAILURE_ADVICE = 'If this recurs with the same cause, change approach rather than retrying identically ' +
-  '(e.g. drop an oversized attachment or an unsupported setting).';
 const TIMEOUT_ADVICE = 'If a reply is still owed from that turn, you can give it now.';
 const MADE_AGAIN = 'The call was made again, and it timed out again.';
 const OVERLOADED_TURN_TRIES = 13;
@@ -3373,6 +3398,17 @@ interface RewindRecord {
    *  sets aside 2+): taken out of the agent's window on a presented one,
    *  removed from the record on one that is still the record. */
   removedIds: MessageId[];
+}
+
+/** How an agent's `/unstick` came out, as `unstick-outcome` answers it: at the
+ *  session's end, or at a turn that fails inside the session, which ends
+ *  nothing (`turn-failed`). Labels only: a refusal's category, a failed
+ *  turn's type and HTTP status, never a provider's sentence. */
+interface UnstickAnswer {
+  outcome: 'cleared' | 'gave-up' | 'turn-failed' | 'agent-ended' | 'host-stopped';
+  /** The turns the session had set aside when it answered. */
+  rewinds: number;
+  cause?: { kind: 'refusal'; category: string } | { kind: 'failure'; type?: string; status?: number };
 }
 
 interface Deferred<T> {
@@ -4458,6 +4494,7 @@ export class AgentFramework {
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
+  private failedLastTurnAt = new WeakMap<Agent, number>();
   private processLoggingPersist: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
@@ -4603,7 +4640,6 @@ export class AgentFramework {
   private consecutiveInferenceFailures: Map<string, number> = new Map();
   private turnRearmMs: readonly number[] = DEFAULT_TURN_REARM_MS;
   private turnRearms: Map<string, number> = new Map();
-  private exhaustingRearms: Set<string> = new Set();
   private rearmDeadlineCuts: Set<string> = new Set();
   private statedWaitRuns: Map<string, StatedWaitRun> = new Map();
   /** N consecutive failed inferences ⇒ the agent is treated as hard-down and
@@ -4654,6 +4690,8 @@ export class AgentFramework {
     serverId: string;
     channelId: string;
   }> = new Map();
+  private unstickAnswers = new Map<string, UnstickAnswer>();
+  private unstickWaiters = new Map<string, Set<(answer: UnstickAnswer | 'replaced') => void>>();
   /** Name of the primary (non-ephemeral) agent for routing framework messages. */
   private primaryAgentName: string | null = null;
 
@@ -4850,9 +4888,7 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
-  private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
-  private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
-  private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  private coalescingStore: CoalescingStore | null = null;
   /**
    * Dendrite agent registry — every agent this framework runs, with its
    * roles, lifetime and relationships. `agents` stays the map of live Agent
@@ -5385,9 +5421,10 @@ export class AgentFramework {
     // release's, which the importer reads and clears (one release).
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
     ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
-    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID, AGENT_REGISTRY_STATE_ID]) {
+    for (const id of [COALESCING_TABLE_ID, COALESCING_RECENT_ID, AGENT_REGISTRY_STATE_ID]) {
       ensureStateRegistered(store, { id, strategy: 'snapshot' });
     }
+    ensureStateRegistered(store, COALESCING_JOURNAL_REGISTRATION);
     ensureStateRegistered(store, {
       id: INFERENCE_LOG_ID,
       strategy: 'append_log',
@@ -5697,6 +5734,7 @@ export class AgentFramework {
         // timers: a wake already queued for it, and a turn a provider cooldown
         // holds until it ends.
         upcomingWakes: (agentName) => framework.upcomingWakesFor(agentName),
+        failedLastTurn: (agentName) => framework.failedLastTurnFor(agentName),
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
@@ -6398,7 +6436,7 @@ export class AgentFramework {
       for (const connection of this.modernServers().values()) connection.stopReconnecting();
     });
     step(() => this.pushCoalescer?.suspend());
-    step(() => this.flushCoalescingSnapshot());
+    step(() => this.writeCoalescingTable('stop'));
     this.running = false;
     // Bounded work this stop cuts off is neither finished nor failed. Its
     // record stays live in the snapshot, so the next boot ends it as
@@ -6881,6 +6919,11 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new MaintenanceWithdrawnError(`provider admission closed while stopping (${agentName})`);
     }
+  }
+  private failedLastTurnFor(agentName: string): import('./gate/types.js').FailedLastTurn | undefined {
+    const agent = this.agents.get(agentName);
+    const at = agent && this.failedLastTurnAt.get(agent);
+    return at === undefined ? undefined : { at };
   }
   /**
    * Wakes the framework holds for `agentName` that need no new event: a
@@ -8350,7 +8393,7 @@ export class AgentFramework {
   private cancelProviderAdmission(): void {
     for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
     this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
-    this.turnRearms?.clear(); this.exhaustingRearms?.clear();
+    this.turnRearms?.clear();
     for (const gate of this.providerGates.values()) {
       gate.primaryDepth = 0; gate.primaryPending = false;
       for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
@@ -8929,10 +8972,8 @@ export class AgentFramework {
    * [turn-interrupted] marker, an attributable inference-log terminal, gate
    * release. Deliberately none of the failure accounting: inference:failed /
    * inference:exhausted feed the consecutive-failure streak, hard-down ops
-   * alerts, the poison-history breaker and the "[inference-failed]" marker —
-   * all of which told a resident, in the user's voice, that its turn failed
-   * and advised remediation for a failure that never happened — and
-   * errorPolicy would relaunch the very inference someone just stopped.
+   * alerts, the poison-history breaker and the "[inference-failed]" marker,
+   * and errorPolicy would relaunch the very inference someone just stopped.
    *
    * Only called while `agent` still owns stream `myStreamId`.
    */
@@ -8983,7 +9024,7 @@ export class AgentFramework {
       error: 'Stream cancelled',
     }, closes, stream);
     // Distinct trace type: emitTrace funnels every inference:exhausted into
-    // noteInferenceExhausted (streak, failures.log, marker); inference:aborted
+    // noteInferenceExhausted (streak, failures.log); inference:aborted
     // carries the honest cause without any of that.
     this.emitTrace({
       type: 'inference:aborted',
@@ -9338,6 +9379,7 @@ export class AgentFramework {
     'tail_tokens',
     'transition_pace_tokens',
     'same_round_think_text_policy',
+    'send_silencing',
   ];
 
   /**
@@ -9436,6 +9478,7 @@ export class AgentFramework {
   private captureInferenceToolSnapshot(agent: Agent): InferenceToolSnapshot {
     return {
       sameRoundThinkTextPolicy: agent.getEffectiveSameRoundThinkTextPolicy(),
+      sendSilencing: agent.getEffectiveSendSilencing(),
     };
   }
 
@@ -9852,6 +9895,9 @@ export class AgentFramework {
             ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
           canSkipReply,
         );
+      }
+      if (tool.name === 'drafts') {
+        return { ...tool, description: draftsToolDescription(snapshot?.sendSilencing ?? this.getAgentRuntimeSettings(agentName).sendSilencing) };
       }
       if (tool.name === 'journal' && !canSkipReply) return { ...tool, description: journalToolDescription(false) };
       // A holder's words are the registry's, so its cached tool list doesn't change.
@@ -11709,6 +11755,11 @@ export class AgentFramework {
         `Invalid persisted sameRoundThinkTextPolicy for agent "${agentName}": ${JSON.stringify(overrides.sameRoundThinkTextPolicy)}`,
       );
     }
+    if (overrides.sendSilencing !== undefined && typeof overrides.sendSilencing !== 'boolean') {
+      throw new Error(
+        `Invalid persisted sendSilencing for agent "${agentName}": ${JSON.stringify(overrides.sendSilencing)}`,
+      );
+    }
     return overrides;
   }
 
@@ -11797,8 +11848,9 @@ export class AgentFramework {
     overrides: AgentRuntimeSettingsOverrides,
   ): void {
     const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
-    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, ...settings } = overrides;
+    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, sendSilencing, ...settings } = overrides;
     if (sameRoundThinkTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundThinkTextPolicy });
+    if (sendSilencing !== undefined) agent.restoreRuntimeSettings({ sendSilencing });
     const unapplied: string[] = [];
     /** Restore one setting, or keep it set but unapplied; true if it applied. */
     const restore = (part: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>) => {
@@ -12220,6 +12272,7 @@ export class AgentFramework {
       ...(parent.contextBudgetTokens !== undefined ? { contextBudgetTokens: parent.contextBudgetTokens } : {}),
       sameRoundThinkTextPolicy: parent.getEffectiveSameRoundThinkTextPolicy(),
       sameRoundSkipReplyTextPolicy: undefined,
+      sendSilencing: parent.getEffectiveSendSilencing(),
       ...options.config,
       name: options.name,
       strategy: options.strategy,
@@ -13296,7 +13349,12 @@ export class AgentFramework {
     this.refusalStreak.delete(name);
     this.refusalRewinds.delete(name);
     this.rewindEpisode.delete(name);
-    if (this.forcedRewind.delete(name)) console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
+    const session = this.forcedRewind.get(name);
+    if (session) {
+      this.forcedRewind.delete(name);
+      console.error(`[unstick] agent=${name} its /unstick session ended with its agent`);
+      this.answerUnstick(name, { outcome: 'agent-ended', rewinds: session.removed.length });
+    }
   }
 
   /**
@@ -13388,7 +13446,6 @@ export class AgentFramework {
     // (endStatedWaitRun).
     this.turnRearms.delete(name);
     this.rearmDeadlineCuts.delete(name);
-    this.exhaustingRearms.delete(name);
     this.exhaustedTurns.delete(name);
     this.endStatedWaitRun(name);
     if (name === this.subconsciousAgentName) {
@@ -14765,17 +14822,7 @@ export class AgentFramework {
    *  every property as required can still say "not in use" (fieldInUse). */
   private static readonly DRAFTS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'drafts',
-    description:
-      'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in its turn ' +
-      'may already have posted where it was going, because a routing prefix bounced, or because it had no destination. ' +
-      `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
-      `drafts are always kept; an older one may be let go once ${AgentFramework.DRAFT_KEEP_DAYS} days pass in which nothing happens to it. ` +
-      'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
-      'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
-      'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
-      'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
-      'already have been posted (its outcome is unknown), resend needs confirmDuplicate: true. dismiss: set ' +
-      'drafts aside (your history keeps the words). A field you are not using may be omitted or passed as null.',
+    description: draftsToolDescription(true),
     inputSchema: {
       type: 'object',
       properties: {
@@ -14908,7 +14955,7 @@ export class AgentFramework {
     name: 'agent_settings',
     description:
       'Read or change your hot runtime settings. This intentionally exposes only ' +
-      'context budget, recent raw tail size, transition pace, and same-round think text routing; model, prompts, ' +
+      'context budget, recent raw tail size, transition pace, same-round think text routing, and send silencing; model, prompts, ' +
       'folding strategy, and other restart-bound configuration are not mutable here. ' +
       'Lower context budgets converge gradually under the transition pace before ' +
       'becoming the hard live limit; increases take effect immediately.',
@@ -14932,9 +14979,18 @@ export class AgentFramework {
             'Routing policy for ordinary text emitted in the same native assistant round as think(). ' +
             "Omitted in the recipe preserves the compatibility carry-forward: public.",
         },
+        send_silencing: {
+          type: 'boolean',
+          description:
+            'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
+            'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
+            'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
+            'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
+            'that an earlier send in the turn already set.',
+        },
         settings: {
           type: 'array',
-          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy'] },
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy', 'send_silencing'] },
           description: 'For reset: settings to restore to recipe values. Omit to reset all.',
         },
       },
@@ -15232,6 +15288,17 @@ export class AgentFramework {
         `${category ? ` category=${logValue(category)}` : ''}`,
     );
     if (s.channelId) void this.postToChannel(s.serverId, s.channelId, content);
+    this.answerUnstick(agentName, success
+      ? { outcome: 'cleared', rewinds: n }
+      : { outcome: 'gave-up', rewinds: n, ...(category !== undefined ? { cause: { kind: 'refusal' as const, category } } : {}) });
+  }
+
+  private answerUnstick(agentName: string, answer: UnstickAnswer): void {
+    const waiters = this.unstickWaiters.get(agentName);
+    this.unstickWaiters.delete(agentName);
+    if (answer.outcome !== 'turn-failed' || !waiters?.size) this.unstickAnswers.set(agentName, answer);
+    else this.unstickAnswers.delete(agentName);
+    for (const resolve of waiters ?? []) resolve(answer);
   }
 
   /** Best-effort send_message to a raw channel via a named MCPL server. */
@@ -15317,6 +15384,17 @@ export class AgentFramework {
    *   nudge — run inference on the current context with NO new events
    *   (see `nudgeAgent`).
    *
+   *   unstick-outcome — how the agent's `/unstick` came out, as labels
+   *   (UnstickAnswer). An `unstick` acknowledgement carries `outcome: true`
+   *   and `agentName`, the agent this request names. Each request is answered
+   *   once, at the next of the session's end or a turn that fails inside the
+   *   session, which ends nothing. An end is kept for every request after it,
+   *   until the agent's next `unstick`; a failed turn no request waited for
+   *   is kept for the first that comes, until a later answer replaces it or
+   *   the agent's next `unstick` drops it. A new `unstick` answers the
+   *   requests that still wait `ok: false`. While it waits it holds back no
+   *   other command, and a stop answers it `host-stopped`.
+   *
    *   quiesce — enter host maintenance mode (issue #122): park wakes, pause
    *   MCPL data planes, drain in-flight turns (optionally `abandon` on
    *   timeout). Host-scoped, no agentName.
@@ -15381,6 +15459,13 @@ export class AgentFramework {
      *  outcome report is posted to the channel asynchronously. */
     started?: boolean;
     cap?: number;
+    /** For `unstick`: true, since `unstick-outcome` answers for it, with
+     *  `agentName`, the agent its session is on. For `unstick-outcome`: how
+     *  it came out (UnstickAnswer), with `rewinds` and `cause`. */
+    outcome?: true | UnstickAnswer['outcome'];
+    agentName?: string;
+    rewinds?: number;
+    cause?: UnstickAnswer['cause'];
     /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
      *  until resume rather than running. */
     quiesced?: boolean;
@@ -15397,6 +15482,7 @@ export class AgentFramework {
       params.command !== 'undo' &&
       params.command !== 'hide' &&
       params.command !== 'unstick' &&
+      params.command !== 'unstick-outcome' &&
       params.command !== 'nudge' &&
       params.command !== 'quiesce' &&
       params.command !== 'resume' &&
@@ -15507,6 +15593,27 @@ export class AgentFramework {
         `(server=${serverId}): ${released.length} wait(s) lifted`);
       return { ok: true, released };
     }
+    if (params.command === 'unstick-outcome') {
+      const name = params.agentName;
+      if (typeof name !== 'string' || name === '') {
+        return { ok: false, error: 'unstick-outcome: agentName must name the agent, as the unstick acknowledgement does' };
+      }
+      const kept = this.unstickAnswers.get(name);
+      if (kept) {
+        if (kept.outcome === 'turn-failed') this.unstickAnswers.delete(name);
+        return { ok: true, ...kept };
+      }
+      const session = this.forcedRewind.get(name);
+      if (!session) return { ok: false, error: `unstick-outcome: ${name} has no /unstick to answer for` };
+      let resolve!: (answer: UnstickAnswer | 'replaced') => void;
+      const next = new Promise<UnstickAnswer | 'replaced'>((r) => { resolve = r; });
+      this.unstickWaiters.set(name, (this.unstickWaiters.get(name) ?? new Set()).add(resolve));
+      const answer = await this.untilStopBegins(next);
+      if (answer === 'replaced') return { ok: false, error: `unstick-outcome: a new /unstick of ${name} replaced the one this request waited on` };
+      if (answer) return { ok: true, ...answer };
+      this.unstickWaiters.get(name)?.delete(resolve);
+      return { ok: true, outcome: 'host-stopped', rewinds: session.removed.length };
+    }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
     if (!agentName || !this.agents.has(agentName)) {
@@ -15535,6 +15642,10 @@ export class AgentFramework {
       }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
+      const left = this.unstickWaiters.get(agentName);
+      this.unstickWaiters.delete(agentName);
+      for (const resolve of left ?? []) resolve('replaced');
+      this.unstickAnswers.delete(agentName);
       this.forcedRewind.set(agentName, {
         remaining: cap,
         removed: [],
@@ -15559,7 +15670,7 @@ export class AgentFramework {
         params: { cap },
         result: { started: true, ...(this.quiesced ? { quiesced: true } : {}) },
       });
-      return { ok: true, started: true, cap, ...(this.quiesced ? { quiesced: true } : {}) };
+      return { ok: true, started: true, cap, outcome: true, agentName, ...(this.quiesced ? { quiesced: true } : {}) };
     }
 
     // hide: redact a single message (or an inclusive range) from the active
@@ -16267,7 +16378,10 @@ export class AgentFramework {
     try {
       this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
       this.tuneOutCoordinator?.branchMoved(sameBranch);
-      if (!sameBranch) this.redoStacks.clear();
+      if (!sameBranch) {
+        this.redoStacks.clear();
+        this.coalescingStore?.branchMoved(this.storedCoalescing());
+      }
       failures = await this.reinitializeManagers(except);
       // The agent the move was made through initialized its own manager,
       // or failed to: a failed surgery's restore that left it refusing its
@@ -21630,9 +21744,12 @@ export class AgentFramework {
    * acceptance's receipt and the next flush would replace what's stored, and
    * taken as undelivered, an occurrence would be delivered again.
    */
-  private restorePushCoalescer(): { coalescer: PushCoalescer<CoalescedDelivery>; recent?: CoalescingReceiptRecord[] } {
-    const what = (stateId: string): string =>
-      `the coalescing ${stateId === COALESCING_STATE_ID ? 'receipts and batches' : 'receipts since the last snapshot'} (${stateId})`;
+  private restorePushCoalescer(): { coalescer: PushCoalescer<CoalescedDelivery>; durable: CoalescingStore } {
+    const journaled = `${COALESCING_TABLE_ID}+${COALESCING_JOURNAL_ID}`;
+    const what = (stateId: string): string => stateId === journaled
+      ? `the coalescing receipts and batches (${COALESCING_TABLE_ID}) with the changes since (${COALESCING_JOURNAL_ID})`
+      : `the coalescing ${stateId === COALESCING_TABLE_ID ? 'receipts and batches'
+        : stateId === COALESCING_JOURNAL_ID ? 'changes since the last table' : 'receipts since the last snapshot'} (${stateId})`;
     const stops = `MCPL doesn't start without them, and neither does create() with MCPL servers configured, nor a ` +
       `first connectMcplServer(), since the next coalesced push or message would replace them.`;
     const unchanged = `They're unchanged, and starting again won't help until they're repaired.`;
@@ -21645,7 +21762,7 @@ export class AgentFramework {
         throw refuse(stateId, `could not be read: ${thrownText(error)}`, `They're unchanged, and MCPL starts once they can be read.`, error);
       }
     };
-    const snapshot = read(COALESCING_STATE_ID);
+    const snapshot = read(COALESCING_TABLE_ID);
     const recent = read(COALESCING_RECENT_ID);
     if (snapshot !== null && snapshot !== undefined) {
       const version = typeof snapshot === 'object' && !Array.isArray(snapshot)
@@ -21654,12 +21771,12 @@ export class AgentFramework {
       if (version !== 1) {
         throw typeof version === 'number'
           ? refuse(
-            COALESCING_STATE_ID,
+            COALESCING_TABLE_ID,
             `are a version ${version} snapshot, which this version of agent-framework doesn't read`,
             `They're unchanged, and the version that wrote them reads them.`,
           )
           : refuse(
-            COALESCING_STATE_ID,
+            COALESCING_TABLE_ID,
             version === undefined
               ? `are ${jsonKind(snapshot)} with no snapshot version`
               : `are a snapshot whose version is ${jsonKind(version)}, not 1`,
@@ -21669,6 +21786,22 @@ export class AgentFramework {
     }
     if (recent !== null && recent !== undefined && !Array.isArray(recent)) {
       throw refuse(COALESCING_RECENT_ID, `are ${jsonKind(recent)}, not a list of receipts`, unchanged);
+    }
+    const table = (snapshot ?? null) as StoredCoalescingTable | null;
+    const number = typeof table?.journal === 'number' ? table.journal : undefined;
+    const numbered = number !== undefined;
+    const journal = numbered ? read(COALESCING_JOURNAL_ID) : this.unappliedJournal();
+    if (numbered && journal !== null && journal !== undefined && !Array.isArray(journal)) {
+      throw refuse(COALESCING_JOURNAL_ID, `are ${jsonKind(journal)}, not a list of changes`, unchanged);
+    }
+    const items: CoalescingJournalItem[] = [];
+    if (numbered && Array.isArray(journal)) {
+      for (const [at, item] of journal.entries()) {
+        if (!isJournalItem(item)) {
+          throw refuse(COALESCING_JOURNAL_ID, `hold ${jsonKind(item)} at item ${at}, not a numbered change of a subject`, unchanged);
+        }
+        items.push(item);
+      }
     }
     // Set when wasPublished can't read an agent's context, so the restore that
     // asked refuses with what couldn't be checked rather than as malformed.
@@ -21710,23 +21843,7 @@ export class AgentFramework {
         }
         this.emitTrace({ type: 'mcpl:coalescing', ...record });
       },
-      save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
-      recordReceipt: (record) => {
-        // Written now, not at the throttled flush: an acknowledged acceptance
-        // must not lose its receipt, the subject's birth, or (deferred) the
-        // accepted work itself to a crash. A failure here fails the answer:
-        // the coalescer keeps the receipt, and the producer's retry writes it
-        // again, with the subject's state as it is then. So a record whose
-        // write failed leaves the list: a later write would carry it after
-        // the batch it holds had moved on.
-        this.coalescingRecentReceipts.push(record);
-        try {
-          this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
-        } catch (error) {
-          this.coalescingRecentReceipts.pop();
-          throw error;
-        }
-      },
+      write: (changes, table) => durable.write(changes, table),
       // The acceptance of coalesced work (deferred included) is observed
       // here, once; its later delivery reuses the frozen envelope.
       accepted: (occ) => {
@@ -21750,14 +21867,12 @@ export class AgentFramework {
         return false;
       },
       commit: () => this.commitCoalescingDurable(),
-      saveNow: (snapshot) => {
-        if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
-        this.coalescingSnapshotDirty = null;
-        this.store.setStateJson(COALESCING_STATE_ID, snapshot);
-        this.coalescingRecentReceipts = [];
-        this.store.setStateJson(COALESCING_RECENT_ID, []);
-      },
     });
+    const durable = new CoalescingStore(
+      this.store,
+      { table, journal, recent },
+      (error) => console.error('[coalescing] could not write the coalescing table; the journal keeps the changes, and a later change writes it again:', error),
+    );
     const restore = (stateId: string, run: () => void): void => {
       try {
         run();
@@ -21775,19 +21890,18 @@ export class AgentFramework {
         throw refuse(stateId, `could not be restored: ${thrownText(error)}`, unchanged, error);
       }
     };
-    restore(COALESCING_STATE_ID, () => coalescer.restore(snapshot as CoalescingSnapshot | null | undefined));
-    if (!Array.isArray(recent)) return { coalescer };
-    restore(COALESCING_RECENT_ID, () => coalescer.restoreReceipts(recent as CoalescingReceiptRecord[]));
-    return { coalescer, recent: recent as CoalescingReceiptRecord[] };
+    const applied = number !== undefined && items.some((item) => item.seq > number);
+    restore(applied ? journaled : COALESCING_TABLE_ID, () => coalescer.restore(journaledTable(table, items)));
+    if (Array.isArray(recent)) restore(COALESCING_RECENT_ID, () => coalescer.restoreReceipts(recent as CoalescingReceiptRecord[]));
+    return { coalescer, durable };
   }
 
   /** Install a coalescer restorePushCoalescer built: none of this can fail. */
-  private installPushCoalescer(restored: { coalescer: PushCoalescer<CoalescedDelivery>; recent?: CoalescingReceiptRecord[] }): void {
-    // Until the next snapshot flush checkpoints the recovered state, these
-    // records are its only durable form: keep them in the writable buffer
-    // so the next acceptance appends to them instead of replacing them.
-    if (restored.recent) this.coalescingRecentReceipts = restored.recent;
+  private installPushCoalescer(restored: { coalescer: PushCoalescer<CoalescedDelivery>; durable: CoalescingStore }): void {
+    this.coalescingStore = restored.durable;
     this.pushCoalescer = restored.coalescer;
+    this.writeCoalescingTable('start');
+    restored.coalescer.writeSettledAtRestore();
     // Batches restored from a snapshot still owe the agent a wake (§14 v41).
     for (const occ of restored.coalescer.pendingBatchOccurrences()) {
       void this.wakeForCoalescedBatch(occ).catch((error: unknown) => {
@@ -21817,28 +21931,38 @@ export class AgentFramework {
     return this.coalescingCommit;
   }
 
-  private scheduleCoalescingSnapshot(snapshot: () => CoalescingSnapshot): void {
-    this.coalescingSnapshotDirty = snapshot;
-    if (this.coalescingSaveTimer) return;
-    const timer = setTimeout(() => this.flushCoalescingSnapshot(), 2_000);
-    timer.unref?.();
-    this.coalescingSaveTimer = timer;
+  private unappliedJournal(): unknown {
+    try {
+      return this.store.getStateJson(COALESCING_JOURNAL_ID);
+    } catch {
+      return 'unread';
+    }
   }
 
-  private flushCoalescingSnapshot(): void {
-    if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
-    const snapshot = this.coalescingSnapshotDirty;
-    this.coalescingSnapshotDirty = null;
-    if (!snapshot) return;
+  private storedCoalescing(): StoredCoalescing {
     try {
-      this.store.setStateJson(COALESCING_STATE_ID, snapshot());
-      this.coalescingRecentReceipts = [];
-      this.store.setStateJson(COALESCING_RECENT_ID, []);
+      return {
+        table: this.store.getStateJson(COALESCING_TABLE_ID) as StoredCoalescingTable | null,
+        journal: this.store.getStateJson(COALESCING_JOURNAL_ID),
+        recent: this.store.getStateJson(COALESCING_RECENT_ID),
+      };
+    } catch {
+      return { table: null, journal: 'unread', recent: 'unread' };
+    }
+  }
+
+  private writeCoalescingTable(at: 'start' | 'stop'): void {
+    const durable = this.coalescingStore;
+    const coalescer = this.pushCoalescer;
+    if (!durable || !coalescer) return;
+    if (at === 'stop') durable.stopping();
+    if (durable.current) return;
+    try {
+      durable.writeTable(coalescer.snapshot());
     } catch (err) {
-      console.error('[coalescing] could not persist coalescing state:', err);
-      // Still unsaved: the next persist, or the stop's flush, writes it. No
-      // timer of its own, so a store that keeps failing isn't retried here.
-      this.coalescingSnapshotDirty ??= snapshot;
+      console.error(at === 'stop'
+        ? '[coalescing] could not write the coalescing table at the stop, so an earlier release started next reads it without the changes since its last write:'
+        : '[coalescing] could not write the coalescing table at the start; the store keeps what it held, and a later change writes it again:', err);
     }
   }
 
@@ -27495,7 +27619,7 @@ export class AgentFramework {
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
-      if (gate.auxiliaryInFlight > 0) {
+      if (agent.primaryWaitsForAuxiliary && gate.auxiliaryInFlight > 0) {
         // Do not await inside processInferenceRequests: one slow auxiliary call for
         // this resident must not block events or other residents. Admission stays
         // owned and the continuation receives it after the in-flight call settles.
@@ -27576,7 +27700,9 @@ export class AgentFramework {
     // The last admission boundary before this primary call. With the gate
     // held and no auxiliary call in flight, no new provider wait can be
     // recorded for this agent before the call (auxiliary admission waits on
-    // the gate). But one may have been recorded since the scheduler's check:
+    // the gate). A resident that starts beside an auxiliary call in flight
+    // (primaryWaitsForAuxiliary off) is checked again after its compile, as
+    // a conversation agent is. But one may have been recorded since the scheduler's check:
     // an auxiliary call this wake parked behind can fail with a stated wait
     // on the primary model. That wait binds this wake too: hold it, don't call.
     // A conversation agent's waits are recorded and held as a resident's are
@@ -27636,6 +27762,7 @@ export class AgentFramework {
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
     } catch (error) {
+      this.failedLastTurnAt.set(agent, Date.now());
       // A throw outside the stream's own failure handling (the checkpoint,
       // locus resolution, the typing indicator) drops this start's trigger,
       // and nothing retries or holds it. The agent's open logical turn is the
@@ -28415,6 +28542,7 @@ export class AgentFramework {
       this.eventGate?.onInferenceResumed(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: turnStartedAt });
+    this.failedLastTurnAt.delete(agent);
 
     // Typing indicator, started at TURN START. It says "attending", which is
     // true from the moment the turn is accepted — but it used to start inside
@@ -28608,9 +28736,13 @@ export class AgentFramework {
       }
       // A conversation agent takes no provider gate, so its own compression
       // can record a wait while this turn compiles, after the last boundary
-      // checked. Check its waits again here, where nothing has been sent, and
-      // hold the turn as the boundary would rather than send it into the wait.
-      if (this.registry.homeChannel(agent.name) !== undefined) {
+      // checked. So can a resident's whose turn starts beside an auxiliary
+      // call in flight (primaryWaitsForAuxiliary off): that call can fail
+      // with a stated wait during the compile. Check the waits again here,
+      // where nothing has been sent, and hold the turn as the boundary would
+      // rather than send it into the wait. A resident's gate goes back at the
+      // start's end (startAgentStream's finally).
+      if (this.registry.homeChannel(agent.name) !== undefined || (ownsProviderGate && !agent.primaryWaitsForAuxiliary)) {
         const wait = this.providerWaits?.active(agent.name, agent.model);
         // The turn has begun (inference:started), so the hold keeps its retry.
         if (wait && this.holdForProviderWait(agent, wait, trigger ? [this.turnRetryOf(withTurnCarry(trigger, carry), routing)] : [], false, () => {
@@ -28817,7 +28949,6 @@ export class AgentFramework {
           ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
           cause: err,
         }, routing);
-        if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -29550,7 +29681,8 @@ export class AgentFramework {
             // does. So a round whose watched script can call such a tool is
             // routed once those calls have returned (ScriptRound,
             // scriptMayRoute), at the script's end or its yield, and its
-            // prose goes out then. In locus and hybrid mode a round that sends
+            // prose goes out then. In locus and hybrid mode a round that sends,
+            // of an agent whose sends silence (AgentConfig.sendSilencing),
             // is routed once its sends have answered. Any other round is routed now, a round
             // with a script that can't call one included, so narration beside
             // a script isn't held for the call's yield. The turn's locus and
@@ -30525,7 +30657,7 @@ export class AgentFramework {
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
                 ? null
-                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)));
+                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)), agent.getEffectiveSendSilencing());
               const trailingSilence: TurnSilence | null = liveProseRouting
                 ? silence
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
@@ -30831,7 +30963,6 @@ export class AgentFramework {
                 ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
                 cause: err,
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined, streamRouting);
-              if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -30877,11 +31008,7 @@ export class AgentFramework {
             // the host's Stop button, an admin abort, a subagent reclaim.
             // That is a DELIBERATE cancellation, not a failure, and it must
             // not feed the consecutive-failure streak, ops alerts, or the
-            // "[inference-failed] the model call failed" marker — all of
-            // which told the agent, in the user's voice, that its turn
-            // failed and advised remediation for a failure that never
-            // happened. For a long-lived resident whose transcript is
-            // memory, those accumulate as false self-knowledge.
+            // [inference-failed] note.
             //
             // What 'user' does NOT say is WHO cancelled: the wire reason
             // names the call, not the actor. Framework-owned cancels record
@@ -31235,7 +31362,6 @@ export class AgentFramework {
         ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: failureWords(err) }),
         cause: err,
       }, streamRouting);
-      if (isRearmed(trigger) && asTransient) this.exhaustingRearms.add(agent.name);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -32170,7 +32296,8 @@ export class AgentFramework {
     const code = action === 'run'
       ? fields.code
       : action === 'wait' && typeof fields.script_id === 'string' ? ce.scripts.codeOf(agentName, fields.script_id) : undefined;
-    return typeof code === 'string' && changesRouting(routingToolsNamed(code), mode, privateThink);
+    return typeof code === 'string'
+      && changesRouting(routingToolsNamed(code), mode, privateThink, this.agents.get(agentName)?.getEffectiveSendSilencing() === true);
   }
 
   /**
@@ -33668,7 +33795,8 @@ export class AgentFramework {
   private roundCallOf(agentName: string, call: { name: string; input?: unknown; unparseableInput?: string }, refusedHere = false): RoundCall {
     const permitted = !refusedHere && markedInputRefusal(call) === undefined && this.mayCallTool(agentName, call.name);
     const refused = bareToolName(call.name) === 'skip_reply' && (!permitted || this.refusesSelfWake(call));
-    return { name: call.name, cause: permitted || refused ? silenceCauseOf([call]) : null, refused, permitted };
+    const cause = permitted || refused ? silenceCauseOf([call], this.agents.get(agentName)?.getEffectiveSendSilencing() === true) : null;
+    return { name: call.name, cause, refused, permitted };
   }
 
   private runSkipReply(agentName: string, enrichedCall: ToolCall): void {
@@ -35649,10 +35777,10 @@ export class AgentFramework {
    *
    *   1. stderr  — always, with the underlying API reason. The place an
    *      operator greps; previously empty in headless mode.
-   *   2. chronicle marker — a `[inference-failed]` message so the agent itself
-   *      learns its turn failed and why (otherwise it's an experiential blank,
-   *      indistinguishable from "not addressed"). addMessage does NOT request
-   *      inference, so this never causes a retry/wake loop.
+   *   2. chronicle marker — for a turn that got partway, a `[inference-failed]`
+   *      message so the agent itself learns its turn failed and why.
+   *      addMessage does NOT request inference, so this never causes a
+   *      retry/wake loop.
    *   3. escalation — after N consecutive failures the agent is hard-down;
    *      log that loudly (a repeated identical failure is the textbook signal).
    *   4. breaker — when a failure at or past the hard-down threshold suggests
@@ -36056,7 +36184,6 @@ export class AgentFramework {
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
-    const rearmed = this.exhaustingRearms?.delete(agentName) === true;
     const madeAgain = this.freshCallsCut?.delete(agentName) === true;
     // The reason is the failure's own message, and a provider can echo the
     // whole rejected request in it: one household's [inference-failed]
@@ -36095,6 +36222,8 @@ export class AgentFramework {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
+    const agent = this.agents.get(agentName);
+    if (agent) this.failedLastTurnAt.set(agent, Date.now());
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     const labels = [
@@ -36113,9 +36242,21 @@ export class AgentFramework {
     // classification fields are additive.
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
+    const unstick = this.forcedRewind?.get(agentName);
+    if (unstick) {
+      this.answerUnstick(agentName, {
+        outcome: 'turn-failed',
+        rewinds: unstick.removed.length,
+        cause: {
+          kind: 'failure',
+          ...(errorType !== undefined ? { type: errorType } : {}),
+          ...(httpStatus !== undefined ? { status: httpStatus } : {}),
+        },
+      });
+    }
+
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
-    const agent = this.agents.get(agentName);
-    if (agent && !(rearmed && !ended) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+    if (agent && ended && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
@@ -36130,18 +36271,14 @@ export class AgentFramework {
           [{
             type: 'text',
             text:
-              (ended
-                ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
-                  `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
-                  `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
-                  `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
-                  `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
-                  `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
-                  `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}`
-                : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
-                  `the model call ${timedOut ? 'timed out' : 'failed'}${cause ? ` (${suppliedValue(cause)})` : ''} ` +
-                  `and produced no response, so nothing was sent.${madeAgain ? ` ${MADE_AGAIN}` : ''}`) +
-              `${shown} ${timedOut ? TIMEOUT_ADVICE : FAILURE_ADVICE}`,
+              `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
+              `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
+              `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
+              `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
+              `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
+              `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
+              `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}` +
+              `${shown}${timedOut ? ` ${TIMEOUT_ADVICE}` : ''}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
@@ -42886,6 +43023,7 @@ export class AgentFramework {
         tail_tokens: JSON.stringify([s.tailTokens ?? null, saved.tailTokens ?? null]),
         transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
         same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
+        send_silencing: JSON.stringify([s.sendSilencing, saved.sendSilencing ?? null]),
       },
       exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
     };
@@ -42930,6 +43068,7 @@ export class AgentFramework {
         tail_tokens?: unknown;
         transition_pace_tokens?: unknown;
         same_round_think_text_policy?: unknown;
+        send_silencing?: unknown;
         immediate?: unknown;
         settings?: unknown;
       } & Record<string, unknown>;
@@ -42977,6 +43116,7 @@ export class AgentFramework {
           if (input.same_round_think_text_policy !== undefined) {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
+          if (input.send_silencing !== undefined) patch.sendSilencing = settingBoolean('send_silencing', input.send_silencing);
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
           if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
@@ -43029,6 +43169,7 @@ export class AgentFramework {
               ['tail_tokens', 'tailTokens'],
               ['transition_pace_tokens', 'transitionPaceTokens'],
               ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
+              ['send_silencing', 'sendSilencing'],
             ]);
             keys = [];
             for (const name of input.settings) {
