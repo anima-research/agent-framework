@@ -78,9 +78,9 @@ export const NOTICE_TAG = {
 export const FORMER_NOTICE_TAGS = ['refusal-rewind'] as const;
 
 /**
- * The bracket openings context-manager 0.27.0 writes into an agent's context
- * outside a tool result or read back from it, the same as 0.23.1, 0.25.0 and
- * 0.25.1 write, marked as the framework's own are. Its
+ * The bracket openings context-manager 0.28.0 writes into an agent's context
+ * outside a tool result or read back from it, the same as 0.23.1, 0.25.0,
+ * 0.25.1 and 0.27.0 write, marked as the framework's own are. Its
  * `[truncated — original was` isn't here: NOTICE_TAG.truncated marks it. Check
  * them against each context-manager release the framework takes.
  */
