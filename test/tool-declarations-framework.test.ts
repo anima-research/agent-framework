@@ -3,10 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager } from '@animalabs/context-manager';
 import type { ContentBlock, ModelPricing, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
 
-import { AgentFramework, audienceOf, taskForkSpec, type Agent, type AgentSpec } from '../src/index.js';
-import { isSystemChangeMessage, pricedCharacters, type HeadDeclarationStore, type HeadEvent, type HeadRecord } from '../src/system-changes.js';
+import { AgentFramework, audienceOf, residentContextOptions, subconsciousContextOptions, taskForkSpec, type Agent, type AgentSpec } from '../src/index.js';
+import type { RemoveSystemChangesResult } from '../src/recovery/remove-system-changes.js';
+import { isDeclarationRow, isSystemChangeMessage, pricedCharacters, type HeadDeclarationStore, type HeadEvent, type HeadRecord } from '../src/system-changes.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { foldOf, now } from './helpers/declared.js';
@@ -744,5 +749,81 @@ describe('a change of tools or system text in the framework', () => {
       const own = subconscious.getContextManager().getAllMessages().filter(isChange).filter((m) => (m.metadata as { agent?: string } | undefined)?.agent === 'Subconscious');
       assert.equal(own.length, 1, 'stored once');
     }, undefined, { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } });
+  });
+});
+
+describe('the way back to an earlier release', () => {
+  it("takes every change row out of every message slot onto a new branch, so an earlier release opens none, and this release's first request after folds to the agent's tools", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'tool-declarations-back-'));
+    const storePath = join(tempDir, 'store.chronicle');
+    const withSubconscious = { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } };
+    try {
+      // This release: alpha declares in the residents' slot, beside a host's row, and the subconscious declares in its own.
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        const subconscious = framework.getAgent('Subconscious')!;
+        say(framework, alpha, 'user', 'hello');
+        await alpha.buildActivationRequest([tool('a')]);
+        (framework as unknown as { addMessage(participant: string, content: ContentBlock[]): string }).addMessage('system', [{ type: 'system_change', defineTools: [tool('h')] }]);
+        assert.ok(changesIn((await alpha.buildActivationRequest([tool('a'), tool('b')])).messages).length >= 2, "the premise: alpha's request carries the host's row and its own");
+        await subconscious.buildActivationRequest([tool('think')]);
+        assert.ok(changesIn((await subconscious.buildActivationRequest([tool('think'), tool('ponder')])).messages).length >= 2, "the premise: the subconscious's request carries the host's row and its own");
+      }, storePath, withSubconscious);
+
+      // The step back, with the host stopped.
+      const cli = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
+      const recover = (...args: string[]) => spawnSync(process.execPath, [cli, '--store', storePath, '--remove-system-changes', ...args], { encoding: 'utf8' });
+      const scoped = recover('--agent', 'alpha');
+      assert.equal(scoped.status, 1, 'it takes no agent');
+      assert.match(scoped.stderr, /--remove-system-changes takes no --agent/);
+      const planned = recover('--dry-run');
+      assert.equal(planned.status, 0, planned.stderr);
+      const plan = JSON.parse(planned.stdout) as RemoveSystemChangesResult;
+      const ownSlot = plan.slots.find((slot) => slot.slot.startsWith('subconscious/'))?.slot;
+      const rowsIn = (result: RemoveSystemChangesResult, slot: string | undefined) => result.slots.find((s) => s.slot === slot)?.rows ?? 0;
+      assert.ok(rowsIn(plan, 'messages') >= 2 && rowsIn(plan, ownSlot) >= 1, `a dry run counts each slot's rows: ${planned.stdout}`);
+      const done = recover('--branch', 'back/1');
+      assert.equal(done.status, 0, done.stderr);
+      const result = JSON.parse(done.stdout) as RemoveSystemChangesResult;
+      assert.equal(result.sourceBranch, plan.sourceBranch, 'the dry run changed no branch');
+      assert.deepEqual(result.slots, plan.slots, 'and it takes out what the dry run counted');
+      assert.equal(result.targetBranch, 'back/1');
+
+      // An earlier release sends what each agent's slot and window hold, as stored.
+      const store = JsStore.openOrCreate({ path: storePath });
+      try {
+        assert.equal(store.currentBranch().name, 'back/1', 'the new branch is selected');
+        const changeRows = async () => {
+          const held: Record<string, number> = {};
+          for (const options of [residentContextOptions('alpha'), subconsciousContextOptions({ serves: ownSlot!.slice('subconscious/'.length, -'/messages'.length) })]) {
+            const context = await ContextManager.open({ store, ...options });
+            try {
+              held[`${options.namespace} slot`] = context.getAllMessages().filter(isDeclarationRow).length;
+              held[`${options.namespace} window`] = context.getPresentedMessages().filter(isDeclarationRow).length;
+            } finally {
+              context.close();
+            }
+          }
+          return held;
+        };
+        const after = await changeRows();
+        assert.deepEqual(Object.values(after), [0, 0, 0, 0], `no slot and no window holds a change row: ${JSON.stringify(after)}`);
+        store.switchBranch(result.sourceBranch);
+        assert.ok(Object.values(await changeRows()).every((n) => n > 0), 'the source branch keeps its rows');
+        store.switchBranch('back/1');
+      } finally {
+        store.close();
+      }
+
+      // This release again.
+      await withFramework([resident('alpha')], async (framework) => {
+        const alpha = framework.getAgent('alpha')!;
+        const subconscious = framework.getAgent('Subconscious')!;
+        assert.deepEqual(foldOf(await alpha.buildActivationRequest([tool('a'), tool('b')])), now([tool('a'), tool('b')], prompt('You are alpha.')));
+        assert.deepEqual(foldOf(await subconscious.buildActivationRequest([tool('think'), tool('ponder')])), now([tool('think'), tool('ponder')], prompt('You attend.')));
+      }, storePath, withSubconscious);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });
