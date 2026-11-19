@@ -5139,6 +5139,18 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       }
     });
 
+    it("an agent whose sends don't silence: text beside a send would have been posted, so the skip_reply is refused", async () => {
+      const h = await harness(asking({ sendSilencing: false }));
+      try {
+        await h.turn(skipped([text(WORDS), explicitSend('s1')]));
+        assert.ok(roundTaken(h, 'k2'), 'refused: the turn went on');
+        assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [[WORDS, 'skip-reply']]);
+        assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note'], 'only the send posted');
+      } finally {
+        await h.close();
+      }
+    });
+
     it('hybrid mode: a run under a send that reached its target', async () => {
       const h = await harness(asking({ proseRouting: 'hybrid' }));
       const ended = endings(h);
