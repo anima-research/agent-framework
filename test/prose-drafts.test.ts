@@ -1612,6 +1612,24 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it("hybrid mode: under a send whose reach is unknown, a refused target and the line after it are held together and named in one notice", async () => {
+    const h = await harness({ sendTool: true, agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    await h.sendMode('no-channel');
+    try {
+      await h.turn([
+        createMockResponse([text('>>>no-such-channel One.'), unplacedSend('s1'), text('Two.')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const held = h.drafts();
+      assert.deepEqual(held.map((d) => d.text).sort(), ['One.', 'Two.']);
+      const notices = h.texts().filter((t) => t.startsWith('[drafts]'));
+      assert.equal(notices.length, 1, notices.join('\n---\n'));
+      assert.ok(held.every((d) => notices[0]!.includes(d.id)), notices[0]);
+    } finally {
+      await h.close();
+    }
+  });
+
   it("hybrid mode: in a drafts round, a line left with no destination by a refused target is held with no notice (#701)", async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
     try {
@@ -4971,6 +4989,18 @@ describe('sameRoundSkipReplyTextPolicy', () => {
 
     it("a heartbeat turn's text, which has no destination", async () => {
       const h = await harness(asking());
+      const ended = endings(h);
+      try {
+        await h.turn(skipped([text(WORDS)]), 'scout', 'heartbeat');
+        await ranOnce(h, ended);
+        assert.deepEqual(h.publishes(), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("hybrid mode: a heartbeat turn's text, which has no destination", async () => {
+      const h = await harness(asking({ proseRouting: 'hybrid' }));
       const ended = endings(h);
       try {
         await h.turn(skipped([text(WORDS)]), 'scout', 'heartbeat');
