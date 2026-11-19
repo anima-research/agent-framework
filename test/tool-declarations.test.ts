@@ -889,7 +889,7 @@ describe('a change of tools or system text, declared in the context', () => {
       }
     });
 
-    it("counts each inference since the row was stored, by the count in the row's mark, across a restart; a row whose count is above the agent's adds nothing", async () => {
+    it("counts each answered request since the row was stored, by the count in the row's mark, across a restart; a row whose count is above the agent's adds nothing", async () => {
       const { context, heads, count } = await replaced({}, [said('user', 'hello')], 10);
       assert.equal(changeRows(context.rows)[0]!.metadata?.requestCount, 10, "the premise: the row's mark holds the count it was stored at");
       const events: HeadEvent[] = [];
