@@ -9,7 +9,9 @@
  * server suggest how its tagged events should be treated, and §5.2 forbids a
  * host from applying suggestions it was not told to apply. This module is the
  * missing step between the two: the host notices the first undecided event
- * from a server, offers the agent that server's suggestions once, and records
+ * from a server, offers the agent that server's suggestions once (a server
+ * the store already had when onboarding first started on it is settled
+ * `unasked` instead: WakeDecisions), and records
  * the agent's answer — accepted (all of them or some) or declined — keyed to
  * the server's declared ontology, so it asks again only when the ontology
  * changes.
@@ -33,8 +35,8 @@ import type { GateBehavior, GateDecision, GatePolicy } from './types.js';
  * Tags that say an event is addressed to the agent or waiting on it (MCPL
  * RFC-001 `chat:addressed`, RFC-014 `surface:turn`/`surface:alert`; not
  * `surface:invite`, which only suggests). The first undecided event carrying
- * one wakes the agent to decide; any other undecided event leaves its offer
- * for the agent's next turn.
+ * one, from a server that is offered, wakes the agent to decide; any other
+ * undecided event leaves its offer for the agent's next turn.
  */
 export const ATTENTION_TAGS: readonly string[] = ['chat:addressed', 'surface:turn', 'surface:alert'];
 

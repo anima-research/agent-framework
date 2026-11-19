@@ -5750,6 +5750,18 @@ export class AgentFramework {
       // Read before the gate writes its file: a gate.json already there says
       // the store had its rules before this start (wake onboarding, below).
       const gateFileExisted = existsSync(configPath);
+      // Wake onboarding: the agent's decisions about servers' suggested
+      // treatment, beside gate.json (gate/wake-onboarding.ts).
+      if (config.gate.onboarding !== false) {
+        // A store that had a gate before onboarding first starts on it keeps
+        // the servers it is configured with unasked (WakeDecisions): its
+        // agent wrote its rules with them there.
+        framework.wakeDecisions = new WakeDecisions(
+          join(dirname(configPath), 'wake-decisions.json'),
+          (message) => console.error(`[gate] ${message}`),
+          gateFileExisted ? [...configuredServerIds] : [],
+        );
+      }
       const heartbeatOn = config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false;
       framework.eventGate = new EventGate({
         configPath,
@@ -5856,18 +5868,6 @@ export class AgentFramework {
           return undefined;
         },
       });
-      // Wake onboarding: the agent's decisions about servers' suggested
-      // treatment, beside gate.json (gate/wake-onboarding.ts).
-      if (config.gate.onboarding !== false) {
-        // A store that had a gate before onboarding first starts on it keeps
-        // the servers it is configured with unasked (WakeDecisions): its
-        // agent wrote its rules with them there.
-        framework.wakeDecisions = new WakeDecisions(
-          join(dirname(configPath), 'wake-decisions.json'),
-          (message) => console.error(`[gate] ${message}`),
-          gateFileExisted ? [...configuredServerIds] : [],
-        );
-      }
       // The periodic review of what suppress rules hid (gate/suppression-review.ts),
       // with its progress kept beside gate.json. Its calls run on the judge's
       // membrane and count toward the agent's usage as the reply judge's do.
@@ -20759,6 +20759,7 @@ export class AgentFramework {
       this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: event.channelId });
     }
     if (decision.locus) this.noteDeliveredOrPark(event);
+    this.settlePredatingServer(event.serverId);
     if (!decision.held && !decision.suppressed) {
       this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId, ...this.answersOn(event) });
     }
@@ -22755,6 +22756,7 @@ export class AgentFramework {
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
+    this.settlePredatingServer(event.serverId);
     if (!silentHeartbeat && !decision.held && !decision.suppressed) {
       this.considerWakeOnboarding({
         serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId,
@@ -42125,11 +42127,25 @@ export class AgentFramework {
     return evaluated ? { ...decision, gateDecision: evaluated } : decision;
   }
 
+  private settlePredatingServer(serverId: string): void {
+    try {
+      if (!this.wakeDecisions?.predates(serverId)) return;
+      if (!this.mcplServerRegistry?.getServer(serverId) || (this.featureSetManager?.getDeclaredFeatureSets(serverId) ?? null) === null) return;
+      const digest = this.wakeOffer(serverId).digest;
+      this.wakeDecisions.set(serverId, { digest, state: 'unasked' });
+      this.emitTrace({ type: 'gate:onboarding-decided', serverId, digest, state: 'unasked', rules: [] });
+    } catch (error) {
+      console.error(`[gate] wake onboarding for ${logValue(serverId)} failed:`, error);
+    }
+  }
+
   /**
    * Wake onboarding, after an inbound event is stored: if the gate let it go
    * by without anyone having decided about its server (gate/wake-onboarding.ts
-   * isUndecided), and the agent hasn't been offered or answered for this
-   * server's declared ontology, offer the server's suggestions once — a notice
+   * isUndecided), the server isn't one the store had when onboarding first
+   * started on it (settlePredatingServer), and the agent hasn't been offered
+   * or answered for this server's declared ontology, offer the server's
+   * suggestions once — a notice
    * after the event, and a wake when the event is addressed to the agent or
    * waiting on it (ATTENTION_TAGS); otherwise the notice waits for the next
    * turn. Never throws: onboarding is advice, and an event's delivery must not
@@ -42167,20 +42183,7 @@ export class AgentFramework {
     try {
       const d = event.gateDecision;
       if (!this.wakeDecisions || !this.eventGate) return;
-      if (this.wakeDecisions.predates(event.serverId)) {
-        // The store's own server from before onboarding started on it: its
-        // rules stand unasked. It is settled at its first event, whatever
-        // the gate decided about that one, against what it declares now, so
-        // that a declaration it changes later is asked about as any
-        // server's is. A server whose events a rule of the agent's always
-        // decides would otherwise wait unsettled, and be settled against
-        // whatever it declared on the day that rule went.
-        if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
-        const digest = this.wakeOffer(event.serverId).digest;
-        this.wakeDecisions.set(event.serverId, { digest, state: 'unasked' });
-        this.emitTrace({ type: 'gate:onboarding-decided', serverId: event.serverId, digest, state: 'unasked', rules: [] });
-        return;
-      }
+      if (this.wakeDecisions.predates(event.serverId)) return;
       if (!d || d.trigger) return;
       // Cheap refusals first: this runs for every event a catch-all lets by.
       if (!this.wakeDecisions.mayOfferSoon(event.serverId)) return;
