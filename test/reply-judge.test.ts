@@ -336,6 +336,19 @@ describe('reply judge: the document', () => {
     assert.match((requests[0]!.messages.at(-1)!.content[0] as { text: string }).text, /Nothing the host knows of is scheduled/);
   });
 
+  it("opens what waiting leaves with the agent's failed last turn, and a provider that throws counts as none", async () => {
+    const { membrane, requests } = fakeMembrane();
+    const now = Date.now();
+    const preview = async () => ({ messages: conversation(2), config: { model: 'x', maxTokens: 1 } });
+    await new ReplyJudge({ membraneFor: () => membrane, chooseAgent: (n) => n[0], preview, failedLastTurn: () => ({ at: now - 125_000 }) })
+      .judge(judgeRequest());
+    const told = (requests[0]!.messages.at(-1)!.content[0] as { text: string }).text;
+    assert.ok(told.includes("<if_you_wait>\nScout's last turn, 2m ago, failed and may not have answered all of what woke it.\nNothing the host knows of is scheduled"), told);
+    await new ReplyJudge({ membraneFor: () => membrane, chooseAgent: (n) => n[0], preview, failedLastTurn: () => { throw new Error('boom'); } })
+      .judge(judgeRequest());
+    assert.doesNotMatch((requests[1]!.messages.at(-1)!.content[0] as { text: string }).text, /last turn/);
+  });
+
   it('reads the primary agent its chooser names', async () => {
     const { membrane } = fakeMembrane();
     const asked: string[] = [];

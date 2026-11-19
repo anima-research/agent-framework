@@ -66,7 +66,7 @@ function makeHost(options: Options = {}) {
     audit: (record) => {
       if (['removed', 'displaced', 'remove-failed'].includes(String(record.kind))) audits.push(`${String(record.kind)}:${String(record.eventId)}`);
     },
-    save: (snapshot) => { saved = snapshot; },
+    write: (_changes, table) => { saved = table; },
   };
   return {
     host, queue, read, removed, audits, wakes, deliveries, hold,

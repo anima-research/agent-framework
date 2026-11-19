@@ -12,8 +12,11 @@ function makeHarness() {
   fw.consecutiveInferenceFailures = new Map<string, number>();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
+  fw.turnRouting = new Map();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>(); // upstream last-inference tracking; noteInferenceExhausted writes it
+  fw.failedLastTurnAt = new WeakMap();
+  fw.exhaustedTurns = new Map<string, object>();
   fw.pendingRequests = [];
   // opsAlert plumbing (hard-down now routes through it): trace fan-out +
   // webhook cooldown state. No CONNECTOME_OPS_WEBHOOK in env → no fetch.
@@ -38,16 +41,26 @@ function makeHarness() {
   return { fw, markers, errs, restore };
 }
 
-test('exhausted inference: stderr line + [inference-failed] chronicle marker', () => {
+test('exhausted inference of a turn that did nothing: a stderr line with the reason, and no chronicle marker', () => {
   const { fw, markers, errs, restore } = makeHarness();
   try {
     fw.noteInferenceExhausted('cairn', '400 image exceeds 5 MB');
   } finally { restore(); }
 
-  // (1) stderr, with the underlying reason
   assert.ok(errs.some(e => e.includes('[inference-failed]') && e.includes('image exceeds 5 MB')),
     'should log the failure + reason to stderr');
-  // (2) agent-facing chronicle marker, tagged for filtering, with the reason in its metadata only
+  assert.deepEqual(markers, []);
+});
+
+test('exhausted inference of a turn that got partway: one [inference-failed] chronicle marker, with the reason in its metadata only', () => {
+  const { fw, markers, errs, restore } = makeHarness();
+  fw.exhaustedTurns.set('cairn', { roundsRan: true, callsCutOff: false, liveSpeech: false, speechRouting: false });
+  try {
+    fw.noteInferenceExhausted('cairn', '400 image exceeds 5 MB');
+  } finally { restore(); }
+
+  assert.ok(errs.some(e => e.includes('[inference-failed]') && e.includes('image exceeds 5 MB')),
+    'should log the failure + reason to stderr');
   assert.equal(markers.length, 1);
   assert.match(markers[0].text, /\[inference-failed\]/);
   assert.doesNotMatch(markers[0].text, /image exceeds 5 MB/);

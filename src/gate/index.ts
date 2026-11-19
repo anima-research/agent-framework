@@ -14,6 +14,7 @@ export type {
   JudgeFn,
   JudgeRequest,
   JudgeVerdict,
+  FailedLastTurn,
   ReplyJudgeOptions,
   UpcomingWake,
   UpcomingWakeKind,

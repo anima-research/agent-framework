@@ -264,7 +264,7 @@ async function restartTurn(opts: {
     membrane: membrane.asMembrane(),
     agents: [{
       name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all',
-      maxTokens: 4_000, physicalWindowTokens: 200_000, ...(opts.toolResultGuard ? { toolResultGuard: true } : {}),
+      maxTokens: 4_000, physicalWindowTokens: 200_000, primaryWaitsForAuxiliary: true, ...(opts.toolResultGuard ? { toolResultGuard: true } : {}),
     }, ...(opts.extraAgents ?? [])],
     modules: [module, ...(opts.extraModules ?? [])],
     syncIntervalMs: 0,
