@@ -53,7 +53,7 @@ async function harness() {
     async turn(blocks: ContentBlock[]) {
       membrane.pushResponse(createMockResponse(blocks, 'tool_use'));
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public trailing prose' } as ContentBlock]));
-      framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Go', metadata: {} });
+      framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Go', metadata: { channelId: 'world:commons' } });
       await framework.runUntilIdle();
       return (membrane.lastStream?.receivedToolResults[0] ?? []) as Array<{ toolUseId: string; content: string; isError?: boolean }>;
     },

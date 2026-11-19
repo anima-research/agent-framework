@@ -116,7 +116,7 @@ describe('unpromptedChannel in the registry', () => {
 });
 
 describe("channel_publish's description", () => {
-  const MAIN = "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.";
+  const MAIN = "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own has no default, so it names one. Such a turn is any turn while a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, or no channel's message there is newer, or one that continues such a turn. A heartbeat's turn has none either, unless prose_locus points your plain speech at a channel. A subagent has no default, so it must name a channel.";
   const publishTool = (options: Record<string, unknown>) => new ChannelRegistry(
     { getServer: () => undefined } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
@@ -134,9 +134,9 @@ describe("channel_publish's description", () => {
     assert.equal(publishTool({ unpromptedChannel: OPS }).description, MAIN);
   });
 
-  it('with unpromptedChannel and an event gate, it adds a default for a timer\'s turn, the channel this host names for it, and says a heartbeat\'s turn has no channel by design; the rest of the tool is unchanged', () => {
+  it('with unpromptedChannel and an event gate, it adds a default for a timer\'s turn, the channel this host names for it; the rest of the tool is unchanged', () => {
     const tool = publishTool({ unpromptedChannel: OPS, eventGatePresent: true });
-    assert.equal(tool.description, "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn't routed), the channel this host names for such turns. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel by design, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.");
+    assert.equal(tool.description, "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn't routed), the channel this host names for such turns. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own has no default, so it names one. Such a turn is any turn while a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, or no channel's message there is newer, or one that continues such a turn. A heartbeat's turn has none either, unless prose_locus points your plain speech at a channel. A subagent has no default, so it must name a channel.");
     assert.deepEqual({ ...tool, description: MAIN }, publishTool({ eventGatePresent: true }));
   });
 });
@@ -271,9 +271,11 @@ describe('unpromptedChannel on a real MCPL server', () => {
       await settled();
       return before;
     }
-    const skipReplyWake = (responses: Responses) => started(
+    const skipReplyWake = (responses: Responses, from: 'module' | 'operator' = 'module') => started(
       [createMockResponse([{ type: 'tool_use', id: 'sr', name: 'skip_reply', input: { wake_in_seconds: 1 } } as never], 'tool_use')],
-      () => fw.pushEvent({ type: 'external-message', source: 'tui', content: 'come back in a second' } as unknown as ProcessEvent),
+      () => fw.pushEvent((from === 'operator'
+        ? { type: 'external-message', source: 'tui', content: 'come back in a second' }
+        : { type: 'test:chat', source: 'mod', content: 'come back in a second' }) as unknown as ProcessEvent),
       [responses],
     );
     const sleepEnd = (responses: Responses, later: Responses[] = []) =>
@@ -382,6 +384,14 @@ describe('unpromptedChannel on a real MCPL server', () => {
   });
 
   describe("the turns that don't: they keep what they do without it", () => {
+    it("a private turn's: a skip_reply wake that continues a turn answering a person at a console speaks in no channel, and servers are told no default", async () => {
+      const t = await setup(OPS);
+      await t.skipReplyWake([say('back')], 'operator');
+      assert.ok(t.texts().includes('back'), 'the wake\'s turn spoke');
+      assert.deepEqual(t.published(), []);
+      assert.equal(t.toldInTurns.at(-1), undefined);
+    });
+
     it("a locked agent's: its timer's turn speaks at its lock, and servers are told the lock", async () => {
       const t = await setup(OPS, { proseRouting: 'locked', proseLock: BUSY });
       await t.skipReplyWake([say('back')]);

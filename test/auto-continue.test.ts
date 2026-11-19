@@ -178,7 +178,7 @@ describe('autoContinue', () => {
   }
 
   function trigger(framework: AgentFramework, content = 'hello'): void {
-    framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} } as unknown as ProcessEvent);
+    framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: { channelId: 'world:commons' } } as unknown as ProcessEvent);
   }
 
   /** The window's rows: text and kind. */
@@ -956,6 +956,10 @@ describe('autoContinueNotice', () => {
       autoContinueNotice({ agentName: 'lena', stop: 'call skip_reply', last: false, heldAfterSend: true }),
       '[continue] lena, another turn starts now. Some or all of your closing words last turn were held, not sent: a send that turn may already have posted where they were going. ' +
         "If you're done, call skip_reply; anything you write without it is sent as usual.",
+    );
+    assert.equal(
+      autoContinueNotice({ agentName: 'lena', stop: 'call skip_reply', last: false, heartbeat: true, private: true }),
+      "[continue] lena, another turn starts now. If you're done, call skip_reply; plain words you write without it and with no destination go to no channel this turn, and an explicit send reaches a channel.",
     );
   });
 });

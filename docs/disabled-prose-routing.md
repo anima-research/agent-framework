@@ -10,8 +10,9 @@ want every external utterance to be an explicit tool action.
   mode turn does: the channel of the message that woke it. It says the
   resident is attending to that message, whether or not anything is then sent
   there. A turn woken by ambient traffic the gate batched, a heartbeat or a
-  silent wake shows none, and so does a conversation fork that a gate batch
-  wakes for another channel's message. Typing is all this gives the channel:
+  silent wake shows none, and so do a conversation fork that a gate batch
+  wakes for another channel's message and a private turn (docs/dendrite.md,
+  "Private turns"). Typing is all this gives the channel:
   the turn's stream traces (`inference:tokens`, `inference:content_block`)
   still name no channel.
 - Explicit publish tools (Discord/Portal sends, Eidoverse `say`, etc.) are unchanged.

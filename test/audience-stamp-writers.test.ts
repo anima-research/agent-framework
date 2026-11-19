@@ -436,6 +436,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.storeDueClock': { count: 1, when: 'turn', what: 'a clock row: an event with no turn alive, a start, a tool boundary' },
   'framework.ts AgentFramework.storeInjections': { count: 1, when: 'turn', what: "a start's stored injection, before its compile" },
   'framework.ts AgentFramework.repinTurnLocus': { count: 1, when: 'turn', what: 'a routing notice, at a start or injected at a boundary' },
+  'framework.ts AgentFramework.makeTurnPrivate': { count: 1, when: 'turn', what: 'a routing notice, at a private open or a continuing start, or injected at a boundary' },
   'framework.ts AgentFramework.addressedElsewhereNotice': { count: 1, when: 'turn', what: 'a routing notice injected at a boundary' },
   'framework.ts AgentFramework.announceLocusIfChanged': { count: 1, when: 'turn', what: "a start's routing notice" },
   'framework.ts AgentFramework.maybePrimeProseMode': { count: 1, when: 'turn', what: "a start's prose-mode primer" },

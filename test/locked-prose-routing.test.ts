@@ -1,9 +1,11 @@
 /**
  * Locked prose routing (AgentConfig.proseRouting 'locked'): an agent's plain
- * speech goes to one destination it chose, on every turn, and nothing moves it
+ * speech goes to one destination it chose, on every turn but a private one, and nothing moves it
  * but its own prose_locus call — not the channel a turn came from, an
  * addressed message mid-turn, a heartbeat, or the host's locus rule. Pointed
- * at drafts (or with no destination yet), plain speech is held as drafts.
+ * at drafts (or with no destination yet), plain speech is held as drafts,
+ * but for a private turn's, which is held as none unless a send in the turn
+ * has left its reach unknown.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -215,7 +217,9 @@ describe('locked prose routing', () => {
     assert.equal(state.locusCalls, 0, 'a locked turn never asks the registry for a locus');
     const primers = windowTexts(framework).filter((t) => t.startsWith('[prose-routing]'));
     assert.deepEqual(primers, [
-      '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn, until you move it with prose_locus. ' +
+      '[prose-routing] Locked routing: your plain speech goes to discord:g:main, on every turn, until you move it with prose_locus, ' +
+        'except while a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, or no ' +
+        "channel's message there is newer, or on a turn that continues one where that held: then it goes to no channel. " +
         'The channel a message comes from no longer moves it; other channels need an explicit send tool.',
     ]);
     assert.ok(!windowTexts(framework).some((t) => t.startsWith('[routing]')), 'no locus announcements');
@@ -554,6 +558,27 @@ describe('locked prose routing', () => {
     }
   });
 
+  it("a closed-channel invitation in a locked agent's private turn says its speech goes to no channel, and offers no prose_locus move", async () => {
+    const framework = await createFramework({ proseLock: '#main' });
+    stubChannelRegistry(framework);
+    const internals = framework as unknown as {
+      channelRegistry: Record<string, unknown>;
+      openLogical: Map<string, unknown>;
+      buildClosedChannelInvitation(opts: Record<string, unknown>): { block: { text: string } } | null;
+    };
+    internals.channelRegistry.isChannelOpen = () => false;
+    internals.openLogical.set('assistant', { turnId: 1, locked: true, private: true, wasIn: [], engaged: new Set() });
+    const invitation = internals.buildClosedChannelInvitation({
+      serverId: 'stub', channelId: 'discord:g:ops', messageId: 'm1', authorName: 'Ann', tags: ['chat:addressed'],
+    });
+    const text = invitation!.block.text;
+    assert.match(text, /1\. Reply — your plain speech goes to no channel this turn, not here\./);
+    assert.ok(!text.includes('held as drafts'), text);
+    assert.ok(!text.includes('point prose_locus here'), text);
+    internals.openLogical.delete('assistant');
+    await framework.stop();
+  });
+
   it("a locked agent's ephemeral run routes as disabled, its conversation fork as locus mode, and neither is offered prose_locus", async () => {
     const framework = await createFramework({ proseLock: '#main' });
     stubChannelRegistry(framework);
@@ -747,7 +772,7 @@ describe('locked prose routing', () => {
     const internals = framework as unknown as {
       routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: unknown): Promise<unknown>;
     };
-    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: 0 };
+    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: 0, keptForPrivacy: 0 };
     const outcome = await internals.routeLocusSpeech(framework.getAgent('assistant'), { routing, notice: 'later' }, 'A later stream, live.', routing.locus);
     assert.equal(outcome, null);
     assert.deepEqual(routed, [], 'not posted at the new lock');

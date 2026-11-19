@@ -569,7 +569,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own, such as a heartbeat's, has no default, so it names one. A subagent has no default, so it must name a channel.",
+    description: "Publish a message to a channel. If channelId is omitted, publishes where your plain speech goes this turn: your conversation's channel if you are bound to one; otherwise the channel of the message that woke this turn, or one you opened during it; otherwise, while a focus holds, the channel it keeps. Where none of those names a channel, nothing is posted, unless this host is set to use the channel of the latest incoming message instead. A turn with no channel of its own has no default, so it names one. Such a turn is any turn while a message from a surface with no channel (such as a console, the TUI or an API call) in your context is unanswered, or no channel's message there is newer, or one that continues such a turn. A heartbeat's turn has none either, unless prose_locus points your plain speech at a channel. A subagent has no default, so it must name a channel.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1711,8 +1711,7 @@ export class ChannelRegistry {
             .replace(
               'otherwise, while a focus holds, the channel it keeps.',
               'otherwise, while a focus holds, the channel it keeps; otherwise, on a turn your own skip_reply wake or the end of your sleep started (or a turn continuing one, when your plain speech isn\'t routed), the channel this host names for such turns.',
-            )
-            .replace('A turn with no channel of its own, such as', 'A turn with no channel by design, such as'),
+            ),
         };
       }
       if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;

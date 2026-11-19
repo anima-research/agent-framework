@@ -906,6 +906,7 @@ export class DiscordModule implements Module {
     content: ContentBlock[],
     context: SpeechContext
   ): Promise<void> {
+    if (context.private) return;
     // If thoughts are present and this agent posted a message in the turn
     // they end (lastPosts), edit it to prepend the thoughts as spoiler text.
     const post = this.lastPosts.get(agentName);
