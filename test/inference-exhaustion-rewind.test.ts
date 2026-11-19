@@ -55,8 +55,11 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
+  fw.turnRouting = new Map();
+  fw.answeredTurns = new WeakMap();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map(); // upstream last-inference tracking; noteInferenceExhausted writes it
+  fw.failedLastTurnAt = new WeakMap();
   fw.pendingRequests = [];
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
@@ -112,6 +115,53 @@ test("the breaker's retry of a turn its batch gave no channel keeps the batch's 
   assert.equal(fw.pendingRequests.length, 1);
   assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
   assert.deepEqual(fw.pendingRequests[0].wakeChannels, channels);
+});
+
+test("the breaker's retry of a turn that answered a message and gathered a batch's channels keeps both", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
+  const routing = { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels };
+  fw.turnRouting = new Map([['cairn', routing]]);
+  fw.answeredTurns.set(fw.agents.get('cairn'), routing);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.equal(retry.reason, 'inference-failure-rewind-retry');
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-7'], 'the answered message and its channel');
+  assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
+});
+
+test("the breaker's retry, while a channel turn is unfinished and a later turn with other wake channels is the latest, answers that turn's message with that turn's wake channels", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const side = { serverId: 'discord', channelId: 'discord:g:side' };
+  const unfinished = { answers: { channel: room, messageId: 'm-A' }, wakeChannels: [room] };
+  fw.answeredTurns.set(fw.agents.get('cairn'), unfinished);
+  fw.turnRouting = new Map([['cairn', { wakeChannels: [side] }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], ['discord:g:room', 'discord', 'm-A'], "the unfinished turn's message and its channel");
+  assert.deepEqual(retry.wakeChannels, [room], "and that turn's wake channels, not the latest turn's");
+});
+
+test("the breaker's retry, where the latest turn's message is no longer the agent's unfinished turn, answers no message and keeps the turn's wake channels", () => {
+  const { fw, restore } = makeHarness();
+  const room = { serverId: 'discord', channelId: 'discord:g:room' };
+  const channels = [room, { serverId: 'discord', channelId: 'discord:g:side' }];
+  fw.turnRouting = new Map([['cairn', { answers: { channel: room, messageId: 'm-7' }, wakeChannels: channels }]]);
+  try {
+    for (let i = 0; i < 3; i++) fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request');
+  } finally { restore(); }
+  assert.equal(fw.pendingRequests.length, 1);
+  const retry = fw.pendingRequests[0];
+  assert.deepEqual([retry.channelId, retry.channelServerId, retry.answersMessageId], [undefined, undefined, undefined], 'no channel and no message');
+  assert.deepEqual(retry.wakeChannels, channels, "and the turn's wake channels");
 });
 
 test('at the threshold, a row that carries nothing is passed over, uncounted, and the newest turn shed', () => {
