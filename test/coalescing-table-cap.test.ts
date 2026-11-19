@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingPlacement } from '../src/mcpl/push-coalescer.js';
+import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingChange, type CoalescingPlacement } from '../src/mcpl/push-coalescer.js';
+import { journaledTable } from '../src/mcpl/coalescing-store.js';
+import { JOURNALED, numbered } from './helpers/coalescing-journal.js';
 
 const TS = '2026-09-30T00:00:00Z';
 const CAP = 8;
@@ -8,6 +10,7 @@ const CAP = 8;
 function rig(options: { now?: () => number } = {}) {
   const unread = new Set<string>();
   const asked: string[] = [];
+  const written: CoalescingChange[] = [];
   const host: CoalescerHost<null> = {
     isUnread: (p: CoalescingPlacement) => { asked.push(p.messageId!); return unread.has(p.messageId!); },
     isUnshown: () => false,
@@ -16,7 +19,7 @@ function rig(options: { now?: () => number } = {}) {
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {},
     authorized: () => true, audience: async () => ['agent'],
     render: async () => ({ content: [{ type: 'text', text: 'rendered' }] }),
-    audit: () => {}, save: () => {},
+    audit: () => {}, write: (changes) => { written.push(...structuredClone(changes)); },
     ...(options.now ? { now: options.now } : {}),
   };
   const coalescer = new PushCoalescer<null>(host, { maxSubjects: CAP });
@@ -26,7 +29,7 @@ function rig(options: { now?: () => number } = {}) {
   });
   const subjects = () => coalescer.snapshot().subjects;
   const held = (key: string) => subjects().some((s) => JSON.parse(s.subject)[4] === key);
-  return { coalescer, unread, asked, occurrence, subjects, held };
+  return { coalescer, unread, asked, occurrence, subjects, held, host, written };
 }
 
 test('with more placed and read subjects than the cap, the table is at the cap after each admission', async () => {
@@ -37,6 +40,25 @@ test('with more placed and read subjects than the cap, the table is at the cap a
   }
   assert.deepEqual(r.subjects().map((s) => JSON.parse(s.subject)[4]), Array.from({ length: CAP }, (_, i) => `message:${2 * CAP + i}`),
     'the subjects kept are the ones touched last');
+});
+
+test('each eviction is written, so a coalescer restored from the journal holds the subjects touched last, at the cap', async () => {
+  const r = rig();
+  for (let i = 0; i < 3 * CAP; i++) await r.coalescer.accept(r.occurrence(`message:${i}`, `ev-${i}`));
+  const restored = new PushCoalescer<null>(r.host, { maxSubjects: CAP });
+  restored.restore(journaledTable(JOURNALED, numbered(r.written)));
+  assert.deepEqual(restored.snapshot().subjects.map((s) => JSON.parse(s.subject)[4]), Array.from({ length: CAP }, (_, i) => `message:${2 * CAP + i}`));
+});
+
+test('a restore of a table over the cap forgets the subjects touched longest ago, asking nothing, since a restored occurrence counts as read', () => {
+  const r = rig();
+  const subjects = Array.from({ length: 3 * CAP }, (_, i) => ({
+    subject: JSON.stringify(['chat', 'chat', 'channel', 'chat:room', `message:${i}`]), history: 'none' as const,
+    occupant: { eventId: `ev-${i}`, placement: { agent: 'agent', messageId: `row-ev-${i}` } },
+  }));
+  r.coalescer.restore({ version: 1, receipts: [], subjects });
+  assert.deepEqual(r.subjects().map((s) => JSON.parse(s.subject)[4]), Array.from({ length: CAP }, (_, i) => `message:${2 * CAP + i}`));
+  assert.deepEqual(r.asked, []);
 });
 
 test('with unread subjects beyond the cap, none is evicted, and each admission asks at most one question more than it evicts', async () => {

@@ -29,6 +29,7 @@ import { fixture, crash } from './helpers/coalescing-fixture.js';
 import { rejectsBuild } from './helpers/failed-create.js';
 import { isStateExistsError } from '../src/module-registry.js';
 import { CheckpointManager } from '../src/mcpl/checkpoint-manager.js';
+import { journaledTable, type CoalescingJournalItem, type StoredCoalescingTable } from '../src/mcpl/coalescing-store.js';
 
 /** An I/O error from a store read of `stateId` by the framework's `reader`,
  *  `times` times, as a failing disk would give. */
@@ -477,27 +478,28 @@ test("tool-result guards that can't be read, or that aren't an object, fail crea
 // Coalescing
 // ---------------------------------------------------------------------------
 
-test("coalescing receipts that can't be read fail create(), and the next boot delivers the acknowledged work", async (t) => {
+test("coalescing changes that can't be read fail create(), and the next boot delivers the acknowledged work", async (t) => {
   const f = await fixture(); t.after(f.close);
   const params = f.params('1', 'accepted_before_crash', { deferred: true, data: { k: 'v' } });
   const original = await f.send('push/event', params);
   await crash(f);
-  const restore = failStoreRead('mcpl/coalescing-recent', 'restorePushCoalescer');
+  const restore = failStoreRead('mcpl/coalescing-journal', 'restorePushCoalescer');
   try {
-    await rejectsBuild(() => f.create(), /^the coalescing receipts since the last snapshot \(mcpl\/coalescing-recent\) could not be read: injected EIO reading mcpl\/coalescing-recent\. MCPL doesn't start without them, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since the next coalesced push or message would replace them\. They're unchanged, and MCPL starts once they can be read\.$/);
+    await rejectsBuild(() => f.create(), /^the coalescing changes since the last table \(mcpl\/coalescing-journal\) could not be read: injected EIO reading mcpl\/coalescing-journal\. MCPL doesn't start without them, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since the next coalesced push or message would replace them\. They're unchanged, and MCPL starts once they can be read\.$/);
   } finally { restore(); }
   await f.create();
   const retry = await f.send('push/event', params);
   assert.deepEqual(retry.result, original.result, 'the receipt survived');
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1, 'the accepted work was delivered');
-  assert.ok(f.lastRequest().includes('accepted_before_crash'));
+  assert.equal(f.renders.length, 1, 'as its render: the journal holds no start of a render');
+  assert.ok(f.lastRequest().includes('document_diff'), 'and its render reached the agent');
 });
 
 test("a coalescing snapshot that can't be read fails create(), and the next boot renders its batch", async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'pending_before_crash', { deferred: true }));
-  (f.framework as unknown as { flushCoalescingSnapshot(): void }).flushCoalescingSnapshot();
+  (f.framework as unknown as { writeCoalescingTable(at: 'start'): void }).writeCoalescingTable('start');
   await crash(f);
   const restore = failStoreRead('mcpl/coalescing', 'restorePushCoalescer');
   try {
@@ -509,12 +511,19 @@ test("a coalescing snapshot that can't be read fails create(), and the next boot
   assert.ok(f.lastRequest().includes('document_diff'));
 });
 
-test("coalescing receipts whose delivery an agent's context can't confirm fail create(), and the next boot delivers once", async (t) => {
+test("a coalescing batch whose render may have started, which an agent's context can't confirm delivered, fails create(), and the next boot delivers it once", async (t) => {
   const f = await fixture(); t.after(f.close);
   const params = f.params('1', 'accepted_before_crash', { deferred: true, data: { k: 'v' } });
   const original = await f.send('push/event', params);
   await crash(f);
-  // Restoring a receipt asks every agent's context whether its occurrence was delivered.
+  const journaled = JsStore.openOrCreate({ path: join(f.dir, 'store') });
+  const table = journaled.getStateJson('mcpl/coalescing') as StoredCoalescingTable;
+  const journal = journaled.getStateJson('mcpl/coalescing-journal') as CoalescingJournalItem[];
+  const accepted = journaledTable(table, journal)!.subjects.find((record) => record.batch)!;
+  const seq = journal.reduce((most, item) => Math.max(most, item.seq), table.journal!) + 1;
+  journaled.appendToStateJson('mcpl/coalescing-journal', { subject: accepted.subject, seq, record: { ...accepted, batch: { ...accepted.batch!, rendering: true } } });
+  journaled.close();
+  // Restoring a batch whose render may have started asks every agent's context whether it was delivered.
   const proto = ContextManager.prototype as unknown as { getAllMessages(this: ContextManager): unknown[] };
   const real = proto.getAllMessages;
   proto.getAllMessages = function (this: ContextManager) {
@@ -522,7 +531,7 @@ test("coalescing receipts whose delivery an agent's context can't confirm fail c
     return real.call(this);
   };
   try {
-    await rejectsBuild(() => f.create(), /^the coalescing receipts since the last snapshot \(mcpl\/coalescing-recent\) can't be checked for occurrences already delivered: agent's context could not be read: injected EIO reading the context\. MCPL doesn't start without that check, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since an occurrence delivered before the restart would be delivered again\. They're unchanged, and MCPL starts once that context can be read\.$/);
+    await rejectsBuild(() => f.create(), /^the coalescing receipts and batches \(mcpl\/coalescing\) with the changes since \(mcpl\/coalescing-journal\) can't be checked for occurrences already delivered: agent's context could not be read: injected EIO reading the context\. MCPL doesn't start without that check, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since an occurrence delivered before the restart would be delivered again\. They're unchanged, and MCPL starts once that context can be read\.$/);
   } finally { proto.getAllMessages = real; }
   await f.create();
   const retry = await f.send('push/event', params);
@@ -534,7 +543,7 @@ test("coalescing receipts whose delivery an agent's context can't confirm fail c
 test("coalescing state this code doesn't read fails create(), naming what it is, and is left as it was", async (t) => {
   const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'pending', { deferred: true }));
-  (f.framework as unknown as { flushCoalescingSnapshot(): void }).flushCoalescingSnapshot();
+  (f.framework as unknown as { writeCoalescingTable(at: 'start'): void }).writeCoalescingTable('start');
   await crash(f);
   const storePath = join(f.dir, 'store');
   const snapshot = readState(storePath, 'mcpl/coalescing') as Record<string, unknown>;
@@ -546,6 +555,9 @@ test("coalescing state this code doesn't read fails create(), naming what it is,
     ['a snapshot restore throws on', 'mcpl/coalescing', { ...snapshot, subjects: 5 }, 'receipts and batches \\(mcpl/coalescing\\) could not be restored: .*\\. MCPL doesn\'t start'],
     ['receipts that are an object', 'mcpl/coalescing-recent', { 0: 'receipt' }, 'receipts since the last snapshot \\(mcpl/coalescing-recent\\) are an object, not a list of receipts\\.'],
     ['receipts restoreReceipts throws on', 'mcpl/coalescing-recent', [null], 'receipts since the last snapshot \\(mcpl/coalescing-recent\\) could not be restored: .*\\. MCPL doesn\'t start'],
+    ['changes that are an object', 'mcpl/coalescing-journal', { 0: 'change' }, 'changes since the last table \\(mcpl/coalescing-journal\\) are an object, not a list of changes\\.'],
+    ['a change that names no subject', 'mcpl/coalescing-journal', [null], 'changes since the last table \\(mcpl/coalescing-journal\\) hold null at item 0, not a numbered change of a subject\\.'],
+    ['a change with no record', 'mcpl/coalescing-journal', [{ subject: 's', seq: 1 }], 'changes since the last table \\(mcpl/coalescing-journal\\) hold an object at item 0, not a numbered change of a subject\\.'],
   ];
   for (const [name, stateId, value, says] of cases) {
     const store = JsStore.openOrCreate({ path: storePath });
@@ -804,10 +816,11 @@ test("at a runtime connect, coalescing state or checkpoint trees that can't be r
   try {
     const server = { id: 'editor', url: `ws://127.0.0.1:${f.port}`, enabledFeatureSets: ['doc'] } as McplServerConfig;
     const store = framework.getStore() as unknown as JsStore;
-    const stored = () => ['mcpl/coalescing', 'mcpl/coalescing-recent', 'mcpl/checkpoints'].map((id) => store.getStateJson(id));
+    const stored = () => ['mcpl/coalescing', 'mcpl/coalescing-journal', 'mcpl/coalescing-recent', 'mcpl/checkpoints'].map((id) => store.getStateJson(id));
     const before = stored();
     const internals = framework as unknown as { mcplServerRegistry: unknown; pushCoalescer: unknown; checkpointManager: unknown };
     for (const [stateId, reader, says] of [
+      ['mcpl/coalescing-journal', 'restorePushCoalescer', 'the coalescing changes since the last table'],
       ['mcpl/coalescing-recent', 'restorePushCoalescer', 'the coalescing receipts since the last snapshot'],
       ['mcpl/coalescing', 'restorePushCoalescer', 'the coalescing receipts and batches'],
       ['mcpl/checkpoints', 'loadFromStore', 'the MCPL checkpoint trees'],

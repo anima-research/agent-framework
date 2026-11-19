@@ -596,8 +596,17 @@ doesn't say whether it carries injections is taken as one that doesn't: at a
 tool boundary nothing is injected into it, and what arrived for the agent
 waits out of its window for the turn's end. On any doubt — restart, branch switch, eviction — the host
 appends, as it does today. There is no per-subject cap: a busy channel's unread
-backlog is simply its unread backlog. Receipts and subject history are kept in
-the `mcpl/coalescing` state (retry window 1 h); audit lines are
+backlog is simply its unread backlog. Past 4,096 subjects, each admission
+forgets subjects from the one touched longest ago
+while their occurrence has been read, until the table is back at that number
+or it meets one whose occurrence is unread; a subject with a pending batch
+stays. A later occurrence of a forgotten subject is answered as one of a
+subject the host never saw. Receipts and subject records are kept in the
+`mcpl/coalescing` state (retry window 1 h). Each change since that state was
+last written is appended to `mcpl/coalescing-journal`, and the state is
+written whole, emptying the journal, once the journal has grown to the
+state's size, after a write that failed, after a branch move, at a clean
+stop, and at a start that finds changes since. Audit lines are
 `mcpl:coalescing` trace events.
 
 #### Tool presence and toolsets (RFC-014)

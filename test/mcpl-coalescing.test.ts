@@ -17,7 +17,9 @@ import { MembraneError } from '@animalabs/membrane';
 import { createMockResponse, HeldStream, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, settles, crash, ok, TS } from './helpers/coalescing-fixture.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
-import { PushCoalescer, type CoalescerHost, type CoalescedOccurrence, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
+import { PushCoalescer, coalescingReceiptKey, coalescingSubjectKey, type CoalescerHost, type CoalescedOccurrence, type CoalescingChange, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
+import { journaledTable, type CoalescingJournalItem, type StoredCoalescingTable } from '../src/mcpl/coalescing-store.js';
+import { JOURNALED, numbered } from './helpers/coalescing-journal.js';
 import { coverTest, readMarkForTest, type ReadMark } from '../src/read-marks.js';
 
 /**
@@ -765,7 +767,7 @@ test('G15: inference/request is refused while a cancelled render is still outsta
 // Review round 2 (#197): Codex R1–R4 on d86afc1
 // ---------------------------------------------------------------------------
 
-test('R1: a deferred acceptance survives a crash before the snapshot flush, with its receipt', async (t) => {
+test('R1: a deferred acceptance survives a crash, with its receipt, and renders, since its render had not started', async (t) => {
   const f = await fixture(); t.after(f.close);
   const params = f.params('1', 'crash_fallback', { deferred: true, data: { k: 'v' } });
   const original = await f.send('push/event', params);
@@ -774,8 +776,8 @@ test('R1: a deferred acceptance survives a crash before the snapshot flush, with
   assert.deepEqual(retry.result, original.result, 'the receipt survived');
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1, 'the accepted work was delivered');
-  assert(f.lastRequest().includes('crash_fallback'), 'as its fallback: the host cannot prove no render started');
-  assert.equal(f.renders.length, 0);
+  assert(f.lastRequest().includes('document_diff'), 'as its render: the journal holds no start of a render');
+  assert.equal(f.renders.length, 1);
 });
 
 test('R2: work admitted under a former binding never reaches the replacement endpoint', async (t) => {
@@ -812,8 +814,9 @@ test('R4: the render-start boundary is persisted before the RPC is issued', asyn
   await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
   const run = f.framework.runUntilIdle();
   await started;
-  const store = (f.framework as unknown as { store: { getStateJson(id: string): { subjects: Array<{ batch?: { rendering?: boolean } }> } } }).store;
-  assert.equal(store.getStateJson('mcpl/coalescing').subjects[0]?.batch?.rendering, true, 'persisted as RENDERING while the RPC is outstanding');
+  const store = (f.framework as unknown as { store: { getStateJson(id: string): unknown } }).store;
+  const durable = journaledTable(store.getStateJson('mcpl/coalescing') as StoredCoalescingTable, store.getStateJson('mcpl/coalescing-journal') as CoalescingJournalItem[]);
+  assert.equal(durable?.subjects[0]?.batch?.rendering, true, 'persisted as RENDERING while the RPC is outstanding');
   release({ content: [{ type: 'text', text: 'rendered' }] });
   await run;
   assert(f.lastRequest().includes('rendered'));
@@ -890,7 +893,8 @@ test('R8 (kill, acceptance): the receipt and the accepted work survive SIGKILL a
   assert.deepEqual(retry.result, receipt, 'the receipt survived the kill');
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1, 'the accepted work survived the kill');
-  assert(f.lastRequest().includes('killed_fallback'));
+  assert.deepEqual(f.renders.map((r) => r.eventId), ['1'], 'it renders: the journal holds no start of a render');
+  assert(f.lastRequest().includes('document_diff'), 'and its render reaches the agent');
 });
 
 test('R9 (kill, render-start): a render that may have run is not issued again after SIGKILL', async (t) => {
@@ -927,17 +931,18 @@ test('R10: a retry after a failed commit is acknowledged only once the commit su
   assert.equal(f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter((m) => JSON.stringify(m.content).includes('other')).length, 1, 'plain: delivered exactly once across the failed and successful acknowledgement');
 });
 
-/** Make the host's next `times` writes of a coalescing receipt record fail,
- *  as a full disk would; returns how many are still to fail. A write that
- *  only empties the list, as the snapshot flush's does, isn't counted. */
+/** Make the host's next `times` writes of the coalescing state fail, as a
+ *  full disk would: an append to its journal, or its table, which a write
+ *  after a failed one writes in the journal's place. Returns how many are
+ *  still to fail. A write that only empties the journal isn't counted. */
 function failReceiptWrites(f: Awaited<ReturnType<typeof fixture>>, times: number): () => number {
-  const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void } }).store;
-  const orig = store.setStateJson.bind(store);
+  const store = (f.framework as unknown as { store: { setStateJson: (id: string, value: unknown) => void; appendToStateJson: (id: string, item: unknown) => unknown } }).store;
+  const set = store.setStateJson.bind(store);
+  const append = store.appendToStateJson.bind(store);
   let left = times;
-  store.setStateJson = (id, value) => {
-    if (id === 'mcpl/coalescing-recent' && Array.isArray(value) && value.length > 0 && left > 0) { left--; throw new Error('ENOSPC simulated'); }
-    orig(id, value);
-  };
+  const fail = () => { if (left > 0) { left--; throw new Error('ENOSPC simulated'); } };
+  store.setStateJson = (id, value) => { if (id === 'mcpl/coalescing') fail(); set(id, value); };
+  store.appendToStateJson = (id, item) => { if (id === 'mcpl/coalescing-journal') fail(); return append(id, item); };
   return () => left;
 }
 
@@ -1084,7 +1089,7 @@ test('a retry of an admitted message while the host is stopping fails the reques
   assert.deepEqual(retry.error && { code: retry.error.code, message: retry.error.message }, { code: -32000, message: 'host is stopping' });
 });
 
-test('a coalescing save that fails stays unsaved, so the stop saves it and a retry after the restart is answered from the receipt it carries', async (t) => {
+test('a coalescing table whose write fails stays owed, so the stop writes it and a retry after the restart is answered from the receipt it carries', async (t) => {
   const f = await fixture(); t.after(f.close);
   f.alwaysRespond();
   failReceiptWrites(f, 1);
@@ -1097,9 +1102,9 @@ test('a coalescing save that fails stays unsaved, so the stop saves it and a ret
   };
   const send = () => f.send('push/event', f.params('e1', 'plain_copy', { initial: true }));
   assert.equal((await send()).error?.code, -32000, "the receipt's record wasn't written");
-  // The throttled save fails too: only the receipt in memory holds the admission.
-  (f.framework as unknown as { flushCoalescingSnapshot: () => void }).flushCoalescingSnapshot();
-  assert.equal(failSnapshot, 0, 'the save failed');
+  // The table's write fails too: only the receipt in memory holds the admission.
+  (f.framework as unknown as { writeCoalescingTable: (at: 'start') => void }).writeCoalescingTable('start');
+  assert.equal(failSnapshot, 0, "the table's write failed");
   await f.framework.runUntilIdle();
   await f.framework.stop(); await f.create();
   const retry = await send();
@@ -1898,7 +1903,7 @@ test("a deferred batch is all ambient only while every notice folded into it was
       if (holdRender) await holdRender;
       return { content: [{ type: 'text', text: 'diff' }] };
     },
-    audit: () => {}, save: (snapshot) => { saved = snapshot; },
+    audit: () => {}, write: (_changes, table) => { saved = table; },
   });
   const occurrence = (key: string, eventId: string, tags?: readonly string[], deferred = true): CoalescedOccurrence<null> => ({
     serverId: 'editor', binding: 'binding', scope: { kind: 'channel', id: 'editor:room' }, key, eventId, timestamp: TS,
@@ -2596,8 +2601,8 @@ test('R14: two consecutive crash windows with an acceptance in between keep both
   const retryA = await f.send('push/event', f.params('a', 'first_window_fallback', { deferred: true, key: 'A' }));
   assert.equal(retryA.result?.coalesce?.outcome, 'first', "A's receipt survived the second window");
   await f.framework.runUntilIdle();
-  const req = f.lastRequest();
-  assert(req.includes('first_window_fallback') && req.includes('second_window_fallback'), 'both recovered batches delivered');
+  assert.deepEqual(f.renders.map((r) => r.eventId).sort(), ['a', 'b'], 'both recovered batches rendered');
+  assert.equal(f.context().split('document_diff').length - 1, 2, 'and both renders reached the agent');
 });
 
 test('R15: a retraction arriving between the render result and its publication waits for the settlement', async (t) => {
@@ -3020,7 +3025,7 @@ test("a render's delivery that may have stored it is redelivered at its recovery
       wakeForBatch: async () => {}, wakeToRead: async () => {},
       cancelWake: () => {}, authorized: () => true, audience: async () => ['agent'],
       render: async () => ({ content: [{ type: 'text', text: 'rendered' }] }),
-      audit: (record) => { audits.push(record); }, save: () => {},
+      audit: (record) => { audits.push(record); }, write: () => {},
     };
     const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 3_600_000 });
     await coalescer.accept(occurrence('e1'));
@@ -3060,8 +3065,7 @@ test("a render whose delivery throws is re-woken by its recovery though the save
     audience: async () => ['agent'],
     render: async () => ({ content: [{ type: 'text', text: 'rendered' }] }),
     audit: (record) => { audits.push(record); },
-    save: () => {},
-    saveNow: () => {},
+    write: () => {},
     // The render-start boundary's commit returns at once; the failed
     // delivery's is held past the backoff.
     commit: async () => { if (++commits === 2) await held; },
@@ -3102,8 +3106,7 @@ test("a render cancelled while it runs leaves the recovery wake of a batch opene
       return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] };
     },
     audit: (record) => { audits.push(record); },
-    save: () => {},
-    saveNow: () => { if (failPersist) throw new Error('EIO simulated'); },
+    write: () => { if (failPersist) throw new Error('EIO simulated'); },
   };
   const coalescer = new PushCoalescer<null>(host, { recoveryBackoffMs: 200 });
   const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
@@ -3211,14 +3214,11 @@ test("a render whose store write is refused leaves a batch opened while it rende
   assert.equal(renders, 1, 'the server was asked to render the first batch only');
 });
 
-test("a render whose store write is refused while a newer batch is open saves that batch's fallback mark at once, so a restart before the assembly's other renders settle delivers it as its fallback", async () => {
-  // The host saves as the framework's does: save() is throttled, written
-  // only once its timer fires (flush), and saveNow() writes at once but
-  // unsynced, which commit() syncs, so `onDisk` is what a restart finds.
-  let onDisk: CoalescingSnapshot | undefined;
-  let unsynced: CoalescingSnapshot | undefined;
-  let dirty: (() => CoalescingSnapshot) | undefined;
-  const flush = () => { if (dirty) { onDisk = structuredClone(dirty()); dirty = undefined; } };
+test("a render whose store write is refused while a newer batch is open writes that batch's fallback mark at once, so a restart before the assembly's other renders settle delivers it as its fallback", async () => {
+  // The host writes as the framework's does: each write lands at once but
+  // unsynced, and commit() syncs it, so `onDisk` is what a restart finds.
+  const onDisk: CoalescingChange[] = [];
+  let unsynced: CoalescingChange[] = [];
   const latch = () => { let open!: () => void; const opened = new Promise<void>((resolve) => { open = resolve; }); return { open, opened }; };
   const documentStarted = latch(), documentGo = latch(), outlineGo = latch();
   const kinds: string[] = [];
@@ -3242,9 +3242,8 @@ test("a render whose store write is refused while a newer batch is open saves th
       return { content: [{ type: 'text', text: `render_${occ.eventId}` }] };
     },
     audit: (record) => { kinds.push(String(record.kind)); },
-    save: (snapshot) => { dirty = snapshot; },
-    saveNow: (snapshot) => { dirty = undefined; unsynced = structuredClone(snapshot); },
-    commit: async () => { if (unsynced) { onDisk = unsynced; unsynced = undefined; } },
+    write: (changes) => { unsynced.push(...structuredClone(changes)); },
+    commit: async () => { onDisk.push(...unsynced); unsynced = []; },
   };
   const occurrence = (key: string, eventId: string, initial = false): CoalescedOccurrence<null> => ({
     serverId: 'editor', binding: 'binding', scope: { kind: 'featureSet', id: 'doc' }, key, eventId, timestamp: TS,
@@ -3258,15 +3257,14 @@ test("a render whose store write is refused while a newer batch is open saves th
   const assembling = coalescer.assemble('agent').then(() => { assembled = true; });
   await documentStarted.opened;
   await coalescer.accept(occurrence('document', 'n2'));
-  flush(); // the newer batch's acceptance snapshot reaches the disk: its timer fired
   documentGo.open();
   for (let i = 0; !kinds.includes('deliver-failed'); i++) {
     assert(i < 1000, "the document's render was delivered");
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.ok(!assembled, "premise: the outline's render is still out, so the assembly hasn't settled");
-  // The process stops here, before a throttled save's timer fires.
-  const atStop = structuredClone(onDisk!);
+  // The process stops here, before the assembly's other renders settle.
+  const atStop = journaledTable(JOURNALED, numbered(structuredClone(onDisk)));
   outlineGo.open();
   await assembling;
   refuse = false;
@@ -4010,7 +4008,7 @@ test("#157: a render stored unread for another agent whose turn is alive keeps i
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
     render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
-    audit: () => {}, save: () => {},
+    audit: () => {}, write: () => {},
   };
   const coalescer = new PushCoalescer<null>(host);
   const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
@@ -4036,7 +4034,7 @@ test("#157: a notice's render that lands while an earlier render of its subject 
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent', 'other'],
     render: async (occ) => { if (occ.eventId === 'n1') await firstRender; return { content: [{ type: 'text', text: `diff_${occ.eventId}` }] }; },
-    audit: () => {}, save: () => {},
+    audit: () => {}, write: () => {},
   };
   const coalescer = new PushCoalescer<null>(host);
   const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
@@ -4065,6 +4063,7 @@ test("#157: a notice's render that lands while an earlier render of its subject 
  *  options added.) */
 function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Set<string>; readEvents?: Set<string> }, { held = ['n1'], stored = [] as string[], unplaced = [] as string[], blank = [] as string[] } = {}) {
   const delivered: Array<{ eventId: string; firstView?: true }> = [];
+  const written: CoalescingChange[] = [];
   // Each placement's event, for the per-event read and shown answers.
   const eventOf = new Map<string, string>();
   const named = (p: { messageId?: string }, events?: Set<string>) => events?.has(eventOf.get(p.messageId ?? '') ?? '') === true;
@@ -4093,7 +4092,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Se
       await gates.get(occ.eventId);
       return { content: [{ type: 'text', text: blank.includes(occ.eventId) ? ' ' : `diff_${occ.eventId}` }] };
     },
-    audit: () => {}, save: () => {},
+    audit: () => {}, write: (changes) => { written.push(...structuredClone(changes)); },
   };
   const coalescer = new PushCoalescer<null>(host);
   const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
@@ -4101,7 +4100,7 @@ function firstViewProbe(state: { shown: boolean; read: boolean; shownEvents?: Se
     retract: false, deferred: false, initial: false, content: [{ type: 'text', text: eventId }], event: null, ...flags,
   });
   return {
-    coalescer, host, delivered, occurrence,
+    coalescer, host, delivered, occurrence, written,
     release: (id: string) => releases.get(id)!(),
     renderStarted: (id: string) => renderStarted.get(id)!,
   };
@@ -4350,56 +4349,65 @@ async function firstViewDisplacedByPlain(p: ReturnType<typeof firstViewProbe>, s
 
 const firstViewEndings = { 'a retraction': firstViewRetracted, 'a plain occurrence that displaces it': firstViewDisplacedByPlain };
 
-for (const [ending, end] of Object.entries(firstViewEndings)) for (const shown of [false, true]) test(`#157: the crash-window receipt records keep a subject's ended first view after ${ending}, so a coalescer restored from them alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+for (const [ending, end] of Object.entries(firstViewEndings)) for (const shown of ending === 'a retraction' ? [false, true] : [true]) test(`#157: the journal keeps a subject's ended first view after ${ending}, so a coalescer restored from it alone ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
-  const records: CoalescingReceiptRecord[] = [];
-  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
   await end(p, state, shown);
-  // A crash before the throttled snapshot: only the records written at each acceptance survive.
+  // A crash before any table is written: only the journal's changes survive.
   const restored = new PushCoalescer<null>(p.host);
-  restored.restoreReceipts(records);
+  restored.restore(journaledTable(JOURNALED, numbered(p.written)));
   await restored.accept(p.occurrence('n2', { deferred: true }));
   await restored.assemble('agent');
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
 });
 
-for (const shown of [false, true]) test(`#157: a snapshot taken before a subject's first view ended, with the records written after it, ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
+test("#157: a coalescer restored from the journal after a plain occurrence displaced a first-view render counts that placed occurrence as read, as a table's restore does, so the next batch is no first view", async () => {
+  const state = { shown: false, read: false };
+  const p = firstViewProbe(state, { held: [] });
+  await firstViewDisplacedByPlain(p, state, false);
+  const restored = new PushCoalescer<null>(p.host);
+  restored.restore(journaledTable(JOURNALED, numbered(p.written)));
+  await restored.accept(p.occurrence('n2', { deferred: true }));
+  await restored.assemble('agent');
+  assert.deepEqual(p.delivered.at(-1), { eventId: 'n2' });
+});
+
+for (const shown of [false, true]) test(`#157: a table written before a subject's first view ended, with the journal written after it, ${shown ? 'gives the next batch no first view' : 'still gives the next batch its first view when nothing had shown the agent the last'}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
-  // The last snapshot holds the subject with its batch pending; the records after it are the crash window's.
+  // The last table holds the subject with its batch pending; the journal after it is what a crash leaves.
   const snapshot = p.coalescer.snapshot();
-  const records: CoalescingReceiptRecord[] = [];
-  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
+  p.written.length = 0;
   await p.coalescer.assemble('agent');
   assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
   state.shown = shown;
   const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
   assert.equal(r1.coalesce?.outcome, 'retracted');
   state.shown = false;
-  assert.equal(records.length, 1, "the retraction's record is the only one after the snapshot");
   const restored = new PushCoalescer<null>(p.host);
-  restored.restore(snapshot);
-  restored.restoreReceipts(records);
+  restored.restore(journaledTable({ ...snapshot, journal: 0 }, numbered(p.written)));
   await restored.accept(p.occurrence('n2', { deferred: true }));
   await restored.assemble('agent');
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n2', ...(shown ? {} : { firstView: true as const }) });
 });
 
-for (const shown of [false, true]) test(`#157: a snapshot that holds a first-view batch, restored with the records after it once their retry window has passed, ${shown ? "gives that batch's render no first view when a record ends the first view" : "leaves that batch's render the first view when nothing had shown the agent the last"}`, async () => {
+for (const shown of [false, true]) test(`#157: a snapshot that holds a first-view batch, restored with the records a release before the journal wrote after it once their retry window has passed, ${shown ? "gives that batch's render no first view when a record ends the first view" : "leaves that batch's render the first view when nothing had shown the agent the last"}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
   await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   // The last snapshot holds n1's batch pending, as the agent's first view.
   const snapshot = p.coalescer.snapshot();
-  const records: CoalescingReceiptRecord[] = [];
-  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
   await p.coalescer.assemble('agent');
   assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }], "n1's render is the agent's first view");
   state.shown = shown;
-  await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
+  const r1 = await p.coalescer.accept(p.occurrence('r1', { retract: true, content: [] }));
   state.shown = false;
+  const records: CoalescingReceiptRecord[] = [{
+    key: coalescingReceiptKey('editor', 'binding', 'r1'), result: r1, at: Date.now(),
+    subject: coalescingSubjectKey('editor', 'binding', { kind: 'featureSet', id: 'doc' }, 'document'),
+    ...(shown ? { firstViewEnded: true as const } : {}), batch: null,
+  }];
   // The host comes back two hours after the crash. Past their retry window
   // the records' batch facts aren't read, so the snapshot's batch is back,
   // and the end a record carries holds for it too.
@@ -4411,16 +4419,14 @@ for (const shown of [false, true]) test(`#157: a snapshot that holds a first-vie
   assert.deepEqual(p.delivered.at(-1), { eventId: 'n1', ...(shown ? {} : { firstView: true as const }) });
 });
 
-for (const shown of [false, true]) test(`#157: crash-window records restored after their retry window has passed ${shown ? "still end the first view, so the edit of a later initial plain occurrence is no first view" : "leave the edit of a later initial plain occurrence the first view when nothing had shown the agent the last"}`, async () => {
+for (const shown of [false, true]) test(`#157: a journal restored after its retry window has passed ${shown ? "still ends the first view, so the edit of a later initial plain occurrence is no first view" : "leaves the edit of a later initial plain occurrence the first view when nothing had shown the agent the last"}`, async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
-  const records: CoalescingReceiptRecord[] = [];
-  p.host.recordReceipt = (record) => { records.push(structuredClone(record)); };
   await firstViewRetracted(p, state, shown);
-  // The host comes back two hours after the crash: every record is past the default one-hour retry window.
+  // The host comes back two hours after the crash: every receipt is past the default one-hour retry window.
   const later = Date.now() + 2 * 3_600_000;
   const restored = new PushCoalescer<null>({ ...p.host, now: () => later });
-  restored.restoreReceipts(records);
+  restored.restore(journaledTable(JOURNALED, numbered(p.written)));
   await restored.accept(p.occurrence('p1', { initial: true }));
   const e1 = await restored.accept(p.occurrence('e1', { tags: ['chat:edited'] }));
   assert.equal(e1.coalesce?.outcome, 'replaced', 'e1 replaced the unread p1');
@@ -4467,7 +4473,7 @@ for (const shown of [false, true]) test(`#157: a notice that displaces an unread
     wakeForBatch: async () => {}, wakeToRead: async () => {}, cancelWake: () => {}, authorized: () => true,
     audience: async () => ['agent'],
     render: async () => ({ content: [{ type: 'text', text: 'document_diff' }] }),
-    audit: () => {}, save: () => {},
+    audit: () => {}, write: () => {},
   };
   const coalescer = new PushCoalescer<null>(host);
   const occurrence = (eventId: string, flags: Partial<CoalescedOccurrence<null>>): CoalescedOccurrence<null> => ({
@@ -4582,78 +4588,70 @@ test('#157: a channel edit of a message the agent has read leaves context.incomi
   assert.equal(incomingAnchor(f)?.messageId, 'mb', 'the marker left the anchor at the later message');
 });
 
-test("a receipt whose write failed is written by the producer's retry with the subject's batch as it is then, so records restored after a crash don't bring back a batch already rendered", async () => {
+function failWrites(p: ReturnType<typeof firstViewProbe>, times: number): void {
+  const write = p.host.write;
+  let failing = times;
+  p.host.write = (changes, table) => {
+    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
+    write(changes, table);
+  };
+}
+
+test("an admission whose write failed is written by the producer's retry with the subject as it is then, so a journal restored after a crash doesn't bring back a batch already rendered", async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [] });
-  const records: CoalescingReceiptRecord[] = [];
-  let failing = 1;
-  p.host.recordReceipt = (record) => {
-    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
-    records.push(structuredClone(record));
-  };
+  failWrites(p, 1);
   await assert.rejects(p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true })), (error: { code?: number }) => error.code === -32000);
   // The accepted notice renders before the producer's retry comes.
   await p.coalescer.assemble('agent');
   assert.deepEqual(p.delivered, [{ eventId: 'n1', firstView: true }]);
   const retry = await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } }, "the retry answers the admission's result");
-  assert.equal(records.length, 1, 'the retry wrote the record');
-  // A crash before the throttled snapshot: only the record survives.
+  assert.ok(p.written.at(-1)?.receipt?.[0].includes('"n1"'), "the retry wrote the admission's change");
+  // A crash before any table is written: only the journal survives.
   const restored = new PushCoalescer<null>(p.host);
-  restored.restoreReceipts(records);
+  restored.restore(journaledTable(JOURNALED, numbered(p.written)));
   await restored.assemble('agent');
   assert.equal(p.delivered.length, 1, 'the rendered notice is not delivered again');
 });
 
-test("a receipt a retry writes while its batch renders records that batch, so a crash before the render's content is stored brings it back for its fallback", async () => {
+test("an admission's change a retry writes while its batch renders records that batch, so a crash before the render's content is stored brings it back for its fallback", async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: ['n1'] });
-  const records: CoalescingReceiptRecord[] = [];
-  let failing = 1;
-  p.host.recordReceipt = (record) => {
-    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
-    records.push(structuredClone(record));
-  };
+  failWrites(p, 1);
   await assert.rejects(p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true })), (error: { code?: number }) => error.code === -32000);
   const assembling = p.coalescer.assemble('agent');
   await p.renderStarted('n1');
-  // The render-start snapshot, then the producer's retry while the render runs.
-  const snapshot = p.coalescer.snapshot();
+  // The render's start is written, then the producer's retry comes while the render runs.
   const retry = await p.coalescer.accept(p.occurrence('n1', { deferred: true, initial: true }));
   assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
-  assert.equal(records.length, 1, 'the retry wrote the record');
-  // A crash before the render's content is stored: the snapshot and the record survive.
+  assert.ok(p.written.at(-1)?.receipt?.[0].includes('"n1"'), "the retry wrote the admission's change");
+  // A crash before the render's content is stored: the journal so far survives.
   const restored = new PushCoalescer<null>(p.host);
-  restored.restore(snapshot);
-  restored.restoreReceipts(records);
+  restored.restore(journaledTable(JOURNALED, numbered(structuredClone(p.written))));
   await restored.assemble('agent');
   assert.deepEqual(p.delivered.map((d) => d.eventId), ['n1'], 'the accepted notice comes back for its fallback');
   p.release('n1');
   await assembling;
 });
 
-test('a snapshot carries a receipt whose record was never written, so a coalescer restored from it answers the retry from that receipt', async () => {
+test('a table carries a receipt whose change was never written, so a coalescer restored from it answers the retry from that receipt', async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [], stored: ['p1'] });
-  p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
+  p.host.write = () => { throw new Error('ENOSPC simulated'); };
   await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
   const snapshot = p.coalescer.snapshot();
-  const restored = new PushCoalescer<null>({ ...p.host, recordReceipt: () => {} });
+  const restored = new PushCoalescer<null>({ ...p.host, write: () => {} });
   restored.restore(snapshot);
   const retry = await restored.accept(p.occurrence('p1', { initial: true }));
   assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
   assert.deepEqual(p.delivered, [{ eventId: 'p1' }], 'delivered once');
 });
 
-test("a retry's record for a subject evicted since its admission says nothing of the subject's birth", async () => {
+test("a retry's change for a subject evicted since its admission says the subject left", async () => {
   const state = { shown: false, read: false };
   const p = firstViewProbe(state, { held: [], stored: ['p1', 'q1'] });
-  const records: CoalescingReceiptRecord[] = [];
-  let failing = 1;
-  p.host.recordReceipt = (record) => {
-    if (failing > 0) { failing--; throw new Error('ENOSPC simulated'); }
-    records.push(structuredClone(record));
-  };
+  failWrites(p, 1);
   const coalescer = new PushCoalescer<null>(p.host, { maxSubjects: 1 });
   await assert.rejects(coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
   // Read, then withdrawn with nothing to say: the subject is idle.
@@ -4664,9 +4662,9 @@ test("a retry's record for a subject evicted since its admission says nothing of
   await coalescer.accept({ ...p.occurrence('q1', { initial: true }), key: 'other' });
   const retry = await coalescer.accept(p.occurrence('p1', { initial: true }));
   assert.deepEqual(retry, { accepted: true, coalesce: { outcome: 'first' } });
-  const rewritten = records.find((r) => r.key.includes('"p1"'));
-  assert.ok(rewritten, 'the retry wrote the record');
-  assert.equal(rewritten.born, undefined, 'no birth: the subject is untracked now');
+  const rewritten = p.written.find((change) => change.receipt?.[0].includes('"p1"'));
+  assert.ok(rewritten, 'the retry wrote the change');
+  assert.equal(rewritten.record, null, 'the subject left: it is untracked now');
 });
 
 test('an admission whose receipt is never written is observed once, after its effects', async () => {
@@ -4675,7 +4673,7 @@ test('an admission whose receipt is never written is observed once, after its ef
   const observed: string[] = [];
   const deliveredWhenObserved: number[] = [];
   p.host.accepted = (occurrence) => { observed.push(occurrence.eventId); deliveredWhenObserved.push(p.delivered.length); };
-  p.host.recordReceipt = () => { throw new Error('ENOSPC simulated'); };
+  p.host.write = () => { throw new Error('ENOSPC simulated'); };
   for (let attempt = 0; attempt < 6; attempt++) {
     await assert.rejects(p.coalescer.accept(p.occurrence('p1', { initial: true })), (error: { code?: number }) => error.code === -32000);
   }
