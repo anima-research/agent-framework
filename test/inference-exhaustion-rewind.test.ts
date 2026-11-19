@@ -93,7 +93,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 
   const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 earlier turn\(s\) were set aside after requests couldn't be completed\. Their content isn't shown here\. The originals normally remain in the raw record; where this context is itself the record \(legacy mode\), they were removed from it\. You are clear to continue/);
+  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 earlier turn\(s\) were set aside after requests couldn't be completed\. Their content isn't shown here\. This context is itself the record \(legacy mode\), so they were removed from it\. You are clear to continue/);
   assert.doesNotMatch(marker!.content[0].text, /tool_use ids|refus|filter|rejecting the conversation/i, "the marker carries none of the provider's words");
   assert.ok(String(marker!.meta.category).includes('tool_use ids must have a corresponding tool_result'), 'the record keeps them');
 

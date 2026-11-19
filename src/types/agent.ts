@@ -286,7 +286,7 @@ export interface AgentConfig {
    * on a presented window, one before a run of system notices when the pair
    * is proven); otherwise the result goes alone and its call can stay. On a
    * presented window the originals stay in the raw record; a window that is
-   * still the record (legacy mode) removes them. That isn't necessarily the content that tripped the
+   * still the record (legacy mode) removes them, and the notice says which. That isn't necessarily the content that tripped the
    * classifier. The first rewind of an episode appends one notice at the tail
    * of the context saying that earlier content was set aside, and later ones
    * update that notice in place; it carries none of that content, so it cannot

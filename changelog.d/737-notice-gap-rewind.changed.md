@@ -5,6 +5,7 @@
   carry, so what it set aside isn't always the newest, nor always all on
   the failed request. It still opens "[turns-set-aside] The ", so a reader
   matching that prefix still finds it. It also no longer says the
-  originals always remain in the raw record: they do on a presented window
-  (the default), and a window that is still the record (legacy mode)
-  removes them, as it did before. The tag and the metadata are unchanged.
+  originals always remain in the raw record: it says they remain there
+  after a rewind on a presented window (the default), and that they were
+  removed from it after one on a window that is still the record (legacy
+  mode), as it did before. The tag and the metadata are unchanged.

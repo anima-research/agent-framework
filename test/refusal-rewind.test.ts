@@ -235,8 +235,7 @@ test("a refusal's rewind tells the agent its turns couldn't be completed, naming
     assert.ok(marker.includes('[turns-set-aside] The 1 earlier turn(s)'), `the marker opens with its documented tag and "The ", as before: ${marker}`);
     assert.ok(marker.includes(
       `${REWIND_TAG} The 1 earlier turn(s) were set aside after requests couldn't be completed. ` +
-      "Their content isn't shown here. The originals normally remain in the raw record; " +
-      'where this context is itself the record (legacy mode), they were removed from it. You are clear to continue',
+      "Their content isn't shown here. The originals remain in the raw record. You are clear to continue",
     ), marker);
     assert.doesNotMatch(marker, /refus|filter|categor/i);
     assert.ok(!rig.texts(retry).some((t) => t.includes(SENTINEL)), 'the retry carries none of the category');

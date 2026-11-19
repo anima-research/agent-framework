@@ -3389,10 +3389,12 @@ function isGapNotice(rows: readonly StoredMessage[], hasBlock: (m: StoredMessage
  * each; every row of both carries the same non-null owner stamp
  * (`ownRowOf`) and the same audience stamp (`audience`), so a round isn't
  * paired with another writer's, and a row with no owner stamp, whose writer
- * is unknown, proves nothing; and none of those IDs is on any other call or result the
- * agent's record or window holds, so no other round, earlier, reused or
- * another writer's, can be the one the result answers. Anything else isn't
- * proven, and the result is shed as before, without crossing the notices.
+ * is unknown, proves nothing; every row of both is in the agent's own
+ * record, not only presented from another slot's, whose record isn't read;
+ * and none of those IDs is on any other call or result the agent's record
+ * or window holds, so no other round there, earlier, reused or another
+ * writer's, can be the one the result answers. Anything else isn't proven,
+ * and the result is shed as before, without crossing the notices.
  */
 function gapPairProven(
   cm: { getAllMessages(): StoredMessage[] },
@@ -3423,7 +3425,12 @@ function gapPairProven(
   // Each ID once as a call and once as a result, over the record and the
   // window (which can hold another slot's rows), each row counted once.
   const rows = new Map<MessageId, StoredMessage>();
-  for (const m of [...cm.getAllMessages(), ...window]) rows.set(m.id, m);
+  for (const m of cm.getAllMessages()) rows.set(m.id, m);
+  // A body from another slot's record (a persistent subconscious's view of
+  // its primary, say) can't be proven: that record, where the ID could be
+  // reused, isn't read here. Such a pair pairs only as on main.
+  if ([...call, ...result].some((m) => !rows.has(m.id))) return false;
+  for (const m of window) rows.set(m.id, m);
   const seen = [...rows.values()];
   const uses = (type: 'tool_use' | 'tool_result') => ids(seen, type).filter((id) => callIds.includes(id as string)).length;
   return uses('tool_use') === callIds.length && uses('tool_result') === callIds.length;
@@ -15271,7 +15278,10 @@ export class AgentFramework {
    * once the refusal clears. It opens "[tag] The N", as it did before, so a
    * reader matching that prefix still finds it. The originals stay in the
    * record on a presented window; a window that is still the record (legacy
-   * mode) removes them, and the marker says so. Returns the running count.
+   * mode) removes them. The marker says which, by the agent's mode when it
+   * is written, the mode of the shed just before it; an episode whose
+   * rewinds ran in both modes is described by its latest. Returns the
+   * running count.
    */
   private updateRewindMarker(
     agent: Agent,
@@ -15281,11 +15291,14 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
+    // The shed just before this call ran in the mode presents() gives now.
+    const kept = this.presents(agent)
+      ? `The originals remain in the raw record.`
+      : `This context is itself the record (legacy mode), so they were removed from it.`;
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} earlier turn(s) were set aside after ` +
-      `requests couldn't be completed. Their content isn't shown here. The originals ` +
-      `normally remain in the raw record; where this context is itself the record ` +
-      `(legacy mode), they were removed from it. You are clear to continue — if you ` +
+      `requests couldn't be completed. Their content isn't shown here. ${kept} ` +
+      `You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -35679,9 +35692,11 @@ export class AgentFramework {
    *      tool_use/tool_result pairing or an oversized attachment), retrying
    *      the same context is likely to fail the same way, and every new push
    *      event would wake the agent onto that same history. At the hard-down
-   *      threshold, automatically quarantine: shed the newest complete
-   *      exchange (the same forced-rewind primitive `/unstick` uses —
-   *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
+   *      threshold, automatically quarantine: shed the newest exchange (the
+   *      same forced-rewind primitive `/unstick` uses; shedNewestTurn takes
+   *      a tool result with its paired call where it finds or proves the
+   *      pair, and otherwise sheds the result alone, which can leave its
+   *      tool_use for membrane to answer with `[pending]`) and retry,
    *      bounded by the same rewind cap so the breaker can never eat the
    *      whole history.
    */

@@ -252,13 +252,14 @@ describe('a presented-window shed pairs a result with its call across system not
     assert.deepEqual(traced.map((t) => t.messageIds), [[call, result]]);
   });
 
-  it('a newer notice is passed over, and the exchange before it goes whole', async () => {
+  it('a newer notice is passed over, and the exchange before it goes whole across the notice between', async () => {
     const h = await boot();
-    const call = h.internals.addMessage('mira', [callBlock('a')]);
-    const result = h.internals.addMessage('user', [resultBlock('a')]);
+    const call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('a')]);
+    const between = h.internals.addMessage('user', [text('notice-between')], { system: true });
+    const result = storeOwnRow(h.agent('mira'), 'user', [resultBlock('a')]);
     const notice = h.internals.addMessage('user', [text('newer-notice')], { system: true });
     assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result, call]);
-    assert.equal(h.cm('mira').windowStatusOf(notice), 'in');
+    assert.deepEqual([between, notice].map((id) => h.cm('mira').windowStatusOf(id)), ['in', 'in']);
   });
 
   for (const stamped of [true, false]) {
@@ -313,8 +314,13 @@ describe('a presented-window shed pairs a result with its call across system not
       const h = await boot(shape === 'other-writer' ? { agents: { mira: { observes: ['oren'], foreignRounds: 'raw' } } } : {});
       h.internals.addMessage('user', [text('keep-before')]);
       const own = (participant: string, content: ContentBlock[]) => storeOwnRow(h.agent('mira'), participant, content);
-      if (shape === 'unresolved-reuse') { own('mira', [callBlock('a')]); own('mira', [callBlock('a')]); own('user', [resultBlock('a')]); }
-      if (shape === 'answered-earlier') { own('mira', [callBlock('a')]); own('user', [resultBlock('a')]); }
+      // An earlier result of 'a' and no other call, so only the count of
+      // results rejects the pair: in the record and the window
+      // (answered-earlier), or in the record only, set aside from the window
+      // (unresolved-reuse).
+      if (shape === 'answered-earlier') own('user', [resultBlock('a')]);
+      const earlier = shape === 'unresolved-reuse' ? own('user', [resultBlock('a')]) : undefined;
+      if (earlier) h.cm('mira').retractRows([earlier], { undone: true });
       if (shape === 'reused-call') own('mira', [callBlock('a')]);
       const call = own('mira', [callBlock('a'), ...(shape === 'incomplete' ? [callBlock('b')] : [])]);
       const between = shape === 'ordinary-turn' ? h.internals.addMessage('user', [text('ordinary')])
@@ -324,6 +330,7 @@ describe('a presented-window shed pairs a result with its call across system not
         ...(shape === 'mixed' ? [callBlock('b')] : [])];
       const result = shape === 'other-writer' ? storeOwnRow(h.agent('oren'), 'user', resultContent) : own('user', resultContent);
       assert.notEqual(h.cm('mira').ordinalOf(result), undefined, "the premise: mira's window holds the result");
+      if (earlier) assert.ok(h.cm('mira').getMessage(earlier) && h.cm('mira').ordinalOf(earlier) === undefined, 'the premise: the earlier result is in the record only');
       const { retracts, removals } = watchRetracts(h);
       const rec = h.internals.shedNewestTurn(h.agent('mira'));
       assert.deepEqual(rec?.removedIds, [result], 'the result body alone, as on main');
@@ -493,4 +500,77 @@ describe('a presented-window shed recovers what main recovered', () => {
     const internals = framework as unknown as Internals;
     assert.deepEqual(internals.shedNewestTurn(sub, new Set([call, result]))?.removedIds, [result, call]);
   });
+
+  // Two of the primary's rounds reuse ID 'x'. The subconscious's window
+  // keeps the first round's call and the second round's result, with a
+  // notice between; the other endpoints are set aside from its window and
+  // are in the primary's record, not its own. Its own record and window show
+  // one call and one result, so they can't prove the pair: rows from
+  // another slot's record pair across a notice only as on main, and the
+  // result goes alone.
+  it("a persistent subconscious doesn't pair another slot's rows across a notice", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-shed-window-sub-'));
+    dirs.push(dir);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: new WireMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.', foreignRounds: 'raw' },
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    } as never);
+    frameworks.push(framework);
+    await framework.start();
+    const scout = framework.getAgent('scout')!;
+    const sub = framework.getAgent('Subconscious')!;
+    const cm = sub.getContextManager();
+    const call1 = storeOwnRow(scout, 'scout', [callBlock('x')]);
+    const result1 = storeOwnRow(scout, 'user', [resultBlock('x', 'first')]);
+    const notice = storeOwnRow(sub, 'user', [text('notice')], { system: true });
+    const call2 = storeOwnRow(scout, 'scout', [callBlock('x')]);
+    const result2 = storeOwnRow(scout, 'user', [resultBlock('x', 'second')]);
+    cm.retractRows([result1, call2], { undone: true });
+    assert.deepEqual(cm.getPresentedMessages().map((m) => m.id), [call1, notice, result2], 'the premise: its window keeps one call and one result');
+    assert.ok(![call1, result1, call2, result2].some((id) => cm.getAllMessages().some((m) => m.id === id)), "and its own record holds none of the primary's rounds");
+    const internals = framework as unknown as Internals;
+    assert.deepEqual(internals.shedNewestTurn(sub)?.removedIds, [result2], 'the result alone, as on main');
+    assert.deepEqual([call1, notice].map((id) => cm.windowStatusOf(id)), ['in', 'in']);
+  });
+
+  // A collision in the window only: the primary's earlier result of 'a' is
+  // in the subconscious's window and not in its own record, which holds its
+  // own call and result of 'a' across a notice. Without it the pair goes
+  // whole; with it the result goes alone.
+  for (const collide of [false, true]) {
+    it(`a persistent subconscious's own pair across a notice, with a same-ID result in its window only (collision: ${collide})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-shed-window-sub-'));
+      dirs.push(dir);
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'),
+        membrane: new WireMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+        subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.', foreignRounds: 'raw' },
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 0,
+      } as never);
+      frameworks.push(framework);
+      await framework.start();
+      const sub = framework.getAgent('Subconscious')!;
+      const cm = sub.getContextManager();
+      const earlier = collide ? storeOwnRow(framework.getAgent('scout')!, 'user', [resultBlock('a')]) : undefined;
+      const call = storeOwnRow(sub, 'Subconscious', [callBlock('a')]);
+      const notice = storeOwnRow(sub, 'user', [text('notice')], { system: true });
+      const result = storeOwnRow(sub, 'user', [resultBlock('a')]);
+      if (earlier) {
+        assert.ok(cm.ordinalOf(earlier) !== undefined && !cm.getAllMessages().some((m) => m.id === earlier),
+          'the premise: in its window, not its record');
+      }
+      const internals = framework as unknown as Internals;
+      assert.deepEqual(internals.shedNewestTurn(sub)?.removedIds, collide ? [result] : [result, call]);
+      assert.equal(cm.windowStatusOf(notice), 'in');
+      assert.equal(cm.windowStatusOf(call), collide ? 'in' : 'undone');
+    });
+  }
 });
