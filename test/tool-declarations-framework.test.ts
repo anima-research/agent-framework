@@ -24,7 +24,6 @@ const tool = (name: string): ToolDefinition => ({
 });
 
 const prompt = (text: string) => `${text}\n${'Follow the task, and say what you did. '.repeat(2000)}`;
-/** The model the test membrane says takes no change in its context; every other model takes one. */
 const TAKES_NONE = 'model-that-takes-no-change';
 const resident = (name: string) => ({
   name,
@@ -777,7 +776,6 @@ describe('the way back to an earlier release', () => {
     const storePath = join(tempDir, 'store.chronicle');
     const withSubconscious = { subconscious: { enabled: true, systemPrompt: prompt('You attend.') } };
     try {
-      // This release: alpha declares in the residents' slot, beside a host's row, and the subconscious declares in its own.
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
         const subconscious = framework.getAgent('Subconscious')!;
@@ -789,7 +787,6 @@ describe('the way back to an earlier release', () => {
         assert.ok(changesIn((await subconscious.buildActivationRequest([tool('think'), tool('ponder')])).messages).length >= 2, "the premise: the subconscious's request carries the host's row and its own");
       }, storePath, withSubconscious);
 
-      // The step back, with the host stopped.
       const cli = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
       const recover = (...args: string[]) => spawnSync(process.execPath, [cli, '--store', storePath, '--remove-system-changes', ...args], { encoding: 'utf8' });
       const scoped = recover('--agent', 'alpha');
@@ -808,7 +805,6 @@ describe('the way back to an earlier release', () => {
       assert.deepEqual(result.slots, plan.slots, 'and it takes out what the dry run counted');
       assert.equal(result.targetBranch, 'back/1');
 
-      // An earlier release sends what each agent's slot and window hold, as stored.
       const store = JsStore.openOrCreate({ path: storePath });
       try {
         assert.equal(store.currentBranch().name, 'back/1', 'the new branch is selected');
@@ -834,7 +830,6 @@ describe('the way back to an earlier release', () => {
         store.close();
       }
 
-      // This release again.
       await withFramework([resident('alpha')], async (framework) => {
         const alpha = framework.getAgent('alpha')!;
         const subconscious = framework.getAgent('Subconscious')!;
@@ -863,7 +858,6 @@ describe('the way back to an earlier release', () => {
       const plan = await removeSystemChangesOffline({ storePath, dryRun: true });
       const first = plan.slots.find((slot) => slot.rows > 0)!;
       assert.ok(plan.slots.filter((slot) => slot.rows > 0).length >= 2, `the premise: two slots hold change rows: ${JSON.stringify(plan.slots)}`);
-      // The removals go slot by slot: the first slot's go through, and the next one's fails.
       let removals = 0;
       const failing = <Args extends unknown[], Out>(remove: (this: ContextManager, ...args: Args) => Out) =>
         function (this: ContextManager, ...args: Args): Out {
@@ -898,7 +892,6 @@ describe('the way back to an earlier release', () => {
     try {
       const seeded = JsStore.openOrCreate({ path: storePath });
       const strategy = new PassthroughStrategy();
-      // As a strategy's ingress chunking does: one shard for each block of a row of changes.
       (strategy as unknown as { chunkIngressMessage: unknown }).chunkIngressMessage = (_participant: string, content: ContentBlock[]) =>
         content.every((block) => block.type === 'system_change')
           ? { bodyGroupId: 'changes', shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) }

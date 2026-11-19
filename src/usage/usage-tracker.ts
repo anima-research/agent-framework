@@ -66,7 +66,6 @@ export interface PersistedUsageState {
   totals: SessionUsage;
   byAgent: Array<{ agentName: string; usage: SessionUsage; inferenceCount: number; ephemeral?: true }>;
   inferenceCount: number;
-  /** Each agent's count of answered requests (UsageTracker.requestCountOf); absent in a record from before it. */
   requestCounts?: Array<{ agentName: string; requestCount: number }>;
 }
 
@@ -200,11 +199,8 @@ export class UsageTracker {
     });
   }
 
-  /** A provider request of `agentName`'s own stream was answered: one round,
-   *  as membrane reports each round's usage once. Counted in memory, and
-   *  stored with the usage state at the stream's end. The judge's and the
-   *  suppression review's calls aren't counted, and its caller counts no
-   *  ephemeral agent's. */
+  /** A provider request of `agentName`'s own stream was answered: one round.
+   *  @internal For the framework's streams; not a host API. */
   onRequestAnswered(agentName: string): void {
     this.requestCounts.set(agentName, (this.requestCounts.get(agentName) ?? 0) + 1);
   }

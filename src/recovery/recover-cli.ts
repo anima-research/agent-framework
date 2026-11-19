@@ -146,7 +146,6 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options.removeSystemChanges) {
     if (!options.storePath) throw new Error(`--store is required\n\n${usage()}`);
-    // It covers every slot of the store, so it takes nothing that names one agent or what to take out of it.
     const agentScoped = [
       options.agentName && '--agent', options.messageId && '--message-id', options.contextId && '--context-id',
       options.messages !== undefined && '--messages', options.suppressMessageIds.length > 0 && '--suppress',

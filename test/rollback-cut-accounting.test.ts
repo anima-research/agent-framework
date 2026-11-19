@@ -353,7 +353,6 @@ describe("a rollback's accounting at the cut (#291, AF-7)", () => {
     const x = h.store('x');
     const y = h.store('y');
     const change = h.cm().addMessage('Host', [{ type: 'system_change', defineTools: [{ name: 'zz_tool', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] }], { source: 'api' });
-    // And scout's own change row, marked as the framework marks it.
     const own = h.cm().addMessage('system', [{ type: 'system_change', defineTools: [{ name: 'zz_own', description: 'ZZ', inputSchema: { type: 'object', properties: {} } }] }], { system: true, kind: 'system-change', agent: 'scout' } as never);
     h.cm().presentRows([x, y, change, own]);
     await assert.rejects(h.framework.rollbackToMessage('scout', { messageId: x }), (e: unknown) => {

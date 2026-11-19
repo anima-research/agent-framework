@@ -1050,7 +1050,6 @@ import {
 const FRAMEWORK_STATE_ID = 'framework/state';
 const headDeclarationId = (agentName: string) => `framework/head-declarations/${agentName}`;
 
-/** What the store holds as an agent's recorded head, read on the store's branch. */
 type RecordedHead = { kind: 'head'; head: HeadDeclaration } | { kind: 'none' } | { kind: 'not-a-head' } | { kind: 'unreadable' };
 /** Dendrite agent registry: live records, incarnation counters, held mail. */
 const AGENT_REGISTRY_STATE_ID = 'framework/dendrite';
@@ -5058,9 +5057,6 @@ export class AgentFramework {
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
   private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
-  /** The fail-safe's retry after a 400 membrane doesn't mark: per agent, the
-   *  400, until its next stream starts in the fallback form; then per that
-   *  stream, until its first event says whether it was accepted (failSafeOf). */
   private readonly probesNext = new WeakMap<Agent, Error>();
   private readonly probeStreams = new WeakMap<YieldingStream, Error>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
@@ -12125,7 +12121,6 @@ export class AgentFramework {
           throw new Error(`${config.name} was not created: ${verdict.refuse}`);
         }
       }
-      // Read before its context is taken from its source's, so the two agree.
       const inherited = this.inheritedHead(spec);
       let inherit = spec?.inherit;
       // Where the agent's own rows go, as the registry records it: an
@@ -15090,10 +15085,11 @@ export class AgentFramework {
    * of the agent's own window, in its order, leave it as an undone turn's
    * do (retractRows with `undone`), so no presentation point brings them
    * back, and the record keeps them, as the marker says. No other agent's
-   * window, nor its cache prefix or signed thinking, changes. A row the
-   * agent is never sent is passed over: a system_change row, a row a
-   * tune-out holds from residents (for an agent whose window leaves them
-   * out), and another agent's stored context injection. On a window that is
+   * window, nor its cache prefix or signed thinking, changes. A row that
+   * declares tools or system text, or that the agent isn't sent, is passed
+   * over: a system_change row, a row a tune-out holds from residents (for an
+   * agent whose window leaves them out), and another agent's stored context
+   * injection. On a window that is
    * still the record, the rows are removed from it, as before the index,
    * and leave every other window that held them.
    *
@@ -15107,10 +15103,10 @@ export class AgentFramework {
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
-    // In the window, the rows the agent is sent: a held row is in a
-    // resident's written-down window and left out by its view, as another
-    // agent's injection is (agentSees, the one rule main's #853 asks
-    // everywhere), and a system_change row is the host's.
+    // In the window, the rows that are turns the agent is sent: a held row is
+    // in a resident's written-down window and left out by its view, as
+    // another agent's injection is (agentSees, the one rule main's #853 asks
+    // everywhere), and a system_change row declares tools or system text.
     const passedOver = (m: StoredMessage): boolean => {
       const meta = (m.metadata ?? {}) as Record<string, unknown>;
       if (meta.system) return true;
@@ -15139,8 +15135,8 @@ export class AgentFramework {
       const { from: start } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
       const resultOfCarriedCall = body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start);
-      // A row the agent is never sent is passed over, unless it is the
-      // stored result of a call the request carried: the exchange goes whole.
+      // A row that passedOver names is passed over, unless it is the stored
+      // result of a call the request carried: the exchange goes whole.
       if (passedOver(all[i]!) && !resultOfCarriedCall) continue;
       if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
         && (wasCarried(start, i) || resultOfCarriedCall)) {
@@ -18861,7 +18857,6 @@ export class AgentFramework {
   // chronicle: a branch made from another carries only registered states, and
   // each registration costs a lookup at every branch made.
   private readonly registeredHeadStates = new Set<string>();
-  // The lines said for each agent's record, each once on a branch: kind and branch.
   private readonly headLinesSaid = new Map<string, Set<string>>();
 
   private readonly headDeclarations: HeadDeclarationStore = {
@@ -18882,7 +18877,6 @@ export class AgentFramework {
     return id;
   }
 
-  /** Says a line about an agent's record once on the store's branch. */
   private sayHeadLineOnce(agentName: string, kind: 'not-a-head' | 'unreadable', say: () => void): void {
     const said = this.headLinesSaid.get(agentName) ?? new Set<string>();
     const key = `${kind}\u0000${this.store.currentBranch().id}`;
@@ -18929,15 +18923,6 @@ export class AgentFramework {
     return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} only with thinkingBinding.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself`;
   }
 
-  /**
-   * The fail-safe, for a failed request that carried a declaration row: its
-   * request goes again at once. 'resend' for a refusal membrane marks as the
-   * change's, and the agent keeps to its head from now on. 'probe' for a 400
-   * membrane doesn't mark, which is no proof that the rows were the cause:
-   * the request goes once more in the fallback form, and only that
-   * request's acceptance keeps the agent to its head (settleProbe).
-   * Undefined leaves the failure to the error policy.
-   */
   private failSafeOf(agent: Agent, error: Error, carriedChange: boolean): 'resend' | 'probe' | undefined {
     if (!agent.takesChanges() || !carriedChange || !isMembraneError(error)) return undefined;
     if (error.systemChangeRefused === true) {
@@ -18947,8 +18932,6 @@ export class AgentFramework {
     return error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth' ? 'probe' : undefined;
   }
 
-  // The probe's request was accepted when its stream's first event is
-  // neither an error nor an abort.
   private settleProbe(agent: Agent, stream: YieldingStream, event: StreamEvent['type']): void {
     const refusal = this.probeStreams.get(stream);
     if (!refusal) return;
@@ -18972,22 +18955,12 @@ export class AgentFramework {
 
   private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
 
-  /**
-   * The head a new agent's record starts with: a copy of the one recorded by
-   * the running agent that `spec.inherit` names, when it names no checkpoint.
-   */
   private inheritedHead(spec: Pick<AgentSpec, 'inherit'> | undefined): HeadDeclaration | undefined {
     const source = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
     const head = source ? this.headStores.get(source)?.read(source.name) : undefined;
     return head ? copyHead(head) : undefined;
   }
 
-  /**
-   * An Agent for `config` over `contextManager`, as every place that makes
-   * one builds it, with its record of heads: in memory for a bounded job, in
-   * the store otherwise, starting on `inherited`, with nothing carried, where
-   * its context is a copy of its source's (inheritedHead).
-   */
   private constructAgent(config: AgentConfig, contextManager: ContextManager, spec: Pick<AgentSpec, 'lifetime'>, inherited?: HeadDeclaration): Agent {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
@@ -19008,7 +18981,6 @@ export class AgentFramework {
           { data: { changesRemoved: event.changesRemoved } });
       }
     }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'),
-    // An ephemeral run's requests aren't counted (the 'usage' case), so its head never moves for cost.
     () => (this.ephemeralAgents.has(agent) ? undefined : this.usageTracker.requestCountOf(agent.name)));
   }
 
@@ -21175,9 +21147,7 @@ export class AgentFramework {
         // rows, contextAgentOf) are its context, not the conversation, so the
         // seed leaves them out, as it had none before they were stored: a
         // compiled message whose stored rows are all marked so, by the
-        // compile's own account of where each message came from. The fork's
-        // record starts as a copy of the template's (constructAgent), so its
-        // first request declares what differs from that.
+        // compile's own account of where each message came from.
         const injectionRows = new Set(templateRows.filter((m) => contextAgentOf(m.metadata) !== undefined).map((m) => m.id));
         const compiled = compiledWhole.filter((_, i) => {
           const source = provenance?.messages[i];
@@ -31114,8 +31084,6 @@ export class AgentFramework {
                   // Marked as its turn's retry, as at the start's failure.
                   await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
                 } finally {
-                  // A retry that ends before its start takes the probe, as one held at admission, leaves it to no
-                  // later turn: held, it goes in the ordinary form, and a refusal there probes again.
                   if (this.probesNext.get(agent) === err) this.probesNext.delete(agent);
                 }
               } else {
@@ -31255,7 +31223,7 @@ export class AgentFramework {
             this.deadlineCuts.delete(agent.name);
             // Cumulative across the stream's rounds: replace, never sum.
             latestUsage = event.usage;
-            // membrane reports each round's usage once: one request answered, which read the head.
+            // membrane reports each round's usage once.
             if (!this.ephemeralAgents.has(agent)) this.usageTracker.onRequestAnswered(agent.name);
             // The stream's accumulated fresh input, which is what the
             // maxStreamTokens budget checks.

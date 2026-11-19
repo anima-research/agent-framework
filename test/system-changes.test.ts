@@ -27,7 +27,6 @@ describe('requestTokens', () => {
       { participant: 'user', content: [{ type: 'tool_result', toolUseId: 't', content: [{ type: 'image', source: source(opaque ? 'T'.repeat(1000) : '') }] }] },
     ];
     const strip = (value: unknown): unknown => JSON.parse(JSON.stringify(value), (key, v) => (key === 'data' || key === 'signature' || key === 'rawItem' ? undefined : v));
-    // An image, a generated image and the image in a tool result at 1600 each, and a document at 1000.
     const media = 3 * 1600 + 1000;
     const expected = jsonTokenEstimator(JSON.stringify({ system: head.system, tools: head.tools, messages: strip(messages(false)) })) + media;
     assert.equal(requestTokens(head, messages(true)), expected, 'every opaque payload left out, nested ones included, and each media block at its price');

@@ -8,8 +8,6 @@ export interface HeadDeclaration {
   system: string[];
 }
 
-/** An agent's record for a branch is its head alone, written when the head
- *  moves. */
 export interface HeadDeclarationStore {
   read(agentName: string): HeadDeclaration | null;
   write(agentName: string, head: HeadDeclaration): boolean;
@@ -19,7 +17,6 @@ export interface HeadDeclarationStore {
 export function memoryHeadDeclarations(branch: () => string): HeadDeclarationStore {
   const heads = new Map<string, HeadDeclaration>();
   const key = (agentName: string) => JSON.stringify([branch(), agentName]);
-  // An agent that has recorded nothing asks no branch of its context.
   return {
     read: (agentName) => (heads.size === 0 ? null : heads.get(key(agentName)) ?? null),
     write: (agentName, head) => { heads.set(key(agentName), head); return true; },
@@ -38,14 +35,8 @@ export function isHeadDeclaration(value: unknown): value is HeadDeclaration {
     && Array.isArray(system) && system.every((block: unknown) => typeof block === 'string');
 }
 
-/** The `kind` a change row's metadata carries beside `system: true`. */
 export const SYSTEM_CHANGE_KIND = 'system-change';
 
-/** The metadata a change row is stored with: agent-framework's marker for a
- *  row that isn't conversation, the agent it declares for, whose context it
- *  is (contextAgentOf), as a stored injection's mark names its agent, and the
- *  agent's count of answered requests when it was stored, which the rule for
- *  cost reads (carriedTokens). An agent with no count stores none. */
 export function systemChangeMetadata(
   agentName: string,
   requestCount?: number,
@@ -53,19 +44,12 @@ export function systemChangeMetadata(
   return { system: true, kind: SYSTEM_CHANGE_KIND, agent: agentName, ...(requestCount === undefined ? {} : { requestCount }) };
 }
 
-/** A change row's count of answered requests at its storing, from its mark
- *  (systemChangeMetadata). Undefined for a row with none: a copy of a
- *  context's row, which carries no metadata of its own, and a host's row. */
 export function storedRequestCount(metadata: unknown): number | undefined {
   if (metadata === null || typeof metadata !== 'object' || !('kind' in metadata) || metadata.kind !== SYSTEM_CHANGE_KIND) return undefined;
   const count = 'requestCount' in metadata ? metadata.requestCount : undefined;
   return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : undefined;
 }
 
-/** A move for cost's figures, each an estimate in tokens: what carrying has
- *  cost (`carried`), the cache write price over the read price less one
- *  (`k`), and what the move writes that the request would otherwise read
- *  (`extraNow`). The head moves when `carried >= k * extraNow`. */
 export interface CostFigures {
   carried: number;
   k: number;
@@ -89,23 +73,17 @@ export type DeclarationDifference =
  * such a row holds changes alone. Read from the blocks, whatever metadata the
  * row carries, since a copy of a context and a host's own row carry no mark.
  * A host's reader that takes conversation alone leaves such a row out, as it
- * leaves a stored injection out (storedInjectionMarkOf), and the readers of a
- * request's tail look past it.
+ * leaves a stored injection out (storedInjectionMarkOf).
  */
 export function isSystemChangeMessage(message: { content: readonly ContentBlock[] }): boolean {
   return Array.isArray(message.content) && message.content.some(isSystemChangeContent);
 }
 
-/** A message that declares tools or system text: one whose system changes
- *  remove or define a tool, or add system text. One whose changes carry only
- *  `effort` declares none. */
 export function isDeclarationRow(message: { content: readonly ContentBlock[] }): boolean {
   return Array.isArray(message.content) && message.content.some((block) => isSystemChangeContent(block)
     && ((block.removeTools?.length ?? 0) > 0 || (block.defineTools?.length ?? 0) > 0 || (block.addSystem?.length ?? 0) > 0));
 }
 
-/** The compiled messages that are declaration rows, by index: every one the
- *  compile holds, whoever stored it. */
 export function heldDeclarations(compiled: Pick<CompileResult, 'messages'>): Set<number> {
   const held = new Set<number>();
   compiled.messages.forEach((message, index) => {
@@ -114,8 +92,6 @@ export function heldDeclarations(compiled: Pick<CompileResult, 'messages'>): Set
   return held;
 }
 
-/** The stored rows the compile's declaration rows came from, by its own
- *  account of each message's source. */
 export function declarationRowIds(compiled: Pick<CompileResult, 'messages' | 'provenance'>): MessageId[] {
   const sources = compiled.provenance?.messages;
   return [...heldDeclarations(compiled)].flatMap((index) => {
@@ -128,16 +104,6 @@ export function copyHead(head: HeadDeclaration): HeadDeclaration {
   return { tools: JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[], system: [...head.system] };
 }
 
-/** What carrying the tool definitions that a move would take out has cost
- *  by the agent's count of answered requests (`count`), in tokens read. A
- *  definition is dead once a row removes or replaces it, if the head carries
- *  it or a row that the agent's context can remove carries it. Each dead
- *  definition counts once for each request since the row that killed it was
- *  stored (storedRequestCount). A row adds nothing that has no count:
- *  one that the agent's context can't read back, which its caller gives none,
- *  a copy's row and a host's row. Nor does one whose count is above `count`,
- *  as after a usage state that was reset. An addition, a row's own wrapping
- *  and system text add nothing. */
 export function carriedTokens(
   head: HeadDeclaration,
   rows: readonly { changes: readonly SystemChangeContent[]; removable: boolean; requestCount: number | undefined }[],
@@ -161,9 +127,6 @@ export function carriedTokens(
   return carried;
 }
 
-/** A request's tokens, as context-manager estimates JSON's (jsonTokenEstimator)
- *  over what a provider prices by its characters, and each media block, a tool
- *  result's included, at its own price (mediaBlockTokens). */
 export function requestTokens(head: HeadDeclaration, messages: readonly { content: readonly unknown[] }[]): number {
   return pricedTokens({ system: head.system, tools: head.tools, messages })
     + messages.reduce((tokens, message) => tokens + mediaTokens(message.content), 0);
@@ -201,11 +164,6 @@ function wireJson(value: unknown): string {
   return canonicalJson(JSON.parse(JSON.stringify(value) ?? 'null'));
 }
 
-// System text is a sequence, and a request carries a head's as one text, its
-// blocks joined (systemTextOf). The current blocks continue the effective
-// ones where their first blocks, one or more, join to the effective text;
-// the blocks after those are an addition. -1 where they don't: the current
-// blocks replace the effective ones.
 function continuedAt(effective: readonly string[], current: readonly string[]): number {
   if (effective.length === 0) return 0;
   const text = systemTextOf(effective);

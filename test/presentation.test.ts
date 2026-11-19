@@ -324,7 +324,6 @@ describe('the presentation module', () => {
     assert.deepEqual(second.heard.map((h) => h.id), [plain]);
     assert.equal(second.cutAt, voiced, "a row named as the agent would render as its own turn");
 
-    // So does a change of tools or system text, which the next start folds with the agent's head; one of effort alone joins.
     r.alive.delete('mira');
     r.presentation.presentAtEnd(r.mira);
     r.alive.add('mira');

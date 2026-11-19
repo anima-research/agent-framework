@@ -229,16 +229,12 @@ export class MockMembrane {
     return stream;
   }
 
-  /** What `takesToolOrSystemChanges` answers for every model: whether an
-   *  agent declares a later change of its tools or system text in its context. */
   takesChanges = false;
 
   takesToolOrSystemChanges(_model: string): boolean {
     return this.takesChanges;
   }
 
-  /** What `pricingFor` answers for every model: membrane's prices, a 1-hour
-   *  write rate among them from 0.10.4 on; none unless a test sets them. */
   prices: (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined = undefined;
 
   pricingFor(_model: string): (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined {

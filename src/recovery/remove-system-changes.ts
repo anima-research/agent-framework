@@ -27,33 +27,16 @@ type Reader = Pick<ContextManager, 'getMessageCount' | 'getMessageWindow'>;
 type Removals = Pick<ContextManager, 'removeMessage' | 'removeMessages'>;
 type StoredRow = ReturnType<ContextManager['getMessageWindow']>['messages'][number];
 
-/**
- * A message slot, and what it is read and changed through: the context of a
- * namespace that reads it, or, where no context of the store reads it, the
- * message store alone, since a context opened for the run would register a
- * state of its own on the branch.
- */
+// A context opened for the run would register a state of its own on the
+// branch, so a slot that no context of the store reads goes through the
+// message store alone.
 interface Slot {
   id: string;
   through: { namespace: string | undefined; isolate: boolean } | { messages: string | undefined };
 }
 
-/**
- * Take every row that changes tools or system text out of every message slot
- * of the store, onto a new branch made at the head of the current one, while
- * the host is stopped. A release before head declarations sends such a row as
- * stored, beside its own tools, or, with membrane 0.10.0 or later and a
- * formatter or adapter that can't send one, has membrane refuse the request,
- * so this is run before a step back to one; it also mends a store after a
- * step back made without it. Other
- * branches keep their rows. A row is picked by its content, as a request
- * counts it, a body of shards whole, since a host's own rows carry no mark.
- * The store writes to the branch it has selected, so the new branch is
- * selected for its removals. A failure that the command meets selects the
- * source branch again and keeps the new one for diagnosis. A run stopped
- * partway can leave the new branch selected and partly cleaned: the command
- * run again takes the rest out, onto a branch of its own.
- */
+// chronicle writes to the branch the store has selected, so the new branch is
+// selected for its removals.
 export async function removeSystemChangesOffline(options: RemoveSystemChangesOptions): Promise<RemoveSystemChangesResult> {
   const store = JsStore.openOrCreate({ path: options.storePath });
   try {
@@ -157,9 +140,6 @@ async function throughSlot<T>(store: JsStore, slot: Slot, use: (reader: Reader, 
   }
 }
 
-// Each body whose rows change tools or system text, read whole as a compile
-// renders it, a body of shards included: its places in the slot, its first
-// row and its last.
 function declarationBodies(reader: Reader): Array<{ from: number; to: number; first: StoredRow; last: StoredRow }> {
   const total = reader.getMessageCount();
   const bodies: Array<{ from: number; to: number; first: StoredRow; last: StoredRow }> = [];

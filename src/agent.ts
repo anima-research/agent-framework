@@ -198,23 +198,12 @@ type ChangeAnswering = Pick<Membrane, 'stream'> & {
   pricingFor?(model: string): (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined;
 };
 
-/** How a move of the head came about, as its trace says it (HeadEvent). */
 type Move = { why: 'adopted' | 'replaced' } | { why: 'unstored'; error: string } | { why: 'cost'; estimated: CostFigures };
 
-/** How a request carries the agent's changes: declared on its recorded head;
- *  on its current head, its record gone (a model that takes no change, or an
- *  agent kept to its head); or in the fallback form, the store left as it is
- *  (the fail-safe's retry, ActivationRequestOptions.changesLeftOut). */
 type ChangesIn = 'declared' | 'on-head' | 'left-out';
 
-/** A settled request: its compile, the head it carries, the declaration row
- *  it appends, if any, and whether it goes in the fallback form, every
- *  declaration row left out of its messages. */
 type Settled = { compiled: CompileResult; head: HeadDeclaration; declared?: NormalizedMessage; leftOut?: true };
 
-/** The compiles that one request settles with: `compile` is one told a head, and with `leftOut`, that the request
- *  leaves its declaration rows out; `onHead` is the compile for a request on a head, the one given where it was told
- *  that head or where nothing in it depends on the head. */
 type Compiles = {
   compile(head: HeadDeclaration, leftOut?: boolean): Promise<CompileResult>;
   onHead(compiled: CompileResult, head: HeadDeclaration): Promise<CompileResult>;
@@ -2961,20 +2950,15 @@ export class Agent {
     if (changes === 'left-out') return this.withoutDeclarationRows(compiled, current, compiles, previewRows);
     if (changes === 'on-head') return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compiles), current, compiles, previewRows);
     const settled = await this.settleOnRecord(compiled, current, record, dryRun, compiles, previewRows);
-    // What goes out folds to what the agent has now: the head it carries, with
-    // every declaration row in its messages. Otherwise it goes in the
-    // fallback form, which is right, and the next request tries again.
     const out = effectiveDeclaration(settled.head, [...settled.compiled.messages, ...previewRows, ...(settled.declared ? [settled.declared] : [])]
       .filter(isDeclarationRow).flatMap((message) => message.content.filter(isSystemChangeContent)));
     if (declarationDifference(out, current).kind === 'none') return settled;
     return this.withoutDeclarationRows(settled.compiled, current, compiles, previewRows);
   }
 
-  // A model that takes no change, or an agent kept to its head: its record
-  // goes, with the declaration rows its compile holds that its context can
-  // remove, as one move. context-manager's comparison baseline for
-  // `firstChanged`, and with `binds: true` its thinking-binding record, are
-  // the last committing compile's, so a removal compiles again.
+  // context-manager's comparison baseline for `firstChanged`, and with
+  // `binds: true` its thinking-binding record, are the last committing
+  // compile's, so a removal compiles again.
   private async leaveHead(
     compiled: CompileResult,
     current: HeadDeclaration,
@@ -2989,10 +2973,6 @@ export class Agent {
     return compile(current);
   }
 
-  // The fallback form: the agent's current tools and system text, with every
-  // declaration row left out of its messages and the compile told so. It
-  // reads nothing from the cache the recorded head wrote, and changes nothing
-  // in the store.
   private async withoutDeclarationRows(
     compiled: CompileResult,
     current: HeadDeclaration,
@@ -3024,8 +3004,7 @@ export class Agent {
     try {
       storeOwnRow(this, declared.participant, declared.content, systemChangeMetadata(this.name, this.requestsCounted?.()));
     } catch (error) {
-      // context-manager refuses a change between a tool call and its result:
-      // a row the store doesn't take moves the head instead.
+      // context-manager refuses a change between a tool call and its result.
       if (storedOfThrownWrite(error, (id) => this.contextManager.getMessage(id) !== null).length === 0) {
         return this.moveHead(compiled, recorded, current, { why: 'unstored', error: error instanceof Error ? error.message : String(error) }, dryRun, compiles);
       }
@@ -3047,9 +3026,6 @@ export class Agent {
     }
   }
 
-  // The effective declaration is the recorded head with every declaration
-  // row the compile holds folded in, in order, whoever stored it, and a
-  // preview's appended rows as the rows they stand in for will be.
   private declaredDifference(
     compiled: CompileResult,
     held: ReadonlySet<number>,
@@ -3062,11 +3038,7 @@ export class Agent {
     return { difference: declarationDifference(effectiveDeclaration(recorded, blocks), current) };
   }
 
-  // What carrying the definitions a move would take out has cost by the
-  // agent's count of answered requests (carriedTokens), read from the
-  // rows the compile holds: undefined for an agent with no count, whose head
-  // never moves for cost. A row's count is in its mark, which the agent's
-  // context reads back for a row of its own slot.
+  // The agent's context reads back a row of its own slot alone.
   private carriedOf(compiled: CompileResult, held: ReadonlySet<number>, recorded: HeadDeclaration): number | undefined {
     const count = this.requestsCounted?.();
     if (count === undefined) return undefined;
@@ -3085,14 +3057,6 @@ export class Agent {
     return carriedTokens(recorded, rows, count);
   }
 
-  // The rule for cost (report:acorn-2386-design): the head moves when
-  // carrying what a move would take out has cost about as much in cache reads
-  // as the move costs at this compile, `carried >= k * extraNow`. `extraNow`
-  // is what the move writes that the request would otherwise read: the head,
-  // and the messages before the compile's `firstChanged`. It moves only at a
-  // committing compile with a `firstChanged`, and on a model that may bind
-  // its thinking only where no kept thinking comes before it. With nothing
-  // dead, or a model membrane can't price, it never moves for cost.
   private costOfCarrying(compiled: CompileResult, carried: number, current: HeadDeclaration): CostFigures | undefined {
     if (carried === 0) return undefined;
     const k = this.writeOverRead();
@@ -3106,10 +3070,6 @@ export class Agent {
     return carried >= k * extraNow ? { carried, k, extraNow } : undefined;
   }
 
-  // k: the cache write price over the read price, less one, for this agent's
-  // model and cache lifetime, as membrane's cost lines price them. A 1-hour
-  // write takes membrane's 1-hour rate where it has one, and its 5-minute
-  // rate where it has none. Undefined where membrane can't price the model.
   private writeOverRead(): number | undefined {
     const membrane: ChangeAnswering = this.membrane;
     const pricing = membrane.pricingFor?.(this.model);
@@ -3146,7 +3106,6 @@ export class Agent {
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) return { compiled: this.withoutDeclarations(await onHead(compiled, current)), head: current };
     if (recorded && this.moveChangesNothing(compiled, recorded, current)) return { compiled, head: recorded };
-    // A move that can't record the head takes no row out.
     if (!this.headDeclarations.write(this.name, copyHead(current))) {
       const head = recorded ?? current;
       return { compiled: await onHead(compiled, head), head };
@@ -3156,13 +3115,10 @@ export class Agent {
     return { compiled: removed > 0 ? await compile(current) : await onHead(compiled, current), head: current };
   }
 
-  // A move that changes neither what the record declares nor a row is no move.
   private moveChangesNothing(compiled: CompileResult, recorded: HeadDeclaration, current: HeadDeclaration): boolean {
     return declarationDifference(effectiveDeclaration(recorded, []), current).kind === 'none' && this.removableDeclarationRows(compiled).length === 0;
   }
 
-  // The declaration rows a move takes out: those the compile holds that the
-  // agent's context can remove (removeDeclarationRows).
   private removableDeclarationRows(compiled: CompileResult): MessageId[] {
     return declarationRowIds(compiled).filter((id) => this.contextManager.getMessage(id) !== null);
   }
@@ -3174,9 +3130,8 @@ export class Agent {
     return { ...compiled, messages: compiled.messages.filter(kept), ...(provenance ? { provenance } : {}) };
   }
 
-  // Where no compile is at hand (one refused over budget), the declaration
-  // rows it holds are read from the window: those of this agent's own slot
-  // that are no other agent's context, which its view leaves out.
+  // The window is read before the view filter, so another agent's context
+  // rows, which the view leaves out, are left out here.
   private windowDeclarationRows(): MessageId[] {
     return this.contextManager.getPresentedMessages().flatMap((row) => {
       if (!isDeclarationRow(row) || this.contextManager.getMessage(row.id) === null) return [];
@@ -3185,8 +3140,8 @@ export class Agent {
     });
   }
 
-  // A row of a slot this agent's context only reads, such as the residents'
-  // slot the subconscious merges, isn't its to remove: it stays.
+  // The agent's context can't remove a row of a slot that it only reads, such
+  // as the residents' slot that the subconscious merges.
   private removeDeclarationRows(ids: readonly MessageId[]): number {
     const removed: MessageId[] = [];
     let rows = 0;

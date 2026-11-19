@@ -83,8 +83,6 @@ export class RoutedMembrane {
     return createMockResponse([{ type: 'text', text: this.completion }]);
   }
 
-  /** What `takesToolOrSystemChanges` answers for every model: whether an
-   *  agent declares a later change of its tools or system text in its context. */
   takesChanges = false;
 
   takesToolOrSystemChanges(_model: string): boolean {

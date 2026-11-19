@@ -81,16 +81,10 @@ const SYSTEM = `${SHORT}\n${'Follow the task, and say what you did. '.repeat(200
 
 const systemInjection = (text: string) => ({ namespace: 'module', position: 'system' as const, content: [{ type: 'text' as const, text }] });
 
-/** A membrane whose answer to whether a model takes a change in its context is `takes`. */
 const taking = (takes: boolean): Membrane => ({ takesToolOrSystemChanges: () => takes }) as unknown as Membrane;
 
-/** membrane's prices for a model, a 1-hour write rate among them from 0.10.4 on. */
 type Prices = ModelPricing & { cacheWrite1hPerMillion?: number };
 
-/** An agent on the fake context; `takes` is the membrane's answer for its
- *  model, no when left out. `pricing` is membrane's `pricingFor`, which a
- *  membrane before 0.10.4 lacks, and `counted` the agent's count of finished
- *  inferences, which an ephemeral run lacks. */
 function agentOn(
   context: ReturnType<typeof fakeContext>,
   config: Partial<AgentConfig> & { takes?: boolean; pricing?: () => Prices | undefined; counted?: () => number | undefined } = {},
@@ -99,7 +93,6 @@ function agentOn(
 ): Agent {
   const { takes = false, pricing, counted, ...settings } = config;
   const model = settings.model ?? 'test-model';
-  // membrane prices the model it's asked for: here the agent's own alone.
   const pricingFor = pricing && ((asked: string) => (asked === model ? pricing() : undefined));
   const membrane = { takesToolOrSystemChanges: () => takes, ...(pricingFor ? { pricingFor } : {}) } as unknown as Membrane;
   const agent = new Agent({ name: 'agent', model, systemPrompt: SYSTEM, ...settings }, context.cm, membrane);
@@ -755,22 +748,14 @@ describe('a change of tools or system text, declared in the context', () => {
   });
 
   describe('the rule for cost', () => {
-    // A read costs a tenth of the input price, a 5-minute write 1.25 times it
-    // and a 1-hour write twice it: k is 11.5 for 5 minutes and 19 for 1 hour.
     const PRICES: Prices = { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.5, cacheWrite1hPerMillion: 20, cacheReadPerMillion: 1, currency: 'USD' };
     const OLD = tool('a', 'a does a thing, as it was first written');
     const NEW = tool('a', 'a does a thing');
     const NOW: HeadDeclaration = { tools: [NEW], system: [SHORT] };
-    // A move at a compile that rewrites from the first message writes the head alone.
     const EXTRA = requestTokens(NOW, []);
     const DEAD = pricedTokens(OLD);
-    // The count at which carrying OLD reaches k times EXTRA, from a count of 0.
     const BAR = Math.ceil((19 * EXTRA) / DEAD);
 
-    /** An agent that recorded OLD as its head at a count of `counted`, then
-     *  declared NEW in its place at a count of `declaredAt`, so OLD is dead.
-     *  Both are 0 unless a case sets them. Each compile rewrites from
-     *  `firstChanged.at`, the first message unless a case sets it. */
     async function replaced(config: Parameters<typeof agentOn>[1] = {}, rows: Row[] = [said('user', 'hello')], counted = 0, declaredAt = counted) {
       const count = { n: counted };
       const firstChanged: { at: number | null } = { at: 0 };
@@ -933,7 +918,6 @@ describe('a change of tools or system text, declared in the context', () => {
     });
 
     it("counts nothing for a row that its context can't read back: not what it kills, and not what it defines", async () => {
-      // Each carries a count, so only the read back decides.
       const shared = (id: string, definition: ToolDefinition): Row => ({ id, participant: 'system', content: [{ type: 'system_change', defineTools: [definition] } as never], metadata: { system: true, kind: 'system-change', requestCount: 0 } });
       const between = tool('a', 'a does a thing, as it was written next');
       const rows = [said('user', 'hello'), shared('s1', between), shared('s2', NEW)];

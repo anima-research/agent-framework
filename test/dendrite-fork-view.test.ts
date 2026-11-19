@@ -33,10 +33,8 @@ const textOf = (m: { content: unknown }): string =>
   (m.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
 const change = (name: string): ContentBlock[] =>
   [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }];
-/** The tools the change rows of `messages` define, in order. */
 const defined = (messages: ReadonlyArray<{ content: readonly ContentBlock[] }>): string[] =>
   messages.flatMap((m) => m.content.flatMap((b) => (b.type === 'system_change' ? (b.defineTools ?? []).map((t) => t.name) : [])));
-/** A row stored in `agent`'s context and presented to it, as an arrival is. */
 const store = (framework: AgentFramework, agent: Agent, participant: string, content: ContentBlock[], metadata?: Parameters<ContextManager['addMessage']>[2]) => {
   const id = agent.getContextManager().addMessage(participant, content, metadata);
   (framework as unknown as { presentation: { afterStore(agent: Agent, ids: unknown[]): void } }).presentation.afterStore(agent, [id]);
