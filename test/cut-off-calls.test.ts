@@ -793,7 +793,6 @@ describe("the private think policy without a channel registry, across a restart,
   const UNNAMED_NORTH: Reply = { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
   for (const [label, settings, opts] of [
     ["proseRouting: 'disabled'", { proseRouting: 'disabled' }, {}],
-    ["proseRouting: 'explicit'", { proseRouting: 'explicit' }, {}],
     ['no channel registry', {}, { registry: false }],
   ] as const) {
     it(`says nothing of held words where they wouldn't have gone out anyway (${label})`, async () => {
@@ -881,7 +880,9 @@ describe("the private think policy without a channel registry, across a restart,
   });
 
   // The fresh reader's R4 finds: explicit routing sends a `>>` destination's
-  // words, and a destination with no words after it sends nothing.
+  // words, and a destination with no words after it sends nothing. R5-1:
+  // unprefixed words go somewhere too, to the turn's sticky target or back to
+  // the agent as a draft, so a held round's are told of as well.
   it("says the held round's words weren't posted under explicit routing when they had a >> destination", async () => {
     const cutTo: Reply = { xml: '>>world:commons Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
     const pub = await turn('xml', [XML_EAST_ROUND, cutTo], { proseRouting: 'explicit' }, { targets: ['world:commons'] });
@@ -890,6 +891,26 @@ describe("the private think policy without a channel registry, across a restart,
     assert.ok(!run.routed.some((t) => t.includes('Now north')));
     assert.ok(afterCut(run).includes(HELD));
   });
+
+  const XML_TARGET_EAST: Reply = { xml: '>>world:commons Heading out.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  const NAMED_NORTH: Reply = { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">north</parameter>\n</invoke>\n<invoke name="', stop: 'max_tokens' };
+  for (const [cutLabel, cutReply] of [['an unnamed cut', UNNAMED_NORTH], ['a named cut', NAMED_NORTH]] as const) {
+    it(`says the held round's unprefixed words weren't posted under explicit routing with a sticky target (${cutLabel})`, async () => {
+      const pub = await turn('xml', [XML_TARGET_EAST, cutReply], { proseRouting: 'explicit' }, { targets: ['world:commons'] });
+      assert.ok(pub.routed.includes('Now north, everyone.'), `premise: the sticky target routes them: ${pub.routed.join(' | ')}`);
+      const run = await turn('xml', [XML_TARGET_EAST, cutReply], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
+      assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
+      assert.ok(afterCut(run).includes(HELD));
+    });
+
+    it(`says the held round's unprefixed words weren't posted under explicit routing with no target yet (${cutLabel})`, async () => {
+      const pub = await turn('xml', [XML_EAST_ROUND, cutReply], { proseRouting: 'explicit' });
+      assert.ok(afterCut(pub).includes('no destination prefix'), 'premise: without the policy they bounce, with a notice');
+      const run = await turn('xml', [XML_EAST_ROUND, cutReply], { ...PRIVATE, proseRouting: 'explicit' });
+      assert.ok(!afterCut(run).includes('no destination prefix'), 'premise: held back, they never reach the bounce');
+      assert.ok(afterCut(run).includes(HELD));
+    });
+  }
 
   for (const [label, xml] of [
     ['a >> destination with no words', '>>world:commons\n\n<function_calls>\n<invoke name="'],
@@ -901,6 +922,17 @@ describe("the private think policy without a channel registry, across a restart,
       assert.ok(!afterCut(run).includes(HELD));
     });
   }
+
+  // R5-2: any envelope of the cut round that would have gone out counts, not
+  // only its last.
+  it("says the held round's words weren't posted when a hybrid >>>skip_reply followed them in the cut round", async () => {
+    const mixed: Reply = { xml: 'Now north, everyone.\n>>>skip_reply An aside.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const pub = await turn('xml', [XML_EAST_ROUND, mixed], { proseRouting: 'hybrid' });
+    assert.ok(pub.routed.some((t) => t.includes('Now north, everyone.')), `premise: the words before the aside route: ${pub.routed.join(' | ')}`);
+    const run = await turn('xml', [XML_EAST_ROUND, mixed], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
+    assert.ok(afterCut(run).includes(HELD));
+  });
 
   it("says nothing of held words when a hybrid cut held only a >>> destination with no words", async () => {
     const headerOnly: Reply = { xml: '>>>world:commons\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
