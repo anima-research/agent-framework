@@ -167,14 +167,15 @@ export type TraceEvent =
       estimated: { carried: number; k: number; extraNow: number };
     })
   | (TraceEventBase & {
-      /** A request whose system change was refused goes again on the head. */
+      /** A request that carried a system change was refused, so the agent keeps to its head until it is built again. */
       type: 'head:resend';
       agentName: string;
       /** The refusal's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
-      /** How many of the agent's replies it noted to go without their thinking, which was signed under a prefix that
-       *  held a system change its requests on the head leave out. */
-      thinkingSetAside: number;
+      /** What took the change as the cause: membrane, which marked the refusal as the change's, so the request went
+       *  again on the head; or a retry of the request in the fallback form, with no system change, which was accepted
+       *  after a 400 membrane didn't mark. */
+      diagnosis: 'membrane' | 'retry';
     })
   | (TraceEventBase & {
       /**

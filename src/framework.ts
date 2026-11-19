@@ -106,7 +106,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
-import { copyHead, isHeadRecord, isSystemChangeMessage, memoryHeadDeclarations, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent, type HeadRecord } from './system-changes.js';
+import { copyHead, isDeclarationRow, isHeadRecord, memoryHeadDeclarations, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent, type HeadRecord } from './system-changes.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -4323,8 +4323,6 @@ interface StreamRequestNotes {
   note: (rows: readonly SentRow[]) => boolean;
   rounds: RoundRow[];
   stopped: boolean;
-  noteDropped?: (messageIds: readonly MessageId[]) => boolean;
-  carried?: ReadonlySet<MessageId>;
 }
 
 const SUBCONSCIOUS_MODEL_FIELDS = ['physicalWindowTokens', 'thinkingBinding'] as const satisfies ReadonlyArray<keyof AgentConfig>;
@@ -5092,7 +5090,11 @@ export class AgentFramework {
   /** Per live stream that can be noted, its rows so far after the compiled messages (noteRoundSent). */
   private readonly streamRequestNotes = new WeakMap<YieldingStream, StreamRequestNotes>();
   private readonly streamCarried = new WeakMap<YieldingStream, Set<MessageId>>();
-  private readonly streamsHandedChange = new WeakSet<YieldingStream>();
+  /** The fail-safe's retry after a 400 membrane doesn't mark: per agent, the
+   *  400, until its next stream starts in the fallback form; then per that
+   *  stream, until its first event says whether it was accepted (failSafeOf). */
+  private readonly probesNext = new WeakMap<Agent, Error>();
+  private readonly probeStreams = new WeakMap<YieldingStream, Error>();
   /** Per pending round's blocks (pendingAssistantBlocks' value), what membrane held as that round's reply
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
@@ -18959,40 +18961,45 @@ export class AgentFramework {
     return agent.thinkingBindingOption() ? `, ${said}` : `, ${said} only with thinkingBinding.binds: true; left out, the request still carries it, under a prefix it wasn't signed under: with thinkingBinding.dropBlock the provider drops it from each request that carries it, and without it an account that enforces the binding refuses each such request and one that doesn't decides for itself`;
   }
 
-  private keepToHeadAfterRefusal(agent: Agent, error: Error, carriedChange: boolean, stream?: YieldingStream): boolean {
-    if (!agent.takesChanges() || !carriedChange) return false;
-    const recognised = isMembraneError(error) && error.systemChangeRefused === true;
-    const refused = isMembraneError(error) && error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth';
-    if (!recognised && !refused) return false;
-    agent.keepToHeadUntilBuiltAgain();
-    const setAside = this.setAsideThinkingSignedOverChanges(agent, stream);
-    const thinking = setAside.ids.length === 0 ? ''
-      : setAside.noted ? `, and sets aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change`
-      : `; the note setting aside the thinking of ${setAside.ids.length} of its replies signed under a prefix that held a system change didn't land, so, where its head didn't move with the refusal (a move sets every earlier reply's thinking aside), its requests can carry that thinking until those replies leave its window or it's built again, and without thinkingBinding.dropBlock an account that enforces the binding refuses them`;
-    console.error(`[head-declarations] ${agent.name}: a request carrying a system change was refused, so it declares on its head until it's built again, by a restart of the host or by creating the agent again${thinking}; a model that refuses system changes belongs on membrane's list of models that refuse them (Membrane.takesToolOrSystemChanges): ${error.message}`);
-    this.opsAlert('head-resend', agent.name,
-      `${recognised ? 'membrane refused a system change' : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one"}, so it goes again on the agent's head${setAside.ids.length > 0 ? thinking : this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}.${recognised ? " A model that refuses system changes belongs on membrane's list of models that refuse them (Membrane.takesToolOrSystemChanges); where membrane refused the change before sending it, send through a formatter and an adapter that send system changes (a wrapping adapter must declare sendsSystemChanges too)." : ' The 400 may not be about the change.'} The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
-      { data: { ...(recognised ? {} : { httpStatus: 400 }), ...(setAside.ids.length > 0 ? { repliesSignedOverChanges: setAside.ids.length, noted: setAside.noted } : {}) } });
-    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message, thinkingSetAside: setAside.noted ? setAside.ids.length : 0 });
-    return true;
+  /**
+   * The fail-safe, for a failed request that carried a declaration row: its
+   * request goes again at once. 'resend' for a refusal membrane marks as the
+   * change's, and the agent keeps to its head from now on. 'probe' for a 400
+   * membrane doesn't mark, which is no proof that the rows were the cause:
+   * the request goes once more in the fallback form, and only that
+   * request's acceptance keeps the agent to its head (settleProbe).
+   * Undefined leaves the failure to the error policy.
+   */
+  private failSafeOf(agent: Agent, error: Error, carriedChange: boolean): 'resend' | 'probe' | undefined {
+    if (!agent.takesChanges() || !carriedChange || !isMembraneError(error)) return undefined;
+    if (error.systemChangeRefused === true) {
+      this.keepToHead(agent, error, 'membrane');
+      return 'resend';
+    }
+    return error.httpStatus === 400 && error.type !== 'context_length' && error.type !== 'auth' ? 'probe' : undefined;
   }
 
-  private setAsideThinkingSignedOverChanges(agent: Agent, stream: YieldingStream | undefined): { ids: MessageId[]; noted: boolean } {
-    const notes = stream ? this.streamRequestNotes.get(stream) : undefined;
-    if (!notes?.noteDropped) return { ids: [], noted: false };
-    const sent = new Set<MessageId>([...(notes.carried ?? []), ...notes.rounds.flatMap((row) => (row.id === undefined ? [] : [row.id]))]);
-    const cm = agent.getContextManager();
-    const ids: MessageId[] = [];
-    let afterChange = false;
-    for (const row of cm.windowMode() === 'presented' ? cm.getPresentedMessages() : cm.getAllMessages()) {
-      if (!sent.has(row.id)) continue;
-      if (isSystemChangeMessage(row)) afterChange = true;
-      else if (afterChange && agent.isOwnParticipant(row.participant) && row.content.some((b) => ['thinking', 'redacted_thinking'].includes((b as { type?: string }).type ?? ''))) ids.push(row.id);
-    }
-    if (ids.length === 0) return { ids, noted: false };
-    let noted = false;
-    try { noted = notes.noteDropped(ids); } catch (error) { console.error(`[head-declarations] ${agent.name}: the note setting aside thinking signed under a system change threw:`, error); }
-    return { ids, noted };
+  // The probe's request was accepted when its stream's first event is
+  // neither an error nor an abort.
+  private settleProbe(agent: Agent, stream: YieldingStream, event: StreamEvent['type']): void {
+    const refusal = this.probeStreams.get(stream);
+    if (!refusal) return;
+    this.probeStreams.delete(stream);
+    if (event !== 'error' && event !== 'aborted') this.keepToHead(agent, refusal, 'retry');
+  }
+
+  private keepToHead(agent: Agent, error: Error, diagnosis: 'membrane' | 'retry'): void {
+    agent.keepToHeadUntilBuiltAgain();
+    const cause = diagnosis === 'membrane'
+      ? "membrane refused a system change, and the request went again on the agent's head"
+      : "a 400 membrane doesn't recognise as a refused system change ended a request that carried one, and the request went again in the fallback form, on the agent's current tools and system text with no system change, and was accepted";
+    console.error(`[head-declarations] ${agent.name}: ${cause}, so it keeps to its head until it's built again, by a restart of the host or by creating the agent again; a model that refuses system changes belongs on membrane's list of models that refuse them (Membrane.takesToolOrSystemChanges): ${error.message}`);
+    this.opsAlert('head-resend', agent.name,
+      `${cause}${this.thinkingSetAside(agent, 'which can set aside the thinking the request held')}.${diagnosis === 'membrane'
+        ? " A model that refuses system changes belongs on membrane's list of models that refuse them (Membrane.takesToolOrSystemChanges); where membrane refused the change before sending it, send through a formatter and an adapter that send system changes (a wrapping adapter must declare sendsSystemChanges too)."
+        : " That is an inference from one retry: the 400 may not be about the change. A model that refuses system changes belongs on membrane's list of models that refuse them (Membrane.takesToolOrSystemChanges)."} The agent keeps to its head until it's built again, so until then each change to its tools or system text rewrites its cache. A restart of the host, or creating the agent again, has it declare changes again: ${error.message}`,
+      { data: diagnosis === 'retry' ? { httpStatus: 400 } : {} });
+    this.emitTrace({ type: 'head:resend', agentName: agent.name, error: error.message, diagnosis });
   }
 
   private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
@@ -20211,7 +20218,6 @@ export class AgentFramework {
               const injected = currentState.supportsInjectedMessages === true ? midTurnInjections.map((injection) => injection.id) : [];
               for (const id of [replyId, resultsId, ...injected]) if (id !== undefined) carried.add(id);
             }
-            if (midTurnInjections.some(isSystemChangeMessage)) this.streamsHandedChange.add(currentState.stream);
             currentState.stream.provideToolResults(
               submitted,
               midTurnInjections.length > 0 ? { injectedMessages } : undefined,
@@ -28859,6 +28865,8 @@ export class AgentFramework {
       if (carry && this.heardSince(agent, routing, carry.read)) carry = undefined;
       const streamCarry: TurnCarry = { silence: carry?.silence ?? null, sends: carry?.sends ?? null, read: lastHeardAt };
       compileBaseline = { progress: this.compressionProgressOf(agent), settings: agent.contextSettingsChanges() };
+      const refusal = this.probesNext.get(agent);
+      this.probesNext.delete(agent);
       const {
         stream,
         request: compiledRequest,
@@ -28872,6 +28880,7 @@ export class AgentFramework {
         noteThinkingDropped,
         carriedBodies,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
+        ...(refusal ? { changesLeftOut: true } : {}),
         silentHeartbeat: trigger?.silentHeartbeat,
         // This turn's retries are the framework's (errorPolicy below), not
         // membrane's inside each attempt.
@@ -28879,14 +28888,9 @@ export class AgentFramework {
         inferenceBounds: this.inferenceBounds,
       });
       if (trigger) delete (trigger as MarkedRequest)[BUDGET_WAIT];
+      if (refusal) this.probeStreams.set(stream, refusal);
       // Each later round this stream sends is noted as it goes (noteRoundSent).
-      if (noteRequestSent) {
-        this.streamRequestNotes.set(stream, {
-          note: noteRequestSent, rounds: [], stopped: false,
-          ...(noteThinkingDropped ? { noteDropped: noteThinkingDropped } : {}),
-          ...(carriedBodies ? { carried: carriedBodies } : {}),
-        });
-      }
+      if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership and admission again.
@@ -29709,6 +29713,7 @@ export class AgentFramework {
           break;
         }
         this.touchEphemeralRun(agent.name, true);
+        this.settleProbe(agent, stream, event.type);
         // The model's content in a round, or its retry after a refusal, comes
         // after the boundary that may have moved the turn's locus: show the
         // round where it is, before its traces name the channel. The results
@@ -31078,16 +31083,16 @@ export class AgentFramework {
             const retry = retryOf(trigger);
             const asTransient = this.takeAsTransient(agent.name, err, trigger);
 
-            const onHead = this.keepToHeadAfterRefusal(agent, err,
-              compiledRequest?.messages.some(isSystemChangeMessage) === true || this.streamsHandedChange.has(stream), stream);
+            const failSafe = this.failSafeOf(agent, err, compiledRequest?.messages.some(isDeclarationRow) === true);
+            const goesAgain = failSafe !== undefined;
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
-            if (!onHead && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
+            if (!goesAgain && ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
-            const statedWait = onHead || ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
+            const statedWait = goesAgain || ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
             if (statedWait === 'held') {
               this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -31097,7 +31102,7 @@ export class AgentFramework {
             const cuts = isDeadlineExpiry(err) ? this.deadlineCuts.get(agent.name) ?? 0 : undefined;
             // The earlier failures the policy counts, which the wait's nextTry follows.
             const policyAttempt = cuts ?? attempt;
-            const action: ErrorAction = onHead ? { retry: true, delayMs: 0 }
+            const action: ErrorAction = goesAgain ? { retry: true, delayMs: 0 }
               : statedWait === 'fail' || (isRearmed(trigger) && (!gotPartway(streamRouting) || (isDeadlineExpiry(err) && !asTransient)))
                 ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, policyAttempt);
             if (action.retry && cuts !== undefined) this.deadlineCuts.set(agent.name, cuts + 1);
@@ -31134,6 +31139,7 @@ export class AgentFramework {
                   }
                   return;
                 }
+                if (failSafe === 'probe') this.probesNext.set(agent, err);
                 // Marked as its turn's retry, as at the start's failure.
                 await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
               } else {

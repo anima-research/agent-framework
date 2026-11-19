@@ -82,6 +82,11 @@ export interface ActivationRequestOptions {
   /** The framework's inferenceBounds, resolved: the stream gets their phase
    *  bounds and flat bound. None when left out. */
   inferenceBounds?: InferenceBounds | null;
+  /** The request goes in the fallback form, on the agent's current tools and
+   *  system text with every declaration row left out of its messages, and
+   *  declares nothing: it stores no row and moves no head for its changes.
+   *  @internal For the framework's fail-safe; not a host API. */
+  changesLeftOut?: true;
 }
 
 /** A compile's render stats, as context-manager's `getRenderStats()` types
@@ -199,6 +204,12 @@ type Move = { why: 'adopted' | 'replaced' | 'unstored' } | { why: 'cost'; estima
 
 /** What carrying the definitions a move would take out has cost by now. */
 type Carrying = { dead: number; carried: number; count: number };
+
+/** How a request carries the agent's changes: declared on its recorded head;
+ *  on its current head, its record gone (a model that takes no change, or an
+ *  agent kept to its head); or in the fallback form, the store left as it is
+ *  (the fail-safe's retry, ActivationRequestOptions.changesLeftOut). */
+type ChangesIn = 'declared' | 'on-head' | 'left-out';
 
 /** A settled request: its compile, the head it carries, the declaration row
  *  it appends, if any, and whether it goes in the fallback form, every
@@ -2264,7 +2275,8 @@ export class Agent {
           : undefined,
       );
     };
-    let compiledWith = record?.head ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    const changes: ChangesIn = options.changesLeftOut ? 'left-out' : takes ? 'declared' : 'on-head';
+    let compiledWith = (changes === 'left-out' ? undefined : record?.head) ?? this.currentHead(availableTools, prospectiveSystemInjections);
     let first: CompileResult;
     try {
       first = await compile(compiledWith);
@@ -2279,7 +2291,7 @@ export class Agent {
       kvUnified || this.thinkingBinds ? compiledWith : null,
       availableTools,
       record,
-      takes,
+      changes,
       options.dryRun === true,
       compile,
       options.appendedMessages ?? [],
@@ -2930,13 +2942,14 @@ export class Agent {
     compiledWith: HeadDeclaration | null,
     availableTools: ToolDefinition[],
     record: HeadRecord | null,
-    takes: boolean,
+    changes: ChangesIn,
     dryRun: boolean,
     compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
     previewRows: readonly NormalizedMessage[],
   ): Promise<Settled> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
-    if (!takes) return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compile), current, compile);
+    if (changes === 'left-out') return this.withoutDeclarationRows(compiled, current, compile);
+    if (changes === 'on-head') return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compile), current, compile);
     const settled = await this.settleOnRecord(compiled, compiledWith, current, record, dryRun, compile, previewRows);
     // What goes out folds to what the agent has now: the head it carries, with
     // every declaration row in its messages. Otherwise it goes in the

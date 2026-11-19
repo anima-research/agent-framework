@@ -115,7 +115,7 @@ async function pollUntil(cond: () => boolean, timeoutMs = 10_000): Promise<boole
 
 const usageOf = (n: number) => ({ inputTokens: 10 + n, outputTokens: 5, cacheCreationTokens: 200 + n, cacheReadTokens: 3000 + n });
 
-async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; third?: boolean; refuseLater?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
+async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest) => Error | undefined; second?: string[]; effort?: 'high'; third?: boolean; refuseLater?: boolean; providerHold?: () => { holdMs: number; reason: string }; asFork?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
   const membrane = new MockMembrane();
   membrane.takesChanges = true;
@@ -163,9 +163,11 @@ async function turns(opts: { binds: boolean; refuse: (request: NormalizedRequest
     await send('first', 1);
     const agent = framework.getAgent('resident')!;
     tools.names = opts.second ?? ['a', 'b'];
+    if (opts.effort) (framework as unknown as { addMessage(participant: string, content: ContentBlock[]): string }).addMessage('system', [{ type: 'system_change', effort: opts.effort } as unknown as ContentBlock]);
     await send('second', 2);
     const afterSecond = {
       onHead: !agent.takesChanges(),
+      moved: traces.filter((t) => t.type === 'head:moved').map((t) => (t as { why: string }).why),
       undoDepth: framework.getUndoRedoState('resident').undoDepth,
       waitRecorded: internals.providerWaits.active('resident', 'test-model') !== undefined,
     };
@@ -229,21 +231,38 @@ describe('the fail-safe for a refused change', () => {
     assert.equal(run.onHead, true);
   });
 
-  it('resends after a 400 membrane doesn\'t recognise, binding or not, and says so to the operator', async () => {
+  it("goes once more in the fallback form after a 400 membrane doesn't recognise, and keeps to its head once that request is accepted, saying so to the operator", async () => {
     for (const binds of [true, false]) {
-      const run = await turns({ binds, refuse: (r) => (carriesChange(r) ? refusal(false) : undefined) });
-      assert.equal(run.calls.length, 3, `binds ${binds}: a resend`);
-      assert.ok(toolNames(run.calls[2]!).includes(B) && !carriesChange(run.calls[2]!));
-      assert.equal(run.onHead, true);
+      const run = await turns({ binds, refuse: (r) => (carriesChange(r) ? refusal(false) : undefined), third: true });
+      assert.equal(run.calls.length, 4, `binds ${binds}: the adopting turn, the refused request, its retry, the third turn`);
+      assert.ok(toolNames(run.calls[2]!).includes(B) && !carriesChange(run.calls[2]!), 'the retry went on the current tools with no change row');
+      assert.deepEqual(run.moved, ['adopted'], 'and moved no head');
+      assert.equal(run.onHead, true, 'its acceptance keeps the agent to its head');
+      assert.ok(toolNames(run.calls[3]!).includes(B) && !carriesChange(run.calls[3]!), 'so the next turn goes out on the current head');
       assert.deepEqual(run.policyCalls, []);
       const alerts = run.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend');
       assert.equal(alerts.length, 1, `binds ${binds}: one operator line`);
       const alert = alerts[0] as { message: string; data?: { httpStatus?: number } };
       assert.match(alert.message, /role system not accepted here/, 'quoting the 400');
+      assert.match(alert.message, /went again in the fallback form, on the agent's current tools and system text with no system change, and was accepted/);
+      assert.match(alert.message, /That is an inference from one retry: the 400 may not be about the change/);
       assert.match(alert.message, /keeps to its head until it's built again/);
       assert.equal(/can set aside the thinking/.test(alert.message), binds, `binds ${binds}: the thinking's cost said only where it can be paid`);
       assert.equal(alert.data?.httpStatus, 400);
+      assert.deepEqual(run.traces.filter((t) => t.type === 'head:resend').map((t) => (t as { diagnosis: string }).diagnosis), ['retry']);
     }
+  });
+
+  it("leaves the agent as it was when its retry in the fallback form is refused too, and the error policy has that refusal", async () => {
+    const run = await turns({ binds: true, refuse: () => refusal(false), third: true });
+    assert.equal(run.calls.length, 4, 'the adopting turn, the refused request, its retry, the third turn');
+    assert.equal(carriesChange(run.calls[2]!), false, 'the retry carried no change row');
+    assert.equal(run.onHead, false, 'the agent still declares its changes');
+    assert.deepEqual(run.moved, ['adopted'], 'and its record stays');
+    assert.deepEqual(run.policyCalls, [1], "the policy saw the retry's refusal as attempt 1, and nothing of the first");
+    assert.equal(resends(run.traces), 0);
+    assert.equal(run.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend').length, 0, 'and no operator line');
+    assert.equal(carriesChange(run.calls[3]!), true, 'the third turn declares the change again');
   });
 
   it("tells the operator of a refusal membrane recognises, with the remedy, once in the agent's build", async () => {
@@ -252,7 +271,7 @@ describe('the fail-safe for a refused change', () => {
     assert.equal(carriesChange(run.calls.at(-1)!), false, 'the premise: the third turn, after its tools changed again, carried no change to refuse');
     const alerts = run.traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string; data?: { httpStatus?: number } }>;
     assert.equal(alerts.length, 1, 'one operator line for the build');
-    assert.match(alerts[0]!.message, /membrane refused a system change, so it goes again on the agent's head/);
+    assert.match(alerts[0]!.message, /membrane refused a system change, and the request went again on the agent's head/);
     assert.match(alerts[0]!.message, /keeps to its head until it's built again/);
     assert.match(alerts[0]!.message, /belongs on membrane's list of models that refuse them \(Membrane\.takesToolOrSystemChanges\); where membrane refused the change before sending it, send through a formatter and an adapter that send system changes/);
     assert.equal(alerts[0]!.data?.httpStatus, undefined, 'naming no 400 of its own');
@@ -283,13 +302,18 @@ describe('the fail-safe for a refused change', () => {
     });
   }
 
-  it('leaves a refused request that carried no change to the error policy, whatever the refusal', async () => {
-    const run = await turns({ binds: false, second: ['a'], refuse: () => refusal(true) });
-    assert.equal(run.calls.length, 2, 'no resend');
-    assert.equal(carriesChange(run.calls[1]!), false);
-    assert.equal(run.onHead, false);
-    assert.equal(resends(run.traces), 0);
-    assert.deepEqual(run.policyCalls, [0], 'the error policy had it');
+  it('leaves a refused request that carried no declaration row to the error policy, whatever the refusal: no change, or one of its effort alone', async () => {
+    for (const effort of [undefined, 'high'] as const) {
+      for (const marked of [true, false]) {
+        const what = `${effort ? 'an effort change alone' : 'no change'}, ${marked ? 'a refusal membrane marks' : "a 400 it doesn't"}`;
+        const run = await turns({ binds: false, second: ['a'], ...(effort ? { effort } : {}), refuse: () => refusal(marked) });
+        assert.equal(carriesChange(run.calls[1]!), effort !== undefined, `${what}: the premise`);
+        assert.equal(run.calls.length, 2, `${what}: no resend`);
+        assert.equal(run.onHead, false);
+        assert.equal(resends(run.traces), 0);
+        assert.deepEqual(run.policyCalls, [0], `${what}: the error policy had it`);
+      }
+    }
   });
 });
 
@@ -370,13 +394,14 @@ describe('the fail-safe for a refused change in a re-armed turn', () => {
     assert.equal(run.held, 0, 'a refusal is no transient failure, so nothing is re-armed');
   });
 
-  it("resends at once on the head when the refused request is a later round, given a host's change at a tool boundary", async () => {
+  it("leaves a later round refused after a host's change handed at a tool boundary to the error policy, and acts at the next start, whose request carries the row", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-'));
     const membrane = new MockMembrane();
     membrane.takesChanges = true;
     let refusedRound: RefusedAfterChange | undefined;
     membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
       const n = membrane.calls.push(request) - 1;
+      if (n === 2) return new RefusedStream(refusal(true));
       if (n !== 1) return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
       refusedRound = new RefusedAfterChange([
         createMockResponse([{ type: 'tool_use', id: 'look-1', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
@@ -398,17 +423,17 @@ describe('the fail-safe for a refused change in a re-armed turn', () => {
     framework.start();
     const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted').length;
     try {
-      for (const [text, n] of [['first', 1], ['second', 2]] as const) {
+      for (const [text, n] of [['first', 1], ['second', 2], ['third', 3]] as const) {
         framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
         assert.ok(await pollUntil(() => ended() === n), `turn ${n} ended`);
       }
-      assert.equal(carriesChange(membrane.calls[1]!), false, "the turn's first request carried no change");
+      assert.equal(carriesChange(membrane.calls[1]!), false, "the second turn's first request carried no change");
       assert.equal(refusedRound?.handedChange, true, 'its next round was handed the change, and refused');
-      assert.equal(membrane.calls.length, 3, 'the adopting turn, the refused stream, its resend');
-      assert.equal(carriesChange(membrane.calls[2]!), false, 'the resend went out on the head');
+      assert.deepEqual(policyCalls, [0], 'the error policy had that refusal');
+      assert.equal(carriesChange(membrane.calls[2]!), true, "the third turn's request carries the host's row");
+      assert.equal(membrane.calls.length, 4, 'the adopting turn, the refused stream, the third turn, its resend');
+      assert.equal(carriesChange(membrane.calls[3]!), false, 'the resend went out on the head');
       assert.equal(resends(traces), 1);
-      assert.deepEqual(policyCalls, [], 'the refusal never reached the error policy');
-      assert.equal(traces.filter((t) => t.type === 'inference:completed').length, 2, 'and the turn the resend continued ended well');
       assert.equal(framework.getAgent('resident')!.takesChanges(), false, 'the agent keeps to its head');
     } finally {
       await framework.stop();
@@ -418,90 +443,89 @@ describe('the fail-safe for a refused change in a re-armed turn', () => {
 });
 
 describe('the fail-safe for a refused change, with a model that binds thinking to its prefix', () => {
-  class HostChange implements Module {
-    readonly name = 'host';
-    ctx: ModuleContext | null = null;
-    async start(ctx: ModuleContext) { this.ctx = ctx; }
-    async stop() { this.ctx = null; }
-    async onProcess() { return {}; }
-    getTools() { return [{ name: 'a', description: 'a does a thing', inputSchema: { type: 'object' as const, properties: {} } }]; }
-    async handleToolCall(_call: ToolCall) { return { success: true, data: {} }; }
-  }
-  const canonical = (v: unknown) => JSON.stringify(v, (k, x) => (k === 'cache_control' || k === 'cacheControl' ? undefined : x));
+  // A cache marker is no part of what a provider signs.
+  const canonical = (v: unknown) => JSON.stringify(v, (k, x) => (k === 'cache_control' || k === 'cacheControl' || k === 'cacheBreakpoint' ? undefined : x));
   const prefixHash = (r: NormalizedRequest, upTo: number) => createHash('sha256')
     .update(canonical({ system: r.system, tools: (r.tools ?? []).map((t) => t.name), messages: r.messages.slice(0, upTo) })).digest('hex');
   const misboundThinking = (r: NormalizedRequest) => r.messages.some((m, i) => m.content.some((b) =>
     (b as { type?: string }).type === 'thinking' && (b as { signature?: string }).signature !== prefixHash(r, i)));
   const thinkingIn = (r: NormalizedRequest) => r.messages.flatMap((m) => m.content.filter((b) => (b as { type?: string }).type === 'thinking')).length;
 
-  class RefusedTwoBoundariesOn extends RefusedAfterChange {
-    boundaries = 0;
-    override provideToolResults(results: unknown[], options?: { injectedMessages?: Array<{ participant?: string; content: unknown[] }> }): void {
-      this.boundaries++;
-      super.provideToolResults(results, options);
-      if (this.boundaries < 2) this.handedChange = false;
-    }
-  }
+  const thinkingAfterChange = (r: NormalizedRequest) => {
+    const change = r.messages.findIndex((m) => m.content.some((b) => (b as { type?: string }).type === 'system_change'));
+    return change >= 0 && r.messages.slice(change + 1).some((m) => m.content.some((b) => (b as { type?: string }).type === 'thinking'));
+  };
 
-  async function refusedAtALaterRound(noteLands: boolean) {
-    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-rounds-'));
+  // Each answer's thinking is signed over its request's whole prefix, so a
+  // later request carries it validly only on the same system text, tools and
+  // messages before it. The host's row goes in the residents' slot, which a
+  // resident's context takes rows out of and the subconscious's only reads.
+  async function signedOverChanges(who: 'resident' | 'Subconscious', refused: Error) {
+    const dir = mkdtempSync(join(tmpdir(), 'tool-declarations-failsafe-signed-'));
     const membrane = new MockMembrane();
     membrane.takesChanges = true;
-    const outcomes: string[] = [];
-    const carriesMisbound = (request: NormalizedRequest) => request.messages.some((m) => m.content.some((b) => (b as { signature?: string }).signature === 'signed-over-the-change'));
+    let refuseNext = false;
+    let refusedAt = -1;
+    const sent: NormalizedRequest[] = [];
     membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
-      const n = membrane.calls.push(request) - 1;
-      if (n === 1) {
-        outcomes.push('refused at a later round');
-        return new RefusedTwoBoundariesOn([
-          createMockResponse([{ type: 'thinking', thinking: 'before the change', signature: 'signed-before' } as ContentBlock, { type: 'tool_use', id: 'look-1', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
-          createMockResponse([{ type: 'thinking', thinking: 'after the change', signature: 'signed-over-the-change' } as ContentBlock, { type: 'tool_use', id: 'look-2', name: 'host--look', input: {} } as ContentBlock], 'tool_use'),
-          createMockResponse([{ type: 'text', text: 'done' }]),
-        ], refusal(true));
+      membrane.calls.push(request);
+      if ((typeof request.system === 'string' && request.system.includes('ATTENDS')) !== (who === 'Subconscious')) {
+        return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
       }
-      if (carriesMisbound(request)) {
-        outcomes.push('refused: thinking signed over the change');
-        return new RefusedStream(Object.assign(new MembraneError({ type: 'invalid_request', retryable: false, message: 'thinking signature not valid for this prefix', rawError: { status: 400 } }), { httpStatus: 400 }));
+      sent.push(request);
+      if (refuseNext && carriesChange(request)) {
+        refuseNext = false;
+        refusedAt = sent.length - 1;
+        return new RefusedStream(refused);
       }
-      outcomes.push('answered');
-      return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
+      return new MockYieldingStream([createMockResponse([{ type: 'thinking', thinking: 'why', signature: prefixHash(request, request.messages.length) } as ContentBlock, { type: 'text', text: 'done' }])]);
     };
-    const proto = ContextManager.prototype as { noteThinkingDropped(ids: readonly string[], compileId: string): boolean };
-    const note = proto.noteThinkingDropped;
-    if (!noteLands) proto.noteThinkingDropped = () => false;
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', allowedTools: 'all', proseRouting: 'disabled', thinkingBinding: { binds: true } }],
-      modules: [new Input(), new HostChangeAtTool()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      modules: [new Input(), new ChangingTools()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      ...(who === 'Subconscious' ? { subconscious: { enabled: true, systemPrompt: 'ATTENDS', thinkingBinding: { binds: true } } } : {}),
     });
     const traces: TraceEvent[] = [];
     framework.onTrace((event) => { traces.push(event); });
     framework.start();
-    const ended = () => traces.filter((t) => t.type === 'inference:completed' || t.type === 'inference:exhausted' || t.type === 'inference:failed').length;
+    const turn = async (text: string) => {
+      if (who === 'resident') framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
+      else assert.equal(framework.nudgeAgent('Subconscious').ok, true);
+      await framework.runUntilIdle();
+    };
     try {
-      for (const [text, n] of [['first', 1], ['second', 2], ['third', 3]] as const) {
-        const before = ended();
-        framework.pushEvent({ type: 'external-message', source: 'test', content: text, metadata: {} } as unknown as ProcessEvent);
-        assert.ok(await pollUntil(() => ended() > before), `turn ${n} ended`);
-      }
-      return { traces, outcomes };
+      await turn('first');
+      (framework as unknown as { addMessage(participant: string, content: ContentBlock[]): string }).addMessage('system', [
+        { type: 'system_change', defineTools: [{ name: 'h', description: 'h does a thing', inputSchema: { type: 'object', properties: {} } }] } as unknown as ContentBlock,
+      ]);
+      await turn('second');
+      refuseNext = true;
+      await turn('third');
+      await turn('fourth');
+      return { sent, refusedAt, resends: traces.filter((t) => t.type === 'head:resend').length, onHead: !framework.getAgent(who)!.takesChanges() };
     } finally {
-      proto.noteThinkingDropped = note;
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
   }
 
-  it("sets aside the thinking of a later round's reply after a change handed at a boundary, when a round after it is refused", async () => {
-    const { traces, outcomes } = await refusedAtALaterRound(true);
-    const resend = traces.filter((t) => t.type === 'head:resend');
-    assert.equal(resend.length, 1);
-    assert.deepEqual(outcomes, ['answered', 'refused at a later round', 'answered', 'answered'], 'the resend and the next turn go out without that thinking');
-    assert.equal((resend[0] as { thinkingSetAside: number }).thinkingSetAside, 1, "the second round's reply, signed after the change the boundary handed");
-    const alerts = traces.filter((t) => t.type === 'ops:alert' && (t as { kind: string }).kind === 'head-resend') as Array<{ message: string }>;
-    assert.equal(alerts.length, 1, 'an operator line for the recognised refusal');
-    assert.doesNotMatch(alerts[0]!.message, /didn't land/, 'whose note landed');
+  it("once the fail-safe acts, sends no thinking signed under a prefix that held a change row: a host's row its context takes out, and one it can't", async () => {
+    for (const who of ['resident', 'Subconscious'] as const) {
+      for (const marked of [true, false]) {
+        const what = `${who}, ${marked ? 'a refusal membrane marks' : "a 400 membrane doesn't mark"}`;
+        const run = await signedOverChanges(who, refusal(marked));
+        const refused = run.sent[run.refusedAt];
+        assert.ok(refused && thinkingAfterChange(refused) && !misboundThinking(refused), `${what}: the premise: the refused request carried thinking signed over a change row`);
+        const after = run.sent.slice(run.refusedAt + 1);
+        assert.equal(after.length, 2, `${what}: the request that went again, and the next turn's`);
+        assert.deepEqual(after.map(misboundThinking), [false, false], `${what}: neither carries thinking under a prefix it wasn't signed under`);
+        assert.deepEqual(after.map(carriesChange), [false, false], `${what}: nor a change row`);
+        assert.equal(run.resends, 1, what);
+        assert.equal(run.onHead, true, `${what}: the agent keeps to its head`);
+      }
+    }
   });
 
   describe("the direct API on a model that takes a change, by what its caller passes against its head and own change rows", () => {
