@@ -269,7 +269,7 @@ export function assertAgentSwitches(config: AgentConfig): void {
     `${agent} sameRoundSkipReplyTextPolicy`,
     config.sameRoundSkipReplyTextPolicy,
     ['private', 'ask'],
-    '\'private\' or leaving it out keeps text beside skip_reply private, and \'ask\' holds it as a draft and asks once where it goes if it would have gone out',
+    '\'private\' or leaving it out keeps text beside skip_reply private, and \'ask\' holds it as a draft and asks once where it goes if it would have been posted or bounced',
   );
   resolveAutoContinue(config);
 }

@@ -23475,7 +23475,7 @@ export class AgentFramework {
       if (last && sameChannel(last.target, target) && last.wouldHold === wouldHold) last.parts.push(part);
       else runs.push({ hold: sendHold, target, wouldHold, parts: [part] });
     };
-    const holdsAnyway = (to: ChannelRef | null): boolean => !!heldUnder?.(to);
+    const holdsAnyway = (to: ChannelRef | null): boolean => sends === 'skip' && !!heldUnder?.(to);
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
     for (const segment of segments) {
@@ -23537,7 +23537,7 @@ export class AgentFramework {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, round);
             continue;
           }
-          const noDestination = routing.hybridHold === 'failed' || (!routing.pin && locus === null && !!routing.heartbeat);
+          const noDestination = sends === 'skip' && (routing.hybridHold === 'failed' || (!routing.pin && locus === null && !!routing.heartbeat));
           hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}) }, holdsAnyway(target) || noDestination);
         }
       }
@@ -33701,7 +33701,7 @@ export class AgentFramework {
     const drafts = held.flatMap((h) => h.held);
     const error = `${held.map((h) => this.draftsHeldNotice(agentName, h.held, 'skip-reply', undefined, h.target, own)).join(' ')} ` +
       `Where should ${drafts.length > 1 ? 'they' : 'it'} go, if anywhere? This skip_reply didn't run, so your turn goes on: ` +
-      "to end it and keep the draft, call skip_reply again, with wake_in_seconds again if you set a wake. " +
+      `to end it and keep the draft${drafts.length > 1 ? 's' : ''}, call skip_reply again, with wake_in_seconds again if you set a wake. ` +
       "A line meant only for yourself fits in skip_reply's reason.";
     console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
     const result = this.refusedResult(agentName, call.id, error);

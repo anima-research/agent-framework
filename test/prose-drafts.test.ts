@@ -5044,6 +5044,7 @@ describe('sameRoundSkipReplyTextPolicy', () => {
         assert.deepEqual(held.map((d) => d.text).sort(), ['Goodnight.', 'See you.']);
         const result = h.toolResults().find((r) => r.startsWith('[drafts]')) ?? '';
         assert.ok(held.every((d) => result.includes(d.id)), h.toolResults().join('\n'));
+        assert.match(result, /Where should they go, if anywhere\? .* to end it and keep the drafts, call skip_reply again/);
       } finally {
         await h.close();
       }
