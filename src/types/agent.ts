@@ -4,6 +4,7 @@ import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
+export type SameRoundSkipReplyTextPolicy = 'private' | 'ask';
 export type SameRoundThinkTextPolicySource =
   | 'runtime_override'
   | 'recipe'
@@ -156,6 +157,22 @@ export interface AgentConfig {
    * Omitted preserves the compatibility carry-forward: public.
    */
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /**
+   * What becomes of ordinary text in a round that calls `skip_reply`.
+   * Omitted or 'private': it stays private and isn't held. 'ask': text that
+   * only the `skip_reply` keeps back is held as a draft. Where some of a
+   * round's text would have been posted or bounced without the `skip_reply`,
+   * the first such `skip_reply` of a turn, called by the model in a round
+   * with verbatim content, is refused once with a result that names the
+   * round's drafts and asks where they should go. Where the text would only
+   * have been held, the `skip_reply` runs. It acts only on rounds with verbatim
+   * content (membrane's `roundContent`). On the XML tool path nothing is
+   * refused and nothing is held, and the heartbeat notice still drops its
+   * clause, so a resident there is told its words are held when a
+   * `skip_reply` round's aren't. A derived agent and the subconscious don't
+   * take it from this agent.
+   */
+  sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**
    * Extended thinking config. When `enabled: true`, the agent runs with
    * Anthropic's native extended thinking; responses include `thinking` blocks

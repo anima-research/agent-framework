@@ -201,8 +201,9 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses, or whose `observes`
- * is anything but a list of names, or whose `foreignRounds` is neither of
- * its modes (assertOneOfSetting). The constructor runs it
+ * is anything but a list of names, or whose `foreignRounds` or
+ * `sameRoundSkipReplyTextPolicy` is neither of its values
+ * (assertOneOfSetting). The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
  * for each of its agents before anything opens, and `createEphemeralAgent`
  * before it reserves the name, so a refusal there leaves nothing behind.
@@ -275,6 +276,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
     ['transcript', 'raw'],
     '\'transcript\' or leaving it out sends the rounds of an agent it observes as a line per call and result, ' +
       'without their thinking, and \'raw\' sends them as stored',
+  );
+  assertOneOfSetting(
+    `${agent} sameRoundSkipReplyTextPolicy`,
+    config.sameRoundSkipReplyTextPolicy,
+    ['private', 'ask'],
+    '\'private\' or leaving it out keeps text beside skip_reply private, and \'ask\' holds it as a draft and asks once where it goes if it would have been posted or bounced',
   );
   resolveAutoContinue(config);
 }
@@ -390,6 +397,7 @@ export class Agent {
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
+  readonly sameRoundSkipReplyTextPolicy: AgentConfig['sameRoundSkipReplyTextPolicy'];
   /** The participant name this agent's turns are presented under (see AgentConfig.presentAs). */
   readonly presentAs: string;
   /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
@@ -529,6 +537,7 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.sameRoundSkipReplyTextPolicy = config.sameRoundSkipReplyTextPolicy;
     this.presentAs = config.presentAs ?? config.name;
     this.ownParticipants = new Set([config.name, ...(config.selfParticipants ?? [])]);
     this.deniedAtDispatch = new Set(config.denyToolsAtDispatch ?? []);

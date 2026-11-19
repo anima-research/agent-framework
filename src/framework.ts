@@ -1601,6 +1601,7 @@ interface TurnRouting {
   unflushedRounds?: number;
   unpostedSpeech?: true;
   privateEnd?: true;
+  skipReplyAsked?: true;
   silent?: true;
   liveSpeech?: true;
   speechRouting?: number;
@@ -1748,6 +1749,8 @@ function turnInputs(
  */
 type SpeechPublished = (to: PublishDestination, text: string, messageId: string | undefined) => void;
 
+type SkipHeld = { held: Draft[]; target?: ChannelRef; wouldHold: boolean };
+
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
  * it doesn't send is held. `notice` says whether the notice for an envelope
@@ -1755,13 +1758,15 @@ type SpeechPublished = (to: PublishDestination, text: string, messageId: string 
  * boundary on a stream that presents injected messages ('now'), or not at all
  * ('later'), which leaves the drafts to be named as holdProseDrafts says.
  * `keepPrivate` is a skip_reply round: its envelopes all stay in the context,
- * and none is sent, bounced or held.
+ * and none is sent, bounced or held, unless `skipHold` is given.
  */
 interface ProseRound {
   /** The routing state of the turn that queued the round. */
   routing: TurnRouting;
   notice: 'now' | 'later';
   keepPrivate?: boolean;
+  skipHold?: SkipHeld[];
+  skipWouldHold?: boolean;
   draftsRound?: boolean;
   /** The outgoing stream of the stream that queued the round. */
   onPublished?: SpeechPublished;
@@ -5087,6 +5092,7 @@ export class AgentFramework {
   /** Per agent, a round that called code_execution or sent, and waits for
    *  those calls' results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
+  private readonly skipReplyAsks = new Map<string, Promise<SkipHeld[]>>();
   /** Each code_execution result, by the round that dispatched its call: it
    *  settles only that round, even if a newer round reuses its call id. */
   private scriptRoundOfResult: WeakMap<ToolResult, ScriptRound> = new WeakMap();
@@ -12280,6 +12286,7 @@ export class AgentFramework {
       // think-policy override changes what it renders.
       ...(parent.contextBudgetTokens !== undefined ? { contextBudgetTokens: parent.contextBudgetTokens } : {}),
       sameRoundThinkTextPolicy: parent.getEffectiveSameRoundThinkTextPolicy(),
+      sameRoundSkipReplyTextPolicy: undefined,
       sendSilencing: parent.getEffectiveSendSilencing(),
       ...options.config,
       name: options.name,
@@ -19051,6 +19058,7 @@ export class AgentFramework {
       // locus, and bare prose must not fall through to the default channel.
       // Speech happens only via speak_in_channel (its own marked voice).
       proseRouting: 'explicit',
+      sameRoundSkipReplyTextPolicy: undefined,
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
       // No clock rows of its own: its merged view carries the residents'
       // clocks, and clocks it planned from its own rows alone would read the
@@ -23549,9 +23557,10 @@ export class AgentFramework {
    * the same native round, where that policy applies: an XML-mode round has
    * no verbatim content to route live, so its prose is routed at the turn's
    * end as ordinary speech) keeps it private —
-   * counted for the receipt, never drafted. `segments` are the runs exactly
-   * as written (splitProseRuns), so a draft keeps the resident's words byte
-   * for byte. What it holds, keeps or moves is the round's turn's
+   * counted for the receipt, never drafted, but where `round.skipHold` asks
+   * for a skip_reply round's text as drafts (sameRoundSkipReplyTextPolicy).
+   * `segments` are the runs exactly as written (splitProseRuns), so a draft
+   * keeps the resident's words byte for byte. What it holds, keeps or moves is the round's turn's
    * (round.routing), whenever the hold runs. Hybrid speech under a send goes
    * through routeSilencedHybrid.
    */
@@ -23565,7 +23574,8 @@ export class AgentFramework {
   ): boolean {
     if (segments.length === 0) return false;
     const routing = round.routing;
-    if (cause === 'private' || cause === 'kept' || privateThink) {
+    const skipHeld = cause === 'private' && !privateThink && !!round.skipHold;
+    if (!skipHeld && (cause === 'private' || cause === 'kept' || privateThink)) {
       // Match explicit mode: skip_reply keeps publication private but can
       // still set a bounce aside. A private-think round interprets no text.
       if (cause === 'private' && !privateThink && agent.proseRouting === 'hybrid') {
@@ -23580,9 +23590,10 @@ export class AgentFramework {
       return false;
     }
     const note = at.target ? `written for ${this.channelShown(at.target)}` : undefined;
-    return this.holdProseDrafts(agent, segments.map((text) => ({ text, ...(note ? { note } : {}) })), 'explicit-send', {
+    const because = cause === 'private' ? undefined : this.sendHoldText(cause, at.target, at.when);
+    return this.holdProseDrafts(agent, segments.map((text) => ({ text, ...(note ? { note } : {}) })), because ? 'explicit-send' : 'skip-reply', {
       ...round,
-      because: this.sendHoldText(cause, at.target, at.when),
+      ...(because ? { because } : {}),
       ...(at.target ? { target: at.target } : {}),
     }).length > 0;
   }
@@ -23590,11 +23601,13 @@ export class AgentFramework {
   private async routeSilencedHybrid(
     agent: Agent,
     segments: string[],
-    sends: SendsReached,
+    sends: SendsReached | 'skip',
     draftsCause: boolean,
     round: ProseRound,
     locus: ChannelRef | null,
     when: number | 'end' | 'turn',
+    keptBy?: SendsReached,
+    heldUnder?: (to: ChannelRef | null) => boolean,
   ): Promise<boolean> {
     if (segments.length === 0) return false;
     const routing = round.routing;
@@ -23608,14 +23621,16 @@ export class AgentFramework {
     // is withheld: a draft holds what the envelope would have published
     // (`{{unsent}}` under the re-bounce rule, unsentWords), not its routing
     // syntax, and where it was going stays with it as a note.
+    const holdAt = (to: ChannelRef | null): SendHold | 'skip' | undefined => (sends === 'skip' ? 'skip' : sendHoldAt(sends, to));
     let privateCount = 0;
     type Part = { text: string; note?: string; inheritedRisk?: InheritedRisk; deliberate?: boolean };
-    const runs: Array<{ hold: SendHold; target: ChannelRef | null; parts: Part[] }> = [];
-    const hold = (sendHold: SendHold, target: ChannelRef | null, part: Part): void => {
+    const runs: Array<{ hold: SendHold | 'skip'; target: ChannelRef | null; wouldHold: boolean; parts: Part[] }> = [];
+    const hold = (sendHold: SendHold | 'skip', target: ChannelRef | null, part: Part, wouldHold = false): void => {
       const last = runs.at(-1);
-      if (last && sameChannel(last.target, target)) last.parts.push(part);
-      else runs.push({ hold: sendHold, target, parts: [part] });
+      if (last && sameChannel(last.target, target) && last.wouldHold === wouldHold) last.parts.push(part);
+      else runs.push({ hold: sendHold, target, wouldHold, parts: [part] });
     };
+    const holdsAnyway = (to: ChannelRef | null): boolean => sends === 'skip' && !!heldUnder?.(to);
     /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
     const kept: Draft[] = [];
     for (const segment of segments) {
@@ -23624,7 +23639,7 @@ export class AgentFramework {
       const routed = trimmed.length === written.length ? trimmed : written.map((e) => e.trim());
       for (const [index, envelope] of written.entries()) {
         const parsed = parseHybridProsePrefix(envelope);
-        if (parsed.continueTurn) routing.continuation = true;
+        if (parsed.continueTurn && sends !== 'skip') routing.continuation = true;
         if (parsed.kind === 'private') {
           delete routing.pin;
           routing.hybridHold = 'private';
@@ -23635,7 +23650,7 @@ export class AgentFramework {
           // inbound-only is refused as a target for speech.
           const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!, { forSpeech: true, own: this.ownChannels(routing) });
           const to = resolved && !('error' in resolved) ? { serverId: resolved.serverId, channelId: resolved.channelId } : null;
-          const sendHold = sendHoldAt(sends, to);
+          const sendHold = holdAt(to);
           if (!sendHold) {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, round);
             continue;
@@ -23656,40 +23671,43 @@ export class AgentFramework {
               note: `written for >>>${parsed.target}`,
               ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
               deliberate: true,
-            });
+            }, holdsAnyway(to));
           }
         } else if (envelope.startsWith('>>>')) {
           // Malformed: an attempted destination that names none.
-          const sendHold = sendHoldAt(sends, null);
+          const sendHold = holdAt(null);
           if (!sendHold) {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, round);
             continue;
           }
           delete routing.pin;
           routing.hybridHold = 'failed';
-          hold(sendHold, null, { text: envelope, deliberate: true });
+          hold(sendHold, null, { text: envelope, deliberate: true }, holdsAnyway(null));
         } else if (routing.hybridHold === 'private') {
           privateCount++;
         } else {
           const target = routing.hybridHold === 'failed' ? null : routing.pin ?? locus;
-          const sendHold = sendHoldAt(sends, target);
+          const sendHold = holdAt(target);
           if (!sendHold) {
             await this.deliverHybridEnvelope(agent, routed[index]!, locus, true, round);
             continue;
           }
-          hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}) });
+          const noDestination = sends === 'skip' && (routing.hybridHold === 'failed' || (!routing.pin && locus === null && !!routing.heartbeat));
+          hold(sendHold, target, { text: envelope, ...(target ? { note: `written for ${this.channelShown(target)}` } : {}) }, holdsAnyway(target) || noDestination);
         }
       }
     }
     routing.keptPrivate += privateCount;
     let heldAny = false;
-    for (const { hold: sendHold, target, parts } of runs) {
-      const because = this.sendHoldText(sendHold, target, when);
+    for (const { hold: sendHold, target, wouldHold, parts } of runs) {
       const at = target ? { target } : {};
-      const held = draftsCause
-        ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because, ...at })
-        : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because, ...at });
-      if (draftsCause) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
+      const keptAside = sendHold === 'skip' && !!keptBy && !!sendHoldAt(keptBy, target);
+      const held = sendHold === 'skip'
+        ? this.holdProseDrafts(agent, keptAside ? parts.filter((p) => p.deliberate) : parts, 'skip-reply', { ...round, ...at, skipWouldHold: wouldHold })
+        : draftsCause
+          ? this.holdProseDrafts(agent, parts.filter((p) => p.deliberate), 'explicit-send', { ...round, notice: 'later', because: this.sendHoldText(sendHold, target, when), ...at })
+          : this.holdProseDrafts(agent, parts, 'explicit-send', { ...round, because: this.sendHoldText(sendHold, target, when), ...at });
+      if (draftsCause || keptAside) routing.keptPrivate += parts.filter((p) => !p.deliberate).length;
       heldAny = held.length > 0 || heldAny;
     }
     // The turn's receipt names them by their state at turn end; each was
@@ -23741,7 +23759,7 @@ export class AgentFramework {
     agent: Agent,
     texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
-    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef },
+    opts: { routing: TurnRouting; note?: string; notice: 'now' | 'later'; because?: string; target?: ChannelRef; skipHold?: SkipHeld[]; skipWouldHold?: boolean },
   ): Draft[] {
     const segments = texts
       .map((t) => (typeof t === 'string'
@@ -23765,6 +23783,7 @@ export class AgentFramework {
     }
     if (held.length === 0) return held;
     appendAll(logical.drafts, held);
+    if (reason === 'skip-reply') opts.skipHold?.push({ held, ...(opts.target ? { target: opts.target } : {}), wouldHold: !!opts.skipWouldHold });
     console.error(`[drafts] ${agent.name}: held ${held.length} segment(s) as ${held.map((d) => d.id).join(', ')} (${reason})`);
     this.emitTrace({
       type: 'prose:drafts-held',
@@ -23773,47 +23792,56 @@ export class AgentFramework {
       draftIds: held.map((d) => d.id),
       textLen: held.reduce((n, d) => n + d.text.length, 0),
     });
-    if (opts.notice === 'now') {
-      const target = this.noticeTargetFor(agent.name, 'held-draft') ? this.agents.get(agent.name) : undefined;
-      try {
-        // Written while its turn is alive, it waits out of the window
-        // (present false) for the turn's next point, as the write for the
-        // agent it replaces did: the tool boundary whose stream hears it, or
-        // the turn's end. The other readers of its slot that are idle (an
-        // agent that observes it, the persistent subconscious) are presented
-        // it now, as addMessage presents a write mid-turn to them
-        // (afterStore passes over a reader whose turn is alive, its writer
-        // included). With no turn alive it is presented now, as any own row
-        // written at rest.
-        if (target) {
-          const atRest = !this.logicalTurnAlive(target);
-          const id = storeOwnRow(
-            target,
-            'user',
-            [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
-            { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
-            undefined,
-            atRest,
-          );
-          if (!atRest) this.presentation?.afterStore(target, [id]);
-        }
-      } catch (err) {
-        console.error('[drafts] held-draft notice failed:', err);
-      }
-    }
+    if (opts.notice === 'now') this.noteHeldDrafts(agent.name, held, reason, opts);
     return held;
+  }
+
+  private noteHeldDrafts(
+    agentName: string,
+    held: Draft[],
+    reason: DraftReason,
+    opts: { routing: TurnRouting; because?: string; target?: ChannelRef },
+  ): void {
+    const target = this.noticeTargetFor(agentName, 'held-draft') ? this.agents.get(agentName) : undefined;
+    try {
+      // Written while its turn is alive, it waits out of the window
+      // (present false) for the turn's next point, as the write for the
+      // agent it replaces did: the tool boundary whose stream hears it, or
+      // the turn's end. The other readers of its slot that are idle (an
+      // agent that observes it, the persistent subconscious) are presented
+      // it now, as addMessage presents a write mid-turn to them
+      // (afterStore passes over a reader whose turn is alive, its writer
+      // included). With no turn alive it is presented now, as any own row
+      // written at rest.
+      if (target) {
+        const atRest = !this.logicalTurnAlive(target);
+        const id = storeOwnRow(
+          target,
+          'user',
+          [{ type: 'text', text: this.draftsHeldNotice(agentName, held, reason, opts.because, opts.target, this.ownChannels(opts.routing)) }],
+          { system: true, kind: 'prose-drafts', draftOwner: agentName, draftIds: held.map((d) => d.id) } as MessageMetadata,
+          undefined,
+          atRest,
+        );
+        if (!atRest) this.presentation?.afterStore(target, [id]);
+      }
+    } catch (err) {
+      console.error('[drafts] held-draft notice failed:', err);
+    }
   }
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
     'explicit-send': 'an explicit send in its turn held it back',
     'no-destination': 'it had no destination: plain speech with no target waits for one',
     bounced: 'its routing prefix bounced',
+    'skip-reply': 'a skip_reply in its round held it back',
   };
 
   private static readonly DRAFT_REASON_SHORT: Record<DraftReason, string> = {
     'explicit-send': 'explicit send in its turn',
     'no-destination': 'no destination',
     bounced: 'routing prefix bounced',
+    'skip-reply': 'skip_reply in its round',
   };
 
   private draftsHeldNotice(
@@ -24790,7 +24818,8 @@ export class AgentFramework {
     if (!agent) return;
     const text =
       `[${NOTICE_TAG.routing}] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: ` +
-      'it\'s held as a draft you can send with the drafts tool. An explicit send reaches a channel now.';
+      `it's held as a draft you can send with the drafts tool${agent.sameRoundSkipReplyTextPolicy === 'ask' ? '' : ", except in a round that calls skip_reply, where it stays private and isn't held"}. ` +
+      'An explicit send reaches a channel now.';
     try {
       // The agent's own row, presented as it is stored: written where the
       // locus announcement is, before the turn's compile (#291).
@@ -27218,7 +27247,7 @@ export class AgentFramework {
       return;
     }
 
-    if (round.keepPrivate) {
+    if (round.keepPrivate && !round.skipHold) {
       // skip_reply's promise: "Any plain text you wrote this turn stays
       // private and is NOT posted". Every envelope of the round stays in the
       // context, as a >>skip_reply envelope does: it isn't sent, isn't held
@@ -27242,6 +27271,10 @@ export class AgentFramework {
         // follows: the text after the target was meant for that channel, not
         // the earlier one, so it bounces too.
         if (res.refusedChannelId) delete routing.pin;
+        if (round.skipHold) {
+          this.holdSkippedEnvelope(agent, parsed.body, round, undefined, `written for >>${parsed.target}`, false);
+          return;
+        }
         this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', round);
         return;
       }
@@ -27249,8 +27282,16 @@ export class AgentFramework {
       // Sticky within the turn: later unprefixed segments follow this target.
       routing.pin = targetChannel;
       body = parsed.body;
+      if (round.skipHold) {
+        this.holdSkippedEnvelope(agent, body, round, targetChannel, `written for >>${parsed.target}`, false);
+        return;
+      }
     } else {
       const sticky = routing.pin;
+      if (round.skipHold) {
+        this.holdSkippedEnvelope(agent, rawText, round, sticky, sticky ? `written for ${this.channelShown(sticky)}` : undefined, !sticky && !!round.draftsRound);
+        return;
+      }
       if (!sticky) {
         if (round.draftsRound) {
           console.error(`[prose] ${name}: unprefixed — ${rawText.length} chars held with no notice (a drafts round, no destination)`);
@@ -27314,6 +27355,16 @@ export class AgentFramework {
       // delivery to a channel that isn't inbound-only keeps it, as before.
       if (sameChannel(routing.pin, targetChannel)) delete routing.pin;
     }
+  }
+
+  private holdSkippedEnvelope(agent: Agent, text: string, round: ProseRound, target: ChannelRef | undefined, note: string | undefined, wouldHold: boolean): void {
+    const words = this.unsentWords(agent, text);
+    if ('draft' in words) return;
+    this.holdProseDrafts(agent, [{
+      text: words.text,
+      ...(note ? { note } : {}),
+      ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
+    }], 'skip-reply', { ...round, ...(target ? { target } : {}), skipWouldHold: wouldHold });
   }
 
   /** Cap on consecutive bounce-triggered wakes (notices still append after).
@@ -29714,12 +29765,42 @@ export class AgentFramework {
             const roundAdmitted = turnProseRouting === 'explicit'
               ? roundSegments.map((seg) => this.admitProse(seg, streamRouting))
               : [];
+            const skipAsks = agent.sameRoundSkipReplyTextPolicy === 'ask' && !trigger?.suppressProse && !streamRouting.silent
+              && turnProseRouting !== 'disabled';
+            const askingAt = skipAsks && liveRound && roundSegments.length > 0 && !streamRouting.skipReplyAsked
+              ? calls.findIndex((c, i) => c.name === 'skip_reply' && roundCalls[i]!.permitted && !roundCalls[i]!.refused)
+              : -1;
+            const askingCall = askingAt >= 0 ? roundCalls[askingAt] : undefined;
+            let answerAsk: ((held: SkipHeld[]) => void) | undefined;
+            if (askingAt >= 0) {
+              this.skipReplyAsks.set(`${agent.name}\u0000${calls[askingAt]!.id}`, new Promise((resolve) => { answerAsk = resolve; }));
+            }
+            let askedSilence: TurnSilence | null = null;
+            const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
+              && agent.state.status === 'waiting_for_tools';
+            const settleAsk = (held: SkipHeld[]): void => {
+              const answer = answerAsk;
+              if (!answer) return;
+              answerAsk = undefined;
+              if (!waits()) return;
+              if (held.some((h) => !h.wouldHold)) {
+                streamRouting.skipReplyAsked = true;
+                silenceBeforeRefusal = askedSilence;
+                answer(held);
+                return;
+              }
+              if (holdOpts.notice === 'now') {
+                for (const h of held) this.noteHeldDrafts(agent.name, h.held, 'skip-reply', { routing: holdOpts.routing, ...(h.target ? { target: h.target } : {}) });
+              }
+              answer([]);
+            };
             const routeRound = (calls: readonly RoundCall[]): void => {
               if (!this.channelRegistry) return;
               const toolNames = calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
                 toolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
+              const before = silence;
               // A refused skip_reply, called directly or from the round's
               // script, keeps its own round private and silences nothing
               // after it (roundCallOf): the silence before it, and the
@@ -29736,12 +29817,24 @@ export class AgentFramework {
                 refusedWakeRounds.add(toolRound);
               }
               silence = mergeSilence(silence, roundSilenceOf(calls, toolRound));
+              if (askingCall) askedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && c !== askingCall), toolRound));
               turnSends = mergeSends(turnSends, sendsOf(calls, toolRound));
               const roundSilence = silence;
               const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
               const draftsCause = draftsRound
                 && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
+              const withoutSkip = mergeSilence(before, roundSilenceOf(calls.filter((c) => c.cause !== 'private'), toolRound));
+              const heldUnder = (to: ChannelRef | null): boolean => withoutSkip === 'private' || (!!withoutSkip && !!sendHoldAt(withoutSkip, to));
+              const keptBy = draftsCause && withoutSkip && withoutSkip !== 'private' ? withoutSkip : undefined;
+              const keptAtLocus = !!keptBy && turnProseRouting !== 'hybrid' && turnProseRouting !== 'explicit' && !!sendHoldAt(keptBy, roundLocus);
+              const skipHeld = skipAsks && !hasSameRoundPrivateThink && !keptAtLocus && calls.some((c) => c.cause === 'private') ? [] as SkipHeld[] : undefined;
+              const locusHolds = heldUnder(roundLocus) || !!streamRouting.heldForMove
+                || (roundLocus === null && !!(streamRouting.heartbeat || streamRouting.locked));
+              const skipFields = skipHeld
+                ? { skipHold: skipHeld, skipWouldHold: locusHolds, ...(askingCall ? { notice: 'later' as const } : {}) }
+                : {};
+              if (roundSegments.length === 0 || !skipHeld) settleAsk([]);
               if (roundSegments.length === 0) return;
               if (turnProseRouting === 'disabled') {
                 console.error(
@@ -29749,7 +29842,18 @@ export class AgentFramework {
                 );
                 this.recordProseSuppression(streamRouting, roundSegments.length);
               } else if (turnProseRouting === 'hybrid') {
-                if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)) {
+                if (skipHeld) {
+                  chainSpeech(
+                    routingSpeech(async () => {
+                      try {
+                        await this.routeSilencedHybrid(agent, roundRuns, 'skip', false, { ...holdOpts, ...skipFields }, roundLocus, toolRound, keptBy, heldUnder);
+                      } finally {
+                        settleAsk(skipHeld);
+                      }
+                    }),
+                    'mid-turn hybrid prose hold failed:',
+                  );
+                } else if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)) {
                   const cause = roundSilence === 'private' ? 'private' : 'kept';
                   chainSpeech(
                     async () => { this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts, { target: null, when: toolRound }); },
@@ -29773,17 +29877,19 @@ export class AgentFramework {
                 // silencing does not apply: unprefixed prose bounces, and
                 // prefixed prose is deliberate. skip_reply does: its round's
                 // envelopes all stay in the context (deliverProseEnvelope's
-                // keepPrivate), as the tool promises, and skip_reply then
-                // ends the turn at this round's tool results, unless it was
-                // refused, when the turn goes on to its next round.
+                // keepPrivate), as the tool promises, or under
+                // sameRoundSkipReplyTextPolicy 'ask' are held (skipHold), and
+                // skip_reply then ends the turn at this round's tool results,
+                // unless it was refused, when the turn goes on to its next round.
                 if (!hasSameRoundPrivateThink) {
                   const keepPrivate = toolNames.some((n) => bareToolName(n) === 'skip_reply');
                   console.error(
                     `[prose] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                   );
                   for (const envelopes of roundAdmitted) {
-                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...roundOpts, keepPrivate }), 'mid-turn prose delivery failed:');
+                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { ...roundOpts, ...skipFields, keepPrivate }), 'mid-turn prose delivery failed:');
                   }
+                  if (skipHeld) chainSpeech(async () => { settleAsk(skipHeld); }, 'mid-turn prose delivery failed:');
                 }
               } else if (roundSilence === 'private' || (roundSilence && hasSameRoundPrivateThink)
                 || (roundSilence && sendHoldAt(roundSilence, roundLocus))) {
@@ -29795,7 +29901,8 @@ export class AgentFramework {
                 // held as drafts the resident can resend, and named. A drafts
                 // round's is kept and counted instead.
                 const cause = roundSilence === 'private' ? 'private' : hasSameRoundPrivateThink || draftsCause || !sendHold ? 'kept' : sendHold;
-                this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts, { target: roundLocus, when: toolRound });
+                this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, { ...holdOpts, ...skipFields }, { target: roundLocus, when: toolRound });
+                if (skipHeld) settleAsk(skipHeld);
               } else if (hasSameRoundPrivateThink) {
                 console.error(
                   `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -29835,8 +29942,6 @@ export class AgentFramework {
                 ...roundCalls.map((c, i) => (sends.has(calls[i]!.id) ? { ...c, reach: sends.get(calls[i]!.id) } : c)),
                 ...[...round.scripts.values()].flat(),
               ];
-              const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
-                && agent.state.status === 'waiting_for_tools';
               let decidable = scriptCallIds.length === 0;
               const round: ScriptRound = {
                 agent,
@@ -29883,12 +29988,14 @@ export class AgentFramework {
             for (const call of calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
-              // `started` goes out once dispatch returns. Refusal sites inside
-              // dispatch run synchronously and call refuse() first, so a call
-              // the host refuses produces no events.
+              // `started` goes out once dispatch returns, or for a skip_reply
+              // the guard asks about, once its answer runs it. Refusal sites
+              // inside dispatch run synchronously and call refuse() first, as
+              // the guard's refusal does, so a call the host refuses produces
+              // no events.
               this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call, streamRouting.turnId);
-              this.toolLifecycleEmitter?.open(agent.name, call.id);
+              if (call !== calls[askingAt]) this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             if (scriptCallIds.length === 0 && sendCallIds.length === 0) routeRound(roundCalls);
@@ -30157,6 +30264,8 @@ export class AgentFramework {
             // cut or not.
             const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.xml
               && cut.calls.some((call) => call.name === 'think');
+            const cutHeld = cutPrivate && !cutThinkPrivate && !cut?.xml && agent.sameRoundSkipReplyTextPolicy === 'ask'
+              && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
               generationLost = true;
@@ -30170,7 +30279,7 @@ export class AgentFramework {
               }
               hadToolCalls = true;
               const cutRound = toolRounds++;
-              if (turnProseRouting !== 'disabled' && (cutPrivate || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
+              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
               if (liveProseRouting) silence = mergeSilence(silence, roundSilenceOf(cutCalls, cutRound));
               console.error(
                 `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside ${cut.calls.length} call(s) ` +
@@ -30584,9 +30693,10 @@ export class AgentFramework {
                 : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)), agent.getEffectiveSendSilencing());
               const trailingSilence: TurnSilence | null = liveProseRouting
                 ? silence
-                : silence === 'private' || fallbackCause === 'private' ? 'private' : turnSends;
+                : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
               const trailingWhen = liveProseRouting ? 'end' : 'turn';
               const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
+              const trailingSkip = cutHeld ? { skipHold: [] as SkipHeld[] } : {};
 
               const runs = finalRuns;
               const segments = finalSegments;
@@ -30607,7 +30717,9 @@ export class AgentFramework {
                   this.recordProseSuppression(streamRouting, segments.length);
                 }
               } else if (turnProseRouting === 'hybrid') {
-                if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
+                if (trailingSilence === 'private' && !thinkPrivate && trailingSkip.skipHold && segments.length > 0) {
+                  closingHeld = await this.routeSilencedHybrid(agent, runs, 'skip', false, { ...trailingHold, ...trailingSkip }, resolveTurnLocus(), trailingWhen);
+                } else if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
                   this.holdSilencedProse(agent, runs, trailingSilence === 'private' ? 'private' : 'kept', thinkPrivate, trailingHold, { target: null, when: trailingWhen });
                 } else if (trailingSilence && trailingSilence !== 'private' && segments.length > 0) {
                   closingHeld = await this.routeSilencedHybrid(agent, runs, trailingSilence, false, trailingHold, resolveTurnLocus(), trailingWhen);
@@ -30632,7 +30744,7 @@ export class AgentFramework {
                   );
                   for (const envelopes of admittedSegments) {
                     try {
-                      await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, keepPrivate: liveProseRouting && cutPrivate });
+                      await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, ...trailingSkip, keepPrivate: (liveProseRouting && cutPrivate) || cutHeld });
                     } catch (err) {
                       console.error('trailing prose delivery failed:', err);
                     }
@@ -30648,7 +30760,7 @@ export class AgentFramework {
                 );
                 if (segments.length > 0) {
                   const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
-                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
+                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, { ...trailingHold, ...trailingSkip }, { target: resolveTurnLocus(), when: trailingWhen });
                 }
               } else if (thinkPrivate) {
                 thinkHeld();
@@ -33720,6 +33832,44 @@ export class AgentFramework {
     return { name: call.name, cause, refused, permitted };
   }
 
+  private runSkipReply(agentName: string, enrichedCall: ToolCall): void {
+    const skipping = this.callingTurnOf(agentName, enrichedCall);
+    if (skipping) {
+      skipping.privateEnd = true;
+      delete skipping.unpostedSpeech;
+    }
+    const wake = readSkipReplyWake(enrichedCall.input);
+    if (wake.kind === 'wake' && this.eventGate) {
+      const armedAt = Date.now();
+      const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
+      // The heartbeat's tick or reminder due before the timer: if it wakes
+      // the agent, its turn cancels the timer, so the confirmation names
+      // it and the time the self-wake would have left.
+      const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
+      console.error(armed
+        ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
+          + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
+        : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
+      this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
+      return;
+    }
+    this.dispatchChannelToolCall(agentName, enrichedCall);
+  }
+
+  private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[]): void {
+    const routing = this.callingTurnOf(agentName, call);
+    const own = routing ? this.ownChannels(routing) : [];
+    const drafts = held.flatMap((h) => h.held);
+    const error = `${held.map((h) => this.draftsHeldNotice(agentName, h.held, 'skip-reply', undefined, h.target, own)).join(' ')} ` +
+      `Where should ${drafts.length > 1 ? 'they' : 'it'} go, if anywhere? This skip_reply didn't run, so your turn goes on: ` +
+      `to end it and keep the draft${drafts.length > 1 ? 's' : ''}, call skip_reply again, with wake_in_seconds again if you set a wake. ` +
+      "A line meant only for yourself fits in skip_reply's reason.";
+    console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
+    const result = this.refusedResult(agentName, call.id, error);
+    this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels', result });
+  }
+
   private toolRoute(call: ToolCall, actor: string | undefined): ToolRoute {
     const name = call.name;
     if (isPresentationTool(name)) return { kind: 'presentation' };
@@ -33964,26 +34114,23 @@ export class AgentFramework {
             this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
             return;
           }
-          const skipping = this.callingTurnOf(agentName, enrichedCall);
-          if (skipping) {
-            skipping.privateEnd = true;
-            delete skipping.unpostedSpeech;
+          const key = `${agentName}\u0000${enrichedCall.id}`;
+          const asked = this.skipReplyAsks.get(key);
+          this.skipReplyAsks.delete(key);
+          if (asked) {
+            void asked.then((held) => {
+              if (!this.agents.get(agentName)?.getPendingToolIds().includes(enrichedCall.id)) return;
+              if (held.length > 0) {
+                this.refuseSkipReplyOnce(agentName, enrichedCall, held);
+                return;
+              }
+              this.toolLifecycleEmitter?.open(agentName, enrichedCall.id);
+              this.runSkipReply(agentName, enrichedCall);
+            });
+          } else {
+            this.runSkipReply(agentName, enrichedCall);
           }
-          const wake = readSkipReplyWake(enrichedCall.input);
-          if (wake.kind === 'wake' && this.eventGate) {
-            const armedAt = Date.now();
-            const { inMs, armed } = this.eventGate.armSelfWake(agentName, wake.seconds, 'skip_reply');
-            // The heartbeat's tick or reminder due before the timer: if it wakes
-            // the agent, its turn cancels the timer, so the confirmation names
-            // it and the time the self-wake would have left.
-            const earlierWake = armed ? this.heartbeatWakeBefore(agentName, armedAt + inMs) : undefined;
-            console.error(armed
-              ? `[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`
-                + (earlierWake ? `; due sooner, in ~${earlierWake.inSeconds}s: ${logDetail(earlierWake.what)}` : '')
-              : `[self-wake] agent=${agentName} not armed: the framework has stopped (skip_reply)`);
-            this.dispatchChannelToolCall(agentName, enrichedCall, earlierWake);
-            return;
-          }
+          return;
         }
         this.dispatchChannelToolCall(agentName, enrichedCall);
         return;
