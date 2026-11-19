@@ -106,7 +106,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent, assertAgentSwitches, assertThinkingBinding, dryCompileStatsOf, type RenderStats } from './agent.js';
-import { copyHead, isHeadDeclaration, isSystemChangeMessage, memoryHeadDeclarations, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from './system-changes.js';
+import { copyHead, isHeadRecord, isSystemChangeMessage, memoryHeadDeclarations, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent, type HeadRecord } from './system-changes.js';
 import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from './config-checks.js';
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -1083,7 +1083,7 @@ const FRAMEWORK_STATE_ID = 'framework/state';
 const headDeclarationId = (agentName: string) => `framework/head-declarations/${agentName}`;
 
 /** What the store holds as an agent's recorded head, read on the store's branch. */
-type RecordedHead = { kind: 'head'; head: HeadDeclaration } | { kind: 'none' } | { kind: 'not-a-head' } | { kind: 'unreadable' };
+type RecordedHead = { kind: 'head'; record: HeadRecord } | { kind: 'none' } | { kind: 'not-a-head' } | { kind: 'unreadable' };
 /** Dendrite agent registry: live records, incarnation counters, held mail. */
 const AGENT_REGISTRY_STATE_ID = 'framework/dendrite';
 /** Dendrite agent registry: append-only history of ended agent records. */
@@ -18897,9 +18897,9 @@ export class AgentFramework {
   private readonly headDeclarations: HeadDeclarationStore = {
     read: (agentName) => {
       const recorded = this.recordedHead(agentName);
-      return recorded.kind === 'head' ? recorded.head : null;
+      return recorded.kind === 'head' ? recorded.record : null;
     },
-    write: (agentName, head) => this.storeHeadDeclaration(agentName, head),
+    write: (agentName, record) => this.storeHeadDeclaration(agentName, record),
     delete: (agentName) => this.storeHeadDeclaration(agentName, null),
   };
 
@@ -18933,18 +18933,18 @@ export class AgentFramework {
       return { kind: 'unreadable' };
     }
     if (stored == null) return { kind: 'none' };
-    if (isHeadDeclaration(stored)) return { kind: 'head', head: stored };
+    if (isHeadRecord(stored)) return { kind: 'head', record: stored };
     this.sayHeadLineOnce(agentName, 'not-a-head', () => console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside: the agent's next request on a model that takes a change records its current tools and system text as its head, and takes out the change rows its compile holds, once the store takes the write`));
     return { kind: 'not-a-head' };
   }
 
-  private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): boolean {
+  private storeHeadDeclaration(agentName: string, record: HeadRecord | null): boolean {
     const recorded = this.recordedHead(agentName);
-    if (recorded.kind === 'head' ? JSON.stringify(recorded.head) === JSON.stringify(head) : recorded.kind === 'none' && head === null) return true;
+    if (recorded.kind === 'head' ? JSON.stringify(recorded.record) === JSON.stringify(record) : recorded.kind === 'none' && record === null) return true;
     try {
-      this.store.setStateJson(this.headStateId(agentName), head);
+      this.store.setStateJson(this.headStateId(agentName), record);
     } catch (error) {
-      console.error(head === null
+      console.error(record === null
         ? `[head-declarations] ${agentName}: the recorded head could not be cleared, so it stays, with the change rows its context holds, until a later request clears it:`
         : recorded.kind !== 'head'
           ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded.kind === 'unreadable' ? ' that can be read' : ''}, so its requests go on its current head with no change row until a later request stores it:`
@@ -18998,27 +18998,27 @@ export class AgentFramework {
   private readonly headStores = new WeakMap<Agent, HeadDeclarationStore>();
 
   /**
-   * The record a new agent's starts as: a copy of the one held by the running
-   * agent that `spec.inherit` names, when it names no checkpoint.
+   * The head a new agent's record starts with: a copy of the one recorded by
+   * the running agent that `spec.inherit` names, when it names no checkpoint.
    */
   private inheritedHead(spec: Pick<AgentSpec, 'inherit'> | undefined): HeadDeclaration | undefined {
     const source = spec?.inherit && spec.inherit.atSequence === undefined ? this.agents.get(spec.inherit.from) : undefined;
-    const head = source ? this.headStores.get(source)?.read(source.name) : undefined;
-    return head ? copyHead(head) : undefined;
+    const record = source ? this.headStores.get(source)?.read(source.name) : undefined;
+    return record ? copyHead(record.head) : undefined;
   }
 
   /**
    * An Agent for `config` over `contextManager`, as every place that makes
    * one builds it, with its record of heads: in memory for a bounded job, in
-   * the store otherwise, starting as `inherited` where its context is a copy
-   * of its source's (inheritedHead).
+   * the store otherwise, starting on `inherited`, with nothing carried, where
+   * its context is a copy of its source's (inheritedHead).
    */
   private constructAgent(config: AgentConfig, contextManager: ContextManager, spec: Pick<AgentSpec, 'lifetime'>, inherited?: HeadDeclaration): Agent {
     const agent = new Agent(config, contextManager, this.membrane);
     this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     const heads = spec.lifetime.kind === 'task' ? memoryHeadDeclarations(() => contextManager.currentBranch().id) : this.headDeclarations;
-    if (inherited) heads.write(config.name, inherited);
+    if (inherited) heads.write(config.name, { head: inherited, carried: 0, at: this.usageTracker.inferenceCountOf(config.name) });
     this.attachHeads(agent, heads);
     return agent;
   }
@@ -19027,15 +19027,14 @@ export class AgentFramework {
     this.headStores.set(agent, store);
     agent.attachHeadDeclarations(store, (event: HeadEvent) => {
       this.emitTrace({ ...event, agentName: agent.name });
-      if (event.type === 'head:moved' && event.forced) {
-        const why = event.forced === 'budget'
-          ? `a compile was refused over budget, or for dropping messages no summary covers, with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again`
-          : `the system changes reached ${event.changeChars} characters of JSON, at least a fifth of the request's ${event.requestChars}, and no compile had taken them into the head at no further cost, so the head took them`;
+      if (event.type === 'head:moved' && event.why === 'budget') {
         this.opsAlert('head-consolidated', agent.name,
-          `${why}: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
-          { data: { forced: event.forced, changesRemoved: event.changesRemoved, ...(event.forced === 'share' ? { changeChars: event.changeChars, requestChars: event.requestChars } : {}) } });
+          `a compile was refused over budget, or for dropping messages no summary covers, with ${event.changesRemoved} system changes kept, so the head took them and the compile ran again: one whole write${this.thinkingSetAside(agent, 'and the thinking the request held set aside')}`,
+          { data: { changesRemoved: event.changesRemoved } });
       }
-    }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'));
+    }, (ids) => this.retractRemovedElsewhere(agent.getContextManager(), ids, 'head-moved'),
+    // Ephemeral runs share one count in the tracker, so theirs never moves for cost.
+    () => (this.ephemeralAgents.has(agent) ? undefined : this.usageTracker.inferenceCountOf(agent.name)));
   }
 
   /**

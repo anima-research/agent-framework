@@ -133,26 +133,38 @@ export type TraceEvent =
       type: 'head:moved';
       agentName: string;
       /** What moved the head to what's current: the first request on a
-       *  model that takes a change, a replacement of system text, a
-       *  consolidation, a change row the store didn't take (as between a
-       *  tool call and its result), or a request on a model that takes none,
-       *  or kept to its head, that found change rows to take out. */
-      why: 'adopted' | 'replaced' | 'consolidated' | 'unstored' | 'on-head';
+       *  model that takes a change, or the first after a rewind to before a
+       *  head was recorded ('adopted'); a replacement of system text
+       *  ('replaced'); a change row the store didn't take, as between a tool
+       *  call and its result ('unstored'); a compile refused over budget, or
+       *  for dropping messages no summary covers, with change rows kept
+       *  ('budget'); or a request on a model that takes none, or kept to its
+       *  head, that found change rows to take out ('on-head'). A move other
+       *  than 'on-head' is one whole write. At 'budget', with
+       *  `thinkingBinding.binds: true`, the request's thinking is left out.
+       *  With `binds` left out, the requests after it still carry it: with
+       *  `dropBlock` the provider drops it, and without it an account that
+       *  enforces the binding refuses them, and one that doesn't decides for
+       *  itself. */
+      why: 'adopted' | 'replaced' | 'unstored' | 'budget' | 'on-head';
       /** The change rows removed, since the head now holds what they
        *  declared, or what they declared is no longer current. */
       changesRemoved: number;
-      /** For a consolidation: the changes' characters as JSON, and those of the request they reached a share of. */
-      changeChars?: number;
-      requestChars?: number;
-      /** A consolidation no compile made free: past a fifth of the request
-       *  ('share'), or at a compile refused over budget, or for dropping
-       *  messages no summary covers, with changes kept
-       *  ('budget'). A whole write. With `thinkingBinding.binds: true`, the
-       *  request's thinking is left out. With `binds` left out, the requests
-       *  after it still carry it: with `dropBlock` the provider drops it, and
-       *  without it an account that enforces the binding refuses them, and
-       *  one that doesn't decides for itself. */
-      forced?: 'share' | 'budget';
+    })
+  | (TraceEventBase & {
+      type: 'head:moved';
+      agentName: string;
+      /** A move for cost: carrying the tool definitions a move takes out had
+       *  cost about as much in cache reads as the move costs at this compile.
+       *  It never sets kept thinking aside. */
+      why: 'cost';
+      changesRemoved: number;
+      /** The rule's figures, each an estimate: what carrying had cost, in
+       *  characters read (`carried`); the cache write price over the read
+       *  price, less one (`k`); and what the move writes that the request
+       *  would otherwise read, in characters (`extraNow`). The head moved as
+       *  `carried` reached `k * extraNow`. */
+      estimated: { carried: number; k: number; extraNow: number };
     })
   | (TraceEventBase & {
       /** A request whose system change was refused goes again on the head. */

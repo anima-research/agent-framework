@@ -189,6 +189,12 @@ export class UsageTracker {
     });
   }
 
+  /** The inferences counted for `agentName`'s own entry, restored ones
+   *  included; an ephemeral agent's count in the shared entry, not here. */
+  inferenceCountOf(agentName: string): number {
+    return this.byAgent.get(agentName)?.inferenceCount ?? 0;
+  }
+
   getSnapshot(): SessionUsageSnapshot {
     const byAgent: SessionUsageSnapshot['byAgent'] = [...this.byAgent.entries()].map(([name, data]) => ({
       agentName: name,

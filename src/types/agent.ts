@@ -306,21 +306,20 @@ export interface AgentConfig {
      *   as for a model that binds (`Agent.mayBindThinking`), as with
      *   `true`.
      *
-     * The choice that reads `mayBindThinking` is consolidation, on a model
-     * that takes a change in its context: a model that may bind consolidates for
-     * free only where no thinking sits before the compile's `firstChanged`
-     * (the first message that compile renders differently from the last
-     * one; the compile's own change already moved the prefix of everything
-     * from there on, so a move adds no loss of its own there).
-     * Past a fifth of the request, or when a compile is refused over budget,
-     * or for dropping messages no summary covers, with changes kept, it
-     * consolidates anyway. With `true`, the compile for the new head leaves
-     * that thinking out. Left out, the request still carries it, under a
-     * prefix it wasn't signed under. With `dropBlock`, the provider drops it
-     * from each request that carries it. Without it, an account that enforces
-     * the binding refuses each such request, and one that doesn't decides for
-     * itself. The host's model records carry `binds`, beside "takes
-     * entries".
+     * The choice that reads `mayBindThinking` is a move of the head for
+     * cost, on a model that takes a change in its context: a model that may
+     * bind moves its head for cost only at a compile where no kept thinking
+     * sits before its `firstChanged` (the first message that compile renders
+     * differently from the last one; the compile's own change already moved
+     * the prefix of everything from there on, so a move adds no loss of its
+     * own there). So a move for cost never sets kept thinking aside. When a
+     * compile is refused over budget, or for dropping messages no summary
+     * covers, with changes kept, the head moves anyway. With `true`, the
+     * compile for the new head leaves that thinking out. Left out, the
+     * request still carries it, under a prefix it wasn't signed under. With
+     * `dropBlock`, the provider drops it from each request that carries it.
+     * Without it, an account that enforces the binding refuses each such
+     * request, and one that doesn't decides for itself.
      */
     binds?: boolean;
   };

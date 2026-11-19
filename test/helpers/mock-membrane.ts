@@ -9,6 +9,7 @@ import type {
   NormalizedRequest,
   NormalizedResponse,
   ContentBlock,
+  ModelPricing,
   YieldingStream,
   StreamEvent,
 } from '@animalabs/membrane';
@@ -234,6 +235,14 @@ export class MockMembrane {
 
   takesToolOrSystemChanges(_model: string): boolean {
     return this.takesChanges;
+  }
+
+  /** What `pricingFor` answers for every model: membrane's prices, a 1-hour
+   *  write rate among them from 0.10.4 on; none unless a test sets them. */
+  prices: (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined = undefined;
+
+  pricingFor(_model: string): (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined {
+    return this.prices && { ...this.prices };
   }
 
   asMembrane(): import('@animalabs/membrane').Membrane {

@@ -1,6 +1,6 @@
 import { NOTICE_TAG } from './notice-tags.js';
 import { heartbeatToolAlias } from './heartbeat/heartbeat.js';
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
+import type { Membrane, ModelPricing, NormalizedMessage, NormalizedRequest, ContentBlock, SystemChangeContent, ThinkingBindingEntry, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse, isSystemChangeContent } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
@@ -29,12 +29,15 @@ import {
   systemChangeMetadata,
   systemTextOf,
   copyHead,
-  pricedCharacters,
+  carriedBy,
+  deadCharacters,
   requestCharacters,
+  type CostFigures,
   type DeclarationDifference,
   type HeadDeclaration,
   type HeadDeclarationStore,
   type HeadEvent,
+  type HeadRecord,
 } from './system-changes.js';
 import {
   CONTINUE_ROW,
@@ -183,8 +186,19 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, cont
 }
 
 // membrane answers from 0.10.4 on. An earlier membrane, which this package's
-// range admits, has no answer, and its agents take no change.
-type ChangeAnswering = Pick<Membrane, 'stream'> & { takesToolOrSystemChanges?(model: string): boolean };
+// range admits, has no answer, and its agents take no change. membrane
+// gives its prices from 0.10.4 on too, with a 1-hour write rate: before
+// that, no agent's head moves for cost.
+type ChangeAnswering = Pick<Membrane, 'stream'> & {
+  takesToolOrSystemChanges?(model: string): boolean;
+  pricingFor?(model: string): (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined;
+};
+
+/** How a move of the head came about, as its trace says it (HeadEvent). */
+type Move = { why: 'adopted' | 'replaced' | 'unstored' } | { why: 'cost'; estimated: CostFigures };
+
+/** What carrying the definitions a move would take out has cost by now. */
+type Carrying = { dead: number; carried: number; count: number };
 
 /** A settled request: its compile, the head it carries, the declaration row
  *  it appends, if any, and whether it goes in the fallback form, every
@@ -431,6 +445,7 @@ export class Agent {
   private headDeclarations: HeadDeclarationStore = memoryHeadDeclarations(() => this.contextManager.currentBranch().id);
   private onHeadEvent: ((event: HeadEvent) => void) | undefined;
   private onChangesRemoved: ((ids: readonly MessageId[]) => void) | undefined;
+  private requestsCounted: (() => number | undefined) | undefined;
   /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
   readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
@@ -2044,7 +2059,7 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const recorded = this.takesChanges() ? this.headDeclarations.read(this.name) : null;
+    const recorded = this.takesChanges() ? this.headDeclarations.read(this.name)?.head ?? null : null;
     const compileBound = (binding: BindingCompileOptions) => this.toolResultGuard.afterAnnotations(
       () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
     const assemble = async (): Promise<NormalizedRequest> => {
@@ -2233,7 +2248,7 @@ export class Agent {
       .filter((injection) => injection.position === 'system')
       .flatMap((injection) => injection.content);
     const takes = this.takesChanges();
-    let recorded = takes ? this.headDeclarations.read(this.name) : null;
+    let record = takes ? this.headDeclarations.read(this.name) : null;
     const compile = (head: HeadDeclaration, leftOut = false) => {
       const immutablePrefixHash = kvUnified ? headHash(head) : undefined;
       const binding = this.bindingCompileOptions(head, leftOut);
@@ -2249,21 +2264,21 @@ export class Agent {
           : undefined,
       );
     };
-    let compiledWith = recorded ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    let compiledWith = record?.head ?? this.currentHead(availableTools, prospectiveSystemInjections);
     let first: CompileResult;
     try {
       first = await compile(compiledWith);
     } catch (error) {
       if (options.dryRun) throw error;
-      compiledWith = this.takeChangesOverBudget(error, takes, recorded, this.currentHead(availableTools, prospectiveSystemInjections));
-      if (takes) recorded = compiledWith;
+      compiledWith = this.takeChangesOverBudget(error, takes, record?.head ?? null, this.currentHead(availableTools, prospectiveSystemInjections));
+      if (takes) record = this.headDeclarations.read(this.name);
       first = await compile(compiledWith);
     }
     const settled = await this.settleHead(
       first,
       kvUnified || this.thinkingBinds ? compiledWith : null,
       availableTools,
-      recorded,
+      record,
       takes,
       options.dryRun === true,
       compile,
@@ -2890,16 +2905,18 @@ export class Agent {
     return !this.headUntilBuiltAgain && membrane.takesToolOrSystemChanges?.(this.model) === true;
   }
 
-  /** The framework's record of heads, its traces of what moved them, and where the change rows a move takes out go (the removal funnel, #291).
+  /** The framework's record of heads, its traces of what moved them, where the change rows a move takes out go (the removal funnel, #291), and the agent's count of finished inferences, which the rule for cost reads: undefined for an agent whose head never moves for cost.
    *  @internal For the framework's head store; not a host API. */
   attachHeadDeclarations(
     store: HeadDeclarationStore,
     onEvent?: (event: HeadEvent) => void,
     onChangesRemoved?: (ids: readonly MessageId[]) => void,
+    requestsCounted?: () => number | undefined,
   ): void {
     this.headDeclarations = store;
     this.onHeadEvent = onEvent;
     this.onChangesRemoved = onChangesRemoved;
+    this.requestsCounted = requestsCounted;
   }
 
   /** The fail-safe: declare on the head until this agent is built again.
@@ -2912,7 +2929,7 @@ export class Agent {
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
     availableTools: ToolDefinition[],
-    recorded: HeadDeclaration | null,
+    record: HeadRecord | null,
     takes: boolean,
     dryRun: boolean,
     compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
@@ -2920,7 +2937,7 @@ export class Agent {
   ): Promise<Settled> {
     const current = this.currentHead(availableTools, compiled.systemInjections);
     if (!takes) return this.withoutDeclarationRows(await this.leaveHead(compiled, current, dryRun, compile), current, compile);
-    const settled = await this.settleOnRecord(compiled, compiledWith, current, recorded, dryRun, compile, previewRows);
+    const settled = await this.settleOnRecord(compiled, compiledWith, current, record, dryRun, compile, previewRows);
     // What goes out folds to what the agent has now: the head it carries, with
     // every declaration row in its messages. Otherwise it goes in the
     // fallback form, which is right, and the next request tries again.
@@ -2966,18 +2983,25 @@ export class Agent {
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
     current: HeadDeclaration,
-    recorded: HeadDeclaration | null,
+    record: HeadRecord | null,
     dryRun: boolean,
     compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
     previewRows: readonly NormalizedMessage[],
   ): Promise<Settled> {
+    if (!record) return this.moveHead(compiled, compiledWith, null, current, { why: 'adopted' }, dryRun, compile);
+    const recorded = record.head;
     const held = heldDeclarations(compiled);
-    if (!recorded) return this.moveHead(compiled, compiledWith, recorded, current, 'adopted', dryRun, compile);
-    const { blocks, difference } = this.declaredDifference(compiled, held, recorded, current, previewRows);
-    if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, 'replaced', dryRun, compile);
-    const consolidation = this.consolidation(compiled, held, blocks, recorded, previewRows);
-    if (consolidation) return this.moveHead(compiled, compiledWith, recorded, current, 'consolidated', dryRun, compile, consolidation);
-    if (difference.kind === 'none') return { compiled, head: recorded };
+    const { difference } = this.declaredDifference(compiled, held, recorded, current, previewRows);
+    if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, { why: 'replaced' }, dryRun, compile);
+    const carrying = dryRun ? undefined : this.carrying(compiled, held, record);
+    const estimated = carrying && this.costOfCarrying(compiled, carrying, recorded, current);
+    if (estimated) return this.moveHead(compiled, compiledWith, recorded, current, { why: 'cost', estimated }, dryRun, compile);
+    if (difference.kind === 'none') {
+      // A count below the record's, as after a usage state that was reset:
+      // the record's count takes it.
+      if (carrying && carrying.count < record.at) this.noteCarrying(recorded, carrying);
+      return { compiled, head: recorded };
+    }
     const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
     if (dryRun) return { compiled, head: recorded, declared };
     try {
@@ -2986,10 +3010,13 @@ export class Agent {
       // context-manager refuses a change between a tool call and its result:
       // a row the store doesn't take moves the head instead.
       if (storedOfThrownWrite(error, (id) => this.contextManager.getMessage(id) !== null).length === 0) {
-        return this.moveHead(compiled, compiledWith, recorded, current, 'unstored', dryRun, compile);
+        return this.moveHead(compiled, compiledWith, recorded, current, { why: 'unstored' }, dryRun, compile);
       }
       console.error(`[head-declarations] ${this.name}: storing a system change threw, but the store holds it, so the request declares it:`, error);
     }
+    // What carrying has cost is written as the new row changes what a move
+    // would take out, which counts from here.
+    if (carrying) this.noteCarrying(recorded, carrying);
     this.onHeadEvent?.({
       type: 'head:declared',
       removed: difference.block.removeTools ?? [],
@@ -3015,10 +3042,71 @@ export class Agent {
     recorded: HeadDeclaration,
     current: HeadDeclaration,
     previewRows: readonly NormalizedMessage[] = [],
-  ): { blocks: SystemChangeContent[]; difference: DeclarationDifference } {
+  ): { difference: DeclarationDifference } {
     const blocks = [...compiled.messages.filter((_, index) => held.has(index)), ...previewRows.filter(isDeclarationRow)]
       .flatMap((message) => message.content.filter(isSystemChangeContent));
-    return { blocks, difference: declarationDifference(effectiveDeclaration(recorded, blocks), current) };
+    return { difference: declarationDifference(effectiveDeclaration(recorded, blocks), current) };
+  }
+
+  // What carrying the definitions a move would take out has cost by the
+  // agent's count of finished inferences: undefined for an agent with no
+  // count, whose head never moves for cost.
+  private carrying(compiled: CompileResult, held: ReadonlySet<number>, record: HeadRecord): Carrying | undefined {
+    const count = this.requestsCounted?.();
+    if (count === undefined) return undefined;
+    const sources = compiled.provenance?.messages;
+    const rows = [...held].map((index) => {
+      const source = sources?.[index];
+      return {
+        changes: compiled.messages[index]?.content.filter(isSystemChangeContent) ?? [],
+        removable: source?.kind === 'raw' && source.bodies.some((body) => this.contextManager.getMessage(body.messageId) !== null),
+      };
+    });
+    const dead = deadCharacters(record.head, rows);
+    return { dead, carried: carriedBy(record, dead, count), count };
+  }
+
+  // The rule for cost (report:acorn-2386-design): the head moves when
+  // carrying what a move would take out has cost about as much in cache reads
+  // as the move costs at this compile, `carried >= k * extraNow`. `extraNow`
+  // is what the move writes that the request would otherwise read: the head,
+  // and the messages before the compile's `firstChanged`. It moves only at a
+  // committing compile with a `firstChanged`, and on a model that may bind
+  // its thinking only where no kept thinking comes before it. With nothing
+  // dead, or a model membrane can't price, it never moves for cost.
+  private costOfCarrying(compiled: CompileResult, carrying: Carrying, recorded: HeadDeclaration, current: HeadDeclaration): CostFigures | undefined {
+    if (carrying.dead === 0 || this.moveChangesNothing(compiled, recorded, current)) return undefined;
+    const k = this.writeOverRead();
+    if (k === undefined) return undefined;
+    // context-manager compares `firstChanged` when it's read.
+    const { firstChanged } = compiled;
+    if (firstChanged == null) return undefined;
+    const before = this.rowsAsSent(compiled.messages).slice(0, firstChanged).filter((m) => m.content.length > 0);
+    if (this.mayBindThinking && before.some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'))) return undefined;
+    const extraNow = requestCharacters(current, before);
+    return carrying.carried >= k * extraNow ? { carried: carrying.carried, k, extraNow } : undefined;
+  }
+
+  // k: the cache write price over the read price, less one, for this agent's
+  // model and cache lifetime, as membrane's cost lines price them. A 1-hour
+  // write takes membrane's 1-hour rate where it has one, and its 5-minute
+  // rate where it has none. Undefined where membrane can't price the model.
+  private writeOverRead(): number | undefined {
+    const membrane: ChangeAnswering = this.membrane;
+    const pricing = membrane.pricingFor?.(this.model);
+    const read = pricing?.cacheReadPerMillion;
+    const fiveMinute = pricing?.cacheWritePerMillion;
+    const write = fiveMinute !== undefined && this.cacheTtl === '1h' ? pricing?.cacheWrite1hPerMillion ?? fiveMinute : fiveMinute;
+    return read !== undefined && read > 0 && write !== undefined ? write / read - 1 : undefined;
+  }
+
+  private noteCarrying(head: HeadDeclaration, carrying: Carrying): void {
+    this.headDeclarations.write(this.name, { head: copyHead(head), carried: carrying.carried, at: carrying.count });
+  }
+
+  // The record a move writes: the head, with nothing carried yet.
+  private movedRecord(head: HeadDeclaration): HeadRecord {
+    return { head: copyHead(head), carried: 0, at: this.requestsCounted?.() ?? 0 };
   }
 
   private takeChangesOverBudget(error: unknown, takes: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
@@ -3032,11 +3120,9 @@ export class Agent {
       return current;
     }
     const rows = this.windowDeclarationRows();
-    if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
+    if (rows.length === 0 || !this.headDeclarations.write(this.name, this.movedRecord(current))) throw error;
     const removed = this.removeDeclarationRows(rows);
-    this.onHeadEvent?.(recorded
-      ? { type: 'head:moved', why: 'consolidated', changesRemoved: removed, forced: 'budget' }
-      : { type: 'head:moved', why: 'adopted', changesRemoved: removed });
+    this.onHeadEvent?.({ type: 'head:moved', why: recorded ? 'budget' : 'adopted', changesRemoved: removed });
     return current;
   }
 
@@ -3045,21 +3131,32 @@ export class Agent {
     compiledWith: HeadDeclaration | null,
     recorded: HeadDeclaration | null,
     current: HeadDeclaration,
-    why: 'adopted' | 'replaced' | 'consolidated' | 'unstored',
+    move: Move,
     dryRun: boolean,
     compile: (head: HeadDeclaration) => Promise<CompileResult>,
-    sizes?: { changeChars: number; requestChars: number; forced?: 'share' },
   ): Promise<{ compiled: CompileResult; head: HeadDeclaration }> {
     if (dryRun) {
       const shown = compiledWith !== null && headHash(compiledWith) !== headHash(current) ? await compile(current) : compiled;
       return { compiled: this.withoutDeclarations(shown), head: current };
     }
-    const stored = this.headDeclarations.write(this.name, copyHead(current));
+    if (recorded && this.moveChangesNothing(compiled, recorded, current)) return { compiled, head: recorded };
+    const stored = this.headDeclarations.write(this.name, this.movedRecord(current));
     if (!stored && recorded) return { compiled, head: recorded };
-    const removed = this.removeDeclarationRows(declarationRowIds(compiled));
-    if (stored) this.onHeadEvent?.({ type: 'head:moved', why, changesRemoved: removed, ...sizes });
+    const removed = this.removeDeclarationRows(this.removableDeclarationRows(compiled));
+    if (stored) this.onHeadEvent?.({ type: 'head:moved', changesRemoved: removed, ...move });
     const again = removed > 0 || (compiledWith !== null && headHash(compiledWith) !== headHash(current));
     return { compiled: again ? await compile(current) : compiled, head: current };
+  }
+
+  // A move that changes neither the record's head nor a row is no move.
+  private moveChangesNothing(compiled: CompileResult, recorded: HeadDeclaration, current: HeadDeclaration): boolean {
+    return headHash(recorded) === headHash(current) && this.removableDeclarationRows(compiled).length === 0;
+  }
+
+  // The declaration rows a move takes out: those the compile holds that the
+  // agent's context can remove (removeDeclarationRows).
+  private removableDeclarationRows(compiled: CompileResult): MessageId[] {
+    return declarationRowIds(compiled).filter((id) => this.contextManager.getMessage(id) !== null);
   }
 
   private withoutDeclarations(compiled: CompileResult): CompileResult {
@@ -3067,26 +3164,6 @@ export class Agent {
     const kept = (_: unknown, index: number) => !held.has(index);
     const provenance = compiled.provenance && { ...compiled.provenance, messages: compiled.provenance.messages.filter(kept) };
     return { ...compiled, messages: compiled.messages.filter(kept), ...(provenance ? { provenance } : {}) };
-  }
-
-  // context-manager: `firstChanged` is the first compiled message whose bytes
-  // differ from the previous committing compile's, and null before a manager's
-  // first committing compile; and a passthrough strategy over budget, which
-  // keeps changes ahead of its window, re-renders from the first change only at
-  // the compile where its window first passes it.
-  private consolidation(compiled: CompileResult, held: ReadonlySet<number>, blocks: SystemChangeContent[], head: HeadDeclaration, previewRows: readonly NormalizedMessage[]): { changeChars: number; requestChars: number; forced?: 'share' } | undefined {
-    const firstChange = held.values().next().value;
-    if (firstChange === undefined) return undefined;
-    const sent = this.rowsAsSent(compiled.messages);
-    const changeChars = blocks.reduce((sum, block) => sum + pricedCharacters(block), 0);
-    const requestChars = requestCharacters(head, [...sent, ...this.rowsAsSent(previewRows)].filter((m) => m.content.length > 0));
-    if (changeChars * 10 < requestChars) return undefined;
-    // context-manager compares `firstChanged` when it's read.
-    const { firstChanged } = compiled;
-    const free = firstChanged != null && firstChanged <= firstChange && !(this.mayBindThinking && sent.slice(0, firstChanged)
-      .some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking')));
-    if (free) return { changeChars, requestChars };
-    return changeChars * 5 >= requestChars ? { changeChars, requestChars, forced: 'share' } : undefined;
   }
 
   // Where no compile is at hand (one refused over budget), the declaration
