@@ -55,6 +55,15 @@ test("a journal after a table without a number doesn't number the next table", (
   assert.equal(r.tables[0].journal, 0);
 });
 
+test('a store that holds nothing is current, and its first change writes the table in place of an append', () => {
+  const r = recorder();
+  const durable = new CoalescingStore(r.store, NONE, () => {});
+  assert.equal(durable.current, true);
+  durable.write([change('a')], () => TABLE);
+  assert.deepEqual(r.calls, [`set ${COALESCING_TABLE_ID}`]);
+  assert.equal(new CoalescingStore(r.store, { table: TABLE, journal: [], recent: [] }, () => {}).current, false, 'a table without a number is not current');
+});
+
 test('a table write empties the list a release before the journal wrote, after the table', () => {
   const r = recorder();
   new CoalescingStore(r.store, { table: EMPTY, journal: [], recent: [{}] }, () => {}).writeTable(EMPTY);

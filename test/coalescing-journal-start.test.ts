@@ -167,3 +167,10 @@ test("a damaged journal after a table without a number doesn't stop a start, whi
   await f.create();
   assert.deepEqual((f.framework.getStore() as unknown as JsStore).getStateJson('mcpl/coalescing-journal'), []);
 });
+
+test('a start on a store that holds nothing writes nothing', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const store = f.framework.getStore() as unknown as JsStore;
+  assert.equal(store.getStateJson('mcpl/coalescing'), null);
+  assert.deepEqual(store.getStateJson('mcpl/coalescing-journal') ?? [], []);
+});

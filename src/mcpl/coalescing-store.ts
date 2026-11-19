@@ -52,6 +52,7 @@ const bytesOf = (value: unknown): number => Buffer.byteLength(JSON.stringify(val
 export class CoalescingStore {
   private seq = 0;
   private marked = false;
+  private tableHeld = false;
   private journalHeld = false;
   private recentHeld = false;
   private tableBytes = 0;
@@ -71,6 +72,7 @@ export class CoalescingStore {
     const number = typeof table?.journal === 'number' ? table.journal : undefined;
     const items = number !== undefined && Array.isArray(journal) ? journal.filter(isJournalItem) : [];
     this.marked = number !== undefined;
+    this.tableHeld = table !== null && table !== undefined;
     this.seq = items.reduce((most, item) => Math.max(most, item.seq), Math.max(this.seq, number ?? 0));
     this.journalHeld = journal !== null && journal !== undefined && !(Array.isArray(journal) && journal.length === 0);
     this.recentHeld = recent !== null && recent !== undefined && !(Array.isArray(recent) && recent.length === 0);
@@ -88,7 +90,7 @@ export class CoalescingStore {
   }
 
   get current(): boolean {
-    return this.marked && !this.owed && !this.journalHeld && !this.recentHeld;
+    return (this.marked || !this.tableHeld) && !this.owed && !this.journalHeld && !this.recentHeld;
   }
 
   write(changes: readonly CoalescingChange[], table: () => CoalescingSnapshot): void {

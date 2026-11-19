@@ -518,7 +518,7 @@ test("a coalescing batch whose render may have started, which an agent's context
   await crash(f);
   const journaled = JsStore.openOrCreate({ path: join(f.dir, 'store') });
   const table = journaled.getStateJson('mcpl/coalescing') as StoredCoalescingTable;
-  const journal = journaled.getStateJson('mcpl/coalescing-journal') as CoalescingJournalItem[];
+  const journal = (journaled.getStateJson('mcpl/coalescing-journal') ?? []) as CoalescingJournalItem[];
   const accepted = journaledTable(table, journal)!.subjects.find((record) => record.batch)!;
   const seq = journal.reduce((most, item) => Math.max(most, item.seq), table.journal!) + 1;
   journaled.appendToStateJson('mcpl/coalescing-journal', { subject: accepted.subject, seq, record: { ...accepted, batch: { ...accepted.batch!, rendering: true } } });
