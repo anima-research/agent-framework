@@ -38,7 +38,7 @@ async function harness(config: Partial<AgentConfig>, probeHandler?: (call: ToolC
   };
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'Test', ...config }],
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'Test', sendSilencing: true, ...config }],
     modules: deferModule ? [] : [module], syncIntervalMs: 0, codeExecution: { enabled: true },
     conversations: { templateAgent: 'assistant', bind: { channel: 'mention' } },
   });
@@ -667,7 +667,7 @@ test('a script in flight cannot gain legacy permissions when its ephemeral run d
     streamEntered(); return stream;
   };
   try {
-    const created = await h.framework.createEphemeralAgent({ name: 'retiring-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['code_execution', 'probe--allowed'] });
+    const created = await h.framework.createEphemeralAgent({ name: 'retiring-worker', model: 'test', systemPrompt: 'Test', sendSilencing: true, allowedTools: ['code_execution', 'probe--allowed'] });
     created.contextManager.addMessage('user', [{ type: 'text', text: 'Complete once.' }]);
     h.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Completed' }]));
     const run = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
@@ -768,7 +768,7 @@ for (const route of ['model', 'public', 'script'] as const) {
 test('never-run and retired ephemerals report missing registration, not allowlist advice', async () => {
   const h = await harness({ allowedTools: 'all' });
   try {
-    const created = await h.framework.createEphemeralAgent({ name: 'identity-worker', model: 'test', systemPrompt: 'Test', allowedTools: ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'probe--allowed_util'] });
+    const created = await h.framework.createEphemeralAgent({ name: 'identity-worker', model: 'test', systemPrompt: 'Test', sendSilencing: true, allowedTools: ['toolsets--open', 'toolsets--act', 'toolsets--look', 'toolsets--close', 'probe--allowed_util'] });
     const check = async () => {
       const before = h.effects.length;
       for (const [name, input] of [['probe--allowed_util', {}], ['toolsets--act', { tool: 'probe--allowed_util', args: {} }], ['toolsets--look', {}]] as const) {
@@ -805,7 +805,7 @@ test("a resident's call of its reader's tool is refused, so a script is told it 
   const dir = mkdtempSync(join(tmpdir(), 'agent-allowed-tools-reader-'));
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
-    agents: [{ name: 'scout', model: 'test', systemPrompt: 'Test' }],
+    agents: [{ name: 'scout', model: 'test', systemPrompt: 'Test', sendSilencing: true }],
     modules: [], syncIntervalMs: 0, codeExecution: { enabled: true },
     subconscious: { enabled: true, reader: 'forks', model: 'test', voice: 'Read for scout.' },
   });

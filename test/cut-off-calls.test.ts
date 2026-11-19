@@ -106,7 +106,7 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'),
     membrane,
-    agents: [{ name: 'resident', model: mode === 'xml' ? 'claude-opus-4-1' : 'claude-opus-5-5', systemPrompt: 'You are a resident.', proseRouting: 'locus', ...settings } as never],
+    agents: [{ name: 'resident', model: mode === 'xml' ? 'claude-opus-4-1' : 'claude-opus-5-5', systemPrompt: 'You are a resident.', sendSilencing: true, proseRouting: 'locus', ...settings } as never],
     modules: [robot],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
@@ -563,7 +563,7 @@ describe('an ephemeral run whose response ends at the output limit with calls in
     try {
       framework.start();
       const { agent, contextManager } = await framework.createEphemeralAgent({
-        name: 'worker', model: 'claude-opus-5-5', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'disabled',
+        name: 'worker', model: 'claude-opus-5-5', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all', proseRouting: 'disabled',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       const result = await framework.runEphemeralToCompletion(agent, contextManager);

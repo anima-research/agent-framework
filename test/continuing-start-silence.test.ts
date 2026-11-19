@@ -188,9 +188,9 @@ async function turn(options: {
     storePath: join(dir, 'store'),
     membrane: membrane.asMembrane(),
     agents: [{
-      name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', proseRouting: options.proseRouting,
+      name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', sendSilencing: true, proseRouting: options.proseRouting,
       ...(options.maxStreamTokens !== undefined ? { maxStreamTokens: options.maxStreamTokens } : {}),
-    }, ...(options.residents ? [{ name: 'other', model: 'test-model', systemPrompt: 'You are other.' }] : [])],
+    }, ...(options.residents ? [{ name: 'other', model: 'test-model', systemPrompt: 'You are other.', sendSilencing: true }] : [])],
     mcplServers: [{
       id: 'discord', command: process.execPath, args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
       env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath, SEND_TOOL: '1' }, toolPrefix: 'discord',

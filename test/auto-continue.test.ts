@@ -148,7 +148,7 @@ describe('autoContinue', () => {
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [{
-        name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue,
+        name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', sendSilencing: true, proseRouting, autoContinue,
         ...(allowedTools ? { allowedTools } : {}),
       }, ...others],
       modules: [module],
@@ -617,7 +617,7 @@ describe('autoContinue', () => {
   // resident's live turn holds nothing. This test once had the continuation
   // wait for that turn before writing its row.
   it("doesn't wait for another resident's turn: its row is its own, in no other resident's window", async () => {
-    const framework = await createFramework(true, 'locus', undefined, [{ name: 'other', model: 'test-model', systemPrompt: 'Another resident.' }]);
+    const framework = await createFramework(true, 'locus', undefined, [{ name: 'other', model: 'test-model', systemPrompt: 'Another resident.', sendSilencing: true }]);
     stubRegistry(framework);
     const internals = framework as unknown as {
       autoContinueAfterTurn(agent: unknown, routing: unknown, trigger: unknown, stopReason: string): void;
@@ -863,7 +863,7 @@ describe("a continuation of a turn its batch gave no channel", () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', proseRouting, autoContinue }],
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a test agent.', sendSilencing: true, proseRouting, autoContinue }],
       modules: [],
     });
     stubRegistry(framework);
@@ -904,7 +904,7 @@ describe("a continuation of a turn its batch gave no channel", () => {
 });
 
 describe('autoContinue config', () => {
-  const at = (autoContinue: unknown) => ({ name: 'a', model: 'm', systemPrompt: '', autoContinue } as AgentConfig);
+  const at = (autoContinue: unknown) => ({ name: 'a', model: 'm', systemPrompt: '', sendSilencing: true, autoContinue } as AgentConfig);
 
   it('reads off, true, and a cap', () => {
     assert.equal(resolveAutoContinue(at(undefined)), undefined);
