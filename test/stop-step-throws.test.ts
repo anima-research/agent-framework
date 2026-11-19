@@ -147,7 +147,7 @@ function checkPostponedReleases(framework: AgentFramework): void {
 
 const ROWS: Row[] = [
   { step: "the push coalescer's suspend()", inject: (fw, e) => throwIn(internals(fw), 'pushCoalescer', 'suspend', e) },
-  { step: 'flushing the coalescing snapshot', inject: (fw, e) => patchMethod(fw, 'flushCoalescingSnapshot', e) },
+  { step: 'writing the coalescing table', inject: (fw, e) => patchMethod(fw, 'writeCoalescingTable', e) },
   {
     step: "a retry wait's waker",
     inject: (fw, e) => {

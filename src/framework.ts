@@ -124,9 +124,13 @@ import { readSkipReplyWake, skipReplyWakeRefusal, type SkipReplyEarlierWake } fr
 import { convertBlocks } from './mcpl/convert-block.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
-  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement,
   type CoalescingReceiptRecord, type DeliveryOptions,
 } from './mcpl/push-coalescer.js';
+import {
+  COALESCING_JOURNAL_ID, COALESCING_JOURNAL_REGISTRATION, COALESCING_RECENT_ID, COALESCING_TABLE_ID, CoalescingStore,
+  isJournalItem, journaledTable, type CoalescingJournalItem, type StoredCoalescing, type StoredCoalescingTable,
+} from './mcpl/coalescing-store.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, McpToolResultContent, PushEventResult } from './mcpl/types.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent, NON_STRING_TEXT_PLACEHOLDER } from './mcpl/visible-content.js';
 import { isProseTargetToken, parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
@@ -1123,10 +1127,6 @@ interface CoalescedChannelEvent {
 type CoalescedDelivery =
   | { lane: 'channel'; event: CoalescedChannelEvent }
   | { lane: 'push'; event: McplPushEvent };
-/** RFC-006 coalescing bookkeeping: receipts (retry window) + subject history. */
-const COALESCING_STATE_ID = 'mcpl/coalescing';
-/** Receipts written since the last snapshot flush (bridges the throttle window). */
-const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
 /** Requests that CONTINUE a turn whose token is already held — a context-
  *  budget restart, or the non-streaming path's tool-results round. The
  *  quiesce wake gate lets these through: the drain is exactly the phase
@@ -4883,9 +4883,7 @@ export class AgentFramework {
   /** Both lanes are admitted in arrival order: a create, edit and delete of
    *  one subject must not overtake one another while routing awaits. */
   private coalescingAdmission: Promise<unknown> = Promise.resolve();
-  private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
-  private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
-  private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  private coalescingStore: CoalescingStore | null = null;
   /**
    * Dendrite agent registry — every agent this framework runs, with its
    * roles, lifetime and relationships. `agents` stays the map of live Agent
@@ -5417,9 +5415,10 @@ export class AgentFramework {
     // release's, which the importer reads and clears (one release).
     ensureStateRegistered(store, { id: FRAMEWORK_STATE_ID, strategy: 'snapshot' });
     ensureStateRegistered(store, { id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
-    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID, AGENT_REGISTRY_STATE_ID]) {
+    for (const id of [COALESCING_TABLE_ID, COALESCING_RECENT_ID, AGENT_REGISTRY_STATE_ID]) {
       ensureStateRegistered(store, { id, strategy: 'snapshot' });
     }
+    ensureStateRegistered(store, COALESCING_JOURNAL_REGISTRATION);
     ensureStateRegistered(store, {
       id: INFERENCE_LOG_ID,
       strategy: 'append_log',
@@ -6431,7 +6430,7 @@ export class AgentFramework {
       for (const connection of this.modernServers().values()) connection.stopReconnecting();
     });
     step(() => this.pushCoalescer?.suspend());
-    step(() => this.flushCoalescingSnapshot());
+    step(() => this.writeCoalescingTable('stop'));
     this.running = false;
     // Bounded work this stop cuts off is neither finished nor failed. Its
     // record stays live in the snapshot, so the next boot ends it as
@@ -16372,7 +16371,10 @@ export class AgentFramework {
     try {
       this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
       this.tuneOutCoordinator?.branchMoved(sameBranch);
-      if (!sameBranch) this.redoStacks.clear();
+      if (!sameBranch) {
+        this.redoStacks.clear();
+        this.coalescingStore?.branchMoved(this.storedCoalescing());
+      }
       failures = await this.reinitializeManagers(except);
       // The agent the move was made through initialized its own manager,
       // or failed to: a failed surgery's restore that left it refusing its
@@ -21734,9 +21736,12 @@ export class AgentFramework {
    * acceptance's receipt and the next flush would replace what's stored, and
    * taken as undelivered, an occurrence would be delivered again.
    */
-  private restorePushCoalescer(): { coalescer: PushCoalescer<CoalescedDelivery>; recent?: CoalescingReceiptRecord[] } {
-    const what = (stateId: string): string =>
-      `the coalescing ${stateId === COALESCING_STATE_ID ? 'receipts and batches' : 'receipts since the last snapshot'} (${stateId})`;
+  private restorePushCoalescer(): { coalescer: PushCoalescer<CoalescedDelivery>; durable: CoalescingStore } {
+    const journaled = `${COALESCING_TABLE_ID}+${COALESCING_JOURNAL_ID}`;
+    const what = (stateId: string): string => stateId === journaled
+      ? `the coalescing receipts and batches (${COALESCING_TABLE_ID}) with the changes since (${COALESCING_JOURNAL_ID})`
+      : `the coalescing ${stateId === COALESCING_TABLE_ID ? 'receipts and batches'
+        : stateId === COALESCING_JOURNAL_ID ? 'changes since the last table' : 'receipts since the last snapshot'} (${stateId})`;
     const stops = `MCPL doesn't start without them, and neither does create() with MCPL servers configured, nor a ` +
       `first connectMcplServer(), since the next coalesced push or message would replace them.`;
     const unchanged = `They're unchanged, and starting again won't help until they're repaired.`;
@@ -21749,7 +21754,7 @@ export class AgentFramework {
         throw refuse(stateId, `could not be read: ${thrownText(error)}`, `They're unchanged, and MCPL starts once they can be read.`, error);
       }
     };
-    const snapshot = read(COALESCING_STATE_ID);
+    const snapshot = read(COALESCING_TABLE_ID);
     const recent = read(COALESCING_RECENT_ID);
     if (snapshot !== null && snapshot !== undefined) {
       const version = typeof snapshot === 'object' && !Array.isArray(snapshot)
@@ -21758,12 +21763,12 @@ export class AgentFramework {
       if (version !== 1) {
         throw typeof version === 'number'
           ? refuse(
-            COALESCING_STATE_ID,
+            COALESCING_TABLE_ID,
             `are a version ${version} snapshot, which this version of agent-framework doesn't read`,
             `They're unchanged, and the version that wrote them reads them.`,
           )
           : refuse(
-            COALESCING_STATE_ID,
+            COALESCING_TABLE_ID,
             version === undefined
               ? `are ${jsonKind(snapshot)} with no snapshot version`
               : `are a snapshot whose version is ${jsonKind(version)}, not 1`,
@@ -21773,6 +21778,22 @@ export class AgentFramework {
     }
     if (recent !== null && recent !== undefined && !Array.isArray(recent)) {
       throw refuse(COALESCING_RECENT_ID, `are ${jsonKind(recent)}, not a list of receipts`, unchanged);
+    }
+    const table = (snapshot ?? null) as StoredCoalescingTable | null;
+    const number = typeof table?.journal === 'number' ? table.journal : undefined;
+    const numbered = number !== undefined;
+    const journal = numbered ? read(COALESCING_JOURNAL_ID) : this.unappliedJournal();
+    if (numbered && journal !== null && journal !== undefined && !Array.isArray(journal)) {
+      throw refuse(COALESCING_JOURNAL_ID, `are ${jsonKind(journal)}, not a list of changes`, unchanged);
+    }
+    const items: CoalescingJournalItem[] = [];
+    if (numbered && Array.isArray(journal)) {
+      for (const [at, item] of journal.entries()) {
+        if (!isJournalItem(item)) {
+          throw refuse(COALESCING_JOURNAL_ID, `hold ${jsonKind(item)} at item ${at}, not a numbered change of a subject`, unchanged);
+        }
+        items.push(item);
+      }
     }
     // Set when wasPublished can't read an agent's context, so the restore that
     // asked refuses with what couldn't be checked rather than as malformed.
@@ -21814,23 +21835,7 @@ export class AgentFramework {
         }
         this.emitTrace({ type: 'mcpl:coalescing', ...record });
       },
-      save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
-      recordReceipt: (record) => {
-        // Written now, not at the throttled flush: an acknowledged acceptance
-        // must not lose its receipt, the subject's birth, or (deferred) the
-        // accepted work itself to a crash. A failure here fails the answer:
-        // the coalescer keeps the receipt, and the producer's retry writes it
-        // again, with the subject's state as it is then. So a record whose
-        // write failed leaves the list: a later write would carry it after
-        // the batch it holds had moved on.
-        this.coalescingRecentReceipts.push(record);
-        try {
-          this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
-        } catch (error) {
-          this.coalescingRecentReceipts.pop();
-          throw error;
-        }
-      },
+      write: (changes, table) => durable.write(changes, table),
       // The acceptance of coalesced work (deferred included) is observed
       // here, once; its later delivery reuses the frozen envelope.
       accepted: (occ) => {
@@ -21854,14 +21859,12 @@ export class AgentFramework {
         return false;
       },
       commit: () => this.commitCoalescingDurable(),
-      saveNow: (snapshot) => {
-        if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
-        this.coalescingSnapshotDirty = null;
-        this.store.setStateJson(COALESCING_STATE_ID, snapshot);
-        this.coalescingRecentReceipts = [];
-        this.store.setStateJson(COALESCING_RECENT_ID, []);
-      },
     });
+    const durable = new CoalescingStore(
+      this.store,
+      { table, journal, recent },
+      (error) => console.error('[coalescing] could not write the coalescing table; the journal keeps the changes, and a later change writes it again:', error),
+    );
     const restore = (stateId: string, run: () => void): void => {
       try {
         run();
@@ -21879,19 +21882,18 @@ export class AgentFramework {
         throw refuse(stateId, `could not be restored: ${thrownText(error)}`, unchanged, error);
       }
     };
-    restore(COALESCING_STATE_ID, () => coalescer.restore(snapshot as CoalescingSnapshot | null | undefined));
-    if (!Array.isArray(recent)) return { coalescer };
-    restore(COALESCING_RECENT_ID, () => coalescer.restoreReceipts(recent as CoalescingReceiptRecord[]));
-    return { coalescer, recent: recent as CoalescingReceiptRecord[] };
+    const applied = number !== undefined && items.some((item) => item.seq > number);
+    restore(applied ? journaled : COALESCING_TABLE_ID, () => coalescer.restore(journaledTable(table, items)));
+    if (Array.isArray(recent)) restore(COALESCING_RECENT_ID, () => coalescer.restoreReceipts(recent as CoalescingReceiptRecord[]));
+    return { coalescer, durable };
   }
 
   /** Install a coalescer restorePushCoalescer built: none of this can fail. */
-  private installPushCoalescer(restored: { coalescer: PushCoalescer<CoalescedDelivery>; recent?: CoalescingReceiptRecord[] }): void {
-    // Until the next snapshot flush checkpoints the recovered state, these
-    // records are its only durable form: keep them in the writable buffer
-    // so the next acceptance appends to them instead of replacing them.
-    if (restored.recent) this.coalescingRecentReceipts = restored.recent;
+  private installPushCoalescer(restored: { coalescer: PushCoalescer<CoalescedDelivery>; durable: CoalescingStore }): void {
+    this.coalescingStore = restored.durable;
     this.pushCoalescer = restored.coalescer;
+    this.writeCoalescingTable('start');
+    restored.coalescer.writeSettledAtRestore();
     // Batches restored from a snapshot still owe the agent a wake (§14 v41).
     for (const occ of restored.coalescer.pendingBatchOccurrences()) {
       void this.wakeForCoalescedBatch(occ).catch((error: unknown) => {
@@ -21921,28 +21923,38 @@ export class AgentFramework {
     return this.coalescingCommit;
   }
 
-  private scheduleCoalescingSnapshot(snapshot: () => CoalescingSnapshot): void {
-    this.coalescingSnapshotDirty = snapshot;
-    if (this.coalescingSaveTimer) return;
-    const timer = setTimeout(() => this.flushCoalescingSnapshot(), 2_000);
-    timer.unref?.();
-    this.coalescingSaveTimer = timer;
+  private unappliedJournal(): unknown {
+    try {
+      return this.store.getStateJson(COALESCING_JOURNAL_ID);
+    } catch {
+      return 'unread';
+    }
   }
 
-  private flushCoalescingSnapshot(): void {
-    if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
-    const snapshot = this.coalescingSnapshotDirty;
-    this.coalescingSnapshotDirty = null;
-    if (!snapshot) return;
+  private storedCoalescing(): StoredCoalescing {
     try {
-      this.store.setStateJson(COALESCING_STATE_ID, snapshot());
-      this.coalescingRecentReceipts = [];
-      this.store.setStateJson(COALESCING_RECENT_ID, []);
+      return {
+        table: this.store.getStateJson(COALESCING_TABLE_ID) as StoredCoalescingTable | null,
+        journal: this.store.getStateJson(COALESCING_JOURNAL_ID),
+        recent: this.store.getStateJson(COALESCING_RECENT_ID),
+      };
+    } catch {
+      return { table: null, journal: 'unread', recent: 'unread' };
+    }
+  }
+
+  private writeCoalescingTable(at: 'start' | 'stop'): void {
+    const durable = this.coalescingStore;
+    const coalescer = this.pushCoalescer;
+    if (!durable || !coalescer) return;
+    if (at === 'stop') durable.stopping();
+    if (durable.current) return;
+    try {
+      durable.writeTable(coalescer.snapshot());
     } catch (err) {
-      console.error('[coalescing] could not persist coalescing state:', err);
-      // Still unsaved: the next persist, or the stop's flush, writes it. No
-      // timer of its own, so a store that keeps failing isn't retried here.
-      this.coalescingSnapshotDirty ??= snapshot;
+      console.error(at === 'stop'
+        ? '[coalescing] could not write the coalescing table at the stop, so an earlier release started next reads it without the changes since its last write:'
+        : '[coalescing] could not write the coalescing table at the start; the store keeps what it held, and a later change writes it again:', err);
     }
   }
 

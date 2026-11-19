@@ -166,12 +166,8 @@ export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
 }
 
 
-/** Simulate a crash: stop without the snapshot flush a clean stop performs. */
 export async function crash(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
-  const internals = f.framework as unknown as { flushCoalescingSnapshot: () => void; coalescingSaveTimer: ReturnType<typeof setTimeout> | null };
-  if (internals.coalescingSaveTimer) clearTimeout(internals.coalescingSaveTimer);
-  internals.coalescingSaveTimer = null;
-  internals.flushCoalescingSnapshot = () => {};
+  (f.framework as unknown as { writeCoalescingTable: () => void }).writeCoalescingTable = () => {};
   await f.framework.stop();
 }
 
