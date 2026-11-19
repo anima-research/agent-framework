@@ -55,7 +55,8 @@ describe('isSystemChangeMessage', () => {
     for (const metadata of [undefined, { system: true, kind: 'system-change', agent: 'alpha' }, { system: true }]) {
       assert.equal(isSystemChangeMessage(row([change], metadata)), true, JSON.stringify(metadata));
     }
-    assert.equal(isSystemChangeMessage(row([{ type: 'system_change', effort: 'low' }])), true, 'a row that changes only the effort');
+    // The lowest membrane in this package's range doesn't type `effort`.
+    assert.equal(isSystemChangeMessage(row([{ type: 'system_change', effort: 'low' } as unknown as ContentBlock])), true, 'a row that changes only the effort');
     assert.equal(isSystemChangeMessage(row([{ type: 'text', text: 'hello' }], { system: true, kind: 'system-change' })), false, 'conversation, whatever its mark says');
     assert.equal(isSystemChangeMessage(row([{ type: 'tool_result', toolUseId: 't1', content: 'ok' }])), false);
   });
