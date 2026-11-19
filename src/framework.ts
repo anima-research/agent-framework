@@ -519,6 +519,9 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 
 type ViewedRow = { content: readonly ContentBlock[]; metadata?: unknown };
 
+/** What the store holds as an agent's recorded head, read on the store's branch. */
+type RecordedHead = { kind: 'head'; head: HeadDeclaration } | { kind: 'none' } | { kind: 'not-a-head' } | { kind: 'unreadable' };
+
 const isConversationalRow = (row: ViewedRow): boolean =>
   !isSystemChangeMessage(row) && isConversationalInjection(row.metadata as MessageMetadata | undefined);
 
@@ -13529,8 +13532,7 @@ export class AgentFramework {
     this.releaseManager(agent);
     this.toolImageLedgers.delete(name);
     this.evictTurnCheckpoints(name);
-    this.headDeclarationCache?.heads.delete(name);
-    this.headDeclarationCache?.setAside.delete(name);
+    this.headLinesSaid.delete(name);
     this.activeTurnTokens.delete(name);
     this.activeTurnTriggers.delete(name);
     this.logicalTurnToolCalls.delete(agent);
@@ -18978,18 +18980,19 @@ export class AgentFramework {
     }
   }
 
-  // chronicle's state is the branch's: after a switch (undo, redo, a rollback,
-  // a fork) a read gives the other branch's.
-  private headDeclarationCache: { branch: string; heads: Map<string, HeadDeclaration | null>; setAside: Set<string> } | null = null;
   // chronicle: a branch made from another carries only registered states, and
   // each registration costs a lookup at every branch made.
   private readonly registeredHeadStates = new Set<string>();
-  private readonly headDeclarationsUnreadable = new Map<string, string>();
+  // The lines said for each agent's record, each once on a branch: kind and branch.
+  private readonly headLinesSaid = new Map<string, Set<string>>();
 
   private readonly headDeclarations: HeadDeclarationStore = {
-    read: (agentName) => this.readHeadDeclaration(agentName) ?? null,
+    read: (agentName) => {
+      const recorded = this.recordedHead(agentName);
+      return recorded.kind === 'head' ? recorded.head : null;
+    },
     write: (agentName, head) => this.storeHeadDeclaration(agentName, head),
-    delete: (agentName) => (this.readHeadDeclaration(agentName) === null && !this.headDeclarationCache!.setAside.has(agentName)) || this.storeHeadDeclaration(agentName, null),
+    delete: (agentName) => this.storeHeadDeclaration(agentName, null),
   };
 
   private headStateId(agentName: string): string {
@@ -19001,48 +19004,45 @@ export class AgentFramework {
     return id;
   }
 
-  private headsOnBranch(): Map<string, HeadDeclaration | null> {
-    const branch = this.store.currentBranch().id;
-    if (this.headDeclarationCache?.branch !== branch) this.headDeclarationCache = { branch, heads: new Map(), setAside: new Set() };
-    return this.headDeclarationCache.heads;
+  /** Says a line about an agent's record once on the store's branch. */
+  private sayHeadLineOnce(agentName: string, kind: 'not-a-head' | 'unreadable', say: () => void): void {
+    const said = this.headLinesSaid.get(agentName) ?? new Set<string>();
+    const key = `${kind}\u0000${this.store.currentBranch().id}`;
+    if (said.has(key)) return;
+    said.add(key);
+    this.headLinesSaid.set(agentName, said);
+    say();
   }
 
-  private readHeadDeclaration(agentName: string): HeadDeclaration | null | undefined {
-    const heads = this.headsOnBranch();
-    if (heads.has(agentName)) return heads.get(agentName);
-    const branch = this.headDeclarationCache!.branch;
+  // chronicle's state is the branch's: after a switch (undo, redo, a rollback,
+  // a fork) a read gives the other branch's, so each read goes to the store.
+  private recordedHead(agentName: string): RecordedHead {
+    let stored: unknown;
     try {
-      const stored = this.store.getStateJson(headDeclarationId(agentName));
-      const head = isHeadDeclaration(stored) ? stored : null;
-      if (stored != null && head === null) {
-        this.headDeclarationCache!.setAside.add(agentName);
-        console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside: under 'entries' the agent's next request records its current tools and system text as its head and takes its own change rows out, once the store takes the write, and an agent on its head sends no request on it`);
-      }
-      heads.set(agentName, head);
-      this.headDeclarationsUnreadable.delete(agentName);
-      return head;
+      stored = this.store.getStateJson(headDeclarationId(agentName));
     } catch (error) {
-      if (this.headDeclarationsUnreadable.get(agentName) !== branch) console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so its requests go on its current head, its own change rows taken out, and it records that head once it can; a record that reads again before then is the head its next request declares from:`, error);
-      this.headDeclarationsUnreadable.set(agentName, branch);
-      return undefined;
+      this.sayHeadLineOnce(agentName, 'unreadable', () => console.error(`[head-declarations] ${agentName}: the recorded head could not be read, so its requests go on its current head, its own change rows taken out, and it records that head once it can; a record that reads again before then is the head its next request declares from:`, error));
+      return { kind: 'unreadable' };
     }
+    if (stored == null) return { kind: 'none' };
+    if (isHeadDeclaration(stored)) return { kind: 'head', head: stored };
+    this.sayHeadLineOnce(agentName, 'not-a-head', () => console.error(`[head-declarations] ${agentName}: the recorded head isn't one, so it was set aside: under 'entries' the agent's next request records its current tools and system text as its head and takes its own change rows out, once the store takes the write, and an agent on its head sends no request on it`));
+    return { kind: 'not-a-head' };
   }
 
   private storeHeadDeclaration(agentName: string, head: HeadDeclaration | null): boolean {
-    const recorded = this.readHeadDeclaration(agentName);
-    if (recorded !== undefined && !this.headDeclarationCache!.setAside.has(agentName) && JSON.stringify(recorded) === JSON.stringify(head)) return true;
+    const recorded = this.recordedHead(agentName);
+    if (recorded.kind === 'head' ? JSON.stringify(recorded.head) === JSON.stringify(head) : recorded.kind === 'none' && head === null) return true;
     try {
       this.store.setStateJson(this.headStateId(agentName), head);
     } catch (error) {
       console.error(head === null
         ? `[head-declarations] ${agentName}: the recorded head could not be cleared, so it stays, with the agent's own change rows, until a later request on its head clears it:`
-        : !recorded
-          ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded === undefined ? ' that can be read' : ''}, so its requests go on its current head with its own change rows taken out until a later request stores it:`
+        : recorded.kind !== 'head'
+          ? `[head-declarations] ${agentName}: the head could not be stored, and none is recorded${recorded.kind === 'unreadable' ? ' that can be read' : ''}, so its requests go on its current head with its own change rows taken out until a later request stores it:`
           : `[head-declarations] ${agentName}: the recorded head could not be stored, so what was recorded stays, with the agent's change rows, until a later request stores it:`, error);
       return false;
     }
-    this.headsOnBranch().set(agentName, head);
-    this.headDeclarationCache!.setAside.delete(agentName);
     return true;
   }
 

@@ -826,10 +826,9 @@ describe('toolDeclarations in the framework', () => {
         [{ type: 'system_change', defineTools: [tool('b')] }],
         [{ type: 'system_change', defineTools: [tool('c')] }],
       ], 'its template\'s change, then its own');
-      const heads = framework as unknown as { headDeclarations: { read(name: string): unknown }; disposeConversationAgent(name: string): void; headDeclarationCache: { heads: Map<string, unknown> } | null };
+      const heads = framework as unknown as { headDeclarations: { read(name: string): unknown }; disposeConversationAgent(name: string): void };
       assert.notEqual(heads.headDeclarations.read('alpha-fork'), null);
       heads.disposeConversationAgent('alpha-fork');
-      assert.equal(heads.headDeclarationCache?.heads.has('alpha-fork'), false, "a closed fork's head leaves memory");
       assert.notEqual(heads.headDeclarations.read('alpha-fork'), null, "and stays in the store, as the rest of its data does");
       assert.notEqual(heads.headDeclarations.read('alpha'), null);
     }, undefined, { conversations: { templateAgent: 'alpha' } });
@@ -976,7 +975,7 @@ describe('toolDeclarations in the framework', () => {
 
   describe('the recorded heads in the store', () => {
     type Store = { setStateJson(id: string, value: unknown): unknown; getStateJson(id: string): unknown };
-    type Internals = { store: Store; headDeclarationCache: unknown; headDeclarations: { read(name: string): unknown; write(name: string, head: unknown): void } };
+    type Internals = { store: Store; headDeclarations: { read(name: string): unknown; write(name: string, head: unknown): void } };
     const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
     async function statesWritten(store: Store, run: () => Promise<unknown>): Promise<string[]> {
       const written: string[] = [];
@@ -1064,31 +1063,6 @@ describe('toolDeclarations in the framework', () => {
       });
     });
 
-    it("reads each agent's record once a branch", async () => {
-      await withFramework([resident('alpha')], async (framework) => {
-        const internals = framework as unknown as Internals & { store: { createBranch(n: string, from?: string): unknown; switchBranch(n: string): unknown; currentBranch(): { name: string } } };
-        const alpha = framework.getAgent('alpha')!;
-        say(framework, alpha, 'user', 'hello');
-        await alpha.buildActivationRequest([tool('a')]);
-        let reads = 0;
-        const get = internals.store.getStateJson.bind(internals.store);
-        internals.store.getStateJson = (id) => { if (id === 'framework/head-declarations/alpha') reads++; return get(id); };
-        try {
-          internals.headDeclarationCache = null;
-          for (let i = 0; i < 3; i++) await alpha.buildActivationRequest([tool('a')]);
-          assert.equal(reads, 1, 'once on this branch');
-          const main = internals.store.currentBranch().name;
-          internals.store.createBranch('elsewhere', main);
-          internals.store.switchBranch('elsewhere');
-          for (let i = 0; i < 2; i++) internals.headDeclarations.read('alpha');
-          assert.equal(reads, 2, 'and once on another');
-          internals.store.switchBranch(main);
-        } finally {
-          internals.store.getStateJson = get;
-        }
-      });
-    });
-
     it("reads a branch's own record, though another branch of the same name came before it", async () => {
       await withFramework([resident('alpha')], async (framework) => {
         const internals = framework as unknown as Internals & { store: { createBranch(n: string, from?: string): unknown; switchBranch(n: string): unknown; deleteBranch(n: string): void; currentBranch(): { name: string } } };
@@ -1116,7 +1090,6 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a')]);
         await beta.buildActivationRequest([tool('b')]);
         internals.store.setStateJson('framework/head-declarations/alpha', { tools: 'not a list', system: [] });
-        internals.headDeclarationCache = null;
         const traces: TraceEvent[] = [];
         framework.onTrace((event) => { traces.push(event); });
         const errors: string[] = [];
@@ -1141,7 +1114,6 @@ describe('toolDeclarations in the framework', () => {
         await alpha.buildActivationRequest([tool('a'), tool('b')]);
         assert.equal(storedChanges(alpha, 'alpha'), 1, 'the premise: its own change row, so a request on the head deletes its head');
         internals.store.setStateJson('framework/head-declarations/alpha', { tools: 'not a list', system: [] });
-        internals.headDeclarationCache = null;
         alpha.keepToHeadUntilBuiltAgain();
         const error = console.error;
         console.error = () => {};
@@ -1189,7 +1161,6 @@ describe('toolDeclarations in the framework', () => {
           if (id === 'framework/head-declarations/alpha') throw new Error('unreadable');
           return get(id);
         };
-        internals.headDeclarationCache = null;
         const errors: string[] = [];
         const error = console.error;
         console.error = (...args: unknown[]) => { errors.push(String(args[0])); };
@@ -1198,7 +1169,6 @@ describe('toolDeclarations in the framework', () => {
           assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
           assert.deepEqual(changesIn(request.messages), [], 'with its own change row taken out of the request');
           assert.equal(storedChanges(alpha, 'alpha'), 0, 'and out of its context');
-          internals.headDeclarationCache = null;
           await alpha.buildActivationRequest([tool('a'), tool('c')]);
         } finally {
           console.error = error;
