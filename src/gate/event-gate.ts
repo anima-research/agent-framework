@@ -4264,7 +4264,11 @@ export class EventGate {
     // channel last saw any traffic. Ambient-only batches set no locus, and
     // name the channels they came from (`batchChannels`).
     const chosen = wakeProvenance(events);
-    const provenance: MarkedProvenance = { ...chosen, ...(writes ? { writes } : {}), [BATCH_LINE_ROWS]: lineRows };
+    const provenance: MarkedProvenance = {
+      ...chosen,
+      // Refusal origin merges EVERY admitted cause, never the speech winner.
+      ...(writes ? { writes } : {}), [BATCH_LINE_ROWS]: lineRows,
+    };
     for (const agentName of woken) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
       woke?.push(agentName);

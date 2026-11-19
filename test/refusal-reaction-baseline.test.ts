@@ -24,12 +24,10 @@ import {
 async function emittedFor(category: string): Promise<string> {
   const calls: Array<{ server: string; tool: string; args: { emoji: string } }> = [];
   const fakeThis = {
-    channelRegistry: {
-      incomingFor: () => ({ channel: { serverId: 'srv1', channelId: 'discord:g1:c1' }, messageId: 'm1' }),
-    },
+    turnRouting: new Map([['tester', { answers: { channel: { serverId: 'srv1', channelId: 'discord:g1:c1' }, messageId: 'm1' } }]]),
     mcplServerRegistry: {
       // Each server's connection records under its own id, so the call shows
-      // which one reacted: the incoming message's own server.
+      // which one reacted: the answered message's own server.
       getServer: (serverId: string) => ({
         sendToolsCall: (tool: string, args: { emoji: string }) => {
           calls.push({ server: serverId, tool, args });
@@ -46,7 +44,7 @@ async function emittedFor(category: string): Promise<string> {
   await react.call(fakeThis, 'tester', category);
   assert.equal(calls.length, 1, `exactly one reaction for category "${category}"`);
   assert.equal(calls[0].tool, 'add_reaction');
-  assert.equal(calls[0].server, 'srv1', "the reaction goes through the incoming message's own server");
+  assert.equal(calls[0].server, 'srv1', "the reaction goes through the answered message's own server");
   return calls[0].args.emoji;
 }
 
