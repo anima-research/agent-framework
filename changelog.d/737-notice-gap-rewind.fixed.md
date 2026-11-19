@@ -5,7 +5,8 @@
   with a synthesized `[pending]` result on the next request. The shed now
   takes the call body with the result body in one retraction, as an undone
   turn's, and leaves the notices in the window, when: only system notices
-  sit between them (no rewind marker); the call body holds no results and
+  sit between them (none of them a rewind marker, a host
+  change (`system_change`) or a tool block); the call body holds no results and
   the result body no calls (either can also hold text or thinking); their
   tool IDs are the same set, each a nonblank string that appears once in
   its body; both bodies are in the agent's own record, not only presented

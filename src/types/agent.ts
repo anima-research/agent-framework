@@ -323,7 +323,7 @@ export interface AgentConfig {
      * Native tool mode only — see the XML-mode warning in Membrane.
      */
     retries?: number;
-    /** On refusal, set aside the newest turn the refused request carried (or the stored result of a call it carried, with that call) and retry. Default false. */
+    /** On refusal, set aside the newest turn the refused request carried (or the stored result of a call it carried, with that call, when that pair is found or proven; otherwise the call goes alone and the result stays) and retry. Default false. */
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;

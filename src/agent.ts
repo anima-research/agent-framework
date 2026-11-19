@@ -228,7 +228,8 @@ export function assertAgentSwitches(config: AgentConfig): void {
     assertBooleanSetting(
       `${agent} refusalHandling.autoRewind`,
       config.refusalHandling.autoRewind,
-      'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' +
+      'true sets aside the newest turn the refused request carried, with its call or stored result ' +
+        'when that pair is found or proven, and runs again, up to maxRewinds times, ' +
         'and false or leaving it out doesn\'t',
     );
   }

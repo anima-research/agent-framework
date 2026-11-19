@@ -16,10 +16,12 @@ const REWIND_TAG = `[${NOTICE_TAG.refusalRewind}]`;
 
 /**
  * The refusal auto-rewind sheds the newest turn (in sequence, newest first,
- * INCLUDING the agent's own turns) as a COMPLETE exchange — a tool_result is
- * removed together with its paired tool_use turn, so no orphaned tool_use /
- * signed thinking block is left behind. It maintains exactly ONE consolidated
- * marker per episode.
+ * INCLUDING the agent's own turns) with the rest of its exchange — a
+ * tool_result is removed together with its paired tool_use turn, when that
+ * pair is found (adjacent) or, across notices on a presented window, proven.
+ * A result with no found or proven pair goes alone and can leave its call;
+ * a carried call whose result isn't so paired goes alone and leaves the
+ * result. It maintains exactly ONE consolidated marker per episode.
  */
 function makeAgentHarness(messages: any[]) {
   const removed: string[] = [];

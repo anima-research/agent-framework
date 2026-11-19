@@ -15109,7 +15109,8 @@ export class AgentFramework {
    * With `carried` (the stored bodies a refused request's compile carried,
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
-   * call as one exchange; a row that carries nothing a request sends
+   * call as one exchange when that pair is found or proven (below; if not,
+   * the call goes alone and the result stays); a row that carries nothing a request sends
    * (asNextRequestCarries) is passed over and left in place. It adds no
    * marker; the caller keeps one consolidated marker for the episode
    * (updateRewindMarker). The returned record's descriptor says what was
