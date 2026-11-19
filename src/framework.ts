@@ -21717,7 +21717,6 @@ export class AgentFramework {
       }
     };
     const snapshot = read(COALESCING_TABLE_ID);
-    const journal = read(COALESCING_JOURNAL_ID);
     const recent = read(COALESCING_RECENT_ID);
     if (snapshot !== null && snapshot !== undefined) {
       const version = typeof snapshot === 'object' && !Array.isArray(snapshot)
@@ -21743,7 +21742,9 @@ export class AgentFramework {
       throw refuse(COALESCING_RECENT_ID, `are ${jsonKind(recent)}, not a list of receipts`, unchanged);
     }
     const table = (snapshot ?? null) as StoredCoalescingTable | null;
-    const numbered = typeof table?.journal === 'number';
+    const number = typeof table?.journal === 'number' ? table.journal : undefined;
+    const numbered = number !== undefined;
+    const journal = numbered ? read(COALESCING_JOURNAL_ID) : this.unappliedJournal();
     if (numbered && journal !== null && journal !== undefined && !Array.isArray(journal)) {
       throw refuse(COALESCING_JOURNAL_ID, `are ${jsonKind(journal)}, not a list of changes`, unchanged);
     }
@@ -21824,7 +21825,7 @@ export class AgentFramework {
     const durable = new CoalescingStore(
       this.store,
       { table, journal, recent },
-      (error) => console.error('[coalescing] could not write the coalescing table; the next change writes it:', error),
+      (error) => console.error('[coalescing] could not write the coalescing table; the journal keeps the changes, and a later change writes it again:', error),
     );
     const restore = (stateId: string, run: () => void): void => {
       try {
@@ -21843,8 +21844,8 @@ export class AgentFramework {
         throw refuse(stateId, `could not be restored: ${thrownText(error)}`, unchanged, error);
       }
     };
-    const restored = journaledTable(table, items);
-    restore(restored === table ? COALESCING_TABLE_ID : journaled, () => coalescer.restore(restored));
+    const applied = number !== undefined && items.some((item) => item.seq > number);
+    restore(applied ? journaled : COALESCING_TABLE_ID, () => coalescer.restore(journaledTable(table, items)));
     if (Array.isArray(recent)) restore(COALESCING_RECENT_ID, () => coalescer.restoreReceipts(recent as CoalescingReceiptRecord[]));
     return { coalescer, durable };
   }
@@ -21884,6 +21885,14 @@ export class AgentFramework {
     return this.coalescingCommit;
   }
 
+  private unappliedJournal(): unknown {
+    try {
+      return this.store.getStateJson(COALESCING_JOURNAL_ID);
+    } catch {
+      return 'unread';
+    }
+  }
+
   private storedCoalescing(): StoredCoalescing {
     try {
       return {
@@ -21907,7 +21916,7 @@ export class AgentFramework {
     } catch (err) {
       console.error(at === 'stop'
         ? '[coalescing] could not write the coalescing table at the stop, so an earlier release started next reads it without the changes since its last write:'
-        : '[coalescing] could not write the coalescing table at the start; the next change writes it:', err);
+        : '[coalescing] could not write the coalescing table at the start; the store keeps what it held, and a later change writes it again:', err);
     }
   }
 

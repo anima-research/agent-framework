@@ -166,7 +166,6 @@ export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
 }
 
 
-/** Simulate a crash: stop without the table write a clean stop performs. */
 export async function crash(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
   (f.framework as unknown as { writeCoalescingTable: () => void }).writeCoalescingTable = () => {};
   await f.framework.stop();

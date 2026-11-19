@@ -95,7 +95,12 @@ export class CoalescingStore {
 
   write(changes: readonly CoalescingChange[], table: () => CoalescingSnapshot): void {
     if (this.owed || !this.marked || this.stopped) {
-      this.writeTable(table());
+      try {
+        this.writeTable(table());
+      } catch (error) {
+        this.owed = true;
+        throw error;
+      }
       return;
     }
     try {
@@ -118,22 +123,17 @@ export class CoalescingStore {
   }
 
   writeTable(snapshot: CoalescingSnapshot): void {
-    try {
-      if (!this.marked && this.journalHeld) this.emptyJournal();
-      const table: StoredCoalescingTable = { ...snapshot, journal: this.seq };
-      this.store.setStateJson(COALESCING_TABLE_ID, table);
-      this.marked = true;
-      this.owed = false;
-      this.tableBytes = bytesOf(table);
-      this.journalBytes = 0;
-      if (this.journalHeld) this.emptyJournal();
-      if (this.recentHeld) {
-        this.store.setStateJson(COALESCING_RECENT_ID, []);
-        this.recentHeld = false;
-      }
-    } catch (error) {
-      this.owed = true;
-      throw error;
+    if (!this.marked && this.journalHeld) this.emptyJournal();
+    const table: StoredCoalescingTable = { ...snapshot, journal: this.seq };
+    this.store.setStateJson(COALESCING_TABLE_ID, table);
+    this.marked = true;
+    this.owed = false;
+    this.tableBytes = bytesOf(table);
+    this.journalBytes = 0;
+    if (this.journalHeld) this.emptyJournal();
+    if (this.recentHeld) {
+      this.store.setStateJson(COALESCING_RECENT_ID, []);
+      this.recentHeld = false;
     }
   }
 

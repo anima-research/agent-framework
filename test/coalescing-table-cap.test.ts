@@ -45,9 +45,20 @@ test('with more placed and read subjects than the cap, the table is at the cap a
 test('each eviction is written, so a coalescer restored from the journal holds the subjects touched last, at the cap', async () => {
   const r = rig();
   for (let i = 0; i < 3 * CAP; i++) await r.coalescer.accept(r.occurrence(`message:${i}`, `ev-${i}`));
-  const restored = new PushCoalescer<null>(r.host, { maxSubjects: CAP });
+  const restored = new PushCoalescer<null>(r.host, { maxSubjects: 10 * CAP });
   restored.restore(journaledTable(JOURNALED, numbered(r.written)));
   assert.deepEqual(restored.snapshot().subjects.map((s) => JSON.parse(s.subject)[4]), Array.from({ length: CAP }, (_, i) => `message:${2 * CAP + i}`));
+});
+
+test("an admission's changes are written in the order it made them, so the journal replays to the coalescer's order", async () => {
+  const r = rig();
+  for (let i = 0; i < CAP; i++) await r.coalescer.accept(r.occurrence(`message:${i}`, `ev-${i}`));
+  r.unread.add('row-ev-0');
+  await r.coalescer.accept(r.occurrence('message:x', 'ev-x'));
+  const restored = new PushCoalescer<null>(r.host, { maxSubjects: 10 * CAP });
+  restored.restore(journaledTable(JOURNALED, numbered(r.written)));
+  assert.deepEqual(restored.snapshot().subjects.map((s) => s.subject), r.subjects().map((s) => s.subject));
+  assert.equal(JSON.parse(r.subjects().at(-1)!.subject)[4], 'message:0', "premise: the walk's unread subject was touched last");
 });
 
 test('a restore of a table over the cap forgets the subjects touched longest ago, asking nothing, since a restored occurrence counts as read', () => {
@@ -86,7 +97,7 @@ test('once unread subjects beyond the cap are read, each admission evicts read s
   assert.equal(r.subjects().length, CAP);
 });
 
-test('the walk stops at the oldest unread subject, which stays, and the next admission walks on past it', async () => {
+test('the walk stops at the oldest unread subject, which stays with the read subjects after it, and the next admission walks on past it', async () => {
   const r = rig();
   for (let i = 0; i < CAP; i++) await r.coalescer.accept(r.occurrence(`message:${i}`, `ev-${i}`));
   r.unread.add('row-ev-0');
@@ -132,4 +143,15 @@ test('a receipt older than the retry window leaves at the next admission', async
   clock = 3_600_001;
   await r.coalescer.accept(r.occurrence('message:new', 'ev-new'));
   assert.deepEqual(r.coalescer.snapshot().receipts.map(([key]) => JSON.parse(key)[2]), ['ev-new']);
+});
+
+test('a receipt stamped ahead of the clock keeps no expired receipt after it', async () => {
+  let clock = 10 * 3_600_000;
+  const r = rig({ now: () => clock });
+  await r.coalescer.accept(r.occurrence('message:ahead', 'ev-ahead'));
+  clock = 0;
+  await r.coalescer.accept(r.occurrence('message:old', 'ev-old'));
+  clock = 3_600_001;
+  await r.coalescer.accept(r.occurrence('message:new', 'ev-new'));
+  assert.deepEqual(r.coalescer.snapshot().receipts.map(([key]) => JSON.parse(key)[2]), ['ev-ahead', 'ev-new']);
 });

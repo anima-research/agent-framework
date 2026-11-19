@@ -64,6 +64,13 @@ test('a store that holds nothing is current, and its first change writes the tab
   assert.equal(new CoalescingStore(r.store, { table: TABLE, journal: [], recent: [] }, () => {}).current, false, 'a table without a number is not current');
 });
 
+test('a store that holds nothing, whose first write fails, is no longer current', () => {
+  const r = recorder(() => true);
+  const durable = new CoalescingStore(r.store, NONE, () => {});
+  assert.throws(() => durable.write([change('a')], () => TABLE), /ENOSPC/);
+  assert.equal(durable.current, false);
+});
+
 test('a table write empties the list a release before the journal wrote, after the table', () => {
   const r = recorder();
   new CoalescingStore(r.store, { table: EMPTY, journal: [], recent: [{}] }, () => {}).writeTable(EMPTY);
@@ -122,7 +129,7 @@ test('an append that lands and then throws leaves the table owed, and the table 
   assert.equal(r.tables[0].journal, 1);
 });
 
-test("a failed table write at a journal's compaction is reported and leaves the change written, and the next write is the table", () => {
+test("a failed table write at a journal's compaction is reported and leaves the change written, and the next write appends and compacts again", () => {
   const reported: unknown[] = [];
   let failTable = true;
   const r = recorder((call) => failTable && call === `set ${COALESCING_TABLE_ID}`);
@@ -132,7 +139,8 @@ test("a failed table write at a journal's compaction is reported and leaves the 
   assert.deepEqual(r.calls, [`append ${COALESCING_JOURNAL_ID}`], 'the change itself was written');
   failTable = false;
   durable.write([change('b')], () => EMPTY);
-  assert.deepEqual(r.calls.slice(1), [`set ${COALESCING_TABLE_ID}`, `set ${COALESCING_JOURNAL_ID} []`]);
+  assert.deepEqual(r.calls.slice(1), [`append ${COALESCING_JOURNAL_ID}`, `set ${COALESCING_TABLE_ID}`, `set ${COALESCING_JOURNAL_ID} []`]);
+  assert.equal(r.tables[0].journal, 2);
 });
 
 test("after the store moves to a branch whose table has a number, the next write is the table, numbered past the branch's journal, and then the journal is emptied", () => {
@@ -292,6 +300,18 @@ test('an admission whose effects throw after they dropped a batch writes its sub
   restored.restore(journaledTable(JOURNALED, numbered(w.written)));
   await restored.assemble('agent');
   assert.deepEqual(w.delivered, []);
+});
+
+test('a render whose start was being committed when the coalescer was suspended is written back as pending', async () => {
+  let coalescer!: PushCoalescer<null>;
+  let suspendAtCommit = false;
+  const w = writer({ commit: async () => { if (suspendAtCommit) coalescer.suspend(); } });
+  coalescer = new PushCoalescer<null>(w.host);
+  await coalescer.accept(notice('n1'));
+  suspendAtCommit = true;
+  await coalescer.assemble('agent');
+  assert.equal(w.written.at(-1)?.record?.batch?.rendering, undefined);
+  assert.equal(w.written.at(-1)?.record?.batch?.latest.eventId, 'n1');
 });
 
 test('a batch that a restore finds published is written as settled', () => {

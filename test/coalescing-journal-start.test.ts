@@ -95,11 +95,13 @@ test('a deferred acceptance that the journal holds survives a crash, with its re
   const store = f.framework.getStore() as unknown as JsStore;
   assert.ok((store.getStateJson('mcpl/coalescing-journal') as unknown[]).length > 0, 'premise: the acceptance is in the journal');
   await crash(f); await f.create();
-  assert.deepEqual((await f.send('push/event', params)).result, original.result, 'the receipt survived');
   f.alwaysRespond();
   await f.framework.runUntilIdle();
   assert.deepEqual(f.renders.map((r) => r.eventId), ['d1']);
   assert.ok(f.context().includes('document_diff'), 'its render reached the agent');
+  assert.deepEqual((await f.send('push/event', params)).result, original.result, 'the receipt survived');
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1, 'and the retry admitted nothing again');
 });
 
 test('a start writes a batch that it finds published, though the store holds nothing else to write', async (t) => {
@@ -122,7 +124,7 @@ test('a start writes a batch that it finds published, though the store holds not
   assert.equal(f.renders.length, 1, 'and nothing rendered again');
 });
 
-test("a change that lands after the stop's table write goes into the table, so an earlier release started next reads it", async (t) => {
+test("a change that lands after the stop's step goes into the table, so an earlier release started next reads it", async (t) => {
   const f = await fixture(); t.after(f.close);
   await tableOfEight(f);
   const internals = f.framework as unknown as {

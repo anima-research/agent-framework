@@ -488,12 +488,31 @@ test("coalescing changes that can't be read fail create(), and the next boot del
     await rejectsBuild(() => f.create(), /^the coalescing changes since the last table \(mcpl\/coalescing-journal\) could not be read: injected EIO reading mcpl\/coalescing-journal\. MCPL doesn't start without them, and neither does create\(\) with MCPL servers configured, nor a first connectMcplServer\(\), since the next coalesced push or message would replace them\. They're unchanged, and MCPL starts once they can be read\.$/);
   } finally { restore(); }
   await f.create();
-  const retry = await f.send('push/event', params);
-  assert.deepEqual(retry.result, original.result, 'the receipt survived');
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1, 'the accepted work was delivered');
   assert.equal(f.renders.length, 1, 'as its render: the journal holds no start of a render');
   assert.ok(f.lastRequest().includes('document_diff'), 'and its render reached the agent');
+  const retry = await f.send('push/event', params);
+  assert.deepEqual(retry.result, original.result, 'the receipt survived');
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1, 'and the retry admitted nothing again');
+});
+
+test("over a table without a number, a journal that can't be read doesn't stop a start, which empties it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await f.send('push/event', f.params('1', 'plain', { key: 'K' }));
+  await crash(f);
+  const storePath = join(f.dir, 'store');
+  const store = JsStore.openOrCreate({ path: storePath });
+  const { journal: _number, ...unnumbered } = store.getStateJson('mcpl/coalescing') as StoredCoalescingTable;
+  store.setStateJson('mcpl/coalescing', unnumbered);
+  store.appendToStateJson('mcpl/coalescing-journal', { subject: 'stale', seq: 1, record: null });
+  store.close();
+  const restore = failStoreRead('mcpl/coalescing-journal', 'restorePushCoalescer');
+  try { await f.create(); } finally { restore(); }
+  const started = f.framework.getStore() as unknown as JsStore;
+  assert.deepEqual(started.getStateJson('mcpl/coalescing-journal') ?? [], []);
+  assert.equal(typeof (started.getStateJson('mcpl/coalescing') as StoredCoalescingTable).journal, 'number');
 });
 
 test("a coalescing snapshot that can't be read fails create(), and the next boot renders its batch", async (t) => {
@@ -523,7 +542,6 @@ test("a coalescing batch whose render may have started, which an agent's context
   const seq = journal.reduce((most, item) => Math.max(most, item.seq), table.journal!) + 1;
   journaled.appendToStateJson('mcpl/coalescing-journal', { subject: accepted.subject, seq, record: { ...accepted, batch: { ...accepted.batch!, rendering: true } } });
   journaled.close();
-  // Restoring a batch whose render may have started asks every agent's context whether it was delivered.
   const proto = ContextManager.prototype as unknown as { getAllMessages(this: ContextManager): unknown[] };
   const real = proto.getAllMessages;
   proto.getAllMessages = function (this: ContextManager) {

@@ -27,8 +27,16 @@
   - After a crash, a deferred batch whose render hadn't started renders at
     the next assembly. Before, one accepted since the table's last write was
     delivered as its fallback, since the record of its receipt couldn't say
-    whether its render had started.
-  - Going back to an earlier release after a clean stop loses nothing. After
+    whether its render had started. And after a plain occurrence displaced a
+    render that was the agent's first view, the next batch of that subject
+    is no first view after a crash, since the restored occurrence counts as
+    read. Before, the record of its receipt carried no occurrence, so that
+    batch could be one.
+  - A start refuses, naming `mcpl/coalescing-journal`, when the journal
+    after a numbered table can't be read, isn't a list, or holds an item
+    that isn't a numbered change of a subject, as it refuses for the table.
+  - Going back to an earlier release after a clean stop loses nothing,
+    unless the stop's write of the table failed, which the host logs. After
     a crash it loses the changes since the table's last write: a retry of an
     occurrence in that span is admitted again, and a batch accepted in it is
     lost. A start of this release after an earlier one ignores the journal

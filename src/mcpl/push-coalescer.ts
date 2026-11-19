@@ -258,12 +258,6 @@ interface SubjectState<E> {
   identity?: CoalescedOccurrence['identity'];
   /** Agent that received the last delivery; replacements and notices follow it. */
   audienceAgent?: string;
-  /** The agent's first view of the subject has ended: an occupant that may
-   *  have been shown left it without handing a first view on
-   *  (occupantLeaves, endFirstView). No later batch or birth of the subject
-   *  is a first view while the coalescer keeps this record. A subject's
-   *  record can be evicted (prune), and an `initial` occurrence after that
-   *  starts the subject afresh. */
   firstViewEnded?: true;
 }
 
@@ -306,8 +300,6 @@ export interface CoalescingChange {
   receipt?: CoalescingSnapshot['receipts'][number];
 }
 
-/** One receipt, as a release before the journal wrote it at acceptance
- *  (`mcpl/coalescing-recent`). Read only, at a start (restoreReceipts). */
 export interface CoalescingReceiptRecord {
   key: string;
   result: PushEventResult;
@@ -402,11 +394,6 @@ export interface CoalescerHost<E> {
   audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
   audit(record: CoalescingAudit): void;
-  /** Write these changes now, in order; `table` builds the whole table,
-   *  for a host that writes it in their place. Throws on failure. An
-   *  admission's failure fails its answer: the receipt is kept unwritten,
-   *  and the producer's retry writes it again rather than admitting it
-   *  again. A render-start's failure declines the render (§3.2). */
   write(changes: CoalescingChange[], table: () => CoalescingSnapshot): void;
   /** One call per ADMITTED occurrence (never for a producer retry the receipt
    *  deduplicates), after its effects, whether or not its receipt could be
@@ -570,13 +557,6 @@ export function validateCoalesceMember(
 
 export class PushCoalescer<E = unknown> {
   private readonly subjects = new Map<string, SubjectState<E>>();
-  /** `committed`: the durability barrier succeeded after this receipt was
-   *  written. An uncommitted receipt deduplicates effects but is not an
-   *  acknowledgement until a commit succeeds. `firstView`: the admission it
-   *  records handed its occurrence to the host's delivery marked as the
-   *  agent's first view (`firstView`), whether or not the host placed
-   *  it, so a retry answered from it says so too. Kept in memory only: a
-   *  restored receipt reads as no first view. */
   private readonly receipts = new Map<string, ReceiptEntry>();
   /** Set by a delivery that carries `firstView`. admit() clears it before
    *  an admission's effects and reads it after them; every delivery runs
@@ -671,7 +651,7 @@ export class PushCoalescer<E = unknown> {
   private async acknowledge(key: string, entry: ReceiptEntry, subject: string, eventId: string, pruned: readonly string[] = []): Promise<PushEventResult> {
     if (entry.unwritten) {
       try {
-        this.write([...pruned.filter((other) => other !== subject), subject], [key, { result: entry.result, at: entry.at }]);
+        this.write([subject, ...pruned.filter((other) => other !== subject)], [key, { result: entry.result, at: entry.at }]);
       } catch (error) {
         this.host.audit({ kind: 'persist-failed', subject, eventId, error: String(error) });
         throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000, { admitted: true });
@@ -745,13 +725,6 @@ export class PushCoalescer<E = unknown> {
     this.touch(subject, state);
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorEventId ? { priorEventId } : {}) } };
     const receiptKey = coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId);
-    // The effects are done, so the receipt is kept whatever its record's
-    // write does: a retry is answered from it, never admitted again (RFC-006
-    // §3.1). Its record is written and made durable before an acknowledgement
-    // (acknowledge), by this answer or a retry's. While this process lives,
-    // the in-memory receipt deduplicates a retry, which writes or commits
-    // what failed. A kill before its write leaves nothing of it, and the
-    // retry is a fresh acceptance.
     const entry: ReceiptEntry = {
       result: structuredClone(result), at: this.now(), committed: false, unwritten: true,
       ...(this.deliveredFirstView ? { firstView: true as const } : {}),
@@ -1171,7 +1144,7 @@ export class PushCoalescer<E = unknown> {
       return 'declined';
     }
     this.disarmRecovery(subject);
-    if (this.suspended) { state.rendering = undefined; state.batch = batch; return undefined; }
+    if (this.suspended) { state.rendering = undefined; state.batch = batch; this.tryWrite(subject, batch.latest.eventId); return undefined; }
     // Authority (grant, registration, binding) is re-checked immediately
     // before dispatch: a server id reassigned to another endpoint during the
     // commit must not receive this batch's notices.
@@ -1285,10 +1258,6 @@ export class PushCoalescer<E = unknown> {
             if (mayHaveStored) batch.mayBeStored = occurrence.eventId;
             state.batch = batch;
           }
-          // Written at once and made durable, as the render-start boundary
-          // is: a newer batch's last record, its acceptance's, has it
-          // rendering as usual, and a restart before the mark is written
-          // would render it on top of the render the agent never got.
           let written = false;
           try {
             this.write([subject]);
@@ -1396,12 +1365,6 @@ export class PushCoalescer<E = unknown> {
     this.prune();
   }
 
-  /**
-   * A batch restored as RENDERING may already have been published (its
-   * result or fallback is a durable context message; only the write of its
-   * settlement was lost). Recovery then marks it consumed instead of
-   * delivering the fallback a second time.
-   */
   private settlePublished(): void {
     if (!this.host.wasPublished) return;
     for (const [subject, state] of this.subjects) {
@@ -1421,8 +1384,6 @@ export class PushCoalescer<E = unknown> {
     this.settledAtRestore.clear();
   }
 
-  /** Apply receipts a release before the journal wrote since its last
-   *  table (`mcpl/coalescing-recent`), by that release's rules. */
   restoreReceipts(records: CoalescingReceiptRecord[]): void {
     const now = this.now();
     for (const r of records) {
@@ -1484,8 +1445,6 @@ export class PushCoalescer<E = unknown> {
       subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
       ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
       ...(s.firstViewEnded ? { firstViewEnded: true as const } : {}),
-      // restore() reads only these. After a restart nothing of the subject
-      // is tracked as unread, a run included: its history counts as read.
       ...(s.occupant ? { occupant: { eventId: s.occupant.eventId, placement: s.occupant.placement } } : {}),
       ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : s.batch.firstView ? { firstView: true as const } : {}), ...(s.batch.allAmbient ? { allAmbient: true as const } : {}) } }
         : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true, ...(s.rendering.batch.allAmbient ? { allAmbient: true as const } : {}) } }
@@ -1514,6 +1473,7 @@ export class PushCoalescer<E = unknown> {
   private prune(): string[] {
     const now = this.now();
     for (const [key, entry] of this.receipts) {
+      if (entry.at > now) continue;
       if (now - entry.at <= this.retryWindowMs) break;
       this.receipts.delete(key);
     }
