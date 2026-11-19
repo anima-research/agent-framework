@@ -6,11 +6,13 @@
   update, though its agent had written its rules with those servers there.
   Now the first start that finds a `gate.json` and no `wake-decisions.json`
   records the servers it is configured with as predating onboarding, and each
-  is settled as `unasked` at its first event, whatever the gate decided about
-  that event, a hold or a suppress rule included, with no notice and no wake
-  (trace `gate:onboarding-decided` with `state: "unasked"`). A server whose
-  declarations can't be read at that event, as after a close it reconnects
-  from, is settled at a later event that finds them. Nothing else changes for
+  is settled as `unasked` when it sends its first event, against what it
+  declares then, whatever the gate later decides about that event, with no
+  onboarding notice or wake (trace `gate:onboarding-decided` with
+  `state: "unasked"`). A server whose declarations can't be read when an
+  event comes is settled at a later event that finds them. A store that ran
+  0.33.0 or later with `gate.onboarding: false` and has a `gate.json` is
+  treated the same way when onboarding is turned on. Nothing else changes for
   them: `event_tags` shows their suggestions, `wake_accept_suggestions` and
   `wake_decline` answer them, and a changed declaration is asked about as any
   server's is. A server added after that start is offered as before, and so

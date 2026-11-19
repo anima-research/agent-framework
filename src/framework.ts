@@ -20759,7 +20759,6 @@ export class AgentFramework {
       this.noteSuppressedWrite(suppressedBy.rule, { eventType: suppressedBy.eventType, serverId: event.serverId, channelId: event.channelId });
     }
     if (decision.locus) this.noteDeliveredOrPark(event);
-    this.settlePredatingServer(event.serverId);
     if (!decision.held && !decision.suppressed) {
       this.considerWakeOnboarding({ serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: event.channelId, ...this.answersOn(event) });
     }
@@ -22756,7 +22755,6 @@ export class AgentFramework {
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${logValue(event.eventId ?? '')}`);
     }
-    this.settlePredatingServer(event.serverId);
     if (!silentHeartbeat && !decision.held && !decision.suppressed) {
       this.considerWakeOnboarding({
         serverId: event.serverId, tags: event.tags, gateDecision: decision.gateDecision, recipients: decision.recipients, channelId: triggerChannel?.channelId,
@@ -39420,6 +39418,7 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
+      this.settlePredatingServer(connection.id);
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
       // applied as it was read; it's told after the event's own content. A
       // push the host then refuses still tells its change, on its own.
@@ -39587,6 +39586,7 @@ export class AgentFramework {
         this.refuseServerItem('channels/incoming', connection.id, responder);
         return;
       }
+      this.settlePredatingServer(connection.id);
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
