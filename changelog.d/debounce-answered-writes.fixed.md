@@ -22,8 +22,8 @@
   held from the residents, is quoted, as before. An event with no message of
   its own keeps the wake,
   unless a turn already under way read and answered the batch's line, which
-  quotes it. A silent heartbeat tick stores nothing and isn't quoted, so it
-  keeps the wake. A judge rule's batch is judged so too where no judge decided
+  quotes it. A silent heartbeat tick stores nothing and isn't quoted. A judge
+  rule's batch is judged so too where no judge decided
   it (none wired, or one that failed, timed out or made no call, with
   `onError: "wake"`), and on a reply verdict, except for an event the gate's
   `isAnswered` counts as answered when the judge answers. AgentFramework's
