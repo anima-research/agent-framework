@@ -681,7 +681,8 @@ are registered for every agent, MCPL or none, unless a module holds the name.
   recorded `unasked` at the first event it sends whose declarations can be
   read, with no onboarding notice or wake. Their suggestions stay readable (`event_tags`) and can be
   accepted or declined as any other's; a server added later is offered as
-  above, and so is one of these once what it declares changes. `gate_status.catchAll` names the catch-all; `event_tags`
+  above, and so is one of these once what it declares changes after that
+  first event. `gate_status.catchAll` names the catch-all; `event_tags`
   shows each server's offer. `gate.onboarding: false` turns it off.
 
 - **Event suppression** (`EventGate.decideSuppression`, `src/gate/suppress-scripts.ts`,

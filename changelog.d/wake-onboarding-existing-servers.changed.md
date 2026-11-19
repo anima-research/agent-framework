@@ -14,8 +14,10 @@
   0.33.0 or later with `gate.onboarding: false` and has a `gate.json` is
   treated the same way when onboarding is turned on. Nothing else changes for
   them: `event_tags` shows their suggestions, `wake_accept_suggestions` and
-  `wake_decline` answer them, and a changed declaration is asked about as any
-  server's is. A server added after that start is offered as before, and so
+  `wake_decline` answer them, and a declaration that changes after that first
+  event is asked about as any server's is; a change before it is part of what
+  the server is settled against, and brings no notice. A server added after
+  that start is offered as before, and so
   is every server of a new store. `wake-decisions.json` is now written at the
   first start, even with nothing decided, so that its absence means
   onboarding has never started on the store; it gains a `predating` list
