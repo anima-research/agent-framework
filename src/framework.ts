@@ -356,13 +356,14 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
 
 /**
  * Whether explicit routing would send any of a cut round's words, had they not
- * been held: a `>>` destination with words after it. Unprefixed words bounce
- * back to the agent with their own notice, and `>>skip_reply` keeps its words.
+ * been held: a `>>` destination with words after it, or unprefixed words,
+ * which go to the turn's sticky target or, with none, back to the agent as a
+ * draft. Only `>>skip_reply` keeps its words.
  */
 const explicitWouldSend = (cutRuns: readonly string[]): boolean =>
   cutRuns.some((run) => splitExplicitEnvelopes(run).some((envelope) => {
     const parsed = parseProsePrefix(envelope);
-    return parsed.kind === 'target' && !!parsed.body.trim();
+    return parsed.kind === 'none' || (parsed.kind === 'target' && !!parsed.body.trim());
   }));
 
 /**
@@ -30171,15 +30172,15 @@ export class AgentFramework {
             // Words held only because the cut left the next call undecided
             // (not a think the round named) may have been meant to go out, so
             // the agent is told they weren't posted (#640 R3-3): only where
-            // they would otherwise have gone out, since the sentence names the
-            // policy as the cause. Disabled routing (a silent turn's too), no
-            // channels and a refused call in the round keep them back on their
-            // own; locus, hybrid and locked routing send them (locked to its
-            // lock, or as drafts with none: #640 R4-1), and explicit routing
-            // sends a `>>` destination's words. In hybrid a `>>>skip_reply`
-            // before them keeps them private, read from the hold and from this
-            // response's routable prose before them, which the turn's end
-            // hasn't parsed yet (R4-2).
+            // they would otherwise have been posted or held as drafts, since
+            // the sentence names the policy as the cause. Disabled routing (a
+            // silent turn's too), no channels and a refused call in the round
+            // keep them back on their own; locus, hybrid and locked routing
+            // send them (locked to its lock, or as drafts with none: #640
+            // R4-1), and explicit routing sends all but a `>>skip_reply`'s
+            // (R5-1). In hybrid a `>>>skip_reply` before them keeps them
+            // private, read from the hold and from this response's routable
+            // prose before them, which the turn's end hasn't parsed yet (R4-2).
             const cutRuns = cut ? splitProseRuns(cut.content.slice(cut.start)) : [];
             const heldUnsaid = cutThinkPrivate && !liveProseRouting && !cutPrivate && !!this.channelRegistry
               && turnProseRouting !== 'disabled'

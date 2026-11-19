@@ -905,9 +905,9 @@ describe("the private think policy without a channel registry, across a restart,
 
     it(`says the held round's unprefixed words weren't posted under explicit routing with no target yet (${cutLabel})`, async () => {
       const pub = await turn('xml', [XML_EAST_ROUND, cutReply], { proseRouting: 'explicit' });
-      assert.ok(afterCut(pub).includes('no destination prefix'), 'premise: without the policy they bounce, with a notice');
+      assert.ok(afterCut(pub).includes('Your text (20 chars)'), 'premise: without the policy the cut round\'s words bounce, with a notice');
       const run = await turn('xml', [XML_EAST_ROUND, cutReply], { ...PRIVATE, proseRouting: 'explicit' });
-      assert.ok(!afterCut(run).includes('no destination prefix'), 'premise: held back, they never reach the bounce');
+      assert.ok(!afterCut(run).includes('Your text (20 chars)'), 'premise: held back, they never reach the bounce');
       assert.ok(afterCut(run).includes(HELD));
     });
   }
