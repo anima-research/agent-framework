@@ -29,15 +29,14 @@ import {
   systemChangeMetadata,
   systemTextOf,
   copyHead,
-  carriedBy,
-  deadCharacters,
+  carriedCharacters,
+  inferenceCountOf,
   requestCharacters,
   type CostFigures,
   type DeclarationDifference,
   type HeadDeclaration,
   type HeadDeclarationStore,
   type HeadEvent,
-  type HeadRecord,
 } from './system-changes.js';
 import {
   CONTINUE_ROW,
@@ -201,9 +200,6 @@ type ChangeAnswering = Pick<Membrane, 'stream'> & {
 
 /** How a move of the head came about, as its trace says it (HeadEvent). */
 type Move = { why: 'adopted' | 'replaced' | 'unstored' } | { why: 'cost'; estimated: CostFigures };
-
-/** What carrying the definitions a move would take out has cost by now. */
-type Carrying = { dead: number; carried: number; count: number };
 
 /** How a request carries the agent's changes: declared on its recorded head;
  *  on its current head, its record gone (a model that takes no change, or an
@@ -2070,7 +2066,7 @@ export class Agent {
     // been retried; one whose store still fails is compiled as the bare
     // notice.
     let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
-    const recorded = this.takesChanges() ? this.headDeclarations.read(this.name)?.head ?? null : null;
+    const recorded = this.takesChanges() ? this.headDeclarations.read(this.name) : null;
     const compileBound = (binding: BindingCompileOptions) => this.toolResultGuard.afterAnnotations(
       () => this.compileWithInjections(budget, injections, binding.thinkingBinding ? binding : undefined));
     const assemble = async (): Promise<NormalizedRequest> => {
@@ -2276,13 +2272,13 @@ export class Agent {
       );
     };
     const changes: ChangesIn = options.changesLeftOut ? 'left-out' : takes ? 'declared' : 'on-head';
-    let compiledWith = (changes === 'left-out' ? undefined : record?.head) ?? this.currentHead(availableTools, prospectiveSystemInjections);
+    let compiledWith = (changes === 'left-out' ? null : record) ?? this.currentHead(availableTools, prospectiveSystemInjections);
     let first: CompileResult;
     try {
       first = await compile(compiledWith);
     } catch (error) {
       if (options.dryRun) throw error;
-      compiledWith = this.takeChangesOverBudget(error, takes, record?.head ?? null, this.currentHead(availableTools, prospectiveSystemInjections));
+      compiledWith = this.takeChangesOverBudget(error, takes, record, this.currentHead(availableTools, prospectiveSystemInjections));
       if (takes) record = this.headDeclarations.read(this.name);
       first = await compile(compiledWith);
     }
@@ -2941,7 +2937,7 @@ export class Agent {
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
     availableTools: ToolDefinition[],
-    record: HeadRecord | null,
+    record: HeadDeclaration | null,
     changes: ChangesIn,
     dryRun: boolean,
     compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
@@ -2996,29 +2992,23 @@ export class Agent {
     compiled: CompileResult,
     compiledWith: HeadDeclaration | null,
     current: HeadDeclaration,
-    record: HeadRecord | null,
+    recorded: HeadDeclaration | null,
     dryRun: boolean,
     compile: (head: HeadDeclaration, leftOut?: boolean) => Promise<CompileResult>,
     previewRows: readonly NormalizedMessage[],
   ): Promise<Settled> {
-    if (!record) return this.moveHead(compiled, compiledWith, null, current, { why: 'adopted' }, dryRun, compile);
-    const recorded = record.head;
+    if (!recorded) return this.moveHead(compiled, compiledWith, null, current, { why: 'adopted' }, dryRun, compile);
     const held = heldDeclarations(compiled);
     const { difference } = this.declaredDifference(compiled, held, recorded, current, previewRows);
     if (difference.kind === 'replace') return this.moveHead(compiled, compiledWith, recorded, current, { why: 'replaced' }, dryRun, compile);
-    const carrying = dryRun ? undefined : this.carrying(compiled, held, record);
-    const estimated = carrying && this.costOfCarrying(compiled, carrying, recorded, current);
+    const carried = dryRun ? undefined : this.carriedOf(compiled, held, recorded);
+    const estimated = carried !== undefined && this.costOfCarrying(compiled, carried, recorded, current);
     if (estimated) return this.moveHead(compiled, compiledWith, recorded, current, { why: 'cost', estimated }, dryRun, compile);
-    if (difference.kind === 'none') {
-      // A count below the record's, as after a usage state that was reset:
-      // the record's count takes it.
-      if (carrying && carrying.count < record.at) this.noteCarrying(recorded, carrying);
-      return { compiled, head: recorded };
-    }
+    if (difference.kind === 'none') return { compiled, head: recorded };
     const declared: NormalizedMessage = { participant: SYSTEM_CHANGE_PARTICIPANT, content: [difference.block] };
     if (dryRun) return { compiled, head: recorded, declared };
     try {
-      storeOwnRow(this, declared.participant, declared.content, systemChangeMetadata(this.name));
+      storeOwnRow(this, declared.participant, declared.content, systemChangeMetadata(this.name, this.requestsCounted?.()));
     } catch (error) {
       // context-manager refuses a change between a tool call and its result:
       // a row the store doesn't take moves the head instead.
@@ -3027,9 +3017,6 @@ export class Agent {
       }
       console.error(`[head-declarations] ${this.name}: storing a system change threw, but the store holds it, so the request declares it:`, error);
     }
-    // What carrying has cost is written as the new row changes what a move
-    // would take out, which counts from here.
-    if (carrying) this.noteCarrying(recorded, carrying);
     this.onHeadEvent?.({
       type: 'head:declared',
       removed: difference.block.removeTools ?? [],
@@ -3062,21 +3049,26 @@ export class Agent {
   }
 
   // What carrying the definitions a move would take out has cost by the
-  // agent's count of finished inferences: undefined for an agent with no
-  // count, whose head never moves for cost.
-  private carrying(compiled: CompileResult, held: ReadonlySet<number>, record: HeadRecord): Carrying | undefined {
+  // agent's count of finished inferences (carriedCharacters), read from the
+  // rows the compile holds: undefined for an agent with no count, whose head
+  // never moves for cost. A row's count is in its mark, which the agent's
+  // context reads back for a row of its own slot.
+  private carriedOf(compiled: CompileResult, held: ReadonlySet<number>, recorded: HeadDeclaration): number | undefined {
     const count = this.requestsCounted?.();
     if (count === undefined) return undefined;
     const sources = compiled.provenance?.messages;
     const rows = [...held].map((index) => {
       const source = sources?.[index];
+      const stored = source?.kind === 'raw'
+        ? source.bodies.map((body) => this.contextManager.getMessage(body.messageId)).find((row) => row !== null)
+        : undefined;
       return {
         changes: compiled.messages[index]?.content.filter(isSystemChangeContent) ?? [],
-        removable: source?.kind === 'raw' && source.bodies.some((body) => this.contextManager.getMessage(body.messageId) !== null),
+        removable: stored !== undefined && stored !== null,
+        inferenceCount: stored ? inferenceCountOf(stored.metadata) : undefined,
       };
     });
-    const dead = deadCharacters(record.head, rows);
-    return { dead, carried: carriedBy(record, dead, count), count };
+    return carriedCharacters(recorded, rows, count);
   }
 
   // The rule for cost (report:acorn-2386-design): the head moves when
@@ -3087,8 +3079,8 @@ export class Agent {
   // committing compile with a `firstChanged`, and on a model that may bind
   // its thinking only where no kept thinking comes before it. With nothing
   // dead, or a model membrane can't price, it never moves for cost.
-  private costOfCarrying(compiled: CompileResult, carrying: Carrying, recorded: HeadDeclaration, current: HeadDeclaration): CostFigures | undefined {
-    if (carrying.dead === 0 || this.moveChangesNothing(compiled, recorded, current)) return undefined;
+  private costOfCarrying(compiled: CompileResult, carried: number, recorded: HeadDeclaration, current: HeadDeclaration): CostFigures | undefined {
+    if (carried === 0 || this.moveChangesNothing(compiled, recorded, current)) return undefined;
     const k = this.writeOverRead();
     if (k === undefined) return undefined;
     // context-manager compares `firstChanged` when it's read.
@@ -3097,7 +3089,7 @@ export class Agent {
     const before = this.rowsAsSent(compiled.messages).slice(0, firstChanged).filter((m) => m.content.length > 0);
     if (this.mayBindThinking && before.some((message) => message.content.some((block) => block.type === 'thinking' || block.type === 'redacted_thinking'))) return undefined;
     const extraNow = requestCharacters(current, before);
-    return carrying.carried >= k * extraNow ? { carried: carrying.carried, k, extraNow } : undefined;
+    return carried >= k * extraNow ? { carried, k, extraNow } : undefined;
   }
 
   // k: the cache write price over the read price, less one, for this agent's
@@ -3113,15 +3105,6 @@ export class Agent {
     return read !== undefined && read > 0 && write !== undefined ? write / read - 1 : undefined;
   }
 
-  private noteCarrying(head: HeadDeclaration, carrying: Carrying): void {
-    this.headDeclarations.write(this.name, { head: copyHead(head), carried: carrying.carried, at: carrying.count });
-  }
-
-  // The record a move writes: the head, with nothing carried yet.
-  private movedRecord(head: HeadDeclaration): HeadRecord {
-    return { head: copyHead(head), carried: 0, at: this.requestsCounted?.() ?? 0 };
-  }
-
   private takeChangesOverBudget(error: unknown, takes: boolean, recorded: HeadDeclaration | null, current: HeadDeclaration): HeadDeclaration {
     const refusal = error instanceof Error ? error.name : undefined;
     if (refusal !== 'OverBudgetError' && refusal !== 'UncoveredDropError') throw error;
@@ -3133,7 +3116,7 @@ export class Agent {
       return current;
     }
     const rows = this.windowDeclarationRows();
-    if (rows.length === 0 || !this.headDeclarations.write(this.name, this.movedRecord(current))) throw error;
+    if (rows.length === 0 || !this.headDeclarations.write(this.name, copyHead(current))) throw error;
     const removed = this.removeDeclarationRows(rows);
     this.onHeadEvent?.({ type: 'head:moved', why: recorded ? 'budget' : 'adopted', changesRemoved: removed });
     return current;
@@ -3153,7 +3136,7 @@ export class Agent {
       return { compiled: this.withoutDeclarations(shown), head: current };
     }
     if (recorded && this.moveChangesNothing(compiled, recorded, current)) return { compiled, head: recorded };
-    const stored = this.headDeclarations.write(this.name, this.movedRecord(current));
+    const stored = this.headDeclarations.write(this.name, copyHead(current));
     if (!stored && recorded) return { compiled, head: recorded };
     const removed = this.removeDeclarationRows(this.removableDeclarationRows(compiled));
     if (stored) this.onHeadEvent?.({ type: 'head:moved', changesRemoved: removed, ...move });

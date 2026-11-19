@@ -7,29 +7,21 @@ export interface HeadDeclaration {
   system: string[];
 }
 
-/** An agent's record for a branch: the head its requests go out on, and
- *  what carrying the definitions a move would take out has cost since the
- *  head last moved. `carried` is in characters read, an estimate. `at` is the
- *  agent's count of finished inferences when `carried` was last written. */
-export interface HeadRecord {
-  head: HeadDeclaration;
-  carried: number;
-  at: number;
-}
-
+/** An agent's record for a branch is its head alone, written when the head
+ *  moves. */
 export interface HeadDeclarationStore {
-  read(agentName: string): HeadRecord | null;
-  write(agentName: string, record: HeadRecord): boolean;
+  read(agentName: string): HeadDeclaration | null;
+  write(agentName: string, head: HeadDeclaration): boolean;
   delete(agentName: string): boolean;
 }
 
 export function memoryHeadDeclarations(branch: () => string): HeadDeclarationStore {
-  const heads = new Map<string, HeadRecord>();
+  const heads = new Map<string, HeadDeclaration>();
   const key = (agentName: string) => JSON.stringify([branch(), agentName]);
   // An agent that has recorded nothing asks no branch of its context.
   return {
     read: (agentName) => (heads.size === 0 ? null : heads.get(key(agentName)) ?? null),
-    write: (agentName, record) => { heads.set(key(agentName), record); return true; },
+    write: (agentName, head) => { heads.set(key(agentName), head); return true; },
     delete: (agentName) => { if (heads.size > 0) heads.delete(key(agentName)); return true; },
   };
 }
@@ -37,7 +29,7 @@ export function memoryHeadDeclarations(branch: () => string): HeadDeclarationSto
 // membrane renders a change by its block, whatever its participant.
 export const SYSTEM_CHANGE_PARTICIPANT = 'system';
 
-function isHeadDeclaration(value: unknown): value is HeadDeclaration {
+export function isHeadDeclaration(value: unknown): value is HeadDeclaration {
   if (!value || typeof value !== 'object' || !('tools' in value) || !('system' in value)) return false;
   const { tools, system } = value;
   return Array.isArray(tools)
@@ -45,20 +37,28 @@ function isHeadDeclaration(value: unknown): value is HeadDeclaration {
     && Array.isArray(system) && system.every((block: unknown) => typeof block === 'string');
 }
 
-export function isHeadRecord(value: unknown): value is HeadRecord {
-  if (!value || typeof value !== 'object' || !('head' in value) || !('carried' in value) || !('at' in value)) return false;
-  const { head, carried, at } = value;
-  return isHeadDeclaration(head) && typeof carried === 'number' && carried >= 0 && typeof at === 'number' && at >= 0;
-}
-
 /** The `kind` a change row's metadata carries beside `system: true`. */
 export const SYSTEM_CHANGE_KIND = 'system-change';
 
 /** The metadata a change row is stored with: agent-framework's marker for a
- *  row that isn't conversation, and the agent it declares for, whose context
- *  it is (contextAgentOf), as a stored injection's mark names its agent. */
-export function systemChangeMetadata(agentName: string): { system: true; kind: typeof SYSTEM_CHANGE_KIND; agent: string } {
-  return { system: true, kind: SYSTEM_CHANGE_KIND, agent: agentName };
+ *  row that isn't conversation, the agent it declares for, whose context it
+ *  is (contextAgentOf), as a stored injection's mark names its agent, and the
+ *  agent's count of finished inferences when it was stored, which the rule
+ *  for cost reads (carriedCharacters). An agent with no count stores none. */
+export function systemChangeMetadata(
+  agentName: string,
+  inferenceCount?: number,
+): { system: true; kind: typeof SYSTEM_CHANGE_KIND; agent: string; inferenceCount?: number } {
+  return { system: true, kind: SYSTEM_CHANGE_KIND, agent: agentName, ...(inferenceCount === undefined ? {} : { inferenceCount }) };
+}
+
+/** A change row's count of finished inferences at its storing, from its mark
+ *  (systemChangeMetadata). Undefined for a row with none: a copy of a
+ *  context's row, which carries no metadata of its own, and a host's row. */
+export function inferenceCountOf(metadata: unknown): number | undefined {
+  if (metadata === null || typeof metadata !== 'object' || !('kind' in metadata) || metadata.kind !== SYSTEM_CHANGE_KIND) return undefined;
+  const count = 'inferenceCount' in metadata ? metadata.inferenceCount : undefined;
+  return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : undefined;
 }
 
 /** A move for cost's figures, each an estimate: what carrying has cost
@@ -126,37 +126,37 @@ export function copyHead(head: HeadDeclaration): HeadDeclaration {
   return { tools: JSON.parse(JSON.stringify(head.tools)) as ToolDefinition[], system: [...head.system] };
 }
 
-/** The characters of the tool definitions that a move would take out: each
- *  definition that the head carries, or that a row the agent's context can
- *  remove carries, and that what they fold to doesn't keep. A replaced or
- *  removed tool's old definition is dead; an addition, a row's own wrapping
+/** What carrying the tool definitions that a move would take out has cost
+ *  by the agent's count of finished inferences (`count`), in characters read.
+ *  A definition is dead once a row removes or replaces it, if the head
+ *  carries it or a row that the agent's context can remove carries it. Each
+ *  dead definition counts once for each inference since the row that killed
+ *  it was stored (inferenceCountOf). A row adds nothing that has no count:
+ *  one that the agent's context can't read back, which its caller gives none,
+ *  a copy's row and a host's row. Nor does one whose count is above `count`,
+ *  as after a usage state that was reset. An addition, a row's own wrapping
  *  and system text add nothing. */
-export function deadCharacters(
+export function carriedCharacters(
   head: HeadDeclaration,
-  rows: readonly { changes: readonly SystemChangeContent[]; removable: boolean }[],
+  rows: readonly { changes: readonly SystemChangeContent[]; removable: boolean; inferenceCount: number | undefined }[],
+  count: number,
 ): number {
   const live = new Map(head.tools.map((tool) => [tool.name, pricedCharacters(tool)] as const));
-  let dead = 0;
-  for (const { changes, removable } of rows) {
+  let carried = 0;
+  for (const { changes, removable, inferenceCount } of rows) {
+    const since = inferenceCount !== undefined && inferenceCount <= count ? count - inferenceCount : 0;
     for (const change of changes) {
       for (const name of change.removeTools ?? []) {
-        dead += live.get(name) ?? 0;
+        carried += (live.get(name) ?? 0) * since;
         live.delete(name);
       }
       for (const tool of change.defineTools ?? []) {
-        dead += live.get(tool.name) ?? 0;
+        carried += (live.get(tool.name) ?? 0) * since;
         live.set(tool.name, removable ? pricedCharacters(tool) : 0);
       }
     }
   }
-  return dead;
-}
-
-/** What carrying has cost by `count`: `carried` grows by `dead` for each
- *  inference counted since `at`. A count below `at`, as after a usage state
- *  that was reset, adds nothing. */
-export function carriedBy(record: Pick<HeadRecord, 'carried' | 'at'>, dead: number, count: number): number {
-  return record.carried + (count > record.at ? dead * (count - record.at) : 0);
+  return carried;
 }
 
 export function requestCharacters(head: HeadDeclaration, messages: readonly unknown[]): number {

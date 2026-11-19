@@ -11,7 +11,7 @@ import type { ContentBlock, ModelPricing, NormalizedMessage, ToolDefinition } fr
 
 import { AgentFramework, audienceOf, residentContextOptions, subconsciousContextOptions, taskForkSpec, type Agent, type AgentSpec } from '../src/index.js';
 import type { RemoveSystemChangesResult } from '../src/recovery/remove-system-changes.js';
-import { isDeclarationRow, isSystemChangeMessage, pricedCharacters, type HeadDeclarationStore, type HeadEvent, type HeadRecord } from '../src/system-changes.js';
+import { isDeclarationRow, isSystemChangeMessage, pricedCharacters, type HeadDeclaration, type HeadDeclarationStore, type HeadEvent } from '../src/system-changes.js';
 import type { TraceEvent } from '../src/types/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { foldOf, now } from './helpers/declared.js';
@@ -369,11 +369,11 @@ describe('a change of tools or system text in the framework', () => {
         const { alpha, child } = await forked(framework, {}, inheriting('alpha-child', 'alpha'), 'alpha-child');
         await child.buildActivationRequest([tool('a'), tool('b'), tool('c')]);
         const heads = framework as unknown as { headDeclarations: HeadDeclarationStore };
-        assert.deepEqual(heads.headDeclarations.read('alpha')!.head.tools.map((t) => t.name), ['a'], "the child's change left the parent's record");
+        assert.deepEqual(heads.headDeclarations.read('alpha')!.tools.map((t) => t.name), ['a'], "the child's change left the parent's record");
         const system = (text: string) => [{ namespace: 'm', position: 'system', content: [{ type: 'text', text }] }] as never;
         await alpha.buildActivationRequest([tool('a'), tool('b')], system('v1'));
         await alpha.buildActivationRequest([tool('a'), tool('b')], system('v2'));
-        assert.deepEqual(heads.headDeclarations.read('alpha')!.head.tools.map((t) => t.name), ['a', 'b'], 'the parent moved its head');
+        assert.deepEqual(heads.headDeclarations.read('alpha')!.tools.map((t) => t.name), ['a', 'b'], 'the parent moved its head');
         const again = await child.buildActivationRequest([tool('a'), tool('b'), tool('c')]);
         assert.deepEqual(again.tools, [tool('a')], "and the child's record stayed as it was copied");
         const parentRecord = JSON.stringify(heads.headDeclarations.read('alpha'));
@@ -391,7 +391,7 @@ describe('a change of tools or system text in the framework', () => {
         await alpha.buildActivationRequest([tool('a')]);
         const pending = framework.createEphemeralAgent({ ...resident('child'), systemPrompt: prompt('You are alpha.') } as never, inheriting('child', 'alpha'));
         const heads = framework as unknown as { headDeclarations: HeadDeclarationStore };
-        heads.headDeclarations.write('alpha', { head: { tools: [tool('a'), tool('b')], system: [prompt('You are alpha.')] }, carried: 0, at: 0 });
+        heads.headDeclarations.write('alpha', { tools: [tool('a'), tool('b')], system: [prompt('You are alpha.')] });
         const { agent: child } = await pending;
         store(framework, child, 'user', [{ type: 'text', text: 'hello' } as ContentBlock]);
         adopt(framework, child);
@@ -476,7 +476,7 @@ describe('a change of tools or system text in the framework', () => {
       assert.deepEqual(foldOf(request), now([tool('x'), tool('y')], prompt('You are beta.')), "beta's request folds to its tools now");
       assert.deepEqual(changesIn(request.messages), [], 'with no change row');
       assert.equal(beta.getContextManager().getAllMessages().filter(isSystemChangeMessage).length, 0, 'none stored between the call and its result');
-      assert.deepEqual(heads.headDeclarations.read('beta')!.head.tools, [tool('x'), tool('y')], 'the head moved');
+      assert.deepEqual(heads.headDeclarations.read('beta')!.tools, [tool('x'), tool('y')], 'the head moved');
       assert.deepEqual(traces.filter((t) => t.type === 'head:moved' && (t as { agentName: string }).agentName === 'beta').map((t) => (t as { why: string }).why), ['adopted', 'unstored']);
     });
   });
@@ -530,12 +530,12 @@ describe('a change of tools or system text in the framework', () => {
         const main = internals.store.currentBranch().name;
         internals.store.createBranch('trial', main);
         internals.store.switchBranch('trial');
-        internals.headDeclarations.write('alpha', { head: { tools: [tool('b')], system: [prompt('You are alpha.')] }, carried: 0, at: 0 });
+        internals.headDeclarations.write('alpha', { tools: [tool('b')], system: [prompt('You are alpha.')] });
         internals.store.switchBranch(main);
         internals.store.deleteBranch('trial');
         internals.store.createBranch('trial', main);
         internals.store.switchBranch('trial');
-        assert.deepEqual(internals.headDeclarations.read('alpha')!.head.tools, [tool('a')], "the new branch's record, made from main's");
+        assert.deepEqual(internals.headDeclarations.read('alpha')!.tools, [tool('a')], "the new branch's record, made from main's");
         internals.store.switchBranch(main);
       });
     });
@@ -558,8 +558,8 @@ describe('a change of tools or system text in the framework', () => {
         assert.deepEqual(request.tools, [tool('a'), tool('c')], 'what is current');
         assert.deepEqual(traces.filter((t) => t.type === 'head:moved').map((t) => (t as { why: string }).why), ['adopted']);
         assert.deepEqual(errors, ["[head-declarations] alpha: the recorded head isn't one, so it was set aside: the agent's next request on a model that takes a change records its current tools and system text as its head, and takes out the change rows its compile holds, once the store takes the write"]);
-        assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as HeadRecord).head.tools, [tool('a'), tool('c')], 'and the record is a head again');
-        assert.deepEqual(internals.headDeclarations.read('beta')!.head.tools, [tool('b')], "beta's stays");
+        assert.deepEqual((internals.store.getStateJson('framework/head-declarations/alpha') as HeadDeclaration).tools, [tool('a'), tool('c')], 'and the record is a head again');
+        assert.deepEqual(internals.headDeclarations.read('beta')!.tools, [tool('b')], "beta's stays");
       });
     });
 
@@ -633,8 +633,8 @@ describe('a change of tools or system text in the framework', () => {
           internals.store.getStateJson = get;
         }
         assert.deepEqual(errors, ['[head-declarations] alpha: the recorded head could not be read, so its requests go on its current head with no change row, and it records that head once it can; a record that reads again before then is the head its next request declares from:'], 'said once on the branch');
-        assert.deepEqual((get('framework/head-declarations/alpha') as HeadRecord).head.tools, [tool('a'), tool('c')], 'the record is written again');
-        assert.deepEqual(internals.headDeclarations.read('beta')!.head.tools, [tool('b')], "beta's is read as before");
+        assert.deepEqual((get('framework/head-declarations/alpha') as HeadDeclaration).tools, [tool('a'), tool('c')], 'the record is written again');
+        assert.deepEqual(internals.headDeclarations.read('beta')!.tools, [tool('b')], "beta's is read as before");
       });
     });
   });
@@ -650,11 +650,11 @@ describe('a change of tools or system text in the framework', () => {
       say(framework, alpha, 'user', 'three');
       await alpha.buildActivationRequest([tool('a')], system('v2'));
       const internals = framework as unknown as { headDeclarations: HeadDeclarationStore };
-      assert.deepEqual(internals.headDeclarations.read('alpha')!.head.system, [prompt('You are alpha.'), 'v2']);
+      assert.deepEqual(internals.headDeclarations.read('alpha')!.system, [prompt('You are alpha.'), 'v2']);
       const host = framework as unknown as { handleHostCommand(server: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> };
       const undone = await host.handleHostCommand('test', { command: 'undo', agentName: 'alpha', messages: 2 });
       assert.equal(undone.ok, true, undone.error);
-      assert.deepEqual(internals.headDeclarations.read('alpha')!.head.system, [prompt('You are alpha.'), 'v1'], "the undo's branch has the head from before the move");
+      assert.deepEqual(internals.headDeclarations.read('alpha')!.system, [prompt('You are alpha.'), 'v1'], "the undo's branch has the head from before the move");
     });
   });
 
