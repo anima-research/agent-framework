@@ -3122,7 +3122,7 @@ function unbatchedStoreRefusal(store: JsStore): string | undefined {
   return 'agent-framework needs a store handle with JsStore.appendManyToStateJsonWithIdentity, the identity-stamped batched append ' +
     'with which context-manager writes each agent\'s window, several rows as one record. The store handle has none ' +
     `(this package loads @animalabs/chronicle ${chronicleVersion() ?? 'of a version it does not say'}). ` +
-    'Install @animalabs/chronicle ^0.6.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
+    'Install @animalabs/chronicle ^0.6.0 || ^0.7.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
 }
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -5333,7 +5333,7 @@ export class AgentFramework {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
           "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
-          'Install @animalabs/context-manager ^0.27.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
+          'Install @animalabs/context-manager ^0.28.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
