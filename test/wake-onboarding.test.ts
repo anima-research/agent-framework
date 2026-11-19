@@ -330,8 +330,9 @@ describe('wake onboarding: the servers a store already had', () => {
       try {
         assert.equal(h.decisions().predates('editor'), true, 'premise: unsettled at the start');
         await h.push('Your move.', ['surface:turn']);
-        assert.ok(h.traces.some((e) => e.type === 'gate:decision' && e.matchedPolicy === rule.name), `premise: ${rule.name} decided the event`);
-        if (rule.suppress) assert.ok(h.traces.some((e) => e.type === 'gate:suppressed'), 'premise: the event was suppressed');
+        assert.ok(h.traces.some((e) => rule.suppress
+          ? e.type === 'gate:suppressed' && e.policyName === rule.name
+          : e.type === 'gate:decision' && e.matchedPolicy === rule.name), `premise: ${rule.name} decided the event`);
         assert.equal(h.woke(), rule.behavior === 'always', 'premise: the agent woke only for the rule that wakes on it');
         assert.equal(h.decisions().get('editor')?.state, 'unasked', 'the rule decided the event, and the server is settled all the same');
         assert.equal(h.stored().length, 0);
