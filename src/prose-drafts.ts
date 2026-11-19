@@ -1,7 +1,8 @@
 /**
  * Held prose drafts: a resident's plain speech that was not sent.
  *
- * Plain speech is held back for reasons that are right in themselves: an
+ * Plain speech is held back for reasons that are right in themselves: for an
+ * agent whose sends silence (AgentConfig.sendSilencing, off by default), an
  * explicit send suppresses plain speech aimed where it may have posted, in
  * its round and the turn's later ones (so a "sent it" postscript is not
  * posted twice), a turn may have no destination, and a
@@ -63,7 +64,9 @@ export type DraftReason =
   /** The speech had no destination (no route this turn, or a failed envelope). */
   | 'no-destination'
   /** An explicit/hybrid routing prefix was missing, malformed or unresolvable. */
-  | 'bounced';
+  | 'bounced'
+  /** A `skip_reply` in its round kept it back, under `sameRoundSkipReplyTextPolicy: 'ask'`. */
+  | 'skip-reply';
 
 export interface DraftAttemptOutcome {
   status: PublishOutcome['status'];

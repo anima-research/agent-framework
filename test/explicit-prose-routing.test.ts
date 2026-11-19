@@ -169,7 +169,7 @@ describe('explicit prose routing', () => {
       agents: [{
         name: 'assistant',
         model: 'test-model',
-        systemPrompt: 'You are a test agent.',
+        systemPrompt: 'You are a test agent.', sendSilencing: true,
         proseRouting: mode,
         ...settings,
       }],

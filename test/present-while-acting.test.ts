@@ -205,15 +205,17 @@ describe('present while acting', () => {
     options: {
       speech?: { locus: 'delivery' | 'latest-inbound' }; maxStreamTokens?: number; proseRouting?: 'locus' | 'hybrid';
       thinkingBinding?: { binds: boolean };
+      /** false leaves `sendSilencing` out, which is the default: sends don't silence. */
+      sendsSilence?: false;
     } = {},
   ): Promise<AgentFramework> {
-    const { speech, ...agentOptions } = options;
+    const { speech, sendsSilence, ...agentOptions } = options;
     const frameworkOptions = speech ? { speech } : {};
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', ...agentOptions },
+        { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', ...(sendsSilence === false ? {} : { sendSilencing: true }), ...agentOptions },
       ],
       modules: [module],
       ...frameworkOptions,
@@ -321,6 +323,34 @@ describe('present while acting', () => {
 
     await framework.stop();
   });
+
+  for (const proseRouting of ['locus', 'hybrid'] as const) {
+    it(`${proseRouting}: by default (no sendSilencing) a send silences nothing: its round's prose and all later prose route`, async () => {
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'sending it directly' },
+        { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'hi' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Narrating round two.' },
+        { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'up' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Sent, and moved.' }] as ContentBlock[]));
+
+      const framework = await createFramework({ sendsSilence: false, proseRouting });
+      const routed = stubChannelRegistry(framework);
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(
+        routed.map((r) => r.text),
+        ['sending it directly', 'Narrating round two.', 'Sent, and moved.'],
+        'with sendSilencing off, prose beside and after an explicit send is routed',
+      );
+
+      await framework.stop();
+    });
+  }
 
   it('sticky silencing is forward-only: earlier rounds\' prose still routes', async () => {
     membrane.pushResponse(createMockResponse([
@@ -1890,7 +1920,7 @@ describe('present while acting', () => {
     console.error = () => {};
     try {
       const { agent, contextManager } = await framework.createEphemeralAgent({
-        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+        name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', sendSilencing: true, allowedTools: 'all',
       });
       contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
       // The default startup limit, 30 s, so only a host stalled that long
@@ -2028,7 +2058,7 @@ describe('present while acting', () => {
     const framework = await AgentFramework.create({
       store,
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' }],
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', sendSilencing: true }],
       modules: [module],
       syncIntervalMs: 0,
       maintenanceIntervalMs: 0,

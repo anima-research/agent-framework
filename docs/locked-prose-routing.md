@@ -96,8 +96,10 @@ should reach channels through MCPL servers rather than such a module.
 
 ## Unchanged from locus mode
 
-- An explicit send silences the plain speech its round and later rounds aim
-  where the send may have posted, holding it as drafts.
+- With `sendSilencing: true`, an explicit send silences the plain speech its
+  round and later rounds aim where the send may have posted, holding it as
+  drafts. By default it doesn't. The resident can switch it with
+  `agent_settings` (`send_silencing`).
 - `skip_reply`, a same-round private `think` and the turn-end `[delivered]`
   receipt work as in locus mode.
 - There's no `>>` or `>>>` envelope grammar. An envelope is plain text here.

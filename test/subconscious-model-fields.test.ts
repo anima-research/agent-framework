@@ -151,7 +151,7 @@ describe('the subconscious and the resident\'s model fields', () => {
       // Read onto #291: the subconscious's own voice is its name alone, so it
       // overrides the resident's selfParticipants and presentAs too (FW-AF-8).
       const own = ['physicalWindowTokens', 'thinkingBinding', 'toolDeclarations', 'name', 'model', 'systemPrompt', 'strategy', 'proseRouting', 'allowedTools', 'clock',
-        'selfParticipants', 'presentAs'];
+        'selfParticipants', 'presentAs', 'sameRoundSkipReplyTextPolicy'];
       const rest = (config: AgentConfig | undefined) =>
         Object.fromEntries(Object.entries(config ?? {}).filter(([key]) => !own.includes(key)));
       const inherited = rest(storedConfig(framework, 'Subconscious'));
