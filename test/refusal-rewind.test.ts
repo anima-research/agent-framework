@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
 import type { InferenceRequest, Module, ProcessEvent, ProcessState, EventResponse, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { storeOwnRow } from '../src/index.js';
+import { audienceOf } from '../src/dendrite/audience.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
 import { NOTICE_TAG } from '../src/notice-tags.js';
@@ -124,7 +126,7 @@ test('marker: six rewinds produce ONE marker, updated in place (not six)', () =>
   assert.equal(c6, 6);
   assert.equal(added.length, 1, 'exactly ONE marker message added for the whole episode');
   assert.equal(edited.length, 5, 'subsequent rewinds edit that one marker in place');
-  assert.match(edited[edited.length - 1].content[0].text, /6 most recent turn/, 'marker reflects the running total');
+  assert.match(edited[edited.length - 1].content[0].text, /6 earlier turn/, 'marker reflects the running total');
   assert.equal(added[0].meta.kind, 'refusal-rewind');
 });
 
@@ -134,6 +136,8 @@ class Surface implements Module {
   readonly name = 'surface';
   framework?: AgentFramework;
   heardWhileLooking?: string;
+  /** The agents a message wakes, when not all of them. */
+  wakes?: string[];
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return [{ name: 'look', description: 'Look at something.', inputSchema: { type: 'object', properties: {} } }]; }
@@ -154,7 +158,7 @@ class Surface implements Module {
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
     const wakes = (event as { triggerInference?: boolean }).triggerInference !== false;
-    return { addMessages: [{ participant: 'user', content: [text(String(event.content))] }], requestInference: wakes };
+    return { addMessages: [{ participant: 'user', content: [text(String(event.content))] }], requestInference: wakes && this.wakes ? this.wakes : wakes };
   }
 }
 
@@ -165,6 +169,8 @@ async function rewindRig(
     strategy?: unknown;
     onRequest?: (count: number, framework: AgentFramework) => void;
     heardWhileLooking?: string;
+    /** Scout observes a second resident, oren, in this foreign-rounds mode. */
+    observe?: 'transcript' | 'raw';
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'refusal-rewind-'));
@@ -172,6 +178,7 @@ async function rewindRig(
   if (setup.heardWhileLooking) membrane.supportsInjectedMessages = true;
   const surface = new Surface();
   surface.heardWhileLooking = setup.heardWhileLooking;
+  if (setup.observe) surface.wakes = ['scout'];
   const requests: NormalizedRequest[] = [];
   const streams: MockYieldingStream[] = [];
   const streamYielding = membrane.streamYielding.bind(membrane);
@@ -187,7 +194,11 @@ async function rewindRig(
   };
   const framework: AgentFramework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout', refusalHandling, ...(setup.strategy ? { strategy: setup.strategy } : {}) }],
+    agents: [
+      { name: 'scout', model: 'test-model', systemPrompt: 'scout', refusalHandling, ...(setup.strategy ? { strategy: setup.strategy } : {}),
+        ...(setup.observe ? { observes: ['oren'], foreignRounds: setup.observe } : {}) },
+      ...(setup.observe ? [{ name: 'oren', model: 'test-model', systemPrompt: 'oren' }] : []),
+    ],
     modules: [surface],
   } as never);
   surface.framework = framework;
@@ -221,9 +232,9 @@ test("a refusal's rewind tells the agent its turns couldn't be completed, naming
     assert.equal(rig.requests.length, 3, 'the turn, the refused request and the retry');
     const retry = rig.requests[2]!;
     const marker = markerOf(retry) ?? '';
-    assert.ok(marker.includes('[turns-set-aside] The 1 most recent turn(s)'), `the marker opens with its documented tag: ${marker}`);
+    assert.ok(marker.includes('[turns-set-aside] 1 earlier turn(s)'), `the marker opens with its documented tag: ${marker}`);
     assert.ok(marker.includes(
-      `${REWIND_TAG} The 1 most recent turn(s) were set aside because the requests that carried them couldn't be completed. ` +
+      `${REWIND_TAG} 1 earlier turn(s) were set aside after requests couldn't be completed. ` +
       "Their content isn't shown here, and the originals remain in the raw record. You are clear to continue",
     ), marker);
     assert.doesNotMatch(marker, /refus|filter|categor/i);
@@ -264,7 +275,7 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
       assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the retry leaves the refused message out');
       if (partial) assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), "and the refused attempt's text");
       assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes(REWIND_TAG)), 'what came before stays');
-      assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+      assert.match(markerOf(retry) ?? '', /1 earlier turn\(s\) were set aside/);
     } finally { await rig.close(); }
   });
 
@@ -278,7 +289,7 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
       assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
       assert.ok(!rig.texts(retry).some((t) => t.includes('reply 1')), 'and the reply before it');
       assert.ok(rig.texts(retry).some((t) => t.includes('first question') && !t.includes(REWIND_TAG)), 'what came before stays');
-      assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+      assert.match(markerOf(retry) ?? '', /2 earlier turn\(s\) were set aside/);
     } finally { await rig.close(); }
   });
 }
@@ -307,7 +318,7 @@ for (const partial of [undefined, 'Here is the start of an answer']) {
       assert.doesNotMatch(sent, /look-1/, 'and the call it answered');
       if (partial) assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), "and the refused attempt's text");
       assert.ok(rig.texts(retry).some((t) => t.includes('look at it')), 'the message before the exchange stays');
-      assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+      assert.match(markerOf(retry) ?? '', /1 earlier turn\(s\) were set aside/);
     } finally { await rig.close(); }
   });
 }
@@ -347,7 +358,7 @@ test('a message injected into the refused round is the newest turn it carried, a
     const retry = rig.requests[2]!;
     assert.ok(!rig.texts(retry).some((t) => t.includes('heard while the tool ran')), 'the injected message is gone');
     assert.match(JSON.stringify(retry.messages), /what the tool saw/, 'the tool exchange before it stays');
-    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.match(markerOf(retry) ?? '', /1 earlier turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });
 
@@ -367,7 +378,87 @@ test('an exchange the refused request carried only by its call is shed whole', a
     // aside), so the result goes with its call out of the agent's window.
     const result = rig.stored().find((m) => JSON.stringify(m.content).includes('what the tool saw'))!;
     assert.notEqual(cm.windowStatusOf(result.id), 'in', 'and so is its result, from the window');
-    assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+    assert.match(markerOf(retry) ?? '', /2 earlier turn\(s\) were set aside/);
+  } finally { await rig.close(); }
+});
+
+// #737 through the public refusal path: a system notice between a call and
+// its result no longer splits the exchange, and the notice stays.
+test('a notice between a call and its result: the rewind sets the exchange aside whole and keeps the notice (#737)', async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 });
+  try {
+    await rig.say('first question', 1);
+    const scout = rig.framework.getAgent('scout')!;
+    const cm = scout.getContextManager();
+    const call = storeOwnRow(scout, 'scout', [{ type: 'tool_use', id: 'gap-look', name: 'surface--look', input: {} } as ContentBlock]);
+    const notice = storeOwnRow(scout, 'user', [text('keep-notice')], { system: true });
+    const result = storeOwnRow(scout, 'user', [{ type: 'tool_result', toolUseId: 'gap-look', content: 'gap-result' } as ContentBlock]);
+    const order = [call, notice, result].map((id) => cm.ordinalOf(id));
+    assert.ok(order.every((o) => o !== undefined) && order[0]! < order[1]! && order[1]! < order[2]!, 'the premise: the window holds the notice between the call and the result');
+    await rig.say('second question', 4);
+    assert.equal(rig.requests.length, 4, 'the turn, two refused requests and the retry');
+    const sent = JSON.stringify(rig.requests[3]!.messages);
+    assert.doesNotMatch(sent, /gap-look|gap-result/, 'neither endpoint, nor a synthesized result for the call');
+    assert.match(sent, /keep-notice/);
+    assert.deepEqual([call, notice, result].map((id) => cm.windowStatusOf(id)), ['undone', 'in', 'undone']);
+  } finally { await rig.close(); }
+});
+
+// Recovery of a valid pair an observer is sent stays as on main: in the
+// default transcript mode, scout is sent oren's call and result as two lines
+// of text, and the rewind sets them aside together and retries.
+test("an observer's rewind sets aside an observed agent's adjacent call and result, and retries", async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 }, { observe: 'transcript' });
+  try {
+    await rig.say('first question', 1);
+    const scout = rig.framework.getAgent('scout')!, oren = rig.framework.getAgent('oren')!;
+    const cm = scout.getContextManager();
+    const call = storeOwnRow(oren, 'oren', [{ type: 'tool_use', id: 'probe-id', name: 'surface--look', input: {} } as ContentBlock]);
+    const result = storeOwnRow(oren, 'user', [{ type: 'tool_result', toolUseId: 'probe-id', content: 'payload-probe' } as ContentBlock]);
+    assert.ok(cm.ordinalOf(call) !== undefined && cm.ordinalOf(result) !== undefined, "the premise: scout's window holds both");
+    await rig.say('second question', 4);
+    assert.equal(rig.requests.length, 4, 'the second rewind sets the pair aside and the retry goes out');
+    assert.doesNotMatch(JSON.stringify(rig.requests[3]!.messages), /payload-probe|surface--look/);
+    assert.deepEqual([call, result].map((id) => cm.windowStatusOf(id)), ['undone', 'undone']);
+  } finally { await rig.close(); }
+});
+
+// In a shared slot, a call and a result with the same ID from different
+// writers are not one exchange: the rewind doesn't pair them across the
+// notice, and scout's call stays in her window, as on main.
+test("a rewind doesn't pair scout's call with an observed agent's result of the same ID across a notice", async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 }, { observe: 'raw' });
+  try {
+    await rig.say('first question', 1);
+    const scout = rig.framework.getAgent('scout')!, oren = rig.framework.getAgent('oren')!;
+    const cm = scout.getContextManager();
+    const call = storeOwnRow(scout, 'scout', [{ type: 'tool_use', id: 'probe-id', name: 'surface--look', input: {} } as ContentBlock]);
+    storeOwnRow(scout, 'user', [text('probe-notice')], { system: true });
+    const result = storeOwnRow(oren, 'user', [{ type: 'tool_result', toolUseId: 'probe-id', content: 'payload-probe' } as ContentBlock]);
+    assert.ok(cm.ordinalOf(call) !== undefined && cm.ordinalOf(result) !== undefined, "the premise: scout's window holds both");
+    await rig.say('second question', 4);
+    assert.equal(cm.windowStatusOf(result), 'undone', "oren's result is set aside");
+    assert.equal(cm.windowStatusOf(call), 'in', "scout's call isn't taken with it");
+  } finally { await rig.close(); }
+});
+
+// Rows with no audience stamp are of unknown ownership, not one writer's:
+// in a shared slot, scout's unstamped call and oren's unstamped result of the
+// same ID across a notice aren't paired, and scout's call stays, as on main.
+test("a rewind doesn't pair unstamped rows of two writers with the same ID across a notice", async () => {
+  const rig = await rewindRig([[], [refused()], [refused()]], { autoRewind: true, maxRewinds: 3 }, { observe: 'raw' });
+  try {
+    await rig.say('first question', 1);
+    const scout = rig.framework.getAgent('scout')!, oren = rig.framework.getAgent('oren')!;
+    const cm = scout.getContextManager();
+    const call = cm.addMessage('scout', [{ type: 'tool_use', id: 'probe-id', name: 'surface--look', input: {} } as ContentBlock]);
+    const notice = cm.addMessage('user', [text('probe-notice')], { system: true });
+    const result = oren.getContextManager().addMessage('user', [{ type: 'tool_result', toolUseId: 'probe-id', content: 'payload-probe' } as ContentBlock]);
+    assert.ok([call, result].every((id) => !audienceOf(cm.getMessage(id)?.metadata)), 'the premise: neither is stamped');
+    await rig.say('second question', 4);
+    assert.equal(rig.requests.length, 4, 'the second rewind sets the result aside and the retry goes out');
+    assert.equal(cm.windowStatusOf(result), 'undone', "oren's result was in scout's window, and is set aside");
+    assert.deepEqual([call, notice].map((id) => cm.windowStatusOf(id)), ['in', 'in'], "scout's call isn't taken with it");
   } finally { await rig.close(); }
 });
 
@@ -383,7 +474,7 @@ test('a row no refused request carried, such as tuned-out traffic, is neither re
     const retry = rig.requests[3]!;
     assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
     assert.ok(!rig.texts(retry).some((t) => t.includes('reply 1')), 'and the reply before it');
-    assert.match(markerOf(retry) ?? '', /The 2 most recent turn\(s\) were set aside/);
+    assert.match(markerOf(retry) ?? '', /2 earlier turn\(s\) were set aside/);
     assert.ok(rig.stored().some((m) => JSON.stringify(m.content).includes('tuned out')), 'the tuned-out row stays stored');
   } finally { await rig.close(); }
 });
@@ -406,7 +497,7 @@ test('a message stored after the refused request was sent is neither removed nor
     // enters the window as that turn ends, after the marker the rewind
     // stored, so the marker is the retry's last message but one.
     const markerAt = rig.texts(retry).findIndex((t) => t.includes(REWIND_TAG));
-    assert.match(rig.texts(retry)[markerAt] ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.match(rig.texts(retry)[markerAt] ?? '', /1 earlier turn\(s\) were set aside/);
     assert.ok(rig.texts(retry).slice(markerAt + 1).some((t) => t.includes('while it streams')), 'the message stored meanwhile follows the marker');
   } finally { await rig.close(); }
 });
@@ -468,7 +559,7 @@ test('a refused reply stored in shards is removed whole, and the marker says 1',
     assert.ok(!rig.texts(retry).some((t) => t.includes('partial')), 'no shard of the refused reply is carried');
     assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
     assert.ok(rig.texts(retry).some((t) => t.includes('answer0')), 'what came before stays');
-    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.match(markerOf(retry) ?? '', /1 earlier turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });
 
@@ -489,7 +580,7 @@ test("/unstick after a refusal whose reply had text sheds that reply first, sinc
     const retry = rig.requests[3]!;
     assert.ok(!rig.texts(retry).some((t) => t.includes(partial)), 'the retry leaves that reply out');
     assert.ok(rig.texts(retry).some((t) => t.includes('second question')), 'the message before it stays, for a later shed if the refusals go on');
-    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.match(markerOf(retry) ?? '', /1 earlier turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });
 
@@ -530,6 +621,6 @@ test('/unstick after a refusal sheds the refused message, not the refused reply,
     const retry = rig.requests[3]!;
     assert.ok(!rig.texts(retry).some((t) => t.includes('second question')), 'the refused message is gone');
     assert.ok(rig.texts(retry).some((t) => t.includes('reply 1')), 'the reply before it stays');
-    assert.match(markerOf(retry) ?? '', /The 1 most recent turn\(s\) were set aside/);
+    assert.match(markerOf(retry) ?? '', /1 earlier turn\(s\) were set aside/);
   } finally { await rig.close(); }
 });

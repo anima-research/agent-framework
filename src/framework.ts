@@ -3368,6 +3368,66 @@ interface RewindRecord {
   removedIds: MessageId[];
 }
 
+/**
+ * A body a presented-window shed may pass over between a tool result and
+ * its call (#737): system notices only, none of them a rewind marker, a
+ * host change or a tool block.
+ */
+function isGapNotice(rows: readonly StoredMessage[], hasBlock: (m: StoredMessage, t: string) => boolean): boolean {
+  return rows.length > 0 && rows.every((m) => {
+    const meta = (m.metadata ?? {}) as Record<string, unknown>;
+    return Boolean(meta.system) && meta.kind !== 'refusal-rewind'
+      && !hasBlock(m, 'system_change') && !hasBlock(m, 'tool_use') && !hasBlock(m, 'tool_result');
+  });
+}
+
+/**
+ * Whether a call body and a result body with only notices between them are
+ * one tool exchange (#737), so a shed may take both and leave the notices:
+ * the call body holds calls and no results, the result body results and no
+ * calls; their tool IDs are the same set, each a non-empty string, once
+ * each; every row of both is stamped (`audience`), with the same owner and
+ * audience stamps (`ownRowOf` and `audience`), so a round isn't paired with
+ * another writer's, and an unstamped row, whose writer is unknown, proves
+ * nothing; and none of those IDs is on any other call or result the
+ * agent's record or window holds, so no other round, earlier, reused or
+ * another writer's, can be the one the result answers. Anything else isn't
+ * proven, and the result is shed as before, without crossing the notices.
+ */
+function gapPairProven(
+  cm: { getAllMessages(): StoredMessage[] },
+  window: readonly StoredMessage[],
+  call: readonly StoredMessage[],
+  result: readonly StoredMessage[],
+): boolean {
+  const blocks = (rows: readonly StoredMessage[]) => rows.flatMap((m) => (Array.isArray(m.content) ? m.content : []) as ContentBlock[]);
+  const ids = (rows: readonly StoredMessage[], type: 'tool_use' | 'tool_result') => blocks(rows)
+    .filter((b) => b.type === type)
+    .map((b) => (type === 'tool_use' ? (b as { id?: unknown }).id : (b as { toolUseId?: unknown }).toolUseId));
+  const valid = (list: unknown[]): list is string[] => list.length > 0
+    && list.every((id) => typeof id === 'string' && id.trim().length > 0) && new Set(list).size === list.length;
+  const callIds = ids(call, 'tool_use'), resultIds = ids(result, 'tool_result');
+  if (ids(call, 'tool_result').length || ids(result, 'tool_use').length) return false;
+  if (!valid(callIds) || !valid(resultIds) || callIds.length !== resultIds.length
+    || !resultIds.every((id) => callIds.includes(id))) return false;
+  const writer = (m: StoredMessage) => {
+    const stamp = audienceOf(m.metadata);
+    return JSON.stringify([stamp?.ownRowOf ?? null, stamp ? [...stamp.audience].sort() : null]);
+  };
+  // A row with no stamp is of unknown ownership, not the same writer as
+  // another unstamped row: it proves nothing.
+  if ([...call, ...result].some((m) => !audienceOf(m.metadata))) return false;
+  const writers = new Set([...call, ...result].map(writer));
+  if (writers.size !== 1) return false;
+  // Each ID once as a call and once as a result, over the record and the
+  // window (which can hold another slot's rows), each row counted once.
+  const rows = new Map<MessageId, StoredMessage>();
+  for (const m of [...cm.getAllMessages(), ...window]) rows.set(m.id, m);
+  const seen = [...rows.values()];
+  const uses = (type: 'tool_use' | 'tool_result') => ids(seen, type).filter((id) => callIds.includes(id as string)).length;
+  return uses('tool_use') === callIds.length && uses('tool_result') === callIds.length;
+}
+
 /** How an agent's `/unstick` came out, as `unstick-outcome` answers it: at the
  *  session's end, or at a turn that fails inside the session, which ends
  *  nothing (`turn-failed`). Labels only: a refusal's category, a failed
@@ -15058,6 +15118,12 @@ export class AgentFramework {
    * still the record, the rows are removed from it, as before the index,
    * and leave every other window that held them.
    *
+   * A tool result is paired with the tool_use body right before it. On a
+   * presented window, and only there, system notices between a result body
+   * and the call body before them are passed over too (#737), when the pair
+   * is proven (gapPairProven); the notices stay in the window. Any other
+   * shape pairs as before.
+   *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
    */
@@ -15078,6 +15144,24 @@ export class AgentFramework {
       if (!windowed) return false;
       return hasBlock(m, 'system_change') || !this.agentSees(agent, m.metadata);
     };
+    // The tool_use body a result body starting at `start` is paired with:
+    // the body right before it when that holds a tool_use; on a presented
+    // window, the call body before a run of system notices when the pair is
+    // proven (#737). Else none, and the result goes alone, as before.
+    const callBefore = (start: number): { from: number; to: number } | null => {
+      if (start <= 0) return null;
+      const turn = bodyRangeIn(all, start - 1);
+      const rows = (r: { from: number; to: number }) => all.slice(r.from, r.to + 1);
+      if (rows(turn).some((m) => hasBlock(m, 'tool_use'))) return turn;
+      if (!windowed) return null;
+      let call = turn;
+      while (isGapNotice(rows(call), hasBlock)) {
+        if (call.from <= 0) return null;
+        call = bodyRangeIn(all, call.from - 1);
+      }
+      if (call === turn) return null;
+      return gapPairProven(cm, all, rows(call), all.slice(start, bodyRangeIn(all, start).to + 1)) ? call : null;
+    };
 
     // We shed strictly newest-first, in sequence (in window order on a
     // presented window) — INCLUDING the agent's own turns (poison lives in
@@ -15091,9 +15175,8 @@ export class AgentFramework {
     // (updateRewindMarker).
     const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
     const callCarried = (start: number) => {
-      if (start <= 0) return false;
-      const turn = bodyRangeIn(all, start - 1);
-      return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
+      const turn = callBefore(start);
+      return turn !== null && wasCarried(turn.from, turn.to);
     };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
@@ -15136,17 +15219,15 @@ export class AgentFramework {
     const heads: MessageId[] = [all[first]!.id];
     let descriptor: string;
     if (toolBlocks.length > 0) {
-      // Pair the tool_result with the tool_use assistant turn right before
-      // it, the whole of it: a turn stored as a body carries its tool_use on
-      // its first shard, not its last.
-      if (first - 1 >= 0) {
-        const turn = bodyRangeIn(all, first - 1);
+      // Pair the tool_result with its tool_use assistant turn (callBefore),
+      // the whole of it: a turn stored as a body carries its tool_use on its
+      // first shard, not its last. Notices passed over between them stay.
+      const turn = callBefore(first);
+      if (turn) {
         const turnMembers = all.slice(turn.from, turn.to + 1);
-        if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
-          from = turn.from;
-          appendAll(removedIds, turnMembers.map((m) => m.id).reverse());
-          heads.unshift(all[turn.from]!.id);
-        }
+        from = turn.from;
+        appendAll(removedIds, turnMembers.map((m) => m.id).reverse());
+        heads.unshift(all[turn.from]!.id);
       }
       const sz = toolBlocks.reduce(
         (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
@@ -15165,7 +15246,8 @@ export class AgentFramework {
       this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...removedIds].reverse(), reason: 'shed' });
       return { descriptor, removedIds };
     }
-    // One removal for the whole exchange, so it is never half applied.
+    // One removal for the whole exchange, so it is never half applied
+    // (callBefore crosses no notice here, so the range is the exchange).
     removeStoredMessages(cm, all[from], msg);
     this.retractRemovedElsewhere(cm, removedIds, 'rewind');
     return { descriptor, removedIds };
@@ -15174,10 +15256,14 @@ export class AgentFramework {
   /**
    * Maintain exactly ONE consolidated marker for the current rewind episode,
    * updated in place as more turns are shed. Six rewinds ⇒ one message that
-   * says "the 6 most recent turns were set aside", not six separate notes — so
-   * the context converges (shed N, add 1) instead of growing, and the marker
-   * sits at the tail giving the model something actionable to answer once the
-   * refusal clears. Returns the running count.
+   * says "6 earlier turns were set aside", not six separate notes — so the
+   * context converges (shed N, add 1) instead of growing. The first rewind
+   * of an episode appends the marker at the tail; later ones update that row
+   * in place, so rows stored since can follow it. It says only that earlier
+   * content was set aside: the shed passes over notices and rows a request
+   * didn't carry, so what it took is not always the newest, nor always all
+   * on the failed request. It gives the model something actionable to answer
+   * once the refusal clears. Returns the running count.
    */
   private updateRewindMarker(
     agent: Agent,
@@ -15188,8 +15274,8 @@ export class AgentFramework {
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
     const text =
-      `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
-      `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
+      `[${NOTICE_TAG.refusalRewind}] ${count} earlier turn(s) were set aside after ` +
+      `requests couldn't be completed. Their content isn't shown here, ` +
       `and the originals remain in the raw record. You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;

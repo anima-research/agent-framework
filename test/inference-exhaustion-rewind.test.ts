@@ -93,7 +93,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 
   const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 most recent turn\(s\) were set aside because the requests that carried them couldn't be completed\. Their content isn't shown here, and the originals remain in the raw record\. You are clear to continue/);
+  assert.match(marker!.content[0].text, /^\[[^\]]+\] 1 earlier turn\(s\) were set aside after requests couldn't be completed\. Their content isn't shown here, and the originals remain in the raw record\. You are clear to continue/);
   assert.doesNotMatch(marker!.content[0].text, /tool_use ids|refus|filter|rejecting the conversation/i, "the marker carries none of the provider's words");
   assert.ok(String(marker!.meta.category).includes('tool_use ids must have a corresponding tool_result'), 'the record keeps them');
 
@@ -128,7 +128,7 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
     'the newest message is gone, and the empty row after it stays with what came before');
   const marker = added.find(isRewindMarker);
-  assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
+  assert.match(marker!.content[0].text, /1 earlier turn\(s\) were set aside/);
 });
 
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {
