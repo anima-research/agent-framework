@@ -789,13 +789,14 @@ describe("the private think policy without a channel registry, across a restart,
   });
 
   // The sentence names the think policy as the cause, so it is written only
-  // where the words would otherwise have gone out (the fresh reader's find).
+  // where the words would otherwise have been posted or held as drafts (the
+  // fresh reader's find).
   const UNNAMED_NORTH: Reply = { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
   for (const [label, settings, opts] of [
     ["proseRouting: 'disabled'", { proseRouting: 'disabled' }, {}],
     ['no channel registry', {}, { registry: false }],
   ] as const) {
-    it(`says nothing of held words where they wouldn't have gone out anyway (${label})`, async () => {
+    it(`says nothing of held words where they wouldn't have been posted or held anyway (${label})`, async () => {
       const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, ...settings }, opts);
       assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
       assert.ok(!afterCut(run).includes(HELD));
@@ -819,6 +820,7 @@ describe("the private think policy without a channel registry, across a restart,
     const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'locked', proseLock: 'world:commons' }, { targets: ['world:commons'] });
     assert.ok(run.routed.includes('First I step east.'), `premise: the lock routes the turn's words: ${run.routed.join(' | ')}`);
     assert.ok(afterCut(run).includes(HELD));
+    assert.ok(!afterCut(run).includes('`>>` destination'), 'only explicit routing names a destination');
   });
 
   it("says the held round's words weren't posted under locked routing with no lock (held as drafts)", async () => {
@@ -901,6 +903,8 @@ describe("the private think policy without a channel registry, across a restart,
       const run = await turn('xml', [XML_TARGET_EAST, cutReply], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
       assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
       assert.ok(afterCut(run).includes(HELD));
+      // A sticky target lasts the turn, so a resend needs its destination.
+      assert.ok(afterCut(run).includes('with its `>>` destination'), 'explicit routing names the destination a resend needs');
     });
 
     it(`says the held round's unprefixed words weren't posted under explicit routing with no target yet (${cutLabel})`, async () => {
@@ -909,6 +913,24 @@ describe("the private think policy without a channel registry, across a restart,
       const run = await turn('xml', [XML_EAST_ROUND, cutReply], { ...PRIVATE, proseRouting: 'explicit' });
       assert.ok(!afterCut(run).includes('Your text (20 chars)'), 'premise: held back, they never reach the bounce');
       assert.ok(afterCut(run).includes(HELD));
+    });
+  }
+
+  it("says the held round's words weren't posted under explicit routing when a >>skip_reply aside followed them", async () => {
+    const mixed: Reply = { xml: 'Now north, everyone.\n>>skip_reply An aside.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const pub = await turn('xml', [XML_EAST_ROUND, mixed], { proseRouting: 'explicit' });
+    assert.ok(afterCut(pub).includes('Your text (20 chars)'), "premise: without the policy the words before the aside bounce, with a notice");
+    const run = await turn('xml', [XML_EAST_ROUND, mixed], { ...PRIVATE, proseRouting: 'explicit' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // `{{unsent}}` alone writes no words of the agent's own: it stands for a
+  // bounced draft, which the held round leaves where it was.
+  for (const [label, settings] of [["proseRouting: 'explicit'", { proseRouting: 'explicit' }], ['the default routing', {}]] as const) {
+    it(`says nothing of held words when the cut round wrote only {{unsent}} (${label})`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml: '{{unsent}}\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, ...settings });
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
     });
   }
 
