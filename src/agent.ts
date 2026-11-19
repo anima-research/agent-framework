@@ -2380,8 +2380,8 @@ export class Agent {
 
     // The [Continue] prompt this request's reply follows, read from the
     // request itself: a new one when it ends on [Continue]; else, when it
-    // ends on tool results (apart from stored context injections after
-    // them), the prompt of the reply that called those tools, whose tool
+    // ends on tool results (apart from stored context injections and system
+    // changes after them), the prompt of the reply that called those tools, whose tool
     // loop this reply continues; else none. A request that ends
     // on anything else (a message that arrived during a cooldown, say) gets
     // a reply that follows that message and carries no prompt.

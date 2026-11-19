@@ -84,8 +84,7 @@ export type DeclarationDifference =
 /** A message that holds system changes. context-manager refuses one that mixes
  *  them with other blocks, so its content is changes alone. Recognised by its
  *  block, which is what membrane sends, whatever metadata a stored copy carries:
- *  what a request on the head leaves out, and what readers of the
- *  conversation's tail look past, are every change row. */
+ *  the readers of a request's tail look past every such row. */
 export function isSystemChangeMessage(message: { content: readonly ContentBlock[] }): boolean {
   return Array.isArray(message.content) && message.content.some(isSystemChangeContent);
 }

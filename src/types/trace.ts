@@ -140,7 +140,9 @@ export type TraceEvent =
        *  for dropping messages no summary covers, with change rows kept
        *  ('budget'); or a request on a model that takes none, or kept to its
        *  head, that found change rows to take out ('on-head'). A move other
-       *  than 'on-head' is one whole write. At 'budget', with
+       *  than 'on-head' is one whole write, unless the provider's cache
+       *  holds the new head already, as at the first request after an
+       *  upgrade. At 'budget', with
        *  `thinkingBinding.binds: true`, the request's thinking is left out.
        *  With `binds` left out, the requests after it still carry it: with
        *  `dropBlock` the provider drops it, and without it an account that
