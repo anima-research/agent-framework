@@ -433,6 +433,7 @@ it("the held-back check reads a `present` that defaults to true as true", () => 
 const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'unregistered' | 'held-back'; what: string }> = {
   'agent.ts Agent.addAssistantResponse': { count: 1, when: 'turn', what: "a stream's round or final reply" },
   'agent.ts Agent.doInference': { count: 1, when: 'turn', what: "the direct API path's reply" },
+  'agent.ts Agent.startStreamWithInjections': { count: 1, when: 'turn', what: "a start's effort row (FrameworkConfig.effort), before its compile" },
   'framework.ts AgentFramework.storeDueClock': { count: 1, when: 'turn', what: 'a clock row: an event with no turn alive, a start, a tool boundary' },
   'framework.ts AgentFramework.storeInjections': { count: 1, when: 'turn', what: "a start's stored injection, before its compile" },
   'framework.ts AgentFramework.repinTurnLocus': { count: 1, when: 'turn', what: 'a routing notice, at a start or injected at a boundary' },

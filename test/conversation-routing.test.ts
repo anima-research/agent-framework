@@ -349,8 +349,9 @@ describe('Conversation routing', () => {
   }
 
   /** The line a spawn logs for a seed that left something out. */
-  function seedLine(thinking: number, calls: number, results: number, notices = 0, injections = 0): string {
+  function seedLine(thinking: number, calls: number, results: number, notices = 0, injections = 0, effortRows = 0): string {
     return `[conversation] ${forkName('slack:D3', 1)}: seeded from trunk without ${injections} stored context injection(s), ` +
+      `${effortRows} effort row(s), ` +
       `${thinking} thinking block(s), ` +
       `${notices} channel or by-name notice(s), ${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`;
   }
@@ -373,6 +374,34 @@ describe('Conversation routing', () => {
     assert.ok(!seeded.some((m) => JSON.stringify(m.content).includes('TRUNK-LESSON')), 'and not its stored injection');
     assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('VISITOR')), 'a speaker named like one is kept: the seed goes by the mark, not the name');
     assert.deepEqual(lines, [seedLine(0, 0, 0, 0, 1)]);
+  });
+
+  it("a fork's seed leaves out the effort rows the framework stored for the trunk, keeps a host's, and says so", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!;
+    const effort = (level: string) => [{ type: 'system_change', effort: level } as unknown as ContentBlock];
+    trunk.getContextManager().addMessage('user', [{ type: 'text', text: 'HANDBOOK: always check the logs first.' }]);
+    trunk.getContextManager().addMessage('system', effort('low'), { effortRowOf: 'trunk' });
+    trunk.getContextManager().addMessage('system', effort('max'));
+    const levels = (rows: Array<{ content: ContentBlock[] }>) =>
+      rows.flatMap((m) => m.content).map((b) => (b as { effort?: string }).effort).filter((level) => level !== undefined);
+
+    const { seeded, lines } = await seedOf(framework);
+    assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('HANDBOOK')), 'the fork inherits the trunk\'s conversation');
+    assert.deepEqual(levels(seeded), ['max'], 'the host\'s effort row comes, and the framework\'s for the trunk doesn\'t');
+    assert.deepEqual(lines, [seedLine(0, 0, 0, 0, 0, 1)]);
+  });
+
+  it("a fork's seed keeps a row that carries the effort mark without an effort block", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!;
+    trunk.getContextManager().addMessage('user', [{ type: 'text', text: 'MARKED: a message whose writer set the mark.' }], { effortRowOf: 'trunk' });
+
+    const { seeded, lines } = await seedOf(framework);
+    assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('MARKED')), 'the mark alone makes no effort row');
+    assert.deepEqual(lines, []);
   });
 
   it('fork inherits the template context, and a seed that leaves nothing out logs nothing', async () => {

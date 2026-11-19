@@ -84,6 +84,7 @@ import { speechOf } from '../../send-tools.js';
 import { safeSlice } from '../../safe-slice.js';
 import { audienceOf } from '../../dendrite/audience.js';
 import { storedInjectionMarkOf } from '../../stored-injections.js';
+import { effortOf } from '../../effort.js';
 
 // ============================================================================
 // Tool input shapes
@@ -2847,6 +2848,10 @@ function blockLabel(block: ContentBlock, failed: ReadonlySet<string> = NO_FAILUR
       return '[audio]';
     case 'video':
       return '[video]';
+    case 'system_change': {
+      const effort = effortOf([block]);
+      return effort !== undefined ? `[effort: ${effort} from here]` : '[system_change]';
+    }
     default:
       // Exhaustiveness guard: a future ContentBlock variant falls back to a
       // generic label instead of a compile error at a call site far from here.

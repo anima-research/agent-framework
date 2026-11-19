@@ -66,6 +66,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AddMessageOptions, ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import { WriteLandedError, WriteOutcomeUnknownError } from '../context-manager-errors.js';
+import { isAnotherAgentsEffortRow } from '../effort.js';
 import { suppressionRecordOf } from '../gate/suppression-stats.js';
 import { isAnotherAgentsInjection } from '../stored-injections.js';
 import type { AgentName, ObserveEdge } from './types.js';
@@ -184,6 +185,7 @@ export function observedRowFor(
   context: { observer: AgentName; owners: readonly AgentName[] },
 ): boolean {
   if (isAnotherAgentsInjection(row.metadata, context.observer)) return false;
+  if (isAnotherAgentsEffortRow(row.metadata, context.observer)) return false;
   if (row.participant === context.observer) return false;
   if (suppressedRow(row.metadata as Record<string, unknown> | undefined)) return false;
   if (heldFromResidents(row.metadata as Record<string, unknown> | undefined)) return edge.includeHeld === true;

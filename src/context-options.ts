@@ -41,11 +41,12 @@ import { isReasoningLoss } from './reasoning-loss.js';
 import { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 import { persistentReaderName } from './tune-out/tools.js';
 import { isAnotherAgentsInjection } from './stored-injections.js';
+import { isAnotherAgentsEffortRow } from './effort.js';
 
 /** ContextManager.open's options over a store the caller gives: everything but the store. */
 export type ContextManagerOpenOptions = Omit<Extract<ContextManagerConfig, { store: unknown }>, 'store'>;
 
-/** A resident's view: no held traffic, suppressed rows, foreign injections or legacy notices.
+/** A resident's view: no held traffic, suppressed rows, foreign injections, another agent's framework effort rows or legacy notices.
  * Supports both a reusable named predicate and a direct metadata-only probe. */
 export function residentViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
 export function residentViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;
@@ -54,16 +55,18 @@ export function residentViewFilter(messageOrName: Pick<StoredMessage, 'metadata'
   return (message) => !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
     && !suppressedRow(message.metadata as Record<string, unknown> | undefined)
     && !isAnotherAgentsInjection(message.metadata, messageOrName)
+    && !isAnotherAgentsEffortRow(message.metadata, messageOrName)
     && !isReasoningLoss(message.metadata);
 }
 
-/** The subconscious includes held traffic, but not suppressed rows, foreign injections or legacy notices. */
+/** The subconscious includes held traffic, but not suppressed rows, foreign injections, another agent's framework effort rows or legacy notices. */
 export function subconsciousViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
 export function subconsciousViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;
 export function subconsciousViewFilter(messageOrName: Pick<StoredMessage, 'metadata'> | string, name?: string): boolean | ((message: Pick<StoredMessage, 'metadata'>) => boolean) {
   if (typeof messageOrName !== 'string') return subconsciousViewFilter(name!)(messageOrName);
   return (message) => !suppressedRow(message.metadata as Record<string, unknown> | undefined)
     && !isAnotherAgentsInjection(message.metadata, messageOrName)
+    && !isAnotherAgentsEffortRow(message.metadata, messageOrName)
     && !isReasoningLoss(message.metadata);
 }
 

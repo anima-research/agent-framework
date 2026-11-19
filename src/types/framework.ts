@@ -116,6 +116,9 @@ export type ProviderHoldHook = (
   error: Error, agentName: string, context: ProviderHoldContext,
 ) => ProviderHold | undefined;
 
+/** An effort level (Anthropic's `output_config.effort`). */
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 export interface FrameworkConfig {
   /**
    * Dendrite agent lifecycle options.
@@ -326,6 +329,109 @@ export interface FrameworkConfig {
 
   /** Custom error policy */
   errorPolicy?: ErrorPolicy;
+
+  /**
+   * Each agent's effort (Anthropic's `output_config.effort`): a level for every
+   * agent, or a function the framework asks with an agent's name and model at
+   * each request it assembles for that agent, giving a level, or `undefined`
+   * for none. Derived agents and conversation forks are asked too. A value
+   * that isn't a level or a function is refused at create. A function's
+   * answer that isn't a level or `undefined`, or a throw, counts as
+   * `undefined`, and is logged once per agent.
+   *
+   * A request's top-level effort is the agent's base. A turn sets it as it
+   * assembles the agent's first request on its model, at the live level. The
+   * direct API sets none. A turn sets or changes a base only where the
+   * agent's rows can go: not with an earlier membrane, and not after a
+   * refusal (both below). The base is kept per agent in `framework/state`,
+   * so it survives a restart and moves with a branch switch. It's kept only
+   * for the model of the agent's latest turn, so going back to an earlier model
+   * starts a new base there at the live level. It's kept only while the agent
+   * is live: an agent's end drops it. So an agent resumed after its end, or a
+   * new one under its name, starts a new base at the live level, and its first
+   * request writes the prompt cache again. A derived agent on its parent's
+   * model starts from the parent's base. What of `framework/state`'s
+   * `effortBases` this release can't read is never stored over, nor dropped
+   * at an end's or a boot's sweep: it's said once, and reads as no base. So
+   * an ended agent's record of another shape outlives it, and a later agent
+   * under that name reads no base and gets none stored until the record is
+   * repaired. Each such agent's top-level effort is its live level meanwhile.
+   *
+   * A different level travels as one effort-only `system_change` row, stored
+   * under the participant `'system'` at the start of the turn that answers new
+   * user input. It goes after that input, and after any context injections the
+   * start stores. So the prompt cache before it still holds. A level that
+   * changes where the request doesn't end on new user input (tool results, the
+   * agent's own message) waits for the next. The agent's own effort row
+   * doesn't end its input. So if the level changes again before a reply
+   * follows a row, the next start writes another after it, and the newest
+   * governs.
+   *
+   * Each row is stored as the framework's own, with `system: true` and
+   * `kind: 'effort-change'`. An agent's requests carry the effort rows the
+   * framework wrote for it, or for a voice it inherits, such as a shared
+   * derivation's parent. Another agent's effort rows, an observed resident's
+   * among them, are out of the agent's view: they're never presented to it,
+   * heard at a tool boundary or copied into a derivation of it. A host's own
+   * effort rows are left out of the agent's requests. Neither counts as in
+   * force. A copy derivation takes the parent's rows as its own, beside the
+   * parent's base. A conversation fork's seed, which takes no base, leaves the
+   * template's effort rows out.
+   *
+   * `undefined` sends no top-level effort and leaves effort rows out of the
+   * request. Where the base was a level, that takes it off the top, which
+   * changes the whole prompt, once. It starts a base of none, and a level
+   * after it travels as a row.
+   * When a level comes back, the agent's last row counts again from where it
+   * sits, before the requests that went without effort. The requests from then
+   * on carry it there, which changes the prompt from that row on, once.
+   *
+   * When membrane refuses an agent's request that carries an effort row, with
+   * `systemChangeRefused`, before the stream's first tool round, the request
+   * is sent again at once. The retry carries no effort rows, and the live
+   * level as its top-level effort. Neither a provider hold nor a stated wait
+   * takes it first. The agent's effort rows that no stored row in its own
+   * voice follows are taken back out of the store. A removal that fails is
+   * logged, and its row stays. The agent's requests go without effort rows
+   * from then on, until the agent ends or the process does. A refusal after a
+   * tool round goes to the error policy instead. `DefaultErrorPolicy` doesn't
+   * retry it, so the turn ends there. A host
+   * policy that retries starts the turn's next stream. Either way, the next
+   * stream's first request carries the agent's stored rows. If that request
+   * is refused too, it goes again at once without them.
+   *
+   * A preview shows the row a start would write, unstored. The direct API
+   * (`Agent.runInference`) sends what a turn's request would carry and writes
+   * no row, so a level changed since the agent's last turn reaches it once a
+   * turn has written its row.
+   *
+   * While this is set, an agent whose `providerParams` sets
+   * `output_config.effort` is refused where it's created.
+   *
+   * Effort rows need membrane 0.10.0 or later, which exports
+   * `SYSTEM_CHANGE_EFFORT`. With an earlier membrane installed, every request
+   * goes as after a refusal: the live level on top and no rows. A change of
+   * level then costs the prompt cache as it did through `providerParams`. This
+   * is read from this package's copy of membrane. A host `Membrane` from an
+   * older copy, installed beside it, leaves effort rows out unsent, so a change
+   * of level never reaches the model.
+   *
+   * Unset, effort is the host's, through `providerParams`, as before. The
+   * framework's own effort rows from when it was set are left out of every
+   * request, and a host's own effort row goes as stored.
+   *
+   * For an agent with `thinkingBinding.binds`, the identity of a request's
+   * head covers whether the request leaves out the effort rows the framework
+   * wrote for the agent. A request that starts or stops leaving them out has
+   * a changed head, as a change of model does. Its compile then leaves the
+   * stored replies' thinking out. That happens when a function's answer
+   * moves between a level and `undefined` while the agent's rows go, when
+   * membrane refuses the agent's rows, or when a restart unsets this or sets
+   * it again. The identity also covers `providerParams`, as before, so moving
+   * an agent's effort from there to this setting leaves that thinking out
+   * once.
+   */
+  effort?: EffortLevel | ((agent: { name: string; model: string }) => EffortLevel | undefined);
 
   /**
    * How long a model call may go without progress before it is cut. A

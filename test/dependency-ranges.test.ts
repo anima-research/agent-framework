@@ -9,9 +9,11 @@
  * which the framework calls when the provider sets aside a stored reply's
  * thinking. Its floor is 0.27.0, the first release whose membrane range is
  * this package's (`^0.8.0 || ^0.9.0 || ^0.10.0`): 0.25.1's and 0.26.0's stop at
- * 0.9, so beside a host's membrane 0.10 npm nests a 0.9.0 under them. So
- * each caret range of its union starts at 0.27.0 or later, and the range
- * admits 0.27.0 itself, the release the changelog names.
+ * 0.9, so beside a host's membrane 0.10 npm nests a 0.9.0 under them.
+ * 0.27.0 is also the first that keeps an effort-only `system_change` in every
+ * strategy, as `FrameworkConfig.effort`'s rows need. So each caret range of
+ * its union starts at 0.27.0 or later, and the range admits 0.27.0 itself,
+ * the release the changelog names.
  * chronicle's range takes only a release with the identity-stamped batched
  * append context-manager writes a window with: the published 0.5.0 (Dendrite's
  * branch views) has none of the batched calls, so the presentation release is
