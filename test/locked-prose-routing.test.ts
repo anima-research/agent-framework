@@ -747,7 +747,7 @@ describe('locked prose routing', () => {
     const internals = framework as unknown as {
       routeLocusSpeech(agent: unknown, round: unknown, text: string, locus: unknown): Promise<unknown>;
     };
-    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: 0 };
+    const routing = { turnId: 1, locked: true, heldForMove: true, locus: { serverId: 'stub', channelId: 'discord:g:ops' }, wasIn: [], engaged: new Set(), deliveries: [], drafts: [] as unknown[], suppressed: 0, keptPrivate: {} };
     const outcome = await internals.routeLocusSpeech(framework.getAgent('assistant'), { routing, notice: 'later' }, 'A later stream, live.', routing.locus);
     assert.equal(outcome, null);
     assert.deepEqual(routed, [], 'not posted at the new lock');
