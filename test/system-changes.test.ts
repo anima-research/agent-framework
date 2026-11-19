@@ -1,8 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { ToolDefinition } from '@animalabs/membrane';
+import type { ContentBlock, ToolDefinition } from '@animalabs/membrane';
 
 import { requestCharacters, type HeadDeclaration } from '../src/system-changes.js';
+import { isSystemChangeMessage } from '../src/index.js';
 
 const tool = (name: string, description = `${name} does a thing`, properties: Record<string, unknown> = {}): ToolDefinition => ({
   name,
@@ -43,5 +44,19 @@ describe('requestCharacters', () => {
     ];
     assert.equal(requestCharacters(head, carrying), requestCharacters(head, plain), 'none of them counts');
     assert.equal(requestCharacters(head, []), JSON.stringify({ system: head.system, tools: head.tools, messages: [] }).length, "a tool's parameters of those names still count");
+  });
+});
+
+describe('isSystemChangeMessage', () => {
+  it('tells a system change row by its blocks, whatever metadata it carries, so a host can leave it out of conversation', () => {
+    const row = (content: ContentBlock[], metadata?: Record<string, unknown>): { content: ContentBlock[]; metadata?: Record<string, unknown> } =>
+      (metadata ? { content, metadata } : { content });
+    const change: ContentBlock = { type: 'system_change', defineTools: [{ name: 'a', description: 'A.', inputSchema: { type: 'object' } }] };
+    for (const metadata of [undefined, { system: true, kind: 'system-change', agent: 'alpha' }, { system: true }]) {
+      assert.equal(isSystemChangeMessage(row([change], metadata)), true, JSON.stringify(metadata));
+    }
+    assert.equal(isSystemChangeMessage(row([{ type: 'system_change', effort: 'low' }])), true, 'a row that changes only the effort');
+    assert.equal(isSystemChangeMessage(row([{ type: 'text', text: 'hello' }], { system: true, kind: 'system-change' })), false, 'conversation, whatever its mark says');
+    assert.equal(isSystemChangeMessage(row([{ type: 'tool_result', toolUseId: 't1', content: 'ok' }])), false);
   });
 });

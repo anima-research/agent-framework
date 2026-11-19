@@ -81,10 +81,15 @@ export type DeclarationDifference =
   | { kind: 'change'; block: SystemChangeContent }
   | { kind: 'replace' };
 
-/** A message that holds system changes. context-manager refuses one that mixes
- *  them with other blocks, so its content is changes alone. Recognised by its
- *  block, which is what membrane sends, whatever metadata a stored copy carries:
- *  the readers of a request's tail look past every such row. */
+/**
+ * Whether a message is a system change row: its content holds `system_change`
+ * blocks. context-manager refuses a row that mixes them with other blocks, so
+ * such a row holds changes alone. Read from the blocks, whatever metadata the
+ * row carries, since a copy of a context and a host's own row carry no mark.
+ * A host's reader that takes conversation alone leaves such a row out, as it
+ * leaves a stored injection out (storedInjectionMarkOf), and the readers of a
+ * request's tail look past it.
+ */
 export function isSystemChangeMessage(message: { content: readonly ContentBlock[] }): boolean {
   return Array.isArray(message.content) && message.content.some(isSystemChangeContent);
 }
