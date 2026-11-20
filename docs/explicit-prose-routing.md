@@ -45,10 +45,11 @@ them the same way.
   writes, such as a framework retry's, a budget restart's or the compile a
   provider-capacity hold defers the turn to. A round kept private (one that
   calls `skip_reply`, or has a same-round private think) sets no target,
-  except that under `sameRoundSkipReplyTextPolicy: 'ask'` a round that calls
-  `skip_reply`, with no same-round private think, sets the target its
-  envelopes name, and what it would have posted or bounced is held as a
-  draft. A
+  except that under `sameRoundSkipReplyTextPolicy: 'ask'`, the config's or
+  the agent's own (`agent_settings`' `same_round_skip_reply_text_policy`),
+  a round that calls `skip_reply`, with no same-round private think, sets
+  the target its envelopes name, and what it would have posted or bounced
+  is held as a draft. A
   target its server declared inbound-only is refused and clears the turn's
   target, so later unprefixed segments bounce until a new `>>` target.
   Cross-turn, nothing is implicit.

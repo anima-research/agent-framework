@@ -170,7 +170,9 @@ export interface AgentConfig {
    * refused and nothing is held, and the heartbeat notice still drops its
    * clause, so a resident there is told its words are held when a
    * `skip_reply` round's aren't. A derived agent and the subconscious don't
-   * take it from this agent.
+   * take it from this agent. The agent can change it for itself with
+   * `agent_settings` (`same_round_skip_reply_text_policy`), except to 'ask'
+   * from a round without verbatim content; its choice persists.
    */
   sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**
@@ -555,6 +557,8 @@ export interface AgentRuntimeSettingsPatch {
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   /** Whether an explicit send silences plain speech aimed where it posted (AgentConfig.sendSilencing). */
   sendSilencing?: boolean;
+  /** What becomes of ordinary text in a round that calls `skip_reply` (AgentConfig.sameRoundSkipReplyTextPolicy). */
+  sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**
    * Apply a `contextBudgetTokens` DECREASE immediately instead of starting a
    * paced descent: the next compile plans straight at the new budget and the
@@ -589,6 +593,7 @@ export interface AgentRuntimeSettingsSnapshot {
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
   sameRoundThinkTextPolicySource: SameRoundThinkTextPolicySource;
   sendSilencing: boolean;
+  sameRoundSkipReplyTextPolicy: SameRoundSkipReplyTextPolicy;
   transition: 'stable' | 'converging' | 'blocked';
   transitionReason?: 'transition_pace_too_small' | 'protected_context_exceeds_target';
 }

@@ -139,6 +139,7 @@ import type {
   AutoContinueConfig,
   AgentState,
   SameRoundThinkTextPolicy,
+  SameRoundSkipReplyTextPolicy,
   SameRoundThinkTextPolicySource,
   PendingToolCall,
   CompletedToolCall,
@@ -765,6 +766,7 @@ export class Agent {
       sameRoundThinkTextPolicy: this.getEffectiveSameRoundThinkTextPolicy(),
       sameRoundThinkTextPolicySource: this.getSameRoundThinkTextPolicySource(),
       sendSilencing: this.getEffectiveSendSilencing(),
+      sameRoundSkipReplyTextPolicy: this.getEffectiveSameRoundSkipReplyTextPolicy(),
       transition: this.contextBudgetTargetTokens === undefined
         ? 'stable'
         : hot?.blocked
@@ -1041,6 +1043,11 @@ export class Agent {
     return this.runtimeSettingsOverrides.sendSilencing ?? this.configuredSendSilencing;
   }
 
+  /** What becomes of ordinary text in a round that calls skip_reply: the agent's own setting, else its config's (AgentConfig.sameRoundSkipReplyTextPolicy), else 'private'. */
+  getEffectiveSameRoundSkipReplyTextPolicy(): SameRoundSkipReplyTextPolicy {
+    return this.runtimeSettingsOverrides.sameRoundSkipReplyTextPolicy ?? this.sameRoundSkipReplyTextPolicy ?? 'private';
+  }
+
   getSameRoundThinkTextPolicySource(): SameRoundThinkTextPolicySource {
     if (this.runtimeSettingsOverrides.sameRoundThinkTextPolicy !== undefined) {
       return 'runtime_override';
@@ -1112,11 +1119,14 @@ export class Agent {
       this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
     }
     if (patch.sendSilencing !== undefined) this.runtimeSettingsOverrides.sendSilencing = patch.sendSilencing;
+    if (patch.sameRoundSkipReplyTextPolicy !== undefined) {
+      this.runtimeSettingsOverrides.sameRoundSkipReplyTextPolicy = patch.sameRoundSkipReplyTextPolicy;
+    }
     return this.getRuntimeSettings();
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
-    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy', 'sendSilencing']);
+    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy', 'sendSilencing', 'sameRoundSkipReplyTextPolicy']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     // A reset to a recipe budget below the live one arms a descent to it.
@@ -1168,6 +1178,7 @@ export class Agent {
       delete this.runtimeSettingsOverrides.sameRoundThinkTextPolicy;
     }
     if (reset.has('sendSilencing')) delete this.runtimeSettingsOverrides.sendSilencing;
+    if (reset.has('sameRoundSkipReplyTextPolicy')) delete this.runtimeSettingsOverrides.sameRoundSkipReplyTextPolicy;
     return this.getRuntimeSettings();
   }
 
@@ -1256,6 +1267,11 @@ export class Agent {
     }
     if (patch.sendSilencing !== undefined && typeof patch.sendSilencing !== 'boolean') {
       throw new Error('sendSilencing must be true or false');
+    }
+    if (patch.sameRoundSkipReplyTextPolicy !== undefined &&
+        patch.sameRoundSkipReplyTextPolicy !== 'private' &&
+        patch.sameRoundSkipReplyTextPolicy !== 'ask') {
+      throw new Error("sameRoundSkipReplyTextPolicy must be 'private' or 'ask'");
     }
   }
 
