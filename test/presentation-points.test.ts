@@ -24,7 +24,7 @@ import type { Agent, EventResponse, Module, ModuleContext, ProcessEvent, Process
 import { residentContextOptions } from '../src/context-options.js';
 import { storeOwnRow } from '../src/dendrite/audience.js';
 import { GateModule, until } from './helpers/dendrite.js';
-import { WireMembrane, final, round } from './helpers/wire-membrane.js';
+import { WireMembrane, final, round, signed } from './helpers/wire-membrane.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
 const textOf = (row: { content: ContentBlock[] }) => row.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('');
@@ -78,7 +78,7 @@ afterEach(async () => {
   while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
 });
 
-async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSeconds: number }; forks?: true } = {}) {
+async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSeconds: number }; forks?: true; binds?: true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'af-presentation-points-'));
   dirs.push(dir);
   const membrane = new WireMembrane();
@@ -89,7 +89,8 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
     storePath: join(dir, 'store.chronicle'),
     membrane: membrane.asMembrane(),
     agents: residents.map((name, i) => ({
-      name, model: 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', proseRouting: 'disabled',
+      name, model: opts.binds ? 'claude-opus-5-5' : 'test-model', systemPrompt: `You are ${name}.`, allowedTools: 'all', proseRouting: 'disabled',
+      ...(opts.binds ? { thinkingBinding: { binds: true } } : {}),
       // One clock a day, so a window takes one at its first event only,
       // unless the case asks for a finer one.
       ...(i === 0 && opts.clock ? { clock: opts.clock === true ? { intervalMinutes: 1440 } : opts.clock } : {}),
@@ -122,6 +123,66 @@ async function boot(opts: { residents?: string[]; clock?: boolean | { intervalSe
 }
 
 describe('presentation points (#291)', () => {
+  for (const [label, participant, content, keeps] of [
+    ["another agent's row of provider items alone", 'scout', [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_scout', encrypted_content: 'enc' } } as ContentBlock], true],
+    ['a row of whitespace', 'user', [text(' \n')], false],
+  ] as const) {
+    it(`a boundary that hears ${label} is vouched for, and the next compile ${keeps ? 'keeps' : 'leaves out'} the thinking of the stream's reply after it`, async () => {
+      const h = await boot({ binds: true });
+      h.membrane.script('mira', round('c1', [signed('sig-1'), text('looking')], 'wait', { gate: 'm' }), final([signed('sig-2'), text('done')]));
+      h.membrane.script('mira', final([signed('sig-3'), text('again')]));
+      h.framework.start();
+      h.framework.pushEvent(input('go', ['mira']));
+      await until(() => h.gates.entered.has('m'), "mira's round waiting on its tool");
+      const heard = h.internals.addMessage(participant, [...content], undefined, { forAgent: 'mira' });
+      h.gates.release('m');
+      await h.framework.runUntilIdle();
+      const injected = h.membrane.streams[0]!.stream.receivedToolResultOptions.flatMap((o) => o?.injectedMessages ?? []);
+      assert.deepEqual(injected.map((m) => (m as { content: ContentBlock[] }).content), keeps ? [] : [[...content]],
+        keeps ? 'its stream is given nothing for the row' : 'its stream is given the row as stored');
+      const window = h.cm('mira').getPresentedMessages().map((m) => m.id);
+      assert.ok(window.includes(heard), "the row is in the agent's window");
+      assert.deepEqual(h.traces.filter((e) => e.type === 'presentation:hand-off-mismatch'), [], 'the boundary handed its stream the rows its window took');
+
+      h.framework.pushEvent(input('again', ['mira']));
+      await h.framework.runUntilIdle();
+      const next = JSON.stringify(h.membrane.callsFor('mira').at(-1)!.messages);
+      assert.ok(next.includes('again') && next.includes('sig-1'), "premise: the next turn's request, with the round's thinking before the boundary");
+      assert.equal(next.includes('sig-2'), keeps, keeps ? "it keeps the stream's reply's thinking" : "it leaves out the stream's reply's thinking, as main does");
+      assert.ok(!next.includes('cmp_scout'), "no item of another agent's goes out");
+    });
+  }
+
+  for (const [label, content, heardAsInput] of [
+    ["another agent's row of provider items alone", [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_scout', encrypted_content: 'enc' } } as ContentBlock], false],
+    ["another agent's row of words", [text('a word from scout')], true],
+  ] as const) {
+    it(`a boundary that hears ${label} ${heardAsInput ? 'takes it as new input' : "takes nothing it wasn't sent as new input"}: the input signal and the prompt stamp`, async () => {
+      const h = await boot();
+      const fw = h.framework as unknown as { midTurnInputSignals: Set<string>; turnPrompts: WeakMap<object, unknown> };
+      const signals: string[] = [];
+      const addSignal = fw.midTurnInputSignals.add.bind(fw.midTurnInputSignals);
+      fw.midTurnInputSignals.add = (name: string) => { signals.push(name); return addSignal(name); };
+      let promptDeletes = 0;
+      const deletePrompt = fw.turnPrompts.delete.bind(fw.turnPrompts);
+      fw.turnPrompts.delete = (key: object) => { promptDeletes++; return deletePrompt(key); };
+
+      h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));
+      h.framework.start();
+      h.framework.pushEvent(input('go', ['mira']));
+      await until(() => h.gates.entered.has('m'), "mira's round waiting on its tool");
+      h.internals.addMessage('scout', [...content], { messageId: 'heard-77' } as MessageMetadata, { forAgent: 'mira' });
+      // From the boundary on: the turn's start sets or clears its own stamp.
+      signals.length = 0;
+      promptDeletes = 0;
+      h.gates.release('m');
+      await h.framework.runUntilIdle();
+
+      assert.equal(signals.includes('mira'), heardAsInput, heardAsInput ? 'the boundary signals new input' : 'no new input signal for a row the agent was sent nothing of');
+      assert.equal(promptDeletes > 0, heardAsInput, heardAsInput ? "the next round's rows lose the turn's prompt stamp" : "the turn's prompt stamp stays");
+    });
+  }
+
   it("a write during a live turn is stored at once, out of the window and with no clock; its boundary hears it, and a row it cuts enters at the turn's end", async () => {
     const h = await boot({ clock: true });
     h.membrane.script('mira', round('c1', [text('looking')], 'wait', { gate: 'm' }), final([text('done')]));

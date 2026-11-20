@@ -242,6 +242,58 @@ describe('subconscious.foreignRounds', () => {
     }
   });
 
+  async function carrierRows() {
+    const dir = mkdtempSync(join(tmpdir(), 'sub-foreign-carriers-'));
+    const membrane = new WireMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      subconscious: { enabled: true, reader: 'persistent', systemPrompt: 'Read for scout.', foreignRounds: 'raw' },
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    } as never);
+    const item = (id: string) => ({ type: 'text', text: '', rawItem: { type: 'compaction', id, encrypted_content: 'enc' } }) as ContentBlock;
+    const stored = { mixed: [item('cmp_scout_1'), text('Summed up.')], only: [item('cmp_scout_2')] };
+    try {
+      await framework.start();
+      const scout = framework.getAgent('scout')!;
+      storeOwnRow(scout, 'scout', stored.mixed);
+      storeOwnRow(scout, 'scout', stored.only);
+      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'Subconscious', reason: 'test', source: 'test', timestamp: Date.now() });
+      await framework.runUntilIdle();
+      const request = membrane.calls.at(-1)!;
+      assert.equal(request.assistantParticipant, 'Subconscious', "premise: the subconscious's request");
+      return { messages: request.messages, stored, reader: framework.getAgent('Subconscious')!, item };
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("'raw' leaves another agent's provider items out of the compile, and a row holding only them out altogether", { timeout: 120_000 }, async () => {
+    const { messages } = await carrierRows();
+    const rows = messages.filter((m) => m.participant === 'scout');
+    assert.deepEqual(rows.map((m) => m.content), [[text('Summed up.')]]);
+    assert.ok(!JSON.stringify(messages).includes('cmp_scout'), "no item of scout's goes out");
+  });
+
+  it("'raw' leaves another agent's provider items out of a tool boundary's injection, and keeps the agent's own", { timeout: 120_000 }, async () => {
+    const { stored, reader, item } = await carrierRows();
+    assert.deepEqual(reader.injectedAsSent('scout', stored.mixed), [text('Summed up.')], 'a row with text keeps its text');
+    assert.equal(reader.injectedAsSent('scout', stored.only), null, 'a row holding only items goes nowhere');
+    const own = [item('cmp_own'), text('Mine.')];
+    assert.deepEqual(reader.injectedAsSent('Subconscious', own), own, "the agent's own row as stored, its item with it");
+  });
+
+  it("'raw' injects another agent's row as the next compile sends it", { timeout: 120_000 }, async () => {
+    const { messages, stored, reader } = await carrierRows();
+    const rows = messages.filter((m) => m.participant === 'scout').map((m) => m.content);
+    const injected = [stored.mixed, stored.only].map((content) => reader.injectedAsSent('scout', content));
+    assert.deepEqual(injected.filter((content) => content !== null), rows);
+  });
+
   it('refuses any other value at create, naming the setting and not the value', async () => {
     for (const value of ['Raw', 1]) {
       await assert.rejects(
