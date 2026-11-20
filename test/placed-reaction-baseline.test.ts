@@ -340,7 +340,8 @@ describe('placed-reaction baseline', () => {
       logged.join('\n'),
     );
     // The failure is reported, with its cause, for the framework to record.
-    assert.match(failures[0] ?? '', /reaction-baseline ledger read/);
+    assert.match(failures[0] ?? '', /^connected, then closed after/);
+    assert.match(failures[1] ?? '', /reaction-baseline ledger read/);
     // The attempts go on, so the child comes back once the ledger reads.
     rmSync(outboxPath, { force: true });
     await waitFor(() => connection.isConnected, 'the child to come back');
@@ -419,9 +420,10 @@ describe('placed-reaction baseline', () => {
     }).mcplServerRegistry;
     await registry.getServer('probe').sendToolsCall('crash', {}).catch(() => {});
     const deadline = Date.now() + 5_000;
-    while (failures.length < 2 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.ok(failures.length >= 2, `each attempt fails and the next is scheduled: ${failures.join(' | ')}`);
-    for (const failure of failures) {
+    while (failures.length < 3 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(failures.length >= 3, `each attempt fails and the next is scheduled: ${failures.join(' | ')}`);
+    assert.match(failures[0]!, /^connected, then closed after/);
+    for (const failure of failures.slice(1)) {
       assert.match(failure, /Discord awareness accounting failed during .*Invalid Discord awareness ledger .*: it isn't JSON/);
     }
     assert.equal(registry.getServer('probe').isConnected, false, 'no child was spawned without the default');

@@ -338,7 +338,9 @@ test('strict reconnect with an empty provider does not make an unauthenticated u
       accessProvider: async () => ++calls === 1 ? 'short-token' : null,
     }) as McplServerConfig, { version: '0.4', pushEvents: true, featureSets: true });
     conn.ready();
-    const failed = once(conn, 'reconnect-failed');
+    const failed = new Promise<void>((resolve) => conn!.on('reconnect-failed', (f: { error: string }) => {
+      if (!f.error.startsWith('connected, then closed after')) resolve();
+    }));
     for (const ws of s.wss.clients) ws.terminate();
     await failed;
     assert.equal(calls, 2);

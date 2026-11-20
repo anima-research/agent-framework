@@ -357,10 +357,13 @@ test("a modern stdio server's retry that ends in a version verdict carries the l
   process.kill(first.pid, 'SIGTERM');
   await waitFor('the verdict', () => downAlerts(traces).length > 0);
   const failed = traces.filter((event) => event.type === 'mcpl:server-connect-failed');
-  assert.equal(failed.length, 1, JSON.stringify(failed));
-  assert.equal(failed[0]!.attempt, 1);
-  assert.equal(failed[0]!.willRetry, false);
-  assert.equal(failed[0]!.stderrTail, 'fatal: this build speaks another revision');
+  assert.equal(failed.length, 2, JSON.stringify(failed));
+  assert.equal(failed[0]!.attempt, 0);
+  assert.match(String(failed[0]!.error), /^connected, then closed after \d+(\.\d)? s \(signal SIGTERM\)$/);
+  assert.equal(failed[0]!.willRetry, true);
+  assert.equal(failed[1]!.attempt, 1);
+  assert.equal(failed[1]!.willRetry, false);
+  assert.equal(failed[1]!.stderrTail, 'fatal: this build speaks another revision');
   await new Promise((resolve) => setTimeout(resolve, 200));
   assert.equal(downAlerts(traces).length, 1, JSON.stringify(downAlerts(traces)));
 });
