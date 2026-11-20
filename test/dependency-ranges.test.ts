@@ -7,17 +7,21 @@
  * a range that admitted any 0.24.x would install a context-manager this
  * framework fails to load on. 0.25.1 is the first with `noteThinkingDropped`,
  * which the framework calls when the provider sets aside a stored reply's
- * thinking. Its floor is 0.27.0, the first release whose membrane range is
+ * thinking. 0.27.0 is the first release whose membrane range is
  * this package's (`^0.8.0 || ^0.9.0 || ^0.10.0`): 0.25.1's and 0.26.0's stop at
- * 0.9, so beside a host's membrane 0.10 npm nests a 0.9.0 under them. So
- * each caret range of its union starts at 0.27.0 or later, and the range
- * admits 0.27.0 itself, the release the changelog names.
+ * 0.9, so beside a host's membrane 0.10 npm nests a 0.9.0 under them. Its
+ * floor is 0.28.0, the first whose chronicle range is this package's
+ * (`^0.6.0 || ^0.7.0`): 0.27.0's stops at 0.6, so beside a host's chronicle
+ * 0.7 npm nests a 0.6.0 under it. So each caret range of its union starts
+ * at 0.28.0 or later, and the range admits 0.28.0 itself, the release the
+ * changelog names.
  * chronicle's range takes only a release with the identity-stamped batched
  * append context-manager writes a window with: the published 0.5.0 (Dendrite's
  * branch views) has none of the batched calls, so the presentation release is
  * 0.6.0, and context-manager, with no one-record-per-row path, throws at the
  * first write-down on a store from 0.5.0. So each caret range of its union
- * starts at 0.6.0 or later, and the range admits 0.6.0 itself.
+ * starts at 0.6.0 or later, and the range admits 0.6.0 itself, and 0.7.0,
+ * which opens a store 0.6.0 wrote.
  * Each @animalabs package context-manager depends on too is declared with
  * the releases context-manager's own range admits, no more and no fewer, so
  * an install takes one copy of each. A narrower range gives a second copy
@@ -137,7 +141,8 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
     for (const published of ['0.25.1', '0.26.0']) {
       assert.equal(admits(range, published), false, `${range} admits context-manager ${published}, whose membrane range stops at 0.9`);
     }
-    startsAt(range, '0.27.0', 'context-manager');
+    assert.equal(admits(range, '0.27.0'), false, `${range} admits context-manager 0.27.0, whose chronicle range stops at 0.6`);
+    startsAt(range, '0.28.0', 'context-manager');
     const proto = ContextManager.prototype as unknown as Record<string, unknown>;
     for (const method of ['windowStatusOf', 'presentRows', 'retractRows', 'getPresentedMessages', 'noteThinkingDropped']) {
       assert.equal(typeof proto[method], 'function', `the context-manager this suite runs on has ${method}`);
@@ -158,6 +163,7 @@ describe("agent-framework's dependency ranges (#291's release set)", () => {
         `${range} admits chronicle ${published}, published without appendManyToStateJsonWithIdentity, appendManyToStateJson, getStateItemsJson or getRecords`);
     }
     startsAt(range, '0.6.0', 'chronicle');
+    assert.equal(admits(range, '0.7.0'), true, `${range} admits chronicle 0.7.0`);
     const proto = JsStore.prototype as unknown as Record<string, unknown>;
     for (const method of ['appendManyToStateJsonWithIdentity', 'appendManyToStateJson', 'getStateItemsJson', 'getRecords']) {
       assert.equal(typeof proto[method], 'function', `the chronicle this suite runs on has JsStore.${method}`);

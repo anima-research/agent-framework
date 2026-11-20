@@ -148,6 +148,23 @@ describe('agent_settings refuses names it doesn\'t take and core values of the w
     });
   });
 
+  it('the skip_reply text policy, applied with the core before an extension\'s refusal, is named as changed', async () => {
+    await withFramework({}, (_framework, call) => {
+      const refused = call({ action: 'update', same_round_skip_reply_text_policy: 'ask', tool_result_guard: 'yes' });
+      assert.equal(refused.error,
+        'tool_result_guard must be true or false, not "yes". Changed before the refusal: same_round_skip_reply_text_policy; no other setting reads differently.');
+      assert.equal(settings(call).sameRoundSkipReplyTextPolicy, 'ask');
+    });
+  });
+
+  it("the agent's own 'private' over a value in force of 'private', applied before an extension's refusal, is named as changed", async () => {
+    await withFramework({}, (_framework, call) => {
+      const refused = call({ action: 'update', same_round_skip_reply_text_policy: 'private', tool_result_guard: 'yes' });
+      assert.equal(refused.error,
+        'tool_result_guard must be true or false, not "yes". Changed before the refusal: same_round_skip_reply_text_policy; no other setting reads differently.');
+    });
+  });
+
   it('a lower budget the strategy can\'t reach gradually is refused before an extension applies', async () => {
     await withFramework({ strategy: false }, (_framework, call) => {
       const refused = call({ action: 'update', context_budget_tokens: 60_000, tool_result_guard: true });

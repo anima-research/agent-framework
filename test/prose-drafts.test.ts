@@ -5297,9 +5297,12 @@ describe('sameRoundSkipReplyTextPolicy', () => {
     }
   });
 
-  it('XML tool mode: the policy changes nothing, so nothing is refused and nothing is held', async () => {
+  it('XML tool mode, where the cancelled stream reports no partial content: nothing is refused, nothing is held, nothing throws, and a line says so', async () => {
     const h = await harness({ ...asking(), xml: true, roundPreamble: true });
     const ended = endings(h);
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
     try {
       await h.turn([
         createMockResponse([text('First words.'), call('l1', 'channel_list', {})], 'tool_use'),
@@ -5308,7 +5311,9 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       assert.equal(ended(), 1, 'never refused');
       assert.deepEqual(h.drafts(), []);
       assert.deepEqual(h.publishes(), []);
+      assert.ok(lines.some((l) => l === "[skip-reply] agent=scout: the turn's stream was cancelled with no partial content, so the text beside its skip_reply isn't held"), lines.filter((l) => l.startsWith('[skip-reply]')).join(' | '));
     } finally {
+      console.error = error;
       await h.close();
     }
   });
@@ -5455,5 +5460,195 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  describe("the agent's own switch: agent_settings' same_round_skip_reply_text_policy", () => {
+    type Harness = Awaited<ReturnType<typeof harness>>;
+    const shown = (settings: unknown): unknown =>
+      typeof settings === 'object' && settings !== null && 'sameRoundSkipReplyTextPolicy' in settings ? settings.sameRoundSkipReplyTextPolicy : undefined;
+    const setTo = (id: string, policy: unknown) => call(id, 'agent_settings', { action: 'update', same_round_skip_reply_text_policy: policy });
+    let made = 0;
+    const settings = (h: Harness, input: Record<string, unknown>, agent = 'scout') =>
+      h.framework.executeToolCall({ id: `settings-${++made}`, name: 'agent_settings', input, callerAgentName: agent });
+    const inForce = async (h: Harness) => shown((await settings(h, { action: 'get' })).data);
+    const parsed = (result: string): unknown => JSON.parse(result);
+    const config = (policy?: 'private' | 'ask') => ({ agents: [{ name: 'scout', ...(policy ? { sameRoundSkipReplyTextPolicy: policy } : {}) }] });
+    const HEARTBEAT_HELD = "[routing] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: it's held as a draft you can send with the drafts tool. An explicit send reaches a channel now.";
+    const HEARTBEAT_PRIVATE = "[routing] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: it's held as a draft you can send with the drafts tool, except in a round that calls skip_reply, where it stays private and isn't held. An explicit send reaches a channel now.";
+
+    it("get shows 'private' with nothing set, and 'ask' where the config says 'ask'", async () => {
+      for (const [policy, expected] of [[undefined, 'private'], ['ask', 'ask']] as const) {
+        const h = await harness(config(policy));
+        try {
+          assert.equal(await inForce(h), expected);
+        } finally {
+          await h.close();
+        }
+      }
+    });
+
+    for (const policy of [undefined, 'private'] as const) {
+      it(`after its own update to 'ask'${policy ? ` over a config of '${policy}'` : ''}, a later response's text beside skip_reply is held, and the skip_reply is refused once, naming the draft`, async () => {
+        const h = await harness(config(policy));
+        try {
+          await h.turn([createMockResponse([setTo('a1', 'ask')], 'tool_use'), createMockResponse([])]);
+          await h.turn([
+            createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+            createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+          ]);
+          const held = h.drafts();
+          assert.deepEqual(held.map((d) => [d.text, d.reason]), [[WORDS, 'skip-reply']]);
+          asksWhere(h.toolResults()[0]!, held[0]!.id);
+          assert.ok(roundTaken(h, 'k2'), 'the refusal let the turn go on to a second round');
+          assert.deepEqual(h.publishes(), []);
+        } finally {
+          await h.close();
+        }
+      });
+    }
+
+    for (const [from, to] of [['private', 'ask'], ['ask', 'private']] as const) {
+      it(`a skip_reply in the response that changes the policy from '${from}' to '${to}' is under '${from}'`, async () => {
+        const h = await harness(config(from));
+        const ended = endings(h);
+        try {
+          await h.turn([
+            createMockResponse([text(WORDS), setTo('a1', to), call('k1', 'skip_reply', {})], 'tool_use'),
+            createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+          ]);
+          assert.equal(await inForce(h), to, 'premise: the change applied');
+          assert.equal(ended(), 1, 'a skip_reply ended the turn');
+          if (from === 'ask') {
+            const held = h.drafts();
+            assert.deepEqual(held.map((d) => [d.text, d.reason]), [[WORDS, 'skip-reply']]);
+            asksWhere(h.toolResults()[1]!, held[0]!.id);
+            assert.ok(roundTaken(h, 'k2'), 'the refusal let the turn go on to a second round');
+          } else {
+            assert.deepEqual(h.drafts(), [], 'the text stays private and is not held');
+            assert.ok(!roundTaken(h, 'k2'), 'the first skip_reply ran: no second round');
+          }
+        } finally {
+          await h.close();
+        }
+      });
+    }
+
+    it("its own choice outlives a restart, over its config's", async () => {
+      const h = await harness(config('private'));
+      try {
+        await h.turn([createMockResponse([setTo('a1', 'ask')], 'tool_use'), createMockResponse([])]);
+        await h.restart();
+        await h.turn([
+          createMockResponse([text(WORDS), call('k1', 'skip_reply', {})], 'tool_use'),
+          createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
+        ]);
+        const held = h.drafts();
+        assert.deepEqual(held.map((d) => [d.text, d.reason]), [[WORDS, 'skip-reply']]);
+        asksWhere(h.toolResults()[0]!, held[0]!.id);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("a reset that names the field, and a reset that names nothing, each put the config's value back", async () => {
+      const h = await harness(config('ask'));
+      try {
+        for (const reset of [{ action: 'reset', settings: ['same_round_skip_reply_text_policy'] }, { action: 'reset' }]) {
+          const set = await settings(h, { action: 'update', same_round_skip_reply_text_policy: 'private' });
+          assert.equal(shown(set.data), 'private', `premise: its own choice; ${set.error ?? ''}`);
+          const result = await settings(h, reset);
+          assert.equal(shown(result.data), 'ask', JSON.stringify(reset));
+        }
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("on a round without verbatim content (the XML tool path), an update to 'ask' is taken with the call's other settings", async () => {
+      const h = await harness({ ...config('private'), xml: true, roundPreamble: true });
+      try {
+        assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "premise: the harness's config");
+        await h.turn([
+          createMockResponse([call('a1', 'agent_settings', { action: 'update', same_round_skip_reply_text_policy: 'ask', send_silencing: false })], 'tool_use'),
+          createMockResponse([]),
+        ]);
+        const [taken] = h.toolResults();
+        assert.equal(shown(parsed(taken!)), 'ask', taken);
+        assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, false, "the call's other setting applied");
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("refuses a value other than 'private' or 'ask', naming both, before any of the call applies", async () => {
+      const h = await harness();
+      try {
+        for (const value of ['Ask', 'public', true]) {
+          const result = await settings(h, { action: 'update', same_round_skip_reply_text_policy: value, send_silencing: false });
+          assert.equal(result.success, false, JSON.stringify(value));
+          assert.equal(result.isError, true, JSON.stringify(value));
+          assert.equal(result.error, "same_round_skip_reply_text_policy must be 'private' or 'ask'. Nothing in this call was changed.");
+        }
+        assert.equal(await inForce(h), 'private');
+        assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the call's other setting was not applied");
+      } finally {
+        await h.close();
+      }
+    });
+
+    for (const [policy, own] of [[undefined, 'ask'], ['ask', 'private']] as const) {
+      it(`the heartbeat turn's notice follows its own '${own}' over ${policy ? `a config of '${policy}'` : 'no config'}`, async () => {
+        const h = await harness(config(policy));
+        try {
+          await h.turn([createMockResponse([setTo('a1', own)], 'tool_use'), createMockResponse([])]);
+          await h.turn([createMockResponse([])], 'scout', 'heartbeat');
+          const notice = h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).at(-1);
+          assert.equal(notice, own === 'ask' ? HEARTBEAT_HELD : HEARTBEAT_PRIVATE);
+        } finally {
+          await h.close();
+        }
+      });
+    }
+
+    it("a derived agent starts at 'private' where its parent's own choice is 'ask'", async () => {
+      const h = await harness();
+      try {
+        const set = await settings(h, { action: 'update', same_round_skip_reply_text_policy: 'ask' });
+        assert.equal(shown(set.data), 'ask', `premise: the parent's own choice; ${set.error ?? ''}`);
+        const fork = await h.framework.deriveAgent({
+          name: 'fork-1', from: 'scout', mode: 'copy',
+          framing: [{ participant: 'user', content: [{ type: 'text', text: 'You are the fork.' }] }],
+        });
+        try {
+          assert.equal(shown(fork.agent.getRuntimeSettings()), 'private');
+        } finally {
+          fork.cleanup();
+        }
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("the subconscious starts at 'private' where the resident's own choice is 'ask'", async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'skip-reply-subconscious-own-'));
+      const create = (subconscious: boolean) => AgentFramework.create({
+        storePath: join(dir, 'store.chronicle'), membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+        ...(subconscious ? { subconscious: { enabled: true, reader: 'persistent' as const, systemPrompt: 'Read for scout.' } } : {}),
+        modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      });
+      let framework = await create(false);
+      try {
+        const set = await framework.executeToolCall({ id: 'a1', name: 'agent_settings', input: { action: 'update', same_round_skip_reply_text_policy: 'ask' }, callerAgentName: 'scout' });
+        assert.equal(shown(set.data), 'ask', `premise: the resident's own choice; ${set.error ?? ''}`);
+        await framework.stop();
+        framework = await create(true);
+        assert.equal(shown(framework.getAgentRuntimeSettings('scout')), 'ask', "premise: the resident's choice is restored");
+        assert.equal(shown(framework.getAgentRuntimeSettings('Subconscious')), 'private');
+      } finally {
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });

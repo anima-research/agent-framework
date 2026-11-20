@@ -63,8 +63,9 @@ async function ok(m: WorkspaceModule, name: string, input: unknown): Promise<Rec
   return result.data as Record<string, unknown>;
 }
 
-// A store error as Chronicle 0.4.0 throws one: a message naming the OS error, and no errno code.
-const storeError = (message: string): Error => Object.assign(new Error(message), { code: 'GenericFailure' });
+// A store error as Chronicle throws one: a message naming the OS error, and no errno code. Through
+// 0.6.0 its code is napi's GenericFailure; from 0.7.0 it is chronicle's own ErrorCode, Io for an I/O failure.
+const storeError = (message: string, code = 'GenericFailure'): Error => Object.assign(new Error(message), { code });
 const WIN32 = process.platform === 'win32' && "a store error's OS error is a Win32 code on Windows, which isn't read as an errno";
 const MAY_WORK = "Calling again may work; if it fails the same way, whoever runs this host can find the whole error in this host's log.";
 const REOPEN = "The workspace can't check its files against disk until its store is reopened, so calling again won't change that; whoever runs this host can reopen it with a restart.";
@@ -78,6 +79,11 @@ describe('an error no handler threw on purpose', () => {
       'The write of "work/b.txt" stopped on an error the workspace didn\'t expect, before the write was stored: no space left on the disk. '
       + "Calling again won't change that; whoever runs this host can free space on its disk.");
     assert.equal((await call(m, 'read', { path: 'work/b.txt' })).success, false, 'nothing was stored');
+    // The same failure as chronicle 0.7.0 codes it reads the same.
+    env.store.storeBlob = () => { throw storeError('IO error: No space left on device (os error 28)', 'Io'); };
+    assert.equal(await refused(m, 'write', { path: 'work/c.txt', content: 'three' }),
+      'The write of "work/c.txt" stopped on an error the workspace didn\'t expect, before the write was stored: no space left on the disk. '
+      + "Calling again won't change that; whoever runs this host can free space on its disk.");
   });
 
   test("a real store error, from store directories nothing may write, is read for its errno", { skip: WIN32 || (IS_ROOT && 'root writes past directory permissions') }, async (t) => {

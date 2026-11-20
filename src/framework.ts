@@ -226,7 +226,7 @@ import { CHILD_ENTRY, ChildCapacity, maxResultBytes, type ToolAnswer } from './c
 import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
-import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { proseRunGroups, splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
@@ -3122,7 +3122,7 @@ function unbatchedStoreRefusal(store: JsStore): string | undefined {
   return 'agent-framework needs a store handle with JsStore.appendManyToStateJsonWithIdentity, the identity-stamped batched append ' +
     'with which context-manager writes each agent\'s window, several rows as one record. The store handle has none ' +
     `(this package loads @animalabs/chronicle ${chronicleVersion() ?? 'of a version it does not say'}). ` +
-    'Install @animalabs/chronicle ^0.6.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
+    'Install @animalabs/chronicle ^0.6.0 || ^0.7.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
 }
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -5333,7 +5333,7 @@ export class AgentFramework {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
           "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
-          'Install @animalabs/context-manager ^0.27.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
+          'Install @animalabs/context-manager ^0.28.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -5747,6 +5747,21 @@ export class AgentFramework {
       });
       framework.judgeWired = judge !== undefined;
       const configuredServerIds = new Set((config.mcplServers ?? []).map((server) => server.id));
+      // Read before the gate writes its file: a gate.json already there says
+      // the store had its rules before this start (wake onboarding, below).
+      const gateFileExisted = existsSync(configPath);
+      // Wake onboarding: the agent's decisions about servers' suggested
+      // treatment, beside gate.json (gate/wake-onboarding.ts).
+      if (config.gate.onboarding !== false) {
+        // A store that had a gate before onboarding first starts on it keeps
+        // the servers it is configured with unasked (WakeDecisions): its
+        // agent wrote its rules with them there.
+        framework.wakeDecisions = new WakeDecisions(
+          join(dirname(configPath), 'wake-decisions.json'),
+          (message) => console.error(`[gate] ${message}`),
+          gateFileExisted ? [...configuredServerIds] : [],
+        );
+      }
       const heartbeatOn = config.heartbeat !== undefined && config.heartbeat !== null && config.heartbeat !== false;
       framework.eventGate = new EventGate({
         configPath,
@@ -5860,14 +5875,6 @@ export class AgentFramework {
       // for start() (admitOverdueWakeIntents), once the loop can serve a
       // wake's request, or for the resume when the host boots quiesced.
       framework.eventGate.restoreWakeIntents();
-      // Wake onboarding: the agent's decisions about servers' suggested
-      // treatment, beside gate.json (gate/wake-onboarding.ts).
-      if (config.gate.onboarding !== false) {
-        framework.wakeDecisions = new WakeDecisions(
-          join(dirname(configPath), 'wake-decisions.json'),
-          (message) => console.error(`[gate] ${message}`),
-        );
-      }
       // The periodic review of what suppress rules hid (gate/suppression-review.ts),
       // with its progress kept beside gate.json. Its calls run on the judge's
       // membrane and count toward the agent's usage as the reply judge's do.
@@ -9433,6 +9440,7 @@ export class AgentFramework {
     'transition_pace_tokens',
     'same_round_think_text_policy',
     'send_silencing',
+    'same_round_skip_reply_text_policy',
   ];
 
   /**
@@ -11828,6 +11836,15 @@ export class AgentFramework {
         `Invalid persisted sendSilencing for agent "${agentName}": ${JSON.stringify(overrides.sendSilencing)}`,
       );
     }
+    if (
+      overrides.sameRoundSkipReplyTextPolicy !== undefined &&
+      overrides.sameRoundSkipReplyTextPolicy !== 'private' &&
+      overrides.sameRoundSkipReplyTextPolicy !== 'ask'
+    ) {
+      throw new Error(
+        `Invalid persisted sameRoundSkipReplyTextPolicy for agent "${agentName}": ${JSON.stringify(overrides.sameRoundSkipReplyTextPolicy)}`,
+      );
+    }
     return overrides;
   }
 
@@ -11883,9 +11900,10 @@ export class AgentFramework {
   /**
    * Apply an agent's persisted settings at boot, each on its own, the budget
    * last. A persisted setting never stops the agent booting, except a
-   * think-text policy, which fails closed: an invalid one is refused before
-   * this (validatePersistedAgentRuntimeSettings), and a valid one always
-   * applies. A tail, pace or budget that can't be applied now (a tail or pace
+   * think-text policy, a skip_reply text policy or send silencing, each of
+   * which fails closed: an invalid one is refused before this
+   * (validatePersistedAgentRuntimeSettings), and a valid one always applies.
+   * A tail, pace or budget that can't be applied now (a tail or pace
    * on a strategy without live settings, a budget no longer above maxTokens,
    * a lower one restored paced on a strategy that can't prepare a smaller
    * window) is kept set but unapplied (Agent.keepRuntimeSettings), so a later
@@ -11916,9 +11934,10 @@ export class AgentFramework {
     overrides: AgentRuntimeSettingsOverrides,
   ): void {
     const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
-    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, sendSilencing, ...settings } = overrides;
+    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, sendSilencing, sameRoundSkipReplyTextPolicy, ...settings } = overrides;
     if (sameRoundThinkTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundThinkTextPolicy });
     if (sendSilencing !== undefined) agent.restoreRuntimeSettings({ sendSilencing });
+    if (sameRoundSkipReplyTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundSkipReplyTextPolicy });
     const unapplied: string[] = [];
     /** Restore one setting, or keep it set but unapplied; true if it applied. */
     const restore = (part: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>) => {
@@ -15023,7 +15042,7 @@ export class AgentFramework {
     name: 'agent_settings',
     description:
       'Read or change your hot runtime settings. This intentionally exposes only ' +
-      'context budget, recent raw tail size, transition pace, same-round think text routing, and send silencing; model, prompts, ' +
+      'context budget, recent raw tail size, transition pace, same-round think text routing, text beside skip_reply, and send silencing; model, prompts, ' +
       'folding strategy, and other restart-bound configuration are not mutable here. ' +
       'Lower context budgets converge gradually under the transition pace before ' +
       'becoming the hard live limit; increases take effect immediately.',
@@ -15056,9 +15075,19 @@ export class AgentFramework {
             'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
             'that an earlier send in the turn already set.',
         },
+        same_round_skip_reply_text_policy: {
+          type: 'string',
+          enum: ['private', 'ask'],
+          description:
+            'What becomes of plain text that a skip_reply would leave unsent. private (the default unless the recipe sets it): ' +
+            'it stays private and is not held. ask: it is held as a draft. On native tools, where the text is in the same response ' +
+            'as the skip_reply and would otherwise have gone out, the first skip_reply you call directly in a turn also does not run: ' +
+            'its result names the draft and asks where it should go. On native tools, text beside a private think stays private either way. ' +
+            'A change applies from your next response on at the latest.',
+        },
         settings: {
           type: 'array',
-          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy', 'send_silencing'] },
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy', 'send_silencing', 'same_round_skip_reply_text_policy'] },
           description: 'For reset: settings to restore to recipe values. Omit to reset all.',
         },
       },
@@ -24871,7 +24900,7 @@ export class AgentFramework {
     if (!agent) return;
     const text =
       `[${NOTICE_TAG.routing}] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: ` +
-      `it's held as a draft you can send with the drafts tool${agent.sameRoundSkipReplyTextPolicy === 'ask' ? '' : ", except in a round that calls skip_reply, where it stays private and isn't held"}. ` +
+      `it's held as a draft you can send with the drafts tool${agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask' ? '' : ", except in a round that calls skip_reply, where it stays private and isn't held"}. ` +
       'An explicit send reaches a channel now.';
     try {
       // The agent's own row, presented as it is stored: written where the
@@ -29395,6 +29424,10 @@ export class AgentFramework {
     // later rounds remain deliverable: the turn-end delivery drops that round's
     // text by its place, the round's index among this stream's tool rounds.
     const refusedWakeRounds = new Set<number>();
+    // The rounds of refusedWakeRounds that a skip_reply keeps private, as
+    // opposed to a private think: under 'ask' their text is held where
+    // nothing routed it live (skipHoldsAtEnd).
+    const skipPrivateRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -29489,6 +29522,29 @@ export class AgentFramework {
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
 
+    const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
+      && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
+    const holdSkipRuns = async (
+      runs: string[],
+      admitted: AdmittedEnvelope[][],
+      hold: ProseRound,
+      locus: ChannelRef | null,
+      when: number | 'end' | 'turn',
+    ): Promise<boolean> => {
+      const skipped: ProseRound = { ...hold, skipHold: [] };
+      if (turnProseRouting === 'hybrid') return this.routeSilencedHybrid(agent, runs, 'skip', false, skipped, locus, when);
+      if (turnProseRouting === 'explicit') {
+        for (const envelopes of admitted) {
+          try {
+            await this.deliverAdmittedProse(agent, envelopes, { ...skipped, keepPrivate: true });
+          } catch (err) {
+            console.error('trailing prose delivery failed:', err);
+          }
+        }
+        return false;
+      }
+      return this.holdSilencedProse(agent, runs, 'private', false, skipped, { target: locus, when });
+    };
     // How a stream the framework cancelled ends, by the mark it recorded,
     // however the stream reports its end: an `aborted` or an `error` event,
     // a close with no terminal event, or a throw. It runs only for a stream
@@ -29505,6 +29561,7 @@ export class AgentFramework {
       cancelKey: string,
       cancelKind: FrameworkCancelKind,
       closes: TurnRouting | undefined,
+      partial?: readonly ContentBlock[],
     ): Promise<void> => {
       this.frameworkCancelledStreams.delete(cancelKey);
       lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
@@ -29542,6 +29599,22 @@ export class AgentFramework {
       // so settle the delivery chain and drop the receipt. A
       // budget restart keeps the same turn's routing and tallies;
       // the continuation stream's end writes one receipt for it.
+      if (cancelKind === 'turn_ended' && streamRouting.privateEnd && skipHoldsAtEnd()) {
+        if (!partial) {
+          console.error(`[skip-reply] agent=${agent.name}: the turn's stream was cancelled with no partial content, so the text beside its skip_reply isn't held`);
+        } else {
+          // As at a natural end: earlier deliveries, an earlier turn's
+          // included, settle the router's state before this text meets it.
+          await turnSpeechChain;
+          const runs = splitProseRuns(partial);
+          const admitted = turnProseRouting === 'explicit' ? runs.map((run) => this.admitProse(run.trim(), streamRouting)) : [];
+          try {
+            await holdSkipRuns(runs, admitted, { routing: streamRouting, notice: 'later' }, resolveTurnLocus(), 'turn');
+          } catch (err) {
+            console.error(`[skip-reply] agent=${agent.name}: holding the text beside the turn's skip_reply failed:`, err);
+          }
+        }
+      }
       if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
         await turnSpeechChain;
         this.appendProseDeliveryReceipt(agent, streamRouting);
@@ -29818,7 +29891,7 @@ export class AgentFramework {
             const roundAdmitted = turnProseRouting === 'explicit'
               ? roundSegments.map((seg) => this.admitProse(seg, streamRouting))
               : [];
-            const skipAsks = agent.sameRoundSkipReplyTextPolicy === 'ask' && !trigger?.suppressProse && !streamRouting.silent
+            const skipAsks = agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask' && !trigger?.suppressProse && !streamRouting.silent
               && turnProseRouting !== 'disabled';
             const askingAt = skipAsks && liveRound && roundSegments.length > 0 && !streamRouting.skipReplyAsked
               ? calls.findIndex((c, i) => c.name === 'skip_reply' && roundCalls[i]!.permitted && !roundCalls[i]!.refused)
@@ -29868,6 +29941,7 @@ export class AgentFramework {
               if (calls.some((c) => c.refused)) {
                 silenceBeforeRefusal = mergeSilence(silence, roundSilenceOf(calls.filter((c) => !c.refused), toolRound));
                 refusedWakeRounds.add(toolRound);
+                skipPrivateRounds.add(toolRound);
               }
               silence = mergeSilence(silence, roundSilenceOf(calls, toolRound));
               if (askingCall) askedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && c !== askingCall), toolRound));
@@ -30317,7 +30391,7 @@ export class AgentFramework {
             // cut or not.
             const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.xml
               && cut.calls.some((call) => call.name === 'think');
-            const cutHeld = cutPrivate && !cutThinkPrivate && !cut?.xml && agent.sameRoundSkipReplyTextPolicy === 'ask'
+            const cutHeld = cutPrivate && !cutThinkPrivate && !cut?.xml && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
               && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
@@ -30332,7 +30406,11 @@ export class AgentFramework {
               }
               hadToolCalls = true;
               const cutRound = toolRounds++;
-              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
+              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) {
+                refusedWakeRounds.add(cutRound);
+                // Text beside a private think stays private: it isn't held.
+                if (!cutThinkPrivate) skipPrivateRounds.add(cutRound);
+              }
               if (liveProseRouting) silence = mergeSilence(silence, roundSilenceOf(cutCalls, cutRound));
               console.error(
                 `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside ${cut.calls.length} call(s) ` +
@@ -30461,18 +30539,19 @@ export class AgentFramework {
                 ? splitProseRuns(response.content)
                 : speechRun.trim() ? [speechRun] : [];
             const finalSpeechSegments = finalSpeechRuns.map((run) => run.trim());
-            const finalRuns = hadToolCalls && allText.length > 0
-              ? splitProseRuns(liveProseRouting
-                ? terminalContent
-                : withoutRoundsProse(response.content, refusedWakeRounds))
-              : [];
-            const finalSegments = finalRuns.map((run) => run.trim());
+            const finalGroups = !hadToolCalls || allText.length === 0
+              ? []
+              : liveProseRouting
+                ? [{ held: false, runs: splitProseRuns(terminalContent) }]
+                : skipHoldsAtEnd()
+                  ? proseRunGroups(response.content, skipPrivateRounds, refusedWakeRounds)
+                  : [{ held: false, runs: splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)) }];
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.
             const finalRouting = streamRouting;
             const admittedSpeechSegments = admitFinal ? finalSpeechSegments.map((seg) => this.admitProse(seg, finalRouting)) : [];
-            const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg, finalRouting)) : [];
+            const admittedGroups = finalGroups.map((group) => (admitFinal ? group.runs.map((run) => this.admitProse(run.trim(), finalRouting)) : []));
 
             const du = response.details?.usage;
             // A refusal's note carries what completeTurn counts.
@@ -30723,8 +30802,9 @@ export class AgentFramework {
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
               // XML tool path (no roundContent, so nothing was live-routed)
-              // the historical behavior applies:
-              // route the whole turn's parsed segments, once, now. The global
+              // the whole turn's parsed segments are routed, once, now, in
+              // groups by round: under 'ask', a round a skip_reply kept
+              // private is held in its place (finalGroups). The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
@@ -30749,94 +30829,104 @@ export class AgentFramework {
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
               const trailingWhen = liveProseRouting ? 'end' : 'turn';
               const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
-              const trailingSkip = cutHeld ? { skipHold: [] as SkipHeld[] } : {};
-
-              const runs = finalRuns;
-              const segments = finalSegments;
-
               const thinkPrivate = cutThinkPrivate && liveProseRouting;
-              const thinkHeld = (): void => {
-                if (segments.length > 0) {
+              const deliverRuns = async (runs: string[], admitted: AdmittedEnvelope[][]): Promise<boolean> => {
+                const segments = runs.map((run) => run.trim());
+                let held = false;
+                const thinkHeld = (): void => {
+                  if (segments.length > 0) {
+                    console.error(
+                      `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
+                    );
+                  }
+                };
+                if (turnProseRouting === 'disabled') {
+                  if (segments.length > 0) {
+                    console.error(
+                      `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
+                    );
+                    this.recordProseSuppression(streamRouting, segments.length);
+                  }
+                } else if (turnProseRouting === 'hybrid') {
+                  if (cutHeld && segments.length > 0) {
+                    held = await holdSkipRuns(runs, admitted, trailingHold, resolveTurnLocus(), trailingWhen);
+                  } else if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
+                    this.holdSilencedProse(agent, runs, trailingSilence === 'private' ? 'private' : 'kept', thinkPrivate, trailingHold, { target: null, when: trailingWhen });
+                  } else if (trailingSilence && trailingSilence !== 'private' && segments.length > 0) {
+                    held = await this.routeSilencedHybrid(agent, runs, trailingSilence, false, trailingHold, resolveTurnLocus(), trailingWhen);
+                  } else if (thinkPrivate) {
+                    thinkHeld();
+                  } else if (segments.length > 0) {
+                    const locus = resolveTurnLocus();
+                    for (const seg of segments) {
+                      try {
+                        await this.deliverHybridProse(agent, seg, locus, true, trailingHold);
+                      } catch (err) {
+                        console.error('trailing hybrid prose delivery failed:', err);
+                      }
+                    }
+                  }
+                } else if (turnProseRouting === 'explicit') {
+                  if (thinkPrivate) {
+                    thinkHeld();
+                  } else if (segments.length > 0) {
+                    console.error(
+                      `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
+                    );
+                    if (cutHeld) {
+                      await holdSkipRuns(runs, admitted, trailingHold, resolveTurnLocus(), trailingWhen);
+                    } else {
+                      for (const envelopes of admitted) {
+                        try {
+                          await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, keepPrivate: liveProseRouting && cutPrivate });
+                        } catch (err) {
+                          console.error('trailing prose delivery failed:', err);
+                        }
+                      }
+                    }
+                  }
+                } else if (trailingSilence === 'private' || segments.length === 0
+                  || (trailingSilence && thinkPrivate)
+                  || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus()))) {
+                  const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus()) : undefined;
                   console.error(
-                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
+                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
+                    `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold || (trailingSilence && thinkPrivate) ? 'turn silenced: send' : 'no trailing prose'})`,
                   );
-                }
-              };
-              if (turnProseRouting === 'disabled') {
-                if (segments.length > 0) {
-                  console.error(
-                    `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
-                  );
-                  this.recordProseSuppression(streamRouting, segments.length);
-                }
-              } else if (turnProseRouting === 'hybrid') {
-                if (trailingSilence === 'private' && !thinkPrivate && trailingSkip.skipHold && segments.length > 0) {
-                  closingHeld = await this.routeSilencedHybrid(agent, runs, 'skip', false, { ...trailingHold, ...trailingSkip }, resolveTurnLocus(), trailingWhen);
-                } else if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
-                  this.holdSilencedProse(agent, runs, trailingSilence === 'private' ? 'private' : 'kept', thinkPrivate, trailingHold, { target: null, when: trailingWhen });
-                } else if (trailingSilence && trailingSilence !== 'private' && segments.length > 0) {
-                  closingHeld = await this.routeSilencedHybrid(agent, runs, trailingSilence, false, trailingHold, resolveTurnLocus(), trailingWhen);
+                  if (segments.length > 0) {
+                    const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
+                    held = cutHeld
+                      ? await holdSkipRuns(runs, admitted, trailingHold, resolveTurnLocus(), trailingWhen)
+                      : this.holdSilencedProse(agent, runs, cause, thinkPrivate, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
+                  }
                 } else if (thinkPrivate) {
                   thinkHeld();
-                } else if (segments.length > 0) {
+                } else {
+                  // The turn's own locus, read from this stream's routing
+                  // state. This dispatch runs AFTER the agent is idle (see PR
+                  // #32 note below), so a next turn may already have started
+                  // with routing of its own, and a turn that narrated live into
+                  // one channel must not land its postscript in another.
                   const locus = resolveTurnLocus();
+                  console.error(
+                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,
+                  );
+                  // Deliver sequentially (await each) so the segments land in order.
                   for (const seg of segments) {
                     try {
-                      await this.deliverHybridProse(agent, seg, locus, true, trailingHold);
+                      const outcome = await this.routeLocusSpeech(agent, trailingHold, seg, locus);
+                      this.recordProseDelivery(streamRouting, outcome);
+                      if (outcome?.delivered) endPublished(outcome, seg, outcome.messageId);
                     } catch (err) {
-                      console.error('trailing hybrid prose delivery failed:', err);
+                      console.error('speech routing failed:', err);
                     }
                   }
                 }
-              } else if (turnProseRouting === 'explicit') {
-                if (thinkPrivate) {
-                  thinkHeld();
-                } else if (segments.length > 0) {
-                  console.error(
-                    `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
-                  );
-                  for (const envelopes of admittedSegments) {
-                    try {
-                      await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, ...trailingSkip, keepPrivate: (liveProseRouting && cutPrivate) || cutHeld });
-                    } catch (err) {
-                      console.error('trailing prose delivery failed:', err);
-                    }
-                  }
-                }
-              } else if (trailingSilence === 'private' || segments.length === 0
-                || (trailingSilence && thinkPrivate)
-                || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus()))) {
-                const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus()) : undefined;
-                console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
-                  `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold || (trailingSilence && thinkPrivate) ? 'turn silenced: send' : 'no trailing prose'})`,
-                );
-                if (segments.length > 0) {
-                  const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
-                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, { ...trailingHold, ...trailingSkip }, { target: resolveTurnLocus(), when: trailingWhen });
-                }
-              } else if (thinkPrivate) {
-                thinkHeld();
-              } else {
-                // The turn's own locus, read from this stream's routing
-                // state. This dispatch runs AFTER the agent is idle (see PR
-                // #32 note below), so a next turn may already have started
-                // with routing of its own, and a turn that narrated live into
-                // one channel must not land its postscript in another.
-                const locus = resolveTurnLocus();
-                console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,
-                );
-                // Deliver sequentially (await each) so the segments land in order.
-                for (const seg of segments) {
-                  try {
-                    const outcome = await this.routeLocusSpeech(agent, trailingHold, seg, locus);
-                    this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) endPublished(outcome, seg, outcome.messageId);
-                  } catch (err) {
-                    console.error('speech routing failed:', err);
-                  }
-                }
+                return held;
+              };
+              for (const [index, group] of finalGroups.entries()) {
+                if (group.held) await holdSkipRuns(group.runs, admittedGroups[index]!, trailingHold, resolveTurnLocus(), trailingWhen);
+                else closingHeld = (await deliverRuns(group.runs, admittedGroups[index]!)) || closingHeld;
               }
             }
             // NOTE: agent.reset() + onInferenceEnded() already ran above,
@@ -31084,7 +31174,7 @@ export class AgentFramework {
               const cancelKey = `${agent.name}:${myStreamId}`;
               const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
               if (cancelKind !== undefined) {
-                await endFrameworkCancel(cancelKey, cancelKind, streamRouting);
+                await endFrameworkCancel(cancelKey, cancelKind, streamRouting, event.partialContent);
                 return;
               }
             }
@@ -39466,6 +39556,7 @@ export class AgentFramework {
         this.refuseServerItem('push/event', connection.id, responder);
         return;
       }
+      this.settlePredatingServer(connection.id);
       // RFC-014 §6.1 carrier 2: the tool change this push explains was
       // applied as it was read; it's told after the event's own content. A
       // push the host then refuses still tells its change, on its own.
@@ -39633,6 +39724,7 @@ export class AgentFramework {
         this.refuseServerItem('channels/incoming', connection.id, responder);
         return;
       }
+      this.settlePredatingServer(connection.id);
       await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
@@ -41438,7 +41530,9 @@ export class AgentFramework {
 
     if (!connected) return fail(`${quotedValue(server)} isn't connected, so its suggestions can't be read now. wake_decline still records a decline.`);
     const offer = this.wakeOffer(server);
-    if (record && (record.shown ?? record.digest) !== offer.digest) {
+    // An unasked server's agent was shown no numbered list: it reads the
+    // numbers from event_tags, which gives the current ones.
+    if (record && record.state !== 'unasked' && (record.shown ?? record.digest) !== offer.digest) {
       // The numbers the agent was shown may not mean what they mean now: show them again, and ask again.
       // The decision on record (and its time, which the daily floor counts from) stays as it is.
       this.wakeDecisions.markShown(server, offer.digest);
@@ -42172,11 +42266,25 @@ export class AgentFramework {
     return evaluated ? { ...decision, gateDecision: evaluated } : decision;
   }
 
+  private settlePredatingServer(serverId: string): void {
+    try {
+      if (!this.wakeDecisions?.predates(serverId)) return;
+      if (!this.mcplServerRegistry?.getServer(serverId) || (this.featureSetManager?.getDeclaredFeatureSets(serverId) ?? null) === null) return;
+      const digest = this.wakeOffer(serverId).digest;
+      this.wakeDecisions.set(serverId, { digest, state: 'unasked' });
+      this.emitTrace({ type: 'gate:onboarding-decided', serverId, digest, state: 'unasked', rules: [] });
+    } catch (error) {
+      console.error(`[gate] wake onboarding for ${logValue(serverId)} failed:`, error);
+    }
+  }
+
   /**
    * Wake onboarding, after an inbound event is stored: if the gate let it go
    * by without anyone having decided about its server (gate/wake-onboarding.ts
-   * isUndecided), and the agent hasn't been offered or answered for this
-   * server's declared ontology, offer the server's suggestions once — a notice
+   * isUndecided), the server isn't one the store had when onboarding first
+   * started on it (settlePredatingServer), and the agent hasn't been offered
+   * or answered for this server's declared ontology, offer the server's
+   * suggestions once — a notice
    * after the event, and a wake when the event is addressed to the agent or
    * waiting on it (ATTENTION_TAGS); otherwise the notice waits for the next
    * turn. Never throws: onboarding is advice, and an event's delivery must not
@@ -42213,7 +42321,9 @@ export class AgentFramework {
   }): void {
     try {
       const d = event.gateDecision;
-      if (!this.wakeDecisions || !this.eventGate || !d || d.trigger) return;
+      if (!this.wakeDecisions || !this.eventGate) return;
+      if (this.wakeDecisions.predates(event.serverId)) return;
+      if (!d || d.trigger) return;
       // Cheap refusals first: this runs for every event a catch-all lets by.
       if (!this.wakeDecisions.mayOfferSoon(event.serverId)) return;
       if (!this.mcplServerRegistry?.getServer(event.serverId)) return;
@@ -43152,6 +43262,7 @@ export class AgentFramework {
         transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
         same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
         send_silencing: JSON.stringify([s.sendSilencing, saved.sendSilencing ?? null]),
+        same_round_skip_reply_text_policy: JSON.stringify([s.sameRoundSkipReplyTextPolicy, saved.sameRoundSkipReplyTextPolicy ?? null]),
       },
       exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
     };
@@ -43197,6 +43308,7 @@ export class AgentFramework {
         transition_pace_tokens?: unknown;
         same_round_think_text_policy?: unknown;
         send_silencing?: unknown;
+        same_round_skip_reply_text_policy?: unknown;
         immediate?: unknown;
         settings?: unknown;
       } & Record<string, unknown>;
@@ -43245,6 +43357,11 @@ export class AgentFramework {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
           if (input.send_silencing !== undefined) patch.sendSilencing = settingBoolean('send_silencing', input.send_silencing);
+          if (input.same_round_skip_reply_text_policy !== undefined) {
+            const policy = input.same_round_skip_reply_text_policy;
+            if (policy !== 'private' && policy !== 'ask') throw new Error("same_round_skip_reply_text_policy must be 'private' or 'ask'");
+            patch.sameRoundSkipReplyTextPolicy = policy;
+          }
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
           if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
@@ -43298,6 +43415,7 @@ export class AgentFramework {
               ['transition_pace_tokens', 'transitionPaceTokens'],
               ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
               ['send_silencing', 'sendSilencing'],
+              ['same_round_skip_reply_text_policy', 'sameRoundSkipReplyTextPolicy'],
             ]);
             keys = [];
             for (const name of input.settings) {
