@@ -1103,16 +1103,39 @@ test("a turn ended by a throw outside its stream's failure handling ends its run
   const membrane = new ScriptedMembrane((n) => (n === 1 || n === 2 ? statedWait(250) : undefined));
   const r = await resident(t, membrane);
   const alerts = () => r.traces.filter((tr) => tr.type === 'ops:alert' && tr.kind === 'provider-wait');
-  const internal = r.fw as unknown as { recordTurnCheckpoint: (name: string) => void };
+  // The held call's retry records no checkpoint (#1013), so the throw comes
+  // from the head-move notice every start takes.
+  const internal = r.fw as unknown as { noticeHeadMoves: (agent: unknown) => void };
   r.say('zz-question');
   await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'hold 1');
-  const record = internal.recordTurnCheckpoint;
-  internal.recordTurnCheckpoint = () => { internal.recordTurnCheckpoint = record; throw new Error('zz checkpoint fault'); };
+  const notice = internal.noticeHeadMoves;
+  internal.noticeHeadMoves = () => { internal.noticeHeadMoves = notice; throw new Error('zz head-move fault'); };
   t.mock.timers.tick(70 * 60_000);
-  await waitFor(() => r.admission().providerAdmission.heldRequests === 0 && internal.recordTurnCheckpoint === record, 'the retry to start and throw');
+  await waitFor(() => r.admission().providerAdmission.heldRequests === 0 && internal.noticeHeadMoves === notice, 'the retry to start and throw');
   r.say('zz-second');
   await waitFor(() => membrane.sends.length === 2 && r.admission().providerAdmission.heldRequests === 1, 'the next turn held');
   assert.equal(alerts().length, 0, "the next turn's run starts with it");
+});
+
+test("an undo after a held call's retry takes the turn's tool round back with the reply (#1013)", async (t) => {
+  // The round runs, the stated wait holds the next call, and the retry answers:
+  // one logical turn. Before, the retry recorded a checkpoint of its own, so
+  // the undo took the reply alone and left the call and its result in the
+  // window (undoDepth 2, 1 row retracted, both tool blocks kept).
+  const membrane = new ScriptedMembrane((n) => (n === 1 ? 'tool round, then a stated wait' : undefined));
+  const r = await resident(t, membrane);
+  const cm = r.fw.getAgent('resident')!.getContextManager();
+  const toolBlocks = () => cm.getPresentedMessages().flatMap((m) => m.content)
+    .filter((b) => b.type === 'tool_use' || b.type === 'tool_result').length;
+  r.say('zz-question');
+  await waitFor(() => membrane.sends.length === 1 && r.admission().providerAdmission.heldRequests === 1, 'held after its tool round');
+  t.mock.timers.tick(70 * 60_000);
+  await waitFor(() => r.count('inference:completed') === 1, 'the retry to answer');
+  assert.equal(toolBlocks(), 2, 'the round ran: its call and its result are in the window');
+  assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 1, 'one logical turn, one checkpoint');
+  assert.equal(r.fw.undoLastTurn('resident').undone, true);
+  assert.equal(toolBlocks(), 0, "the round's call and its result left with the reply");
+  assert.equal(r.fw.getUndoRedoState('resident').undoDepth, 0);
 });
 
 test('a run whose latest hold ran past the hour, with no later hold to alert at, alerts when its turn ends', async (t) => {
