@@ -153,7 +153,7 @@ async function createFramework(opts?: {
     agents: agents.map((agent) => ({
       name: agent.name,
       model: 'test-model',
-      systemPrompt: 'test',
+      systemPrompt: 'test', sendSilencing: true,
       ...(agent.sameRoundThinkTextPolicy !== undefined
         ? { sameRoundThinkTextPolicy: agent.sameRoundThinkTextPolicy }
         : {}),
@@ -1010,7 +1010,7 @@ describe('same-round think text policy', () => {
       const created = await framework.createEphemeralAgent({
         name: 'ephemeral-worker',
         model: 'test-model',
-        systemPrompt: 'test',
+        systemPrompt: 'test', sendSilencing: true,
         allowedTools: 'all',
         sameRoundThinkTextPolicy: 'private',
       });

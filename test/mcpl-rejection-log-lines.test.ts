@@ -262,7 +262,7 @@ test('a refusal reaction with no server for its locus names the locus as one fie
   const lines = captureConsoleError(t);
   const locus = `discord:g1:${FORGED_CHANNEL}`;
   const fakeThis = {
-    channelRegistry: { incomingFor: () => ({ channel: { serverId: 'gone', channelId: locus }, messageId: 'm1' }) },
+    turnRouting: new Map([['agent', { answers: { channel: { serverId: 'gone', channelId: locus }, messageId: 'm1' } }]]),
     mcplServerRegistry: { getServer: () => undefined },
   };
   const react = (AgentFramework.prototype as unknown as { reactToRefusal: (agent: string, category: string) => Promise<void> }).reactToRefusal;

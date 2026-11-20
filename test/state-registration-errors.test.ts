@@ -149,6 +149,7 @@ describe('AgentFramework.create() lets a failed registration through', () => {
     { id: 'framework/deferred-writes' },
     { id: 'mcpl/coalescing' },
     { id: 'mcpl/coalescing-recent' },
+    { id: 'mcpl/coalescing-journal' },
     { id: 'framework/inference-log' },
     { id: 'framework/turn-checkpoints/tree' },
     { id: 'framework/process-log', config: { processLogging: { persist: true } } },

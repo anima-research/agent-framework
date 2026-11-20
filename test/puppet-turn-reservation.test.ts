@@ -101,7 +101,7 @@ describe('puppetToolCall vs a concurrent wake (#145)', () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
-      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', primaryWaitsForAuxiliary: true }],
       modules: [],
     });
     const i = framework as unknown as Internals;

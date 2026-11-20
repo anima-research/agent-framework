@@ -13,6 +13,8 @@ export interface CutOffRound {
   start: number;
   calls: CutOffCall[];
   unnamed: boolean;
+  /** Whether the round's calls were built from XML (a cut tool block, or a call carrying rawXml). */
+  xml: boolean;
   /**
    * In XML tool mode, what the tag the cut came inside says of a call that
    * might have followed: `may` where the response ended in a tag that could
@@ -51,7 +53,8 @@ export function cutOffRound(response: NormalizedResponse, opts: { partialOpener?
   }));
   const unnamed = !!cut && calls.length === 0;
   const nextCall = cut?.nextCall ?? 'none';
-  return calls.length > 0 || unnamed ? { content, start, calls, unnamed, nextCall } : undefined;
+  const xml = !!cut || uses.some((block) => (block as { rawXml?: string }).rawXml !== undefined);
+  return calls.length > 0 || unnamed ? { content, start, calls, unnamed, xml, nextCall } : undefined;
 }
 
 /**

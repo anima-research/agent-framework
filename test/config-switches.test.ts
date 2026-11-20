@@ -82,6 +82,8 @@ const THINKING_ENABLED = 'true asks the provider for extended thinking, ' + does
 const AUTO_REWIND = 'true redacts the turn that tripped a refusal and runs again, up to maxRewinds times, ' + doesnt;
 const TOOL_RESULT_GUARD = 'true turns on tool-output admission, with one guarded retry after a provider refusal, ' + doesnt;
 const TOOL_WRAPPER_PROSE_GUARD = 'true keeps a response whose whole prose is a tool-call-shaped wrapper from running or entering the agent\'s history, ' + doesnt;
+const PRIMARY_WAITS_FOR_AUXILIARY = 'true holds a turn\'s start until the agent\'s compression call in flight ends, ' +
+  'and false or leaving it out starts the turn beside it';
 const AUTO_CONTINUE_MAX =
   'the most turns in a row that continue without skip_reply before the agent waits for the next event';
 
@@ -109,6 +111,10 @@ describe('config switches', () => {
       refused({ refusalHandling: 'on' }, 'refusalHandling must be an object, such as { autoRewind: true }, not a string'),
       refused({ toolResultGuard: 0 }, `toolResultGuard must be true or false, not a number: ${TOOL_RESULT_GUARD}`),
       refused({ toolWrapperProseGuard: { on: true } }, `toolWrapperProseGuard must be true or false, not an object: ${TOOL_WRAPPER_PROSE_GUARD}`),
+      refused({ primaryWaitsForAuxiliary: 'true' }, `primaryWaitsForAuxiliary must be true or false, unquoted, not a string: ${PRIMARY_WAITS_FOR_AUXILIARY}`),
+      refused({ sendSilencing: 'true' }, 'sendSilencing must be true or false, unquoted, not a string: ' +
+        'true makes an explicit send hold back, as drafts, the plain speech aimed where it may have posted, ' +
+        'and false or leaving it out posts that speech as any other'),
       refused({ autoContinue: 'true' }, 'autoContinue must be true, false or an object such as { maxConsecutive: 3 }, not a string (true and false go unquoted)'),
       refused({ autoContinue: { maxConsecutive: 0 } }, `autoContinue.maxConsecutive must be a whole number from 1 to 20, not a number below 1: ${AUTO_CONTINUE_MAX}`),
     ]);

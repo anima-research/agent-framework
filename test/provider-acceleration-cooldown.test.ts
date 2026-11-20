@@ -223,13 +223,51 @@ test('dynamic conversation forks are excluded from provider cooldown ownership',
   }
 });
 
+test('a turn starts beside an auxiliary call in flight when the agent leaves primaryWaitsForAuxiliary out', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-beside-auxiliary-'));
+  const membrane = new AlwaysSuccessMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+  });
+  const internal = framework as unknown as {
+    withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
+    startAgentStream(agent: unknown): Promise<void>;
+  };
+  let finish!: () => void;
+  const auxiliary = internal.withAuxiliaryAdmission('resident', () => new Promise<void>((resolve) => {
+    finish = resolve;
+  }));
+  // The turn's call is answered, not only its stream made: a start held after
+  // its compile makes a stream too, and cancels it unsent.
+  let completed = 0;
+  framework.onTrace((event) => {
+    if (event.type === 'inference:completed' && (event as { agentName?: string }).agentName === 'resident') completed++;
+  });
+  try {
+    await internal.startAgentStream(framework.getAgent('resident')!);
+    const deadline = performance.now() + LONGER_THAN_ANY_START_MS;
+    while (completed === 0) {
+      assert.ok(performance.now() < deadline, 'the turn completes while the auxiliary call is still in flight');
+      await sleep(10);
+    }
+    assert.equal(membrane.calls.length, 1, 'one call, made beside the auxiliary call');
+  } finally {
+    finish();
+    await auxiliary;
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a resident waiting behind auxiliary work does not block another resident', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-provider-cross-agent-'));
   const membrane = new AlwaysSuccessMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
     agents: [
-      { name: 'resident', model: 'test-model', systemPrompt: 'system' },
+      { name: 'resident', model: 'test-model', systemPrompt: 'system', primaryWaitsForAuxiliary: true },
       { name: 'other', model: 'test-model', systemPrompt: 'system' },
     ],
     modules: [], syncIntervalMs: 0, maintenanceIntervalMs: 0,
@@ -264,7 +302,7 @@ test('shutdown aborts a primary waiting behind in-flight auxiliary work', async 
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system', primaryWaitsForAuxiliary: true }],
     modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
   });
   const internal = framework as unknown as {

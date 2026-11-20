@@ -317,7 +317,9 @@ export interface GateOptions {
    * server that the agent's rules let go by without deciding about it brings
    * the agent that server's suggested treatment (MCPL RFC-001 §5), once per
    * declared ontology, with `wake_accept_suggestions` / `wake_decline` to
-   * answer. On unless set to false.
+   * answer. A server configured when onboarding first starts on a store that
+   * already has a gate.json is recorded `unasked` instead, with no offer. On
+   * unless set to false.
    */
   onboarding?: boolean;
 }

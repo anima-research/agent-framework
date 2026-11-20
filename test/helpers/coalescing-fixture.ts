@@ -79,7 +79,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   const create = async (grantPush = true) => {
     framework = await AgentFramework.create({
       storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-      agents: (options.agents ?? [{ name: 'agent', model: 'test', systemPrompt: 'test' }]) as FrameworkConfig['agents'],
+      agents: (options.agents ?? [{ name: 'agent', model: 'test', systemPrompt: 'test', primaryWaitsForAuxiliary: true }]) as FrameworkConfig['agents'],
       modules: [], ...options.framework,
       mcplServers: [{ id: 'editor', url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}`, enabledFeatureSets: ['doc'],
         ...options.server, ...(grantPush ? {} : { disabledCapabilities: ['pushEvents'] }) }],
@@ -166,12 +166,8 @@ export async function settles<T>(work: Promise<T>, what: string): Promise<T> {
 }
 
 
-/** Simulate a crash: stop without the snapshot flush a clean stop performs. */
 export async function crash(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
-  const internals = f.framework as unknown as { flushCoalescingSnapshot: () => void; coalescingSaveTimer: ReturnType<typeof setTimeout> | null };
-  if (internals.coalescingSaveTimer) clearTimeout(internals.coalescingSaveTimer);
-  internals.coalescingSaveTimer = null;
-  internals.flushCoalescingSnapshot = () => {};
+  (f.framework as unknown as { writeCoalescingTable: () => void }).writeCoalescingTable = () => {};
   await f.framework.stop();
 }
 

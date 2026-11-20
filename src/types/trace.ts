@@ -762,12 +762,14 @@ export type TraceEvent =
       rules: number;
       wake: boolean;
     })
-  /** The agent answered an offer: rules accepted (the names written), or declined. */
+  /** The agent answered an offer: rules accepted (the names written), or
+   *  declined. `unasked`: no offer was made, for a server the store already
+   *  had when onboarding first started on it. */
   | (TraceEventBase & {
       type: 'gate:onboarding-decided';
       serverId: string;
       digest: string;
-      state: 'accepted' | 'declined';
+      state: 'accepted' | 'declined' | 'unasked';
       rules: string[];
     })
 

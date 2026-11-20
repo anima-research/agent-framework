@@ -49,6 +49,40 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
           "Omitted in the recipe preserves the compatibility carry-forward: public.",
       },
     );
+    assert.deepEqual(
+      (tool!.inputSchema as { properties: Record<string, unknown> }).properties.send_silencing,
+      {
+        type: 'boolean',
+        description:
+          'Whether a send tool (send_message, channel_publish, a drafts resend and the like) holds back, as drafts, ' +
+          'the plain speech you write in its round and in later rounds of the turn, where that speech would land ' +
+          'where the send may have posted. false (the default unless the recipe sets it): plain speech beside a send ' +
+          'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
+          'that an earlier send in the turn already set.',
+      },
+    );
+    assert.ok(
+      (tool!.inputSchema as unknown as { properties: { settings: { items: { enum: string[] } } } }).properties.settings.items.enum.includes('send_silencing'),
+      'a reset can name it',
+    );
+    assert.deepEqual(
+      (tool!.inputSchema as { properties: Record<string, unknown> }).properties.same_round_skip_reply_text_policy,
+      {
+        type: 'string',
+        enum: ['private', 'ask'],
+        description:
+          'What becomes of plain text that a skip_reply would leave unsent. private (the default unless the recipe sets it): ' +
+          'it stays private and is not held. ask: it is held as a draft. On native tools, where the text is in the same response ' +
+          'as the skip_reply and would otherwise have gone out, the first skip_reply you call directly in a turn also does not run: ' +
+          'its result names the draft and asks where it should go. On native tools, text beside a private think stays private either way. ' +
+          'A change applies from your next response on at the latest.',
+      },
+    );
+    assert.ok(
+      (tool!.inputSchema as unknown as { properties: { settings: { items: { enum: string[] } } } }).properties.settings.items.enum.includes('same_round_skip_reply_text_policy'),
+      'a reset can name the skip_reply text policy',
+    );
+    assert.match(tool!.description, /same-round think text routing, text beside skip_reply, and send silencing;/);
     assert.deepEqual(framework.getAgentRuntimeSettings('agent'), {
       contextBudgetTokens: 100_000,
       effectiveContextBudgetTokens: 100_000,
@@ -56,6 +90,8 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       transitionPaceTokens: 8_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
+      sendSilencing: false,
+      sameRoundSkipReplyTextPolicy: 'private',
       transition: 'stable',
     });
 
@@ -65,6 +101,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
         tailTokens: 20_000,
         transitionPaceTokens: 4_000,
         sameRoundThinkTextPolicy: 'private',
+        sendSilencing: true,
       }),
       {
         contextBudgetTokens: 60_000,
@@ -73,6 +110,8 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
         transitionPaceTokens: 4_000,
         sameRoundThinkTextPolicy: 'private',
         sameRoundThinkTextPolicySource: 'runtime_override',
+        sendSilencing: true,
+        sameRoundSkipReplyTextPolicy: 'private',
         transition: 'converging',
       },
     );
@@ -87,8 +126,53 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       transitionPaceTokens: 8_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
+      sendSilencing: false,
+      sameRoundSkipReplyTextPolicy: 'private',
       transition: 'stable',
     });
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("sameRoundSkipReplyTextPolicy: a host's update takes 'private' or 'ask' and refuses any other value", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-skip-reply-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: strategy() }],
+    modules: [],
+  });
+  try {
+    assert.equal(framework.updateAgentRuntimeSettings('agent', { sameRoundSkipReplyTextPolicy: 'ask' }).sameRoundSkipReplyTextPolicy, 'ask');
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', { sameRoundSkipReplyTextPolicy: 'Ask' as never }),
+      /sameRoundSkipReplyTextPolicy must be 'private' or 'ask'/,
+    );
+    assert.equal(framework.getAgentRuntimeSettings('agent').sameRoundSkipReplyTextPolicy, 'ask');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("sendSilencing: the agent's own false overrides a recipe's true, and a reset restores the recipe's", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-send-silencing-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: strategy(), sendSilencing: true }],
+    modules: [],
+  });
+  try {
+    assert.equal(framework.getAgentRuntimeSettings('agent').sendSilencing, true);
+    assert.equal(framework.updateAgentRuntimeSettings('agent', { sendSilencing: false }).sendSilencing, false);
+    assert.equal(framework.resetAgentRuntimeSettings('agent', ['sendSilencing']).sendSilencing, true);
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', { sendSilencing: 'false' as never }),
+      /sendSilencing must be true or false/,
+    );
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
@@ -119,6 +203,7 @@ it('runtime overrides persist across framework restart', async () => {
     tailTokens: 18_000,
     transitionPaceTokens: 5_000,
     sameRoundThinkTextPolicy: 'private',
+    sendSilencing: true,
   });
   await framework.stop();
 
@@ -133,6 +218,8 @@ it('runtime overrides persist across framework restart', async () => {
       transitionPaceTokens: 5_000,
       sameRoundThinkTextPolicy: 'private',
       sameRoundThinkTextPolicySource: 'runtime_override',
+      sendSilencing: true,
+      sameRoundSkipReplyTextPolicy: 'private',
       transition: 'converging',
     });
   } finally {
@@ -1213,6 +1300,8 @@ describe('a reached budget across a restart', () => {
         effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'public',
         sameRoundThinkTextPolicySource: 'compatibility_default',
+        sendSilencing: false,
+        sameRoundSkipReplyTextPolicy: 'private',
         transition: 'stable',
       });
       assert.deepEqual(log.lines.filter((l) => l.includes('[agent-settings]')), [
@@ -1324,6 +1413,8 @@ it('reset-all skips tail controls unsupported by the active strategy', async () 
       effectiveContextBudgetTokens: 100_000,
       sameRoundThinkTextPolicy: 'public',
       sameRoundThinkTextPolicySource: 'compatibility_default',
+      sendSilencing: false,
+      sameRoundSkipReplyTextPolicy: 'private',
       transition: 'stable',
     });
   } finally {
@@ -1351,6 +1442,8 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
       effectiveContextBudgetTokens: 100_000,
       sameRoundThinkTextPolicy: 'private',
       sameRoundThinkTextPolicySource: 'recipe',
+      sendSilencing: false,
+      sameRoundSkipReplyTextPolicy: 'private',
       transition: 'stable',
     });
 
@@ -1361,6 +1454,8 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
         effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'public',
         sameRoundThinkTextPolicySource: 'runtime_override',
+        sendSilencing: false,
+        sameRoundSkipReplyTextPolicy: 'private',
         transition: 'stable',
       },
     );
@@ -1372,6 +1467,8 @@ it('same_round_think_text_policy reports recipe/runtime/default sources and reje
         effectiveContextBudgetTokens: 100_000,
         sameRoundThinkTextPolicy: 'private',
         sameRoundThinkTextPolicySource: 'recipe',
+        sendSilencing: false,
+        sameRoundSkipReplyTextPolicy: 'private',
         transition: 'stable',
       },
     );
@@ -1433,6 +1530,29 @@ it('fails closed on an invalid persisted same_round_think_text_policy override b
     assert.equal(providerCalls, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("refuses a start whose persisted skip_reply text policy is neither 'private' nor 'ask'", async () => {
+  for (const value of ['Ask', 'public', true]) {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-settings-invalid-skip-policy-'));
+    const storePath = join(dir, 'store');
+    const store = JsStore.openOrCreate({ path: storePath });
+    store.registerState({ id: 'framework/state', strategy: 'snapshot' });
+    store.setStateJson('framework/state', { agentRuntimeSettings: { agent: { sameRoundSkipReplyTextPolicy: value } } });
+    store.close();
+    try {
+      await assert.rejects(
+        () => AgentFramework.create({
+          storePath, membrane,
+          agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', sameRoundSkipReplyTextPolicy: 'ask' }],
+          modules: [],
+        }),
+        new RegExp(`Invalid persisted sameRoundSkipReplyTextPolicy for agent "agent": ${JSON.stringify(value)}`),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 });

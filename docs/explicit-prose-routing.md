@@ -44,7 +44,13 @@ them the same way.
   unprefixed segments of the SAME turn, including those a later stream of it
   writes, such as a framework retry's, a budget restart's or the compile a
   provider-capacity hold defers the turn to. A round kept private (one that
-  calls `skip_reply`, or has a same-round private think) sets no target. A
+  calls `skip_reply`, or has a same-round private think) sets no target,
+  except that under `sameRoundSkipReplyTextPolicy: 'ask'`, the config's or
+  the agent's own (`agent_settings`' `same_round_skip_reply_text_policy`),
+  a round that calls `skip_reply`, with no same-round private think, sets
+  the target its envelopes name, and what it would have posted or bounced
+  is held as a draft: at once on a round whose content reaches the host
+  verbatim, and at the turn's end on the XML tool path. A
   target its server declared inbound-only is refused and clears the turn's
   target, so later unprefixed segments bounce until a new `>>` target.
   Cross-turn, nothing is implicit.
@@ -72,7 +78,8 @@ or hold for lack of a destination is held as a draft with no notice instead of
 bouncing: a later `drafts` listing shows it, and the turn's receipt or, in
 `explicit` mode, which writes none, a later turn's catch-up notice names it,
 but nothing offers it for resend while the turn runs. In a `locus` or `hybrid`
-turn a send has silenced, the round's plain speech aimed where a send may have
+turn a send has silenced (a send silences only for an agent with
+`sendSilencing: true`), the round's plain speech aimed where a send may have
 posted stays in the agent's context instead, counted in the receipt as kept
 private, and what a `>>>` envelope addressed there is held with no notice. A
 round that also makes a send of its own, other than a `drafts` resend, holds

@@ -1,7 +1,8 @@
 /**
  * Tools whose call carries the resident's words, by bare name (an MCPL
  * server's `<prefix>--` stripped); edit_message's words are the new text of a
- * message it sent. The framework reads a call of a `silences` one as an
+ * message it sent. For an agent whose sends silence (AgentConfig.sendSilencing),
+ * the framework reads a call of a `silences` one as an
  * explicit send that silences the round's auto-routed prose where it may have
  * posted; the history module reads the words of any of them as what the
  * resident wrote to someone, whether or not it was delivered. With prose

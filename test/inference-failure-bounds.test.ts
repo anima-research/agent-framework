@@ -57,6 +57,8 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   fw.consecutiveInferenceFailures = new Map<string, number>();
   fw.inferenceFailureEscalationThreshold = 3;
   fw.exhaustionRewinds = new Map<string, number>();
+  fw.turnRouting = new Map();
+  fw.answeredTurns = new WeakMap();
   fw.rewindEpisode = new Map();
   fw.lastInferenceAt = new Map<string, object>();
   fw.failedLastTurnAt = new WeakMap();
@@ -76,6 +78,7 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
   let ticks = 0;
   fw.agents = new Map([['cairn', {
     name: 'cairn',
+    primaryWaitsForAuxiliary: true,
     refusalHandling: { maxRewinds: 3 },
     getContextManager: () => ({
       addMessage: opts?.addMessage ?? ((_p: string, content: any[], meta: any) => { markers.push({ text: content[0].text, meta }); }),

@@ -183,8 +183,8 @@ export class MockYieldingStream implements YieldingStream {
  * stream whose teardown stop() has to wait for.
  */
 export class HeldStream extends MockYieldingStream {
-  constructor(private readonly released: Promise<void>, responses: NormalizedResponse[]) {
-    super(responses);
+  constructor(private readonly released: Promise<void>, responses: NormalizedResponse[], supportsInjectedMessages: boolean | 'undeclared' = true) {
+    super(responses, supportsInjectedMessages);
   }
 
   override async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent> {

@@ -139,6 +139,7 @@ import type {
   AutoContinueConfig,
   AgentState,
   SameRoundThinkTextPolicy,
+  SameRoundSkipReplyTextPolicy,
   SameRoundThinkTextPolicySource,
   PendingToolCall,
   CompletedToolCall,
@@ -196,13 +197,14 @@ export function assertThinkingBinding(setting: string, value: AgentConfig['think
 
 /**
  * Refuse an agent config whose `promptCaching`, `toolResultGuard`,
- * `toolWrapperProseGuard`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
+ * `toolWrapperProseGuard`, `primaryWaitsForAuxiliary`, `turnInputsPin`, `thinking.enabled`, `thinkingBinding.dropBlock`,
  * `thinkingBinding.binds` or `refusalHandling.autoRewind` holds anything but true or false
  * (assertBooleanSetting, where null counts as left out), or whose `thinking`, `thinkingBinding` or
  * `refusalHandling` is anything but an object, null or false (holdsSettings),
  * or whose `autoContinue` resolveAutoContinue refuses, or whose `observes`
- * is anything but a list of names, or whose `foreignRounds` is neither of
- * its modes (assertOneOfSetting). The constructor runs it
+ * is anything but a list of names, or whose `foreignRounds` or
+ * `sameRoundSkipReplyTextPolicy` is neither of its values
+ * (assertOneOfSetting). The constructor runs it
  * first, so the rule holds wherever an Agent is built. `create()` also runs it
  * for each of its agents before anything opens, and `createEphemeralAgent`
  * before it reserves the name, so a refusal there leaves nothing behind.
@@ -245,6 +247,18 @@ export function assertAgentSwitches(config: AgentConfig): void {
       'and false or leaving it out doesn\'t',
   );
   assertBooleanSetting(
+    `${agent} primaryWaitsForAuxiliary`,
+    config.primaryWaitsForAuxiliary,
+    'true holds a turn\'s start until the agent\'s compression call in flight ends, ' +
+      'and false or leaving it out starts the turn beside it',
+  );
+  assertBooleanSetting(
+    `${agent} sendSilencing`,
+    config.sendSilencing,
+    'true makes an explicit send hold back, as drafts, the plain speech aimed where it may have posted, ' +
+      'and false or leaving it out posts that speech as any other',
+  );
+  assertBooleanSetting(
     `${agent} turnInputsPin`,
     config.turnInputsPin,
     'true or leaving it out pins the rows that open a turn raw until it ends, and false places no pin',
@@ -263,6 +277,12 @@ export function assertAgentSwitches(config: AgentConfig): void {
     ['transcript', 'raw'],
     '\'transcript\' or leaving it out sends the rounds of an agent it observes as a line per call and result, ' +
       'without their thinking, and \'raw\' sends them as stored',
+  );
+  assertOneOfSetting(
+    `${agent} sameRoundSkipReplyTextPolicy`,
+    config.sameRoundSkipReplyTextPolicy,
+    ['private', 'ask'],
+    '\'private\' or leaving it out keeps text beside skip_reply private, and \'ask\' holds it as a draft and asks once where it goes if it would have been posted or bounced',
   );
   resolveAutoContinue(config);
 }
@@ -359,6 +379,9 @@ export class Agent {
   readonly proseLock: string | undefined;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
+  /** A turn's start waits for an auxiliary call in flight (see
+   *  AgentConfig.primaryWaitsForAuxiliary). Default off. */
+  readonly primaryWaitsForAuxiliary: boolean;
   /** Continuation after a turn the model ends itself (see
    *  AgentConfig.autoContinue); undefined when off. */
   readonly autoContinue: { maxConsecutive: number } | undefined;
@@ -375,6 +398,7 @@ export class Agent {
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
+  readonly sameRoundSkipReplyTextPolicy: AgentConfig['sameRoundSkipReplyTextPolicy'];
   /** The participant name this agent's turns are presented under (see AgentConfig.presentAs). */
   readonly presentAs: string;
   /** Stored participants presented as this agent's own turns: its name plus AgentConfig.selfParticipants. */
@@ -432,6 +456,7 @@ export class Agent {
   private readonly configuredTailTokens?: number;
   private readonly configuredTransitionPaceTokens?: number;
   private readonly configuredSameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  private readonly configuredSendSilencing: boolean;
   private contextBudgetTargetTokens?: number;
   private runtimeSettingsOverrides: AgentRuntimeSettingsPatch = {};
   /**
@@ -504,6 +529,7 @@ export class Agent {
     this.proseRouting = config.proseRouting ?? 'locus';
     this.proseLock = typeof config.proseLock === 'string' && config.proseLock.trim() ? config.proseLock.trim() : undefined;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard === true;
+    this.primaryWaitsForAuxiliary = config.primaryWaitsForAuxiliary === true;
     this.autoContinue = resolveAutoContinue(config);
     this.clock = resolveClockConfig(config.name, config.clock);
     this.cacheTtl = config.cacheTtl ?? '1h';
@@ -512,6 +538,7 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.sameRoundSkipReplyTextPolicy = config.sameRoundSkipReplyTextPolicy;
     this.presentAs = config.presentAs ?? config.name;
     this.ownParticipants = new Set([config.name, ...(config.selfParticipants ?? [])]);
     this.deniedAtDispatch = new Set(config.denyToolsAtDispatch ?? []);
@@ -530,6 +557,7 @@ export class Agent {
     this.configuredTailTokens = hot?.tailTokens;
     this.configuredTransitionPaceTokens = hot?.transitionPaceTokens;
     this.configuredSameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.configuredSendSilencing = config.sendSilencing ?? false;
   }
 
   /**
@@ -737,6 +765,8 @@ export class Agent {
         : {}),
       sameRoundThinkTextPolicy: this.getEffectiveSameRoundThinkTextPolicy(),
       sameRoundThinkTextPolicySource: this.getSameRoundThinkTextPolicySource(),
+      sendSilencing: this.getEffectiveSendSilencing(),
+      sameRoundSkipReplyTextPolicy: this.getEffectiveSameRoundSkipReplyTextPolicy(),
       transition: this.contextBudgetTargetTokens === undefined
         ? 'stable'
         : hot?.blocked
@@ -1008,6 +1038,16 @@ export class Agent {
       ?? DEFAULT_SAME_ROUND_THINK_TEXT_POLICY;
   }
 
+  /** Whether an explicit send silences plain speech aimed where it posted: the agent's own setting, else its config's (AgentConfig.sendSilencing, default false). */
+  getEffectiveSendSilencing(): boolean {
+    return this.runtimeSettingsOverrides.sendSilencing ?? this.configuredSendSilencing;
+  }
+
+  /** What becomes of ordinary text in a round that calls skip_reply: the agent's own setting, else its config's (AgentConfig.sameRoundSkipReplyTextPolicy), else 'private'. */
+  getEffectiveSameRoundSkipReplyTextPolicy(): SameRoundSkipReplyTextPolicy {
+    return this.runtimeSettingsOverrides.sameRoundSkipReplyTextPolicy ?? this.sameRoundSkipReplyTextPolicy ?? 'private';
+  }
+
   getSameRoundThinkTextPolicySource(): SameRoundThinkTextPolicySource {
     if (this.runtimeSettingsOverrides.sameRoundThinkTextPolicy !== undefined) {
       return 'runtime_override';
@@ -1078,11 +1118,15 @@ export class Agent {
     if (patch.sameRoundThinkTextPolicy !== undefined) {
       this.runtimeSettingsOverrides.sameRoundThinkTextPolicy = patch.sameRoundThinkTextPolicy;
     }
+    if (patch.sendSilencing !== undefined) this.runtimeSettingsOverrides.sendSilencing = patch.sendSilencing;
+    if (patch.sameRoundSkipReplyTextPolicy !== undefined) {
+      this.runtimeSettingsOverrides.sameRoundSkipReplyTextPolicy = patch.sameRoundSkipReplyTextPolicy;
+    }
     return this.getRuntimeSettings();
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
-    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
+    const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy', 'sendSilencing', 'sameRoundSkipReplyTextPolicy']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     // A reset to a recipe budget below the live one arms a descent to it.
@@ -1133,6 +1177,8 @@ export class Agent {
     if (reset.has('sameRoundThinkTextPolicy')) {
       delete this.runtimeSettingsOverrides.sameRoundThinkTextPolicy;
     }
+    if (reset.has('sendSilencing')) delete this.runtimeSettingsOverrides.sendSilencing;
+    if (reset.has('sameRoundSkipReplyTextPolicy')) delete this.runtimeSettingsOverrides.sameRoundSkipReplyTextPolicy;
     return this.getRuntimeSettings();
   }
 
@@ -1218,6 +1264,14 @@ export class Agent {
         patch.sameRoundThinkTextPolicy !== 'public' &&
         patch.sameRoundThinkTextPolicy !== 'private') {
       throw new Error("sameRoundThinkTextPolicy must be 'public' or 'private'");
+    }
+    if (patch.sendSilencing !== undefined && typeof patch.sendSilencing !== 'boolean') {
+      throw new Error('sendSilencing must be true or false');
+    }
+    if (patch.sameRoundSkipReplyTextPolicy !== undefined &&
+        patch.sameRoundSkipReplyTextPolicy !== 'private' &&
+        patch.sameRoundSkipReplyTextPolicy !== 'ask') {
+      throw new Error("sameRoundSkipReplyTextPolicy must be 'private' or 'ask'");
     }
   }
 

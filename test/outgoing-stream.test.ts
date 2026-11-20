@@ -214,7 +214,7 @@ async function harness(
   const module = new ToolModule();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', ...config }], modules: [module], syncIntervalMs: 0,
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', sendSilencing: true, ...config }], modules: [module], syncIntervalMs: 0,
     // An EventGate gives the agent the sleep tool.
     ...(options.gate ? { gate: { configPath: join(dir, 'gate.json') } } : {}),
     // The re-pin is the legacy locus rule; a test about it opts in.
@@ -629,7 +629,7 @@ test("with the real channel registry, a stop() with a publish still out sends th
   const module = new ToolModule();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }], modules: [module], syncIntervalMs: 0,
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', sendSilencing: true }], modules: [module], syncIntervalMs: 0,
   });
   // What reaches the server, with the registry's stopAll and the teardown marked.
   const wire: string[] = [];
@@ -707,7 +707,7 @@ async function realRegistryTurn(
   const module = new ToolModule();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system' }], modules: [module], syncIntervalMs: 0,
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', sendSilencing: true }], modules: [module], syncIntervalMs: 0,
   });
   const wire: string[] = [];
   const traces: string[] = [];
