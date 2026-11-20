@@ -31,6 +31,7 @@ import type {
 } from './types/index.js';
 import { boundedErrorMessage } from './error-message.js';
 import type { Agent } from './agent.js';
+import { beforeUserDeprecationLine } from './context-injection-deprecation.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 import { logValue } from './mcpl/log-value.js';
 import { asCalled, markedInputRefusal, toolArgsProblems } from './tool-args.js';
@@ -125,6 +126,8 @@ export class ModuleRegistry {
   private starting = new Map<Module, Promise<void>>();
   /** Module and namespace pairs already told that a system injection held a block that isn't text. */
   private notShownWarned = new Set<string>();
+  /** Modules already told that placing an injection at beforeUser is deprecated. */
+  private beforeUserWarned = new Set<string>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
@@ -624,6 +627,12 @@ export class ModuleRegistry {
     await Promise.all(promises);
     for (const { slot, moduleName, registration } of asked) {
       if (this.moduleContexts.get(moduleName) === registration) {
+        // A beforeUser injection is deprecated (agent-framework#171): still
+        // collected, and its module is named once on stderr.
+        if (results[slot].some((injection) => injection.position === 'beforeUser') && !this.beforeUserWarned.has(moduleName)) {
+          this.beforeUserWarned.add(moduleName);
+          console.warn(beforeUserDeprecationLine('module', moduleName));
+        }
         this.noteBlocksNotShown(moduleName, results[slot]);
         continue;
       }
