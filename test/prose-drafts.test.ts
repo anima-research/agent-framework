@@ -5297,9 +5297,12 @@ describe('sameRoundSkipReplyTextPolicy', () => {
     }
   });
 
-  it('XML tool mode: the policy changes nothing, so nothing is refused and nothing is held', async () => {
+  it('XML tool mode, where the cancelled stream reports no partial content: nothing is refused, nothing is held, nothing throws, and a line says so', async () => {
     const h = await harness({ ...asking(), xml: true, roundPreamble: true });
     const ended = endings(h);
+    const lines: string[] = [];
+    const error = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
     try {
       await h.turn([
         createMockResponse([text('First words.'), call('l1', 'channel_list', {})], 'tool_use'),
@@ -5308,7 +5311,9 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       assert.equal(ended(), 1, 'never refused');
       assert.deepEqual(h.drafts(), []);
       assert.deepEqual(h.publishes(), []);
+      assert.ok(lines.some((l) => l === "[skip-reply] agent=scout: the turn's stream was cancelled with no partial content, so the text beside its skip_reply isn't held"), lines.filter((l) => l.startsWith('[skip-reply]')).join(' | '));
     } finally {
+      console.error = error;
       await h.close();
     }
   });
