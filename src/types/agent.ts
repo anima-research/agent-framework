@@ -173,7 +173,9 @@ export interface AgentConfig {
    * round of the stream it cancels (after a budget restart, the
    * continuation's); at a natural end, the text of a round whose `skip_reply`
    * was refused for its wake or cut off. A derived agent and the
-   * subconscious don't take it from this agent.
+   * subconscious don't take it from this agent. The agent can change it for
+   * itself with `agent_settings` (`same_round_skip_reply_text_policy`); its
+   * choice persists.
    */
   sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**
@@ -558,6 +560,8 @@ export interface AgentRuntimeSettingsPatch {
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
   /** Whether an explicit send silences plain speech aimed where it posted (AgentConfig.sendSilencing). */
   sendSilencing?: boolean;
+  /** What becomes of ordinary text in a round that calls `skip_reply` (AgentConfig.sameRoundSkipReplyTextPolicy). */
+  sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**
    * Apply a `contextBudgetTokens` DECREASE immediately instead of starting a
    * paced descent: the next compile plans straight at the new budget and the
@@ -592,6 +596,7 @@ export interface AgentRuntimeSettingsSnapshot {
   sameRoundThinkTextPolicy: SameRoundThinkTextPolicy;
   sameRoundThinkTextPolicySource: SameRoundThinkTextPolicySource;
   sendSilencing: boolean;
+  sameRoundSkipReplyTextPolicy: SameRoundSkipReplyTextPolicy;
   transition: 'stable' | 'converging' | 'blocked';
   transitionReason?: 'transition_pace_too_small' | 'protected_context_exceeds_target';
 }

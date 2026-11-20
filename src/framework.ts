@@ -9402,6 +9402,7 @@ export class AgentFramework {
     'transition_pace_tokens',
     'same_round_think_text_policy',
     'send_silencing',
+    'same_round_skip_reply_text_policy',
   ];
 
   /**
@@ -11782,6 +11783,15 @@ export class AgentFramework {
         `Invalid persisted sendSilencing for agent "${agentName}": ${JSON.stringify(overrides.sendSilencing)}`,
       );
     }
+    if (
+      overrides.sameRoundSkipReplyTextPolicy !== undefined &&
+      overrides.sameRoundSkipReplyTextPolicy !== 'private' &&
+      overrides.sameRoundSkipReplyTextPolicy !== 'ask'
+    ) {
+      throw new Error(
+        `Invalid persisted sameRoundSkipReplyTextPolicy for agent "${agentName}": ${JSON.stringify(overrides.sameRoundSkipReplyTextPolicy)}`,
+      );
+    }
     return overrides;
   }
 
@@ -11837,9 +11847,10 @@ export class AgentFramework {
   /**
    * Apply an agent's persisted settings at boot, each on its own, the budget
    * last. A persisted setting never stops the agent booting, except a
-   * think-text policy, which fails closed: an invalid one is refused before
-   * this (validatePersistedAgentRuntimeSettings), and a valid one always
-   * applies. A tail, pace or budget that can't be applied now (a tail or pace
+   * think-text policy, a skip_reply text policy or send silencing, each of
+   * which fails closed: an invalid one is refused before this
+   * (validatePersistedAgentRuntimeSettings), and a valid one always applies.
+   * A tail, pace or budget that can't be applied now (a tail or pace
    * on a strategy without live settings, a budget no longer above maxTokens,
    * a lower one restored paced on a strategy that can't prepare a smaller
    * window) is kept set but unapplied (Agent.keepRuntimeSettings), so a later
@@ -11870,9 +11881,10 @@ export class AgentFramework {
     overrides: AgentRuntimeSettingsOverrides,
   ): void {
     const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
-    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, sendSilencing, ...settings } = overrides;
+    const { contextBudgetReachedTokens: reached, sameRoundThinkTextPolicy, sendSilencing, sameRoundSkipReplyTextPolicy, ...settings } = overrides;
     if (sameRoundThinkTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundThinkTextPolicy });
     if (sendSilencing !== undefined) agent.restoreRuntimeSettings({ sendSilencing });
+    if (sameRoundSkipReplyTextPolicy !== undefined) agent.restoreRuntimeSettings({ sameRoundSkipReplyTextPolicy });
     const unapplied: string[] = [];
     /** Restore one setting, or keep it set but unapplied; true if it applied. */
     const restore = (part: Pick<AgentRuntimeSettingsPatch, 'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens'>) => {
@@ -14977,7 +14989,7 @@ export class AgentFramework {
     name: 'agent_settings',
     description:
       'Read or change your hot runtime settings. This intentionally exposes only ' +
-      'context budget, recent raw tail size, transition pace, same-round think text routing, and send silencing; model, prompts, ' +
+      'context budget, recent raw tail size, transition pace, same-round think text routing, text beside skip_reply, and send silencing; model, prompts, ' +
       'folding strategy, and other restart-bound configuration are not mutable here. ' +
       'Lower context budgets converge gradually under the transition pace before ' +
       'becoming the hard live limit; increases take effect immediately.',
@@ -15010,9 +15022,19 @@ export class AgentFramework {
             'is posted as usual. A change applies to sends from your next response on at the latest, and does not undo a hold ' +
             'that an earlier send in the turn already set.',
         },
+        same_round_skip_reply_text_policy: {
+          type: 'string',
+          enum: ['private', 'ask'],
+          description:
+            'What becomes of plain text that a skip_reply would leave unsent. private (the default unless the recipe sets it): ' +
+            'it stays private and is not held. ask: it is held as a draft. On native tools, where the text is in the same response ' +
+            'as the skip_reply and would otherwise have gone out, the first skip_reply you call directly in a turn also does not run: ' +
+            'its result names the draft and asks where it should go. On native tools, text beside a private think stays private either way. ' +
+            'A change applies from your next response on at the latest.',
+        },
         settings: {
           type: 'array',
-          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy', 'send_silencing'] },
+          items: { type: 'string', enum: ['context_budget_tokens', 'tail_tokens', 'transition_pace_tokens', 'same_round_think_text_policy', 'send_silencing', 'same_round_skip_reply_text_policy'] },
           description: 'For reset: settings to restore to recipe values. Omit to reset all.',
         },
       },
@@ -24825,7 +24847,7 @@ export class AgentFramework {
     if (!agent) return;
     const text =
       `[${NOTICE_TAG.routing}] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: ` +
-      `it's held as a draft you can send with the drafts tool${agent.sameRoundSkipReplyTextPolicy === 'ask' ? '' : ", except in a round that calls skip_reply, where it stays private and isn't held"}. ` +
+      `it's held as a draft you can send with the drafts tool${agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask' ? '' : ", except in a round that calls skip_reply, where it stays private and isn't held"}. ` +
       'An explicit send reaches a channel now.';
     try {
       // The agent's own row, presented as it is stored: written where the
@@ -29447,7 +29469,7 @@ export class AgentFramework {
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
 
-    const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.sameRoundSkipReplyTextPolicy === 'ask'
+    const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
       && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
     const holdSkipRuns = async (
       runs: string[],
@@ -29816,7 +29838,7 @@ export class AgentFramework {
             const roundAdmitted = turnProseRouting === 'explicit'
               ? roundSegments.map((seg) => this.admitProse(seg, streamRouting))
               : [];
-            const skipAsks = agent.sameRoundSkipReplyTextPolicy === 'ask' && !trigger?.suppressProse && !streamRouting.silent
+            const skipAsks = agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask' && !trigger?.suppressProse && !streamRouting.silent
               && turnProseRouting !== 'disabled';
             const askingAt = skipAsks && liveRound && roundSegments.length > 0 && !streamRouting.skipReplyAsked
               ? calls.findIndex((c, i) => c.name === 'skip_reply' && roundCalls[i]!.permitted && !roundCalls[i]!.refused)
@@ -30316,7 +30338,7 @@ export class AgentFramework {
             // cut or not.
             const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.xml
               && cut.calls.some((call) => call.name === 'think');
-            const cutHeld = cutPrivate && !cutThinkPrivate && !cut?.xml && agent.sameRoundSkipReplyTextPolicy === 'ask'
+            const cutHeld = cutPrivate && !cutThinkPrivate && !cut?.xml && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
               && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
             if (cutResults && (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId)) {
@@ -43168,6 +43190,7 @@ export class AgentFramework {
         transition_pace_tokens: JSON.stringify([s.transitionPaceTokens ?? null, saved.transitionPaceTokens ?? null]),
         same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
         send_silencing: JSON.stringify([s.sendSilencing, saved.sendSilencing ?? null]),
+        same_round_skip_reply_text_policy: JSON.stringify([s.sameRoundSkipReplyTextPolicy, saved.sameRoundSkipReplyTextPolicy ?? null]),
       },
       exts: new Map([...touched].map(([ext, keys]) => [ext, { touched: keys, fields: readExtensionSettings(ext, agentName) }])),
     };
@@ -43213,6 +43236,7 @@ export class AgentFramework {
         transition_pace_tokens?: unknown;
         same_round_think_text_policy?: unknown;
         send_silencing?: unknown;
+        same_round_skip_reply_text_policy?: unknown;
         immediate?: unknown;
         settings?: unknown;
       } & Record<string, unknown>;
@@ -43261,6 +43285,11 @@ export class AgentFramework {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
           if (input.send_silencing !== undefined) patch.sendSilencing = settingBoolean('send_silencing', input.send_silencing);
+          if (input.same_round_skip_reply_text_policy !== undefined) {
+            const policy = input.same_round_skip_reply_text_policy;
+            if (policy !== 'private' && policy !== 'ask') throw new Error("same_round_skip_reply_text_policy must be 'private' or 'ask'");
+            patch.sameRoundSkipReplyTextPolicy = policy;
+          }
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
           if (input.immediate !== undefined) patch.immediate = settingBoolean('immediate', input.immediate);
@@ -43314,6 +43343,7 @@ export class AgentFramework {
               ['transition_pace_tokens', 'transitionPaceTokens'],
               ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
               ['send_silencing', 'sendSilencing'],
+              ['same_round_skip_reply_text_policy', 'sameRoundSkipReplyTextPolicy'],
             ]);
             keys = [];
             for (const name of input.settings) {

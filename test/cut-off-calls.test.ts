@@ -304,6 +304,15 @@ describe('native tools: a response that ends at the output limit with calls in i
     assert.deepEqual(run.drafts, [{ text: 'A note for the room.', reason: 'skip-reply' }], 'the cut-off text, whole, as a skip_reply draft');
   });
 
+  it("follows the agent's own 'ask', set with agent_settings in an earlier response, over a config of 'private'", async () => {
+    const run = await turn('native', [
+      { blocks: [{ call: 'agent_settings', json: ['{"action":"update","same_round_skip_reply_text_policy":"ask"}'], whole: true }], stop: 'tool_use' },
+      { blocks: [{ text: 'A note for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' },
+    ], { sameRoundSkipReplyTextPolicy: 'private' });
+    assert.equal(run.skipReplies, 0);
+    assert.deepEqual(run.drafts, [{ text: 'A note for the room.', reason: 'skip-reply' }], 'the cut-off text, whole, as a skip_reply draft');
+  });
+
   it('keeps a cut-off skip_reply\'s round private after an earlier round published its words', async () => {
     const run = await turn('native', [EAST_ROUND, { blocks: [{ text: 'A note to myself, not for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' }]);
     assert.equal(run.skipReplies, 0);
@@ -747,6 +756,29 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     const next = run.requests.find((r) => r.includes('And next?')) ?? '';
     assert.ok(ids.every((id) => next.includes(id)), 'each id in the next request');
     assert.equal(receipts(run).length, 0, receipts(run).join(' | '));
+  });
+
+  it("the hold reads the value in force: an agent whose config is 'private' sets 'ask' with agent_settings, and its turn's text is held", async () => {
+    const run = await turn('xml', [
+      { xml: 'First words.\n\n<function_calls>\n<invoke name="agent_settings">\n<parameter name="action">update</parameter>\n<parameter name="same_round_skip_reply_text_policy">ask</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+      skipRound(SECOND),
+    ]);
+    assert.deepEqual(skipHeld(run), ['First words.', SECOND].sort(), JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+  });
+
+  it("the hold reads the value in force when the turn ends: 'ask' set in the response that calls skip_reply applies to it", async () => {
+    const run = await turn('xml', [
+      { xml: 'Same-response words.\n\n<function_calls>\n<invoke name="agent_settings">\n<parameter name="action">update</parameter>\n<parameter name="same_round_skip_reply_text_policy">ask</parameter>\n</invoke>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+    ]);
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.deepEqual(skipHeld(run), ['Same-response words.'], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+  });
+
+  it("the same-round think policy acts on native tools only: on this path, text beside think is held like any other", async () => {
+    const run = await turn('xml', [
+      { xml: 'Beside a think.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+    ], { ...ASK, sameRoundThinkTextPolicy: 'private' });
+    assert.deepEqual(skipHeld(run), ['Beside a think.'], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
   });
 
   it('a turn that another tool ends is as before: nothing is held', async () => {
