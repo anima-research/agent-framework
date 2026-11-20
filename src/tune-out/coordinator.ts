@@ -1718,7 +1718,27 @@ export class TuneOutCoordinator {
     });
   }
 
+  /** Every tune-out on record, its channel registered now or not: a channel
+   *  its server registers only after the start, or whose server was removed,
+   *  still holds what its tune-out diverted, and the tune-out's end time
+   *  still releases it, which a cancel does without the channel. A read of
+   *  the record that throws gives the connected channels' tune-outs
+   *  (listConnected) in their place, and says so: a failed read refuses no
+   *  start (resumeActiveEpochs) and stops no anchor (activeStarts). */
   private listActive(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
+    let onRecord: ReturnType<ChannelRegistry['tuneOutsOnRecord']>;
+    try {
+      onRecord = this.channelRegistry.tuneOutsOnRecord();
+    } catch (err) {
+      console.error(`[tune-out] the tune-outs on record could not be read, so the connected channels' are taken in their place: ${thrownReason(err)}`);
+      return this.listConnected();
+    }
+    return onRecord.map(({ serverId, channelId, params }) => ({ serverId, channelId, params }));
+  }
+
+  /** The tune-outs of the channels registered now, which an agent can name
+   *  (channelsNamed). */
+  private listConnected(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
     const active: Array<{ serverId: string; channelId: string; params: TuneOutParams }> = [];
     for (const entry of this.channelRegistry.listChannelsRaw()) {
       const state = this.channelRegistry.getTuneOutState(entry.serverId, entry.descriptor.id);
@@ -2708,14 +2728,14 @@ export class TuneOutCoordinator {
    * The holds on record, a channel's and the all-except hold (its excepted
    * channel, with `scope`): the registry's record of each channel's, whether
    * or not the channel is registered yet, as at boot it isn't
-   * (tuneOutsOnRecord; the registered ones, listActive, where the registry
+   * (tuneOutsOnRecord; the registered ones, listConnected, where the registry
    * has no such list). May throw.
    */
   private holdsOnRecord(): HoldOnRecord[] {
     const registry = this.channelRegistry as Partial<Pick<ChannelRegistry, 'tuneOutsOnRecord'>>;
     const channels = typeof registry.tuneOutsOnRecord === 'function'
       ? registry.tuneOutsOnRecord.call(this.channelRegistry)
-      : this.listActive();
+      : this.listConnected();
     const held = this.getAllExcept();
     return [
       ...channels.filter(({ params }) => typeof params.epochId === 'string')
@@ -4345,7 +4365,7 @@ export class TuneOutCoordinator {
     }
     let failed = false;
     // What the registry has on record, registered or not: at a start the
-    // channels aren't registered yet, so listActive() would find none.
+    // channels aren't registered yet, so listConnected() would find none.
     let onRecord: ReturnType<ChannelRegistry['tuneOutsOnRecord']> = [];
     try {
       onRecord = this.channelRegistry.tuneOutsOnRecord();
@@ -4771,7 +4791,7 @@ export class TuneOutCoordinator {
       return (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId && !delivered(m);
     };
     const countOf = (epochId: string) => stored.filter(heldOf(epochId)).length;
-    const channels = this.listActive().map(({ serverId, channelId, params }) => ({
+    const channels = this.listConnected().map(({ serverId, channelId, params }) => ({
       serverId, channelId, epochId: params.epochId, held: countOf(params.epochId),
       ...(params.expiresAtMs !== undefined ? { expiresAtMs: params.expiresAtMs } : {}),
     }));
@@ -5597,13 +5617,13 @@ export class TuneOutCoordinator {
    * how a tune-out ends without one. `backlogTo`
    * names the resident as the message's reader knows it: "you" to the
    * resident, "the resident" to the subconscious. It speaks of connected
-   * channels because listActive reads the registered ones: removing a server
-   * drops its channels and keeps their tune-outs, so a tune-out there is in
-   * neither this list nor the name's lookup (channelsNamed, which reads the
-   * registered channels too), and the text claims nothing about it.
+   * channels because listConnected reads the registered ones: removing a
+   * server drops its channels and keeps their tune-outs, so a tune-out there
+   * is in neither this list nor the name's lookup (channelsNamed, which reads
+   * the registered channels too), and the text claims nothing about it.
    */
   private notTunedOut(quoted: string, backlogTo: 'you' | 'the resident'): string {
-    const active = this.listActive().map((e) => this.quotedShown(e.serverId, e.channelId));
+    const active = this.listConnected().map((e) => this.quotedShown(e.serverId, e.channelId));
     const opening = active.length === 0
       ? 'no connected channel is tuned out now.'
       : `no connected channel ${quoted} is tuned out. Connected channels tuned out now: `
