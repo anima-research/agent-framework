@@ -12,6 +12,80 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.35.1 — 2026-11-20
+
+### Added
+
+- **`agent_settings` shows and switches the agent's own
+  `sameRoundSkipReplyTextPolicy`** as `same_round_skip_reply_text_policy`
+  (`'private'` or `'ask'`), in the form `send_silencing` has. `get` shows
+  the value in force: the agent's own choice, else its config's, else
+  `'private'`. `update` sets the agent's choice, and `reset` takes it off
+  when it names the field in `settings` or names nothing. The choice
+  overrides the config, persists with the agent's other runtime settings,
+  and applies from the agent's next response on at the latest. On native
+  tools, a `skip_reply` in the response that changes it is under the old
+  value. On the XML tool path, the hold at the turn's end reads the value
+  in force then, so a change in the same response applies to it. A
+  change made while a response is being written, by the host or by a script
+  still running from an earlier turn, can apply to that response. The
+  guard, a cut-off round, the XML tool path's hold at the turn's end and
+  the heartbeat notice read the value in force.
+  A heartbeat notice is written as its turn starts, so a change inside a
+  heartbeat turn shows in the next one's notice.
+  `AgentRuntimeSettingsPatch` and `AgentRuntimeSettingsSnapshot` carry
+  `sameRoundSkipReplyTextPolicy` (a required field of the snapshot type, so
+  a typed fixture or mock of one needs it). A stored value other than
+  `'private'` or `'ask'` is refused at a start, as a stored think-text
+  policy is.
+  - A derived agent and the subconscious still start at `'private'`,
+    whatever the agent's own choice, as they don't take its config's value.
+    A host's `deriveAgent` call can still set the policy in the child's own
+    config.
+  - Tool text: `agent_settings`' description and schema name the setting.
+    At the upgrade the tool block changes once for every agent that has
+    `agent_settings`, and a changed block misses the provider's prompt cache
+    once.
+  - After a rollback to 0.35.0 or 0.34.0, a stored choice is ignored and
+    the config's value applies. A persisted update, reset or cancel there of
+    the agent's budget, tail, pace, think-text policy or `send_silencing`
+    writes the record without the choice.
+
+### Changed
+
+- **`sameRoundSkipReplyTextPolicy: 'ask'` now holds text on the XML tool
+  path,** where it did nothing. That path gives no round content (membrane's
+  `roundContent`), so the policy refuses no `skip_reply` there (one that
+  asks for a wake it may not have is still refused for that). What a `skip_reply`
+  leaves unsent is held as `'skip-reply'` drafts at the turn's end, from
+  membrane's own parse of the turn, which keeps thinking apart: a cancelled
+  stream's `partialContent`, or a finished response's content.
+  - A `skip_reply` that runs ends the turn and cancels its stream. The
+    text of every round of that stream is held when the turn ends, after
+    the agent's earlier deliveries have run. Text that the agent marks
+    private in hybrid mode stays private, and nothing is held while the
+    agent's prose routing is `'disabled'`. A turn that another tool
+    ends, such as the sleep tool or a module's tool, is as before.
+  - At a natural end, the text of a round whose `skip_reply` was refused
+    for its wake, or of a response cut off with a `skip_reply` among its
+    unrun calls, is held in its place, and the turn's other text is
+    delivered as before. In hybrid and explicit mode the held text's
+    envelopes set the router's state in order. The same-round think
+    policy acts on native tools only, as before: on the XML tool path,
+    text beside `think` is held like any other.
+  - The resident isn't asked on this path. In locus and hybrid mode the
+    turn's receipt names the drafts. Explicit mode writes no receipt, and
+    the draft notice at the agent's next turn names them. The heartbeat
+    notice, which under `'ask'` says nothing of text
+    beside `skip_reply` staying private, is now true on this path.
+  - Where a cancelled stream reports no partial content, nothing is held,
+    and a `[skip-reply]` line says so.
+  - After a budget restart on this path, the first stream's text isn't
+    held; the `[speech-not-posted]` notice names it, as before.
+  - Who notices: an agent on the XML tool path whose config sets `'ask'`,
+    which now gets drafts where it got nothing. No connectome-host release
+    passes the key yet.
+
 ## 0.35.0 — 2026-11-19
 
 ### Breaking
