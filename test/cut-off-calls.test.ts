@@ -285,6 +285,15 @@ describe('native tools: a response that ends at the output limit with calls in i
     assert.deepEqual(run.drafts, [{ text: 'A note for the room.', reason: 'skip-reply' }], 'the cut-off text, whole, as a skip_reply draft');
   });
 
+  it("follows the agent's own 'ask', set with agent_settings in an earlier response, over a config of 'private'", async () => {
+    const run = await turn('native', [
+      { blocks: [{ call: 'agent_settings', json: ['{"action":"update","same_round_skip_reply_text_policy":"ask"}'], whole: true }], stop: 'tool_use' },
+      { blocks: [{ text: 'A note for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' },
+    ], { sameRoundSkipReplyTextPolicy: 'private' });
+    assert.equal(run.skipReplies, 0);
+    assert.deepEqual(run.drafts, [{ text: 'A note for the room.', reason: 'skip-reply' }], 'the cut-off text, whole, as a skip_reply draft');
+  });
+
   it('keeps a cut-off skip_reply\'s round private after an earlier round published its words', async () => {
     const run = await turn('native', [EAST_ROUND, { blocks: [{ text: 'A note to myself, not for the room.' }, { call: 'skip_reply', json: ['{"wake_in_sec'], whole: false }], stop: 'max_tokens' }]);
     assert.equal(run.skipReplies, 0);
