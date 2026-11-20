@@ -165,12 +165,13 @@ export interface AgentConfig {
    * the first such `skip_reply` of a turn, called by the model in a round
    * with verbatim content, is refused once with a result that names the
    * round's drafts and asks where they should go. Where the text would only
-   * have been held, the `skip_reply` runs. It acts only on rounds with verbatim
-   * content (membrane's `roundContent`). On the XML tool path nothing is
-   * refused and nothing is held, and the heartbeat notice still drops its
-   * clause, so a resident there is told its words are held when a
-   * `skip_reply` round's aren't. A derived agent and the subconscious don't
-   * take it from this agent.
+   * have been held, the `skip_reply` runs. The refusal acts only on rounds
+   * with verbatim content (membrane's `roundContent`). On the XML tool path,
+   * which gives none, nothing is refused, and what a `skip_reply` leaves
+   * unsent is held at the turn's end, from membrane's parse of the turn: the
+   * whole turn's text where a `skip_reply` ends the turn, and at a natural end
+   * the text of a round whose `skip_reply` was refused for its wake or cut
+   * off. A derived agent and the subconscious don't take it from this agent.
    */
   sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**

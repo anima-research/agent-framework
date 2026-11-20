@@ -83,3 +83,27 @@ export function withoutRoundsProse(
     return !(block.type === 'text' && rounds.has(round));
   });
 }
+
+export function proseRunGroups(
+  content: readonly ContentBlock[],
+  rounds: ReadonlySet<number>,
+): Array<{ held: boolean; runs: string[] }> {
+  const groups: Array<{ held: boolean; blocks: ContentBlock[] }> = [];
+  let round = 0;
+  let afterResults = false;
+  for (const block of content) {
+    if (block.type === 'tool_result') {
+      afterResults = true;
+    } else if (afterResults) {
+      round++;
+      afterResults = false;
+    }
+    const held = rounds.has(round);
+    const last = groups.at(-1);
+    if (last && last.held === held) last.blocks.push(block);
+    else groups.push({ held, blocks: [block] });
+  }
+  return groups
+    .map((group) => ({ held: group.held, runs: splitProseRuns(group.blocks) }))
+    .filter((group) => group.runs.length > 0);
+}
