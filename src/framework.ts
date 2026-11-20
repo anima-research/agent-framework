@@ -226,7 +226,7 @@ import { CHILD_ENTRY, ChildCapacity, maxResultBytes, type ToolAnswer } from './c
 import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
-import { splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { proseRunGroups, splitProseRuns, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
@@ -29349,6 +29349,10 @@ export class AgentFramework {
     // later rounds remain deliverable: the turn-end delivery drops that round's
     // text by its place, the round's index among this stream's tool rounds.
     const refusedWakeRounds = new Set<number>();
+    // The rounds of refusedWakeRounds that a skip_reply keeps private, as
+    // opposed to a private think: under 'ask' their text is held where
+    // nothing routed it live (skipHoldsAtEnd).
+    const skipPrivateRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -29443,6 +29447,29 @@ export class AgentFramework {
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
 
+    const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.sameRoundSkipReplyTextPolicy === 'ask'
+      && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
+    const holdSkipRuns = async (
+      runs: string[],
+      admitted: AdmittedEnvelope[][],
+      hold: ProseRound,
+      locus: ChannelRef | null,
+      when: number | 'end' | 'turn',
+    ): Promise<boolean> => {
+      const skipped: ProseRound = { ...hold, skipHold: [] };
+      if (turnProseRouting === 'hybrid') return this.routeSilencedHybrid(agent, runs, 'skip', false, skipped, locus, when);
+      if (turnProseRouting === 'explicit') {
+        for (const envelopes of admitted) {
+          try {
+            await this.deliverAdmittedProse(agent, envelopes, { ...skipped, keepPrivate: true });
+          } catch (err) {
+            console.error('trailing prose delivery failed:', err);
+          }
+        }
+        return false;
+      }
+      return this.holdSilencedProse(agent, runs, 'private', false, skipped, { target: locus, when });
+    };
     // How a stream the framework cancelled ends, by the mark it recorded,
     // however the stream reports its end: an `aborted` or an `error` event,
     // a close with no terminal event, or a throw. It runs only for a stream
@@ -29459,6 +29486,7 @@ export class AgentFramework {
       cancelKey: string,
       cancelKind: FrameworkCancelKind,
       closes: TurnRouting | undefined,
+      partial?: readonly ContentBlock[],
     ): Promise<void> => {
       this.frameworkCancelledStreams.delete(cancelKey);
       lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
@@ -29496,6 +29524,22 @@ export class AgentFramework {
       // so settle the delivery chain and drop the receipt. A
       // budget restart keeps the same turn's routing and tallies;
       // the continuation stream's end writes one receipt for it.
+      if (cancelKind === 'turn_ended' && streamRouting.privateEnd && skipHoldsAtEnd()) {
+        if (!partial) {
+          console.error(`[skip-reply] agent=${agent.name}: the turn's stream was cancelled with no partial content, so the text beside its skip_reply isn't held`);
+        } else {
+          // As at a natural end: earlier deliveries, an earlier turn's
+          // included, settle the router's state before this text meets it.
+          await turnSpeechChain;
+          const runs = splitProseRuns(partial);
+          const admitted = turnProseRouting === 'explicit' ? runs.map((run) => this.admitProse(run.trim(), streamRouting)) : [];
+          try {
+            await holdSkipRuns(runs, admitted, { routing: streamRouting, notice: 'later' }, resolveTurnLocus(), 'turn');
+          } catch (err) {
+            console.error(`[skip-reply] agent=${agent.name}: holding the text beside the turn's skip_reply failed:`, err);
+          }
+        }
+      }
       if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
         await turnSpeechChain;
         this.appendProseDeliveryReceipt(agent, streamRouting);
@@ -29822,6 +29866,7 @@ export class AgentFramework {
               if (calls.some((c) => c.refused)) {
                 silenceBeforeRefusal = mergeSilence(silence, roundSilenceOf(calls.filter((c) => !c.refused), toolRound));
                 refusedWakeRounds.add(toolRound);
+                skipPrivateRounds.add(toolRound);
               }
               silence = mergeSilence(silence, roundSilenceOf(calls, toolRound));
               if (askingCall) askedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && c !== askingCall), toolRound));
@@ -30286,7 +30331,11 @@ export class AgentFramework {
               }
               hadToolCalls = true;
               const cutRound = toolRounds++;
-              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
+              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) {
+                refusedWakeRounds.add(cutRound);
+                // Text beside a private think stays private: it isn't held.
+                if (!cutThinkPrivate) skipPrivateRounds.add(cutRound);
+              }
               if (liveProseRouting) silence = mergeSilence(silence, roundSilenceOf(cutCalls, cutRound));
               console.error(
                 `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside ${cut.calls.length} call(s) ` +
@@ -30415,18 +30464,19 @@ export class AgentFramework {
                 ? splitProseRuns(response.content)
                 : speechRun.trim() ? [speechRun] : [];
             const finalSpeechSegments = finalSpeechRuns.map((run) => run.trim());
-            const finalRuns = hadToolCalls && allText.length > 0
-              ? splitProseRuns(liveProseRouting
-                ? terminalContent
-                : withoutRoundsProse(response.content, refusedWakeRounds))
-              : [];
-            const finalSegments = finalRuns.map((run) => run.trim());
+            const finalGroups = !hadToolCalls || allText.length === 0
+              ? []
+              : liveProseRouting
+                ? [{ held: false, runs: splitProseRuns(terminalContent) }]
+                : skipHoldsAtEnd()
+                  ? proseRunGroups(response.content, skipPrivateRounds, refusedWakeRounds)
+                  : [{ held: false, runs: splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)) }];
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.
             const finalRouting = streamRouting;
             const admittedSpeechSegments = admitFinal ? finalSpeechSegments.map((seg) => this.admitProse(seg, finalRouting)) : [];
-            const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg, finalRouting)) : [];
+            const admittedGroups = finalGroups.map((group) => (admitFinal ? group.runs.map((run) => this.admitProse(run.trim(), finalRouting)) : []));
 
             const du = response.details?.usage;
             // A refusal's note carries what completeTurn counts.
@@ -30677,8 +30727,9 @@ export class AgentFramework {
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
               // XML tool path (no roundContent, so nothing was live-routed)
-              // the historical behavior applies:
-              // route the whole turn's parsed segments, once, now. The global
+              // the whole turn's parsed segments are routed, once, now, in
+              // groups by round: under 'ask', a round a skip_reply kept
+              // private is held in its place (finalGroups). The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
@@ -30703,94 +30754,104 @@ export class AgentFramework {
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
               const trailingWhen = liveProseRouting ? 'end' : 'turn';
               const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
-              const trailingSkip = cutHeld ? { skipHold: [] as SkipHeld[] } : {};
-
-              const runs = finalRuns;
-              const segments = finalSegments;
-
               const thinkPrivate = cutThinkPrivate && liveProseRouting;
-              const thinkHeld = (): void => {
-                if (segments.length > 0) {
+              const deliverRuns = async (runs: string[], admitted: AdmittedEnvelope[][]): Promise<boolean> => {
+                const segments = runs.map((run) => run.trim());
+                let held = false;
+                const thinkHeld = (): void => {
+                  if (segments.length > 0) {
+                    console.error(
+                      `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
+                    );
+                  }
+                };
+                if (turnProseRouting === 'disabled') {
+                  if (segments.length > 0) {
+                    console.error(
+                      `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
+                    );
+                    this.recordProseSuppression(streamRouting, segments.length);
+                  }
+                } else if (turnProseRouting === 'hybrid') {
+                  if (cutHeld && segments.length > 0) {
+                    held = await holdSkipRuns(runs, admitted, trailingHold, resolveTurnLocus(), trailingWhen);
+                  } else if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
+                    this.holdSilencedProse(agent, runs, trailingSilence === 'private' ? 'private' : 'kept', thinkPrivate, trailingHold, { target: null, when: trailingWhen });
+                  } else if (trailingSilence && trailingSilence !== 'private' && segments.length > 0) {
+                    held = await this.routeSilencedHybrid(agent, runs, trailingSilence, false, trailingHold, resolveTurnLocus(), trailingWhen);
+                  } else if (thinkPrivate) {
+                    thinkHeld();
+                  } else if (segments.length > 0) {
+                    const locus = resolveTurnLocus();
+                    for (const seg of segments) {
+                      try {
+                        await this.deliverHybridProse(agent, seg, locus, true, trailingHold);
+                      } catch (err) {
+                        console.error('trailing hybrid prose delivery failed:', err);
+                      }
+                    }
+                  }
+                } else if (turnProseRouting === 'explicit') {
+                  if (thinkPrivate) {
+                    thinkHeld();
+                  } else if (segments.length > 0) {
+                    console.error(
+                      `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
+                    );
+                    if (cutHeld) {
+                      await holdSkipRuns(runs, admitted, trailingHold, resolveTurnLocus(), trailingWhen);
+                    } else {
+                      for (const envelopes of admitted) {
+                        try {
+                          await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, keepPrivate: liveProseRouting && cutPrivate });
+                        } catch (err) {
+                          console.error('trailing prose delivery failed:', err);
+                        }
+                      }
+                    }
+                  }
+                } else if (trailingSilence === 'private' || segments.length === 0
+                  || (trailingSilence && thinkPrivate)
+                  || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus()))) {
+                  const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus()) : undefined;
                   console.error(
-                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> trailing prose NOT routed (same_round_think_text_policy=private)`,
+                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
+                    `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold || (trailingSilence && thinkPrivate) ? 'turn silenced: send' : 'no trailing prose'})`,
                   );
-                }
-              };
-              if (turnProseRouting === 'disabled') {
-                if (segments.length > 0) {
-                  console.error(
-                    `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
-                  );
-                  this.recordProseSuppression(streamRouting, segments.length);
-                }
-              } else if (turnProseRouting === 'hybrid') {
-                if (trailingSilence === 'private' && !thinkPrivate && trailingSkip.skipHold && segments.length > 0) {
-                  closingHeld = await this.routeSilencedHybrid(agent, runs, 'skip', false, { ...trailingHold, ...trailingSkip }, resolveTurnLocus(), trailingWhen);
-                } else if ((trailingSilence === 'private' || (trailingSilence && thinkPrivate)) && segments.length > 0) {
-                  this.holdSilencedProse(agent, runs, trailingSilence === 'private' ? 'private' : 'kept', thinkPrivate, trailingHold, { target: null, when: trailingWhen });
-                } else if (trailingSilence && trailingSilence !== 'private' && segments.length > 0) {
-                  closingHeld = await this.routeSilencedHybrid(agent, runs, trailingSilence, false, trailingHold, resolveTurnLocus(), trailingWhen);
+                  if (segments.length > 0) {
+                    const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
+                    held = cutHeld
+                      ? await holdSkipRuns(runs, admitted, trailingHold, resolveTurnLocus(), trailingWhen)
+                      : this.holdSilencedProse(agent, runs, cause, thinkPrivate, trailingHold, { target: resolveTurnLocus(), when: trailingWhen });
+                  }
                 } else if (thinkPrivate) {
                   thinkHeld();
-                } else if (segments.length > 0) {
+                } else {
+                  // The turn's own locus, read from this stream's routing
+                  // state. This dispatch runs AFTER the agent is idle (see PR
+                  // #32 note below), so a next turn may already have started
+                  // with routing of its own, and a turn that narrated live into
+                  // one channel must not land its postscript in another.
                   const locus = resolveTurnLocus();
+                  console.error(
+                    `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,
+                  );
+                  // Deliver sequentially (await each) so the segments land in order.
                   for (const seg of segments) {
                     try {
-                      await this.deliverHybridProse(agent, seg, locus, true, trailingHold);
+                      const outcome = await this.routeLocusSpeech(agent, trailingHold, seg, locus);
+                      this.recordProseDelivery(streamRouting, outcome);
+                      if (outcome?.delivered) endPublished(outcome, seg, outcome.messageId);
                     } catch (err) {
-                      console.error('trailing hybrid prose delivery failed:', err);
+                      console.error('speech routing failed:', err);
                     }
                   }
                 }
-              } else if (turnProseRouting === 'explicit') {
-                if (thinkPrivate) {
-                  thinkHeld();
-                } else if (segments.length > 0) {
-                  console.error(
-                    `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
-                  );
-                  for (const envelopes of admittedSegments) {
-                    try {
-                      await this.deliverAdmittedProse(agent, envelopes, { ...trailingHold, ...trailingSkip, keepPrivate: (liveProseRouting && cutPrivate) || cutHeld });
-                    } catch (err) {
-                      console.error('trailing prose delivery failed:', err);
-                    }
-                  }
-                }
-              } else if (trailingSilence === 'private' || segments.length === 0
-                || (trailingSilence && thinkPrivate)
-                || (trailingSilence && sendHoldAt(trailingSilence, resolveTurnLocus()))) {
-                const sendHold = trailingSilence && trailingSilence !== 'private' ? sendHoldAt(trailingSilence, resolveTurnLocus()) : undefined;
-                console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
-                  `(${trailingSilence === 'private' ? 'turn silenced: private' : sendHold || (trailingSilence && thinkPrivate) ? 'turn silenced: send' : 'no trailing prose'})`,
-                );
-                if (segments.length > 0) {
-                  const cause = trailingSilence === 'private' ? 'private' : thinkPrivate ? 'kept' : sendHold ?? 'private';
-                  closingHeld = this.holdSilencedProse(agent, runs, cause, thinkPrivate, { ...trailingHold, ...trailingSkip }, { target: resolveTurnLocus(), when: trailingWhen });
-                }
-              } else if (thinkPrivate) {
-                thinkHeld();
-              } else {
-                // The turn's own locus, read from this stream's routing
-                // state. This dispatch runs AFTER the agent is idle (see PR
-                // #32 note below), so a next turn may already have started
-                // with routing of its own, and a turn that narrated live into
-                // one channel must not land its postscript in another.
-                const locus = resolveTurnLocus();
-                console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ? qualifiedChannelName(locus) : '(none)'}`,
-                );
-                // Deliver sequentially (await each) so the segments land in order.
-                for (const seg of segments) {
-                  try {
-                    const outcome = await this.routeLocusSpeech(agent, trailingHold, seg, locus);
-                    this.recordProseDelivery(streamRouting, outcome);
-                    if (outcome?.delivered) endPublished(outcome, seg, outcome.messageId);
-                  } catch (err) {
-                    console.error('speech routing failed:', err);
-                  }
-                }
+                return held;
+              };
+              for (const [index, group] of finalGroups.entries()) {
+                if (group.held) await holdSkipRuns(group.runs, admittedGroups[index]!, trailingHold, resolveTurnLocus(), trailingWhen);
+                else closingHeld = (await deliverRuns(group.runs, admittedGroups[index]!)) || closingHeld;
               }
             }
             // NOTE: agent.reset() + onInferenceEnded() already ran above,
@@ -31038,7 +31099,7 @@ export class AgentFramework {
               const cancelKey = `${agent.name}:${myStreamId}`;
               const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
               if (cancelKind !== undefined) {
-                await endFrameworkCancel(cancelKey, cancelKind, streamRouting);
+                await endFrameworkCancel(cancelKey, cancelKind, streamRouting, event.partialContent);
                 return;
               }
             }

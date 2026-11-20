@@ -73,15 +73,22 @@ interface Run {
   moves: unknown[];
   skipReplies: number;
   routed: string[];
+  /** Each posted text with the channel it went to. */
+  routedTo: Array<[string, string]>;
   rows: Array<{ participant: string; content: Array<Record<string, any>> }>;
   requests: string[];
   boundaryLines: string[];
   failedTraces: Array<{ callId?: string; tool?: string; error?: string }>;
   audit: Array<Record<string, any>>;
   drafts: Array<{ text: string; reason: string }>;
+  /** The open drafts with their ids and notes. */
+  held: Array<{ id: string; text: string; reason: string; note?: string }>;
 }
 
-async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}): Promise<Run> {
+/** What a turn's harness adds beside the agent's settings: framework config, modules, a first wake that is a heartbeat, labels the stand-in registry resolves, and the channel tools it offers (a script sees only those). */
+type TurnOptions = { framework?: Record<string, unknown>; modules?: Module[]; heartbeat?: boolean; resolves?: Record<string, string>; channelTools?: ToolDefinition[] };
+
+async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: TurnOptions = {}): Promise<Run> {
   const requests: string[] = [];
   const queue = [...replies];
   const server: Server = createServer((req, res) => {
@@ -108,14 +115,17 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
     storePath: join(dir, 'store.chronicle'),
     membrane,
     agents: [{ name: 'resident', model: mode === 'xml' ? 'claude-opus-4-1' : 'claude-opus-5-5', systemPrompt: 'You are a resident.', sendSilencing: true, proseRouting: 'locus', ...settings } as never],
-    modules: [robot],
+    modules: [robot, ...(opts.modules ?? [])],
     syncIntervalMs: 0,
     maintenanceIntervalMs: 0,
+    ...opts.framework,
   });
   const routed: string[] = [];
+  const routedTo: Array<[string, string]> = [];
   let skipReplies = 0;
   const deliver = async (_agent: string, text: string, locus?: { channelId: string } | null) => {
     routed.push(text);
+    routedTo.push([locus?.channelId ?? 'world:commons', text]);
     return { status: 'delivered' as const, destination: { serverId: 'stub', channelId: locus?.channelId ?? 'world:commons' }, at: Date.now() };
   };
   const registry: Record<string, unknown> = {
@@ -124,13 +134,15 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       await deliver(agent, text, locus);
       return { delivered: true, serverId: 'stub', channelId: locus?.channelId ?? 'world:commons' };
     },
-    resolveProseTarget: (spec: string) => ({ error: `no channel matches "${spec}"` }),
+    resolveProseTarget: (spec: string) => (opts.resolves?.[spec]
+      ? { serverId: 'stub', channelId: opts.resolves[spec] }
+      : { error: `no channel matches "${spec}"` }),
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }),
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
-    getChannelTools: () => [],
+    getChannelTools: () => opts.channelTools ?? [],
     channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
     nameShown: (channel: { channelId: string }) => channel.channelId,
     handleChannelToolCall: async () => {
@@ -150,7 +162,11 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
   console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
   try {
     framework.start();
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    if (opts.heartbeat) {
+      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'resident', timestamp: Date.now(), reason: 'heartbeat', source: 'heartbeat' });
+    } else {
+      framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    }
     await framework.runUntilIdle();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'And next?', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
@@ -160,6 +176,7 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       moves: robot.moves,
       skipReplies,
       routed: [...routed],
+      routedTo: [...routedTo],
       rows: cm.getAllMessages(),
       requests,
       boundaryLines: lines.filter((line) => line.startsWith('[tool-boundary]')),
@@ -167,6 +184,8 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       audit: settings.toolResultGuard ? framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, any>> : [],
       drafts: (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> } })
         .proseDrafts.open('resident').map((d) => ({ text: d.text, reason: d.reason })),
+      held: (framework as unknown as { proseDrafts: { open(agent: string): Array<{ id: string; text: string; reason: string; note?: string }> } })
+        .proseDrafts.open('resident').map((d) => ({ id: d.id, text: d.text, reason: d.reason, ...(d.note ? { note: d.note } : {}) })),
     };
   } finally {
     console.error = error;
@@ -588,5 +607,168 @@ describe('an ephemeral run whose response ends at the output limit with calls in
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_reply leaves unsent is held at the turn's end", () => {
+  const ASK = { sameRoundSkipReplyTextPolicy: 'ask' };
+  const skipRound = (text: string, input = '<parameter name="reason">done</parameter>\n'): Reply =>
+    ({ xml: `${text}\n\n<function_calls>\n<invoke name="skip_reply">\n${input}</invoke>\n`, stop: 'stop_sequence' });
+  const refusedWake = (text: string): Reply => skipRound(text, '<parameter name="wake_in_seconds">60</parameter>\n');
+  const SECOND = 'Second words for the room.';
+  /** The texts of the run's open 'skip-reply' drafts, trimmed (the parse decides a run's whitespace), sorted (the store lists the newest first). */
+  const skipHeld = (run: Run): string[] => run.held.filter((d) => d.reason === 'skip-reply').map((d) => d.text.trim()).sort();
+  const receipts = (run: Run) => run.rows.flatMap((row) => row.content.filter((block) => block.type === 'text').map((block) => block.text as string))
+    .filter((t) => t.startsWith('[delivered]'));
+
+  it('a turn of two rounds ended by a skip_reply: both rounds\' text are skip-reply drafts, nothing of the turn is posted, and the receipt names them', async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, skipRound(SECOND)], ASK);
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.deepEqual(skipHeld(run), ['First I step east.', SECOND].sort());
+    assert.deepEqual(run.routed, [NEXT], 'only the next turn\'s answer is posted');
+    const receipt = receipts(run)[0] ?? '';
+    assert.ok(run.held.every((d) => receipt.includes(d.id)), receipt);
+  });
+
+  it("under 'private' the same turn posts nothing and holds nothing, as before", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, skipRound(SECOND)]);
+    assert.deepEqual(run.held, []);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it('hybrid mode: a >>>target round\'s text is held with that destination, and nothing is published', async () => {
+    const run = await turn('xml', [
+      { xml: '>>>#ops To the ops room.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+      skipRound(SECOND),
+    ], { ...ASK, proseRouting: 'hybrid' }, { resolves: { '#ops': 'ops' } });
+    const ops = run.held.find((d) => d.text === 'To the ops room.');
+    assert.deepEqual(ops && [ops.reason, ops.note], ['skip-reply', 'written for >>>#ops'], JSON.stringify(run.held));
+    assert.ok(skipHeld(run).includes(SECOND), JSON.stringify(run.held));
+    assert.ok(!run.routed.some((t) => t.includes('ops room') || t === SECOND), JSON.stringify(run.routed));
+  });
+
+  it('explicit mode: what would have been posted or bounced is held', async () => {
+    const run = await turn('xml', [
+      { xml: '>>#ops To the ops room.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+      skipRound(SECOND),
+    ], { ...ASK, proseRouting: 'explicit' }, { resolves: { '#ops': 'ops' } });
+    assert.deepEqual(skipHeld(run), ['To the ops room.', SECOND].sort());
+    assert.ok(!run.routed.some((t) => t.includes('ops room') || t === SECOND), JSON.stringify(run.routed));
+  });
+
+  it("explicit mode: a held round's ` !` asks for no continuation, as a skip_reply round's doesn't", async () => {
+    const run = await turn('xml', [skipRound('>>#ops ! To the ops room.')], { ...ASK, proseRouting: 'explicit' }, { resolves: { '#ops': 'ops' } });
+    assert.deepEqual(skipHeld(run), ['To the ops room.']);
+    assert.equal(run.requests.findIndex((r) => r.includes('And next?')), 1, 'no continuation request before the next message');
+  });
+
+  it("native tools: a turn that a skip_reply ends holds nothing at the turn's end, so text already posted isn't held again", async () => {
+    const run = await turn('native', [
+      { blocks: [{ text: 'Posted words.' }, { call: 'robot--move', json: ['{"dir":"east"}'], whole: true }], stop: 'tool_use' },
+      { blocks: [{ call: 'skip_reply', json: ['{"reason":"done"}'], whole: true }], stop: 'tool_use' },
+    ], ASK);
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.equal(run.routed[0], 'Posted words.');
+    assert.deepEqual(skipHeld(run), []);
+  });
+
+  it("a round whose text holds thinking: the draft holds the speech and none of the thinking", async () => {
+    const run = await turn('xml', [skipRound('<thinking>Should I answer at all?</thinking>\nVisible words.')], ASK);
+    assert.deepEqual(skipHeld(run), ['Visible words.']);
+  });
+
+  it("a heartbeat turn ended by a skip_reply: its text is held, and that turn's notice had no clause", async () => {
+    const run = await turn('xml', [skipRound('Heartbeat words.')], ASK, { heartbeat: true });
+    assert.deepEqual(skipHeld(run), ['Heartbeat words.']);
+    const notice = run.rows.flatMap((row) => row.content.filter((block) => block.type === 'text').map((block) => block.text as string))
+      .find((t) => t.startsWith('[routing] This turn came from your heartbeat'));
+    assert.equal(notice, "[routing] This turn came from your heartbeat, not from a channel, so plain speech here isn't posted: it's held as a draft you can send with the drafts tool. An explicit send reaches a channel now.");
+  });
+
+  it('a skip_reply refused for its wake, then a reply, then a natural end: the reply is posted, and the refused round\'s text is held', async () => {
+    const run = await turn('xml', [refusedWake('Not yet.'), { xml: 'Here is my reply.', stop: 'end_turn' }], ASK);
+    assert.equal(run.skipReplies, 0, 'premise: the skip_reply was refused for its wake');
+    assert.deepEqual(run.routed, ['Here is my reply.', NEXT]);
+    assert.deepEqual(skipHeld(run), ['Not yet.']);
+  });
+
+  it("hybrid mode: a round refused for its wake is held in its place, and its >>>target still sets where the next round's plain text goes", async () => {
+    const run = await turn('xml', [refusedWake('>>>#ops Not yet.'), { xml: 'Here is my reply.', stop: 'end_turn' }], { ...ASK, proseRouting: 'hybrid' }, { resolves: { '#ops': 'ops' } });
+    assert.deepEqual(skipHeld(run), ['Not yet.']);
+    assert.deepEqual(run.routedTo[0], ['ops', 'Here is my reply.']);
+  });
+
+  it('a skip_reply refused for its wake, then a skip_reply that runs: both rounds\' text are held', async () => {
+    const run = await turn('xml', [refusedWake('Not yet.'), skipRound('Never mind.')], ASK);
+    assert.equal(run.skipReplies, 1, 'premise: the second skip_reply ran');
+    assert.deepEqual(skipHeld(run), ['Never mind.', 'Not yet.']);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("a response cut off with a skip_reply among its unrun calls: the cut round's text is held, and the earlier round's is posted", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'A note for the room.\n\n<function_calls>\n<invoke name="skip_reply">\n<parameter name="wake_in_sec', stop: 'max_tokens' }], ASK);
+    assert.equal(run.skipReplies, 0);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+    assert.deepEqual(skipHeld(run), ['A note for the room.']);
+  });
+
+  it('a message that arrives during the turn, so a wake is pending when the skip_reply ends it, leaves the hold whole', async () => {
+    class Pinger implements Module {
+      readonly name = 'pinger';
+      private ctx?: ModuleContext;
+      async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] { return [{ name: 'ping', description: 'Ping', inputSchema: { type: 'object', properties: {} } }]; }
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+        this.ctx!.pushEvent({ type: 'external-message', source: 'test', content: 'Ping!', metadata: {} } as unknown as ProcessEvent);
+        return { success: true, data: { pinged: true } };
+      }
+      async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+    }
+    const run = await turn('xml', [
+      { xml: 'First words.\n\n<function_calls>\n<invoke name="pinger--ping">\n</invoke>\n', stop: 'stop_sequence' },
+      skipRound(SECOND),
+    ], ASK, { modules: [new Pinger()] });
+    assert.deepEqual(skipHeld(run), ['First words.', SECOND].sort());
+    const receipt = receipts(run)[0] ?? '';
+    assert.ok(run.held.every((d) => d.reason !== 'skip-reply' || receipt.includes(d.id)), receipt);
+  });
+
+  it("native tools: a first response cut off in a round with a private think holds nothing, as the think policy keeps the text private", async () => {
+    const run = await turn('native', [THINK_CUT], { ...ASK, sameRoundThinkTextPolicy: 'private' });
+    assert.deepEqual(skipHeld(run), []);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("explicit mode writes no receipt: the draft notice at the agent's next turn names the held drafts", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, skipRound(SECOND)], { ...ASK, proseRouting: 'explicit' });
+    const ids = run.held.filter((d) => d.reason === 'skip-reply').map((d) => d.id);
+    assert.equal(ids.length, 2, JSON.stringify(run.held));
+    const next = run.requests.find((r) => r.includes('And next?')) ?? '';
+    assert.ok(ids.every((id) => next.includes(id)), 'each id in the next request');
+    assert.equal(receipts(run).length, 0, receipts(run).join(' | '));
+  });
+
+  it('a turn that another tool ends is as before: nothing is held', async () => {
+    class Rest implements Module {
+      readonly name = 'rest';
+      async start(_ctx: ModuleContext): Promise<void> {}
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] { return [{ name: 'now', description: 'Rest now', inputSchema: { type: 'object', properties: {} } }]; }
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: { resting: true }, endTurn: true }; }
+      async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+    }
+    const run = await turn('xml', [{ xml: 'Resting now.\n\n<function_calls>\n<invoke name="rest--now">\n</invoke>\n', stop: 'stop_sequence' }], ASK, { modules: [new Rest()] });
+    assert.ok(run.requests.length >= 1);
+    assert.deepEqual(run.held, []);
+    assert.ok(!run.routed.includes('Resting now.'), JSON.stringify(run.routed));
+  });
+
+  it("a script's skip_reply ends the turn: the turn's text is held", async () => {
+    const run = await turn('xml', [
+      { xml: 'Scripted words.\n\n<function_calls>\n<invoke name="code_execution">\n<parameter name="code">await tools.skip_reply({ reason: "done" });</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+    ], ASK, { framework: { codeExecution: { enabled: true } }, channelTools: [{ name: 'skip_reply', description: 'End the turn without replying.', inputSchema: { type: 'object', properties: { reason: { type: 'string' } } } }] });
+    assert.equal(run.skipReplies, 1, `premise: the script's skip_reply ran; ${JSON.stringify(blocks(run, 'tool_result').map(toolResultText))}`);
+    assert.deepEqual(skipHeld(run), ['Scripted words.']);
   });
 });
