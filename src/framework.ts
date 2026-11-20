@@ -29349,6 +29349,10 @@ export class AgentFramework {
     // later rounds remain deliverable: the turn-end delivery drops that round's
     // text by its place, the round's index among this stream's tool rounds.
     const refusedWakeRounds = new Set<number>();
+    // The rounds of refusedWakeRounds that a skip_reply keeps private, as
+    // opposed to a private think: under 'ask' their text is held where
+    // nothing routed it live (skipHoldsAtEnd).
+    const skipPrivateRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -29524,6 +29528,9 @@ export class AgentFramework {
         if (!partial) {
           console.error(`[skip-reply] agent=${agent.name}: the turn's stream was cancelled with no partial content, so the text beside its skip_reply isn't held`);
         } else {
+          // As at a natural end: earlier deliveries, an earlier turn's
+          // included, settle the router's state before this text meets it.
+          await turnSpeechChain;
           const runs = splitProseRuns(partial);
           const admitted = turnProseRouting === 'explicit' ? runs.map((run) => this.admitProse(run.trim(), streamRouting)) : [];
           try {
@@ -29859,6 +29866,7 @@ export class AgentFramework {
               if (calls.some((c) => c.refused)) {
                 silenceBeforeRefusal = mergeSilence(silence, roundSilenceOf(calls.filter((c) => !c.refused), toolRound));
                 refusedWakeRounds.add(toolRound);
+                skipPrivateRounds.add(toolRound);
               }
               silence = mergeSilence(silence, roundSilenceOf(calls, toolRound));
               if (askingCall) askedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && c !== askingCall), toolRound));
@@ -30323,7 +30331,11 @@ export class AgentFramework {
               }
               hadToolCalls = true;
               const cutRound = toolRounds++;
-              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) refusedWakeRounds.add(cutRound);
+              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) {
+                refusedWakeRounds.add(cutRound);
+                // Text beside a private think stays private: it isn't held.
+                if (!cutThinkPrivate) skipPrivateRounds.add(cutRound);
+              }
               if (liveProseRouting) silence = mergeSilence(silence, roundSilenceOf(cutCalls, cutRound));
               console.error(
                 `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside ${cut.calls.length} call(s) ` +
@@ -30457,7 +30469,7 @@ export class AgentFramework {
               : liveProseRouting
                 ? [{ held: false, runs: splitProseRuns(terminalContent) }]
                 : skipHoldsAtEnd()
-                  ? proseRunGroups(response.content, refusedWakeRounds)
+                  ? proseRunGroups(response.content, skipPrivateRounds, refusedWakeRounds)
                   : [{ held: false, runs: splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)) }];
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
@@ -30715,8 +30727,9 @@ export class AgentFramework {
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
               // XML tool path (no roundContent, so nothing was live-routed)
-              // the historical behavior applies:
-              // route the whole turn's parsed segments, once, now. The global
+              // the whole turn's parsed segments are routed, once, now, in
+              // groups by round: under 'ask', a round a skip_reply kept
+              // private is held in its place (finalGroups). The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //

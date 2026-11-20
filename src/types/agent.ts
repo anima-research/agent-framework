@@ -167,11 +167,13 @@ export interface AgentConfig {
    * round's drafts and asks where they should go. Where the text would only
    * have been held, the `skip_reply` runs. The refusal acts only on rounds
    * with verbatim content (membrane's `roundContent`). On the XML tool path,
-   * which gives none, nothing is refused, and what a `skip_reply` leaves
-   * unsent is held at the turn's end, from membrane's parse of the turn: the
-   * whole turn's text where a `skip_reply` ends the turn, and at a natural end
-   * the text of a round whose `skip_reply` was refused for its wake or cut
-   * off. A derived agent and the subconscious don't take it from this agent.
+   * which gives none, the policy refuses no `skip_reply`, and what a
+   * `skip_reply` leaves unsent is held at the turn's end, from membrane's
+   * parse of the turn: where a `skip_reply` ends the turn, the text of every
+   * round of the stream it cancels (after a budget restart, the
+   * continuation's); at a natural end, the text of a round whose `skip_reply`
+   * was refused for its wake or cut off. A derived agent and the
+   * subconscious don't take it from this agent.
    */
   sameRoundSkipReplyTextPolicy?: SameRoundSkipReplyTextPolicy;
   /**

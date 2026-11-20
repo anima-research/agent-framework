@@ -84,9 +84,16 @@ export function withoutRoundsProse(
   });
 }
 
+/**
+ * A turn's prose runs (splitProseRuns) in order, in groups whose rounds are
+ * all in `held` or all outside it, the rounds counted as withoutRoundsProse
+ * counts them. The text of a round in `dropped` and not in `held` is left
+ * out, as withoutRoundsProse leaves it. Groups with no run are left out.
+ */
 export function proseRunGroups(
   content: readonly ContentBlock[],
-  rounds: ReadonlySet<number>,
+  held: ReadonlySet<number>,
+  dropped: ReadonlySet<number>,
 ): Array<{ held: boolean; runs: string[] }> {
   const groups: Array<{ held: boolean; blocks: ContentBlock[] }> = [];
   let round = 0;
@@ -98,10 +105,11 @@ export function proseRunGroups(
       round++;
       afterResults = false;
     }
-    const held = rounds.has(round);
+    const inHeld = held.has(round);
+    if (block.type === 'text' && !inHeld && dropped.has(round)) continue;
     const last = groups.at(-1);
-    if (last && last.held === held) last.blocks.push(block);
-    else groups.push({ held, blocks: [block] });
+    if (last && last.held === inHeld) last.blocks.push(block);
+    else groups.push({ held: inHeld, blocks: [block] });
   }
   return groups
     .map((group) => ({ held: group.held, runs: splitProseRuns(group.blocks) }))

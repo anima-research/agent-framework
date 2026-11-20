@@ -712,6 +712,43 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     assert.deepEqual(skipHeld(run), ['A note for the room.']);
   });
 
+  it('a message that arrives during the turn, so a wake is pending when the skip_reply ends it, leaves the hold whole', async () => {
+    class Pinger implements Module {
+      readonly name = 'pinger';
+      private ctx?: ModuleContext;
+      async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] { return [{ name: 'ping', description: 'Ping', inputSchema: { type: 'object', properties: {} } }]; }
+      async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+        this.ctx!.pushEvent({ type: 'external-message', source: 'test', content: 'Ping!', metadata: {} } as unknown as ProcessEvent);
+        return { success: true, data: { pinged: true } };
+      }
+      async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
+    }
+    const run = await turn('xml', [
+      { xml: 'First words.\n\n<function_calls>\n<invoke name="pinger--ping">\n</invoke>\n', stop: 'stop_sequence' },
+      skipRound(SECOND),
+    ], ASK, { modules: [new Pinger()] });
+    assert.deepEqual(skipHeld(run), ['First words.', SECOND].sort());
+    const receipt = receipts(run)[0] ?? '';
+    assert.ok(run.held.every((d) => d.reason !== 'skip-reply' || receipt.includes(d.id)), receipt);
+  });
+
+  it("native tools: a first response cut off in a round with a private think holds nothing, as the think policy keeps the text private", async () => {
+    const run = await turn('native', [THINK_CUT], { ...ASK, sameRoundThinkTextPolicy: 'private' });
+    assert.deepEqual(skipHeld(run), []);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("explicit mode writes no receipt: the draft notice at the agent's next turn names the held drafts", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, skipRound(SECOND)], { ...ASK, proseRouting: 'explicit' });
+    const ids = run.held.filter((d) => d.reason === 'skip-reply').map((d) => d.id);
+    assert.equal(ids.length, 2, JSON.stringify(run.held));
+    const next = run.requests.find((r) => r.includes('And next?')) ?? '';
+    assert.ok(ids.every((id) => next.includes(id)), 'each id in the next request');
+    assert.equal(receipts(run).length, 0, receipts(run).join(' | '));
+  });
+
   it('a turn that another tool ends is as before: nothing is held', async () => {
     class Rest implements Module {
       readonly name = 'rest';
