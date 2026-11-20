@@ -5507,13 +5507,14 @@ describe('sameRoundSkipReplyTextPolicy', () => {
     for (const [from, to] of [['private', 'ask'], ['ask', 'private']] as const) {
       it(`a skip_reply in the response that changes the policy from '${from}' to '${to}' is under '${from}'`, async () => {
         const h = await harness(config(from));
+        const ended = endings(h);
         try {
-          const before = h.membrane.calls.length;
           await h.turn([
             createMockResponse([text(WORDS), setTo('a1', to), call('k1', 'skip_reply', {})], 'tool_use'),
-            ...(from === 'ask' ? [createMockResponse([call('k2', 'skip_reply', {})], 'tool_use')] : []),
+            createMockResponse([call('k2', 'skip_reply', {})], 'tool_use'),
           ]);
           assert.equal(await inForce(h), to, 'premise: the change applied');
+          assert.equal(ended(), 1, 'a skip_reply ended the turn');
           if (from === 'ask') {
             const held = h.drafts();
             assert.deepEqual(held.map((d) => [d.text, d.reason]), [[WORDS, 'skip-reply']]);
@@ -5521,7 +5522,7 @@ describe('sameRoundSkipReplyTextPolicy', () => {
             assert.ok(roundTaken(h, 'k2'), 'the refusal let the turn go on to a second round');
           } else {
             assert.deepEqual(h.drafts(), [], 'the text stays private and is not held');
-            assert.equal(h.membrane.calls.length, before + 1, 'the skip_reply ran: no second request');
+            assert.ok(!roundTaken(h, 'k2'), 'the first skip_reply ran: no second round');
           }
         } finally {
           await h.close();

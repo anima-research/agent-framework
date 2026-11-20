@@ -72,8 +72,10 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
         enum: ['private', 'ask'],
         description:
           'What becomes of plain text that you write in the same response as skip_reply. private (the default unless the recipe sets it): ' +
-          'it stays private and is not held. ask: it is held as a draft, and where it would otherwise have gone out, your first such ' +
-          'skip_reply of a turn does not run: its result names the draft and asks where it should go. A change applies from your next response on.',
+          'it stays private and is not held. ask: it is held as a draft, and where it would otherwise have gone out, the first skip_reply ' +
+          'you call directly beside such text in a turn does not run: its result names the draft and asks where it should go. ' +
+          "ask does nothing where your response's content doesn't reach the host verbatim (the XML tool path), and text beside a " +
+          'private think stays private either way. A change applies from your next response on at the latest.',
       },
     );
     assert.ok(

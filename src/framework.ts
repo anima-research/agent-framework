@@ -11847,9 +11847,10 @@ export class AgentFramework {
   /**
    * Apply an agent's persisted settings at boot, each on its own, the budget
    * last. A persisted setting never stops the agent booting, except a
-   * think-text policy, which fails closed: an invalid one is refused before
-   * this (validatePersistedAgentRuntimeSettings), and a valid one always
-   * applies. A tail, pace or budget that can't be applied now (a tail or pace
+   * think-text policy, a skip_reply text policy or send silencing, each of
+   * which fails closed: an invalid one is refused before this
+   * (validatePersistedAgentRuntimeSettings), and a valid one always applies.
+   * A tail, pace or budget that can't be applied now (a tail or pace
    * on a strategy without live settings, a budget no longer above maxTokens,
    * a lower one restored paced on a strategy that can't prepare a smaller
    * window) is kept set but unapplied (Agent.keepRuntimeSettings), so a later
@@ -15026,8 +15027,10 @@ export class AgentFramework {
           enum: ['private', 'ask'],
           description:
             'What becomes of plain text that you write in the same response as skip_reply. private (the default unless the recipe sets it): ' +
-            'it stays private and is not held. ask: it is held as a draft, and where it would otherwise have gone out, your first such ' +
-            'skip_reply of a turn does not run: its result names the draft and asks where it should go. A change applies from your next response on.',
+            'it stays private and is not held. ask: it is held as a draft, and where it would otherwise have gone out, the first skip_reply ' +
+            'you call directly beside such text in a turn does not run: its result names the draft and asks where it should go. ' +
+            "ask does nothing where your response's content doesn't reach the host verbatim (the XML tool path), and text beside a " +
+            'private think stays private either way. A change applies from your next response on at the latest.',
         },
         settings: {
           type: 'array',
