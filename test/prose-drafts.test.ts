@@ -5566,25 +5566,17 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       }
     });
 
-    it("on a round without verbatim content (the XML tool path), an update to 'ask' is refused before any of the call applies; 'private', a reset, and a call outside a round are taken", async () => {
+    it("on a round without verbatim content (the XML tool path), an update to 'ask' is taken with the call's other settings", async () => {
       const h = await harness({ ...config('private'), xml: true, roundPreamble: true });
       try {
         assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "premise: the harness's config");
         await h.turn([
           createMockResponse([call('a1', 'agent_settings', { action: 'update', same_round_skip_reply_text_policy: 'ask', send_silencing: false })], 'tool_use'),
-          createMockResponse([setTo('a2', 'private')], 'tool_use'),
-          createMockResponse([call('a3', 'agent_settings', { action: 'reset', settings: ['same_round_skip_reply_text_policy'] })], 'tool_use'),
           createMockResponse([]),
         ]);
-        const [refused, privateTaken, resetTaken] = h.toolResults();
-        assert.equal(refused,
-          "same_round_skip_reply_text_policy can't be 'ask' here: it acts only on a response whose content reaches the host verbatim, " +
-          "and this one's did not (the XML tool path). Text beside skip_reply stays private and is not held. Nothing in this call was changed.");
-        assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the call's other setting was not applied");
-        assert.equal(shown(parsed(privateTaken!)), 'private');
-        assert.equal(shown(parsed(resetTaken!)), 'private');
-        const outside = await settings(h, { action: 'update', same_round_skip_reply_text_policy: 'ask' });
-        assert.equal(shown(outside.data), 'ask', `no round says the path; ${outside.error ?? ''}`);
+        const [taken] = h.toolResults();
+        assert.equal(shown(parsed(taken!)), 'ask', taken);
+        assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, false, "the call's other setting applied");
       } finally {
         await h.close();
       }

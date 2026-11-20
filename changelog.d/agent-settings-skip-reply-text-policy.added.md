@@ -9,7 +9,8 @@
   `skip_reply` in the response that changes it is under the old value. A
   change made while a response is being written, by the host or by a script
   still running from an earlier turn, can apply to that response. The
-  guard, a cut-off round and the heartbeat notice read the value in force.
+  guard, a cut-off round, the XML tool path's hold at the turn's end and
+  the heartbeat notice read the value in force.
   A heartbeat notice is written as its turn starts, so a change inside a
   heartbeat turn shows in the next one's notice.
   `AgentRuntimeSettingsPatch` and `AgentRuntimeSettingsSnapshot` carry
@@ -17,16 +18,6 @@
   a typed fixture or mock of one needs it). A stored value other than
   `'private'` or `'ask'` is refused at a start, as a stored think-text
   policy is.
-  - Where the agent's pending round has no verbatim content (membrane's
-    `roundContent`), as on the XML tool path, `agent_settings` refuses an
-    update to `'ask'` before anything in the call applies, since the policy
-    does nothing there. An update to `'private'` and a reset are taken
-    there, and so is any call made while the agent has no round pending,
-    such as a host's between turns. An agent whose own `'ask'` was set on
-    native tools keeps it if its host later moves it to the XML formatter:
-    the policy then does nothing there, and the heartbeat notice still
-    drops its clause, as with a config of `'ask'` there. Its own update to
-    `'private'`, or a reset, ends that.
   - A derived agent and the subconscious still start at `'private'`,
     whatever the agent's own choice, as they don't take its config's value.
   - Tool text: `agent_settings`' description and schema name the setting.

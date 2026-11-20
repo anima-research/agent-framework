@@ -758,6 +758,14 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     assert.equal(receipts(run).length, 0, receipts(run).join(' | '));
   });
 
+  it("the hold reads the value in force: an agent whose config is 'private' sets 'ask' with agent_settings, and its turn's text is held", async () => {
+    const run = await turn('xml', [
+      { xml: 'First words.\n\n<function_calls>\n<invoke name="agent_settings">\n<parameter name="action">update</parameter>\n<parameter name="same_round_skip_reply_text_policy">ask</parameter>\n</invoke>\n', stop: 'stop_sequence' },
+      skipRound(SECOND),
+    ]);
+    assert.deepEqual(skipHeld(run), ['First words.', SECOND].sort(), JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+  });
+
   it('a turn that another tool ends is as before: nothing is held', async () => {
     class Rest implements Module {
       readonly name = 'rest';

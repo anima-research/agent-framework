@@ -15026,11 +15026,11 @@ export class AgentFramework {
           type: 'string',
           enum: ['private', 'ask'],
           description:
-            'What becomes of plain text that you write in the same response as skip_reply. private (the default unless the recipe sets it): ' +
-            'it stays private and is not held. ask: it is held as a draft, and where it would otherwise have gone out, the first skip_reply ' +
-            'you call directly beside such text in a turn does not run: its result names the draft and asks where it should go. ' +
-            "ask does nothing where your response's content doesn't reach the host verbatim (the XML tool path), and text beside a " +
-            'private think stays private either way. A change applies from your next response on at the latest.',
+            'What becomes of plain text that a skip_reply would leave unsent. private (the default unless the recipe sets it): ' +
+            'it stays private and is not held. ask: it is held as a draft. On native tools, where the text is in the same response ' +
+            'as the skip_reply and would otherwise have gone out, the first skip_reply you call directly in a turn also does not run: ' +
+            'its result names the draft and asks where it should go. Text beside a private think stays private either way. ' +
+            'A change applies from your next response on at the latest.',
         },
         settings: {
           type: 'array',
@@ -29469,7 +29469,7 @@ export class AgentFramework {
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
 
-    const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.sameRoundSkipReplyTextPolicy === 'ask'
+    const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
       && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
     const holdSkipRuns = async (
       runs: string[],
@@ -43288,13 +43288,6 @@ export class AgentFramework {
           if (input.same_round_skip_reply_text_policy !== undefined) {
             const policy = input.same_round_skip_reply_text_policy;
             if (policy !== 'private' && policy !== 'ask') throw new Error("same_round_skip_reply_text_policy must be 'private' or 'ask'");
-            const pending = this.pendingAssistantBlocks.get(agentName);
-            if (policy === 'ask' && pending && this.pendingRoundSent.get(pending) === null) {
-              throw new Error(
-                "same_round_skip_reply_text_policy can't be 'ask' here: it acts only on a response whose content reaches the host verbatim, " +
-                "and this one's did not (the XML tool path). Text beside skip_reply stays private and is not held",
-              );
-            }
             patch.sameRoundSkipReplyTextPolicy = policy;
           }
           // Immediate budget decrease: skip the paced descent; the next

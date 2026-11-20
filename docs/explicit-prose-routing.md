@@ -49,8 +49,8 @@ them the same way.
   the agent's own (`agent_settings`' `same_round_skip_reply_text_policy`),
   a round that calls `skip_reply`, with no same-round private think, sets
   the target its envelopes name, and what it would have posted or bounced
-  is held as a draft, on a round whose content reaches the host verbatim
-  (not on the XML tool path, where the round stays private). A
+  is held as a draft: at once on a round whose content reaches the host
+  verbatim, and at the turn's end on the XML tool path. A
   target its server declared inbound-only is refused and clears the turn's
   target, so later unprefixed segments bounce until a new `>>` target.
   Cross-turn, nothing is implicit.
