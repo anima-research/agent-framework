@@ -10,8 +10,13 @@
  *  - the one invalid-field rule (§8): a bad optional field is dropped while
  *    the block and its subtractive `disposition` survive; a bad `uri`
  *    rejects the block whole;
- *  - `disposition:"never"` withholds payload AND uri from model context
- *    unconditionally — enforced in code here, not by caller discipline (§5);
+ *  - `disposition:"never"` from a server marks its uri's record (§3.1, §5):
+ *    while the mark stands, the framework starts no fetch of the payload and
+ *    saves none of it, a fetch under way stops at its next chunk, and no
+ *    stub, script object or link names a saved copy or the uri. A copy
+ *    saved before the mark stays in the workspace, one whose save finished
+ *    as the mark came is deleted where the delete succeeds, and the mark
+ *    goes with a record lost to eviction or a restart;
  *  - stub size is independent of every server-supplied field length (§5);
  *  - unparseable `expiresAt` fails closed (§7.4), and so does one rejected
  *    as a field: it's absent as testimony, never read as immortal;
@@ -21,10 +26,9 @@
  *
  * The ReferenceRegistry is the host-private reference record (§6.2): raw
  * URIs and testimony live here, and model-visible content shows a uri only
- * as a tool result's link line shows one (shownLinkUri). Fetching
- * (§6/§7 origin binding, ceilings, redirects) is deliberately not here yet —
- * the registry is what makes a future host-mediated fetcher and the
- * code-execution materialization hook possible.
+ * as a tool result's link line shows one (shownLinkUri). Fetching (§6/§7
+ * origin binding, ceilings, redirects) is reference-fetcher.ts's, which
+ * reads a record's servers and marks from here.
  */
 import { cutToFit, suppliedValue } from '../supplied-text.js';
 import { NOTICE_TAG } from '../notice-tags.js';
@@ -52,7 +56,8 @@ export interface ReferenceTestimony {
   rejectedFields: string[];
   /** Set when the testimony is an MCP resource_link's, which claims no
    *  digest, expiry or disposition. A link is registered but never fetched
-   *  on the side, and its testimony never replaces a record's (register). */
+   *  on the side, and its testimony replaces a record's only as a server's
+   *  first word for the record (register). */
   fromLink?: true;
 }
 
@@ -61,7 +66,8 @@ export type BlockClassification =
   | { kind: 'inline'; contradiction: boolean }
   | { kind: 'reference'; testimony: ReferenceTestimony }
   /** MCP's embedded resource (embeddedResourceContents): each lane shows
-   *  its contents as it shows the block they make. */
+   *  its contents as it shows the block they make, unless a `never` names
+   *  its uri. */
   | { kind: 'embedded'; contents: EmbeddedContents }
   /** `shown` is what the model-visible lanes put in the block's place. */
   | { kind: 'invalid'; shown: string };
@@ -120,7 +126,8 @@ export function classifyBlock(block: unknown): BlockClassification {
     }
     case 'resource': {
       const contents = embeddedResourceContents(block);
-      return contents ? { kind: 'embedded', contents } : parseReferenceFields(block);
+      if (!contents) return parseReferenceFields(block);
+      return { kind: 'embedded', contents };
     }
     case 'resource_link':
       // MCP's link to a resource is a reference too. RFC-005 §8.1 maps it
@@ -500,6 +507,11 @@ export const FRESH_REFERENCE = "Once a fresh reference to it arrives, fetching m
 export const SERVER_BACK = "Calling again won't change that unless whoever runs this host adds that server back.";
 const SERVER_ADDRESS = "Calling again won't change that unless whoever runs this host corrects the server's address.";
 
+export const PAYLOAD_NEVER: Refusal = {
+  error: 'a server asked that its content never reach you or your tools',
+  remedy: NOTHING_TO_DO,
+};
+
 /** ws→http / wss→https with default ports elided, for origin comparison. */
 export function normalizedOrigin(url: string): string | null {
   try {
@@ -693,6 +705,9 @@ export interface ReferenceRecord {
    *  save that landed after the eager pass stopped waiting or by
    *  fetch_reference, can carry it too: fetchedPath is read first. */
   eagerFailed?: boolean;
+  /** Never cleared while the record lives: a server can veto context
+   *  inclusion but never expand it (RFC-005 §3.1). */
+  payloadNever?: true;
 }
 
 const MAX_RECORDS = 2000;
@@ -731,6 +746,42 @@ export class ReferenceRegistry {
   private counter = 0;
   /** Each open journal's copies (openJournal), by uri. */
   private journals = new Set<Map<string, ReferenceRecord | null>>();
+
+  /** Mark a uri's payload never for a server's content: the record the uri
+   *  has, bound to that server where no server had bound it, or, where it
+   *  has none, a record made for it, marked and bound to that server, which
+   *  a later delivery of the uri then finds. A uri longer than a
+   *  reference's (REFERENCE_LIMITS) gets no record. */
+  markNever(uri: string, serverId: string): void {
+    const record = this.findByUri(uri);
+    if (!record) {
+      if (uri.length <= REFERENCE_LIMITS.uri) this.register({ uri, disposition: 'never', rejectedFields: [] }, serverId);
+      return;
+    }
+    if (record.payloadNever) return;
+    this.keepFirst(uri);
+    if (record.serverIds.length === 0) record.serverIds.push(serverId);
+    this.markPayload(record, serverId);
+  }
+
+  markNevers(claims: ResultClaims, serverId: string): void {
+    for (const [uri, claim] of claims) if (claim.never) this.markNever(uri, serverId);
+  }
+
+  private markPayload(record: ReferenceRecord, serverId: string): void {
+    const marked = `[refs] the "${shownServerId(serverId)}" server marked ${record.refId}'s payload never (RFC-005); the record is bound to ${record.serverIds.map((id) => `"${shownServerId(id)}"`).join(', ') || 'no server'}`;
+    record.payloadNever = true;
+    const path = record.fetchedPath;
+    if (path === undefined) {
+      console.error(marked);
+      return;
+    }
+    delete record.fetchedPath;
+    delete record.verifiedBytes;
+    delete record.verifiedMimeType;
+    delete record.digestVerified;
+    console.error(`${marked}. It was saved before: its copy stays at ${path}, where the agent's workspace tools can still find it; no stub, script object or fetch names it from here on`);
+  }
 
   /**
    * Keep, until `close`, each record as it stood when this opened: a copy
@@ -772,21 +823,27 @@ export class ReferenceRegistry {
     return this.journals.size;
   }
 
-  register(testimony: ReferenceTestimony, serverId?: string): ReferenceRecord {
+  register(testimony: ReferenceTestimony, serverId?: string, claims?: ResultClaims): ReferenceRecord {
     this.keepFirst(testimony.uri);
+    const markedBy = testimony.disposition === 'never' || claims?.get(testimony.uri)?.never === true ? serverId : undefined;
     const existingId = this.byKey.get(testimony.uri);
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
       if (existing) {
+        const unbound = existing.serverIds.length === 0;
         if (serverId !== undefined && !existing.serverIds.includes(serverId)) {
           existing.serverIds.push(serverId);
         }
+        if (markedBy !== undefined && !existing.payloadNever) this.markPayload(existing, markedBy);
         // Refresh testimony while unfetched: a re-issued reference with a new
         // digest/expiry supersedes the stale claims. Once fetched, the record
         // describes verified bytes on disk and keeps the testimony they were
         // verified against. A link claims no digest, expiry or disposition,
-        // so its testimony never replaces a record's claims.
-        if (!existing.fetchedPath && !testimony.fromLink) existing.testimony = testimony;
+        // so its testimony replaces a record's claims only as a server's
+        // first word for the record, and a registration that knows no server
+        // replaces them only where no server has spoken for the record,
+        // since it isn't a server's word.
+        if (!existing.fetchedPath && (testimony.fromLink ? serverId !== undefined && unbound : serverId !== undefined || unbound)) existing.testimony = testimony;
         // Newest again, so a uri just mentioned is the last to be evicted.
         this.records.delete(existingId);
         this.records.set(existingId, existing);
@@ -795,6 +852,7 @@ export class ReferenceRegistry {
     }
     const refId = `${NOTICE_TAG.referenceId}_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 2 + REF_ID_SUFFIX_CHARS)}`;
     const record: ReferenceRecord = { refId, serverIds: serverId === undefined ? [] : [serverId], testimony, receivedAt: Date.now() };
+    if (markedBy !== undefined) this.markPayload(record, markedBy);
     this.records.set(refId, record);
     this.byKey.set(testimony.uri, refId);
     if (this.records.size > MAX_RECORDS) {
@@ -843,6 +901,12 @@ export class ReferenceRegistry {
 
   serverAddress(serverId: string): ServerAddress | undefined {
     return this.addresses.get(serverId)?.at(-1)?.address;
+  }
+
+  /** The record of a uri, where it's marked. */
+  markedAs(uri: string): ReferenceRecord | undefined {
+    const own = this.findByUri(uri);
+    return own?.payloadNever ? own : undefined;
   }
 
   /** Find the record for a uri. */
@@ -922,16 +986,19 @@ export interface StubOptions {
  * testimonies read as one (UriClaims): the strictest claim wins, so a uri any
  * of them marks `disposition: never` is withheld, and one any of them gives
  * an expiry that counts is expired (claimedExpiry), whatever the order of the
- * blocks and whatever the registry evicted while it was read (Ada-1017's
- * call). A decision about a record reads its result's claims where the
- * result's references name its uri, a plain one included, and otherwise the
+ * blocks and whatever the registry evicted while it was read. A decision
+ * about a record reads its result's claims where the result's references
+ * name its uri, a plain one included, and otherwise the
  * record's own testimony, from an earlier result. A reference naming the uri
  * is that result's word on it, the latest, as the registry keeps it
- * (register() replaces a record's testimony with it until the record is
- * fetched), so an earlier result's `never` or expiry gives way to it
- * (Ada-1017's call). A link claims no disposition or expiry, so it adds
- * nothing here, and a result that names a uri only in links leaves its
- * record's testimony in force.
+ * (register() replaces a record's testimony with a server's until the record
+ * is fetched), so an earlier result's expiry gives way to it. A server's
+ * `never` doesn't: it marks the uri's record (payloadNever) for as long as the
+ * record lives, and the stub, the fetcher and a script's object read that
+ * mark first. Another result's `never` marks nothing. A
+ * link claims no disposition or expiry, so it adds nothing here, and a
+ * result that names a uri only in links leaves its record's testimony in
+ * force where a server's word already stands in it.
  */
 export type ResultClaims = ReadonlyMap<string, UriClaims>;
 
@@ -1034,6 +1101,28 @@ export function inlineNeverUri(block: unknown, c: BlockClassification = classify
   return b.disposition === 'never' && typeof uri === 'string' && uri !== '' ? uri : null;
 }
 
+/** A reference a `never` withholds that no server marked, which no fetch
+ *  refuses, so it gives out no id to fetch it by: its name, if it has one. */
+function unmarkedNeverText(t: ReferenceTestimony): string {
+  const name = t.name ? suppliedLabel(t.name, STUB_FIELD_CHARS) : '';
+  return `[${NOTICE_TAG.referenceNotShown}${name ? ` "${name}"` : ''}: its content is marked never to reach you or your tools.]`;
+}
+
+/** MCP's embedded resource whose uri a `never` names (embeddedWithheld). */
+export const EMBEDDED_RESOURCE_NEVER_TEXT = `[${NOTICE_TAG.resourceNotShown}: its content is marked never to reach you or your tools.]`;
+
+export function embeddedWithheld(block: unknown, claims?: ResultClaims): boolean {
+  const uri = (block as { resource?: { uri?: unknown } }).resource?.uri;
+  return typeof uri === 'string' && uri !== ''
+    && (inlineNeverUri(block) !== null || uriWithheld(uri, claims));
+}
+
+/** Whether a uri's payload is withheld where only its uri is read: a mark on
+ *  its record, or a `never` its result's claims give for it. */
+export function uriWithheld(uri: string, claims?: ResultClaims): boolean {
+  return referenceRegistry.markedAs(uri) !== undefined || claims?.get(uri)?.never === true;
+}
+
 /** The claims a decision about a record reads: its result's for its uri,
  *  where the result's references name it, and otherwise the record's own
  *  testimony. */
@@ -1047,6 +1136,10 @@ function uriClaims(record: ReferenceRecord, claims?: ResultClaims): UriClaims | 
 export function claimedNever(record: ReferenceRecord, claims?: ResultClaims): boolean {
   if (claims && neverShown(claims).has(shownUri(record.testimony.uri))) return true;
   return uriClaims(record, claims)?.never === true;
+}
+
+export function withheld(record: ReferenceRecord, claims?: ResultClaims): boolean {
+  return record.payloadNever === true || claimedNever(record, claims);
 }
 
 /** The expiry a record counts, as of `nowMs`: the first of EXPIRY_REASON's
@@ -1072,7 +1165,10 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * inline data to reach context. A tool result's link line (buildReferenceStub,
  * unfetchedLinkUri) and a script's object for the link
  * (referenceBlockForScript) both ask this, so the model and a script, whose
- * output comes back to the model, see a link's uri alike.
+ * output comes back to the model, see a link's uri alike, except that a
+ * script's view also reads a `never` nested in the result's data, which,
+ * where no mark has reached the uri, can withhold from it a link the
+ * model's line shows.
  *
  * The credential check reads the uri as it would be shown, with what
  * sanitizeLabel strips gone, so a uri split by a control character is read
@@ -1080,10 +1176,11 @@ export function claimedExpiry(record: ReferenceRecord, claims: ResultClaims | un
  * as userinfo. A `disposition: "never"` for the uri keeps it out whatever
  * the link says: any reference's in the same result (claims), for this uri
  * or one shown as the same text, or, where no reference in the result names
- * the uri, the record's.
+ * the uri, the record's; and a `never` that marked the record
+ * (payloadNever), whatever the result's references say.
  */
 export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
-  if (!t.fromLink || claimedNever(record, claims)) return null;
+  if (!t.fromLink || record.payloadNever || claimedNever(record, claims)) return null;
   if (unfetchableReason(record, nowMs, claims) === null) return null;
   const uri = shownUri(t.uri);
   return uriMayCarryCredential(uri) || /^data:/i.test(uri) ? null : uri;
@@ -1100,7 +1197,8 @@ export function shownLinkUri(t: ReferenceTestimony, record: ReferenceRecord, now
  * own, its uri bounded by REFERENCE_LIMITS.uri.
  */
 export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, serverId?: string, options?: StubOptions): string {
-  const record = referenceRegistry.register(t, serverId);
+  const record = referenceRegistry.register(t, serverId, options?.claims);
+  if (record.payloadNever !== true && withheld(record, options?.claims)) return unmarkedNeverText(t);
   // One clock reading for the whole stub, so whether it shows a link's uri
   // and the reason it gives can't disagree across an expiry.
   const nowMs = Date.now();
@@ -1115,7 +1213,9 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   if (meta.length) parts.push(meta.join(', '));
   const origin = provenance ? sanitizeLabel(provenance, STUB_FIELD_CHARS) : '';
   if (origin) parts.push(origin);
-  if (record.fetchedPath) {
+  if (withheld(record, options?.claims)) {
+    parts.push(PAYLOAD_NEVER.error);
+  } else if (record.fetchedPath) {
     // Already materialized by the host-mediated fetcher: hand the model the
     // workspace path (host-generated, §7.3) so existing tools just work.
     parts.push(`saved: ${sanitizeLabel(record.fetchedPath, SAVED_PATH_CHARS)}`);
@@ -1144,13 +1244,16 @@ function unfetchedLinkText(t: ReferenceTestimony, uri: string): string {
 
 /**
  * Why the fetcher would refuse a reference before it dials, whatever the
- * fetch, in its stub's words: the registry's dialCheck, from its record and
- * its servers' addresses. Null for a saved copy, which the fetcher serves
+ * fetch, in its stub's words: a payload a `never` marked, or one its result's
+ * claims call `never` (withheld), then the registry's dialCheck, from its
+ * record and its servers' addresses. Null for a saved copy, which the
+ * fetcher serves
  * before any check, and where a fetch would dial. A fetch's own limits, the
  * server's spent budget or a claimed size over the ceiling it's given, the
  * fetcher gives in its own words, and save_recent_image says them too.
  */
 export function unfetchableReason(record: ReferenceRecord, nowMs = Date.now(), claims?: ResultClaims): string | null {
+  if (withheld(record, claims)) return PAYLOAD_NEVER.error;
   if (record.fetchedPath) return null;
   const dial = dialCheck(record, (serverId) => referenceRegistry.serverAddress(serverId), nowMs, claims);
   return 'refusal' in dial ? dial.refusal.inStub ?? dial.refusal.error : null;
@@ -1190,18 +1293,18 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * isn't empty. A reference becomes the stub's facts as data: the host's
  * reference id, what the server said about it in this block (its labels
  * stripped and bounded as in the stub), and `savedTo`, the workspace path
- * its payload was fetched to, or null when it wasn't (`fetch_reference`
- * takes the id as `ref_id`). Its uri is left out, except that a link (MCP's
- * resource_link) carries `uri` where the model's line for it shows the uri
- * (shownLinkUri). An unsaved reference that counts as expired also carries
- * `expired`, and one the fetcher would refuse carries `unfetchable`, the
- * words a stub gives in place of advising fetch_reference
+ * its payload was fetched to, or null when it wasn't or a `never` marked it
+ * (`fetch_reference` takes the id as `ref_id`). Its uri is left out, except
+ * that a link (MCP's resource_link) carries `uri` where the model's line for
+ * it shows the uri (shownLinkUri). An unsaved reference that counts as
+ * expired also carries `expired`, and one the fetcher would refuse carries
+ * `unfetchable`, the words a stub gives in place of advising fetch_reference
  * (unfetchableReason). Both give why a fetch_reference with the object's
  * `refId` would be refused, as the result's references claim it, so a link
  * whose line shows its uri, which the host can't fetch, carries them too: its
  * line has no id to fetch with. The fetch itself reads the record, which
- * keeps the latest testimony registered until it's fetched, and then the one
- * its saved copy was verified against (Ada-1017's call). `claims` are those
+ * keeps the latest testimony a server registered until it's fetched, and
+ * then the one its saved copy was verified against. `claims` are those
  * of everything the script's view shows (scriptViewClaims), so its other
  * references count (ResultClaims). The reference is registered bound to
  * `serverId`, the server whose tool returned it, as the model's lanes bind a
@@ -1213,8 +1316,8 @@ export function referenceStubOrNull(block: unknown, provenance?: string, serverI
  * rejects becomes the notice the model's lanes show, and inline data that
  * also claims a bulk disposition, or a uri of any type but null, absent or
  * empty, the withheld notice, each as a text block. MCP's embedded resource
- * becomes the block its contents make, as the model's lanes show it, never
- * its uri.
+ * becomes the block its contents make, as the model's lanes show it, or the
+ * `never` notice where a `never` names its uri, never its uri.
  * A text block, or inline data that claims nothing, is returned as sent.
  */
 export function referenceBlockForScript(block: unknown, serverId?: string, claims?: ResultClaims, line?: ScriptLine): unknown {
@@ -1240,12 +1343,15 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
       // its uri or its `resource` record (Ada-1017, room-203 #206688): text,
       // or inline data that claims nothing, as such a block reaches a script;
       // the withheld notice where it claims a disposition; its marker
-      // otherwise. Given again, each is as it was.
+      // otherwise; and the `never` notice, whatever its contents, where a
+      // `never` names its uri. Given again, each is as it was.
+      if (embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
       if (c.contents.kind === 'block') return c.contents.block;
       return { type: 'text', text: c.contents.kind === 'withheld' ? INLINE_WITHHELD_TEXT : c.contents.text };
     case 'reference': {
       const t = c.testimony;
-      const record = referenceRegistry.register(t, serverId);
+      const record = referenceRegistry.register(t, serverId, claims);
+      if (record.payloadNever !== true && withheld(record, claims)) return { type: 'text', text: unmarkedNeverText(t) };
       // One clock reading for the whole object, so its words can't disagree
       // with each other across an expiry.
       const nowMs = Date.now();
@@ -1266,7 +1372,7 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
         ? line.recordBefore(t.uri) ?? { refId: record.refId, serverIds: serverId === undefined ? [] : [serverId], testimony: t, receivedAt: record.receivedAt }
         : record;
       const lineShows = shownLinkUri(t, lineRecord, nowMs, line ? line.claims : claims);
-      const uri = lineShows !== null && line !== undefined && claimedNever(record, claims) ? null : lineShows;
+      const uri = lineShows !== null && record.payloadNever ? null : lineShows;
       // Why a fetch_reference with this object's refId would be refused, in
       // the words a stub gives, whether or not the model's line for it is a
       // stub: the line has no id to fetch with, and the object does. As the
@@ -1283,7 +1389,7 @@ export function referenceBlockForScript(block: unknown, serverId?: string, claim
         ...(t.sizeBytes !== undefined ? { sizeBytes: t.sizeBytes } : {}),
         ...(t.digest !== undefined ? { digest: t.digest } : {}),
         ...(t.expiresAt !== undefined ? { expiresAt: sanitizeLabel(t.expiresAt, STUB_FIELD_CHARS) } : {}),
-        savedTo: record.fetchedPath ?? null,
+        savedTo: record.payloadNever ? null : record.fetchedPath ?? null,
         ...(expiry ? { expired: EXPIRY_REASON[expiry] } : {}),
         ...(unfetchable !== null ? { unfetchable } : {}),
       };

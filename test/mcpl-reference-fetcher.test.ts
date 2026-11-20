@@ -136,7 +136,7 @@ test("a registry journal keeps each record as it stood when it opened, through a
   assert.equal(one.before(w), reg.findByUri(w));
   // A closed journal copies nothing more.
   one.close();
-  reg.register(t(w, { expiresAt: '2000-01-01T00:00:00Z' }));
+  reg.register(t(w, { expiresAt: '2000-01-01T00:00:00Z' }), 'first');
   assert.equal(one.before(w)?.testimony.expiresAt, '2000-01-01T00:00:00Z');
   // An eviction: the registry holds 2,000 records, so 2,001 more take u's,
   // which the open journal still has as it stood.
