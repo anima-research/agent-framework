@@ -5464,12 +5464,10 @@ describe('sameRoundSkipReplyTextPolicy', () => {
 
   describe("the agent's own switch: agent_settings' same_round_skip_reply_text_policy", () => {
     type Harness = Awaited<ReturnType<typeof harness>>;
-    /** The skip_reply text policy that a settings snapshot, or a `get`'s data, shows. */
     const shown = (settings: unknown): unknown =>
       typeof settings === 'object' && settings !== null && 'sameRoundSkipReplyTextPolicy' in settings ? settings.sameRoundSkipReplyTextPolicy : undefined;
     const setTo = (id: string, policy: unknown) => call(id, 'agent_settings', { action: 'update', same_round_skip_reply_text_policy: policy });
     let made = 0;
-    /** The agent's settings call outside a turn, as a host makes it for the agent. */
     const settings = (h: Harness, input: Record<string, unknown>, agent = 'scout') =>
       h.framework.executeToolCall({ id: `settings-${++made}`, name: 'agent_settings', input, callerAgentName: agent });
     const inForce = async (h: Harness) => shown((await settings(h, { action: 'get' })).data);
@@ -5582,15 +5580,17 @@ describe('sameRoundSkipReplyTextPolicy', () => {
       }
     });
 
-    it("refuses a value other than 'private' or 'ask', naming both", async () => {
+    it("refuses a value other than 'private' or 'ask', naming both, before any of the call applies", async () => {
       const h = await harness();
       try {
         for (const value of ['Ask', 'public', true]) {
-          const result = await settings(h, { action: 'update', same_round_skip_reply_text_policy: value });
+          const result = await settings(h, { action: 'update', same_round_skip_reply_text_policy: value, send_silencing: false });
           assert.equal(result.success, false, JSON.stringify(value));
-          assert.match(result.error ?? '', /'private' or 'ask'/);
+          assert.equal(result.isError, true, JSON.stringify(value));
+          assert.equal(result.error, "same_round_skip_reply_text_policy must be 'private' or 'ask'. Nothing in this call was changed.");
         }
         assert.equal(await inForce(h), 'private');
+        assert.equal(h.framework.getAgentRuntimeSettings('scout').sendSilencing, true, "the call's other setting was not applied");
       } finally {
         await h.close();
       }

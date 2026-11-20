@@ -13,8 +13,9 @@
     for its wake, or of a response cut off with a `skip_reply` among its
     unrun calls, is held in its place, and the turn's other text is
     delivered as before. In hybrid and explicit mode the held text's
-    envelopes set the router's state in order. Text beside a private
-    think stays private and isn't held, as before.
+    envelopes set the router's state in order. The same-round think
+    policy acts on native tools only, as before: on the XML tool path,
+    text beside `think` is held like any other.
   - The resident isn't asked on this path. In locus and hybrid mode the
     turn's receipt names the drafts. Explicit mode writes no receipt, and
     the draft notice at the agent's next turn names them. The heartbeat

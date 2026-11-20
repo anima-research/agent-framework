@@ -15029,7 +15029,7 @@ export class AgentFramework {
             'What becomes of plain text that a skip_reply would leave unsent. private (the default unless the recipe sets it): ' +
             'it stays private and is not held. ask: it is held as a draft. On native tools, where the text is in the same response ' +
             'as the skip_reply and would otherwise have gone out, the first skip_reply you call directly in a turn also does not run: ' +
-            'its result names the draft and asks where it should go. Text beside a private think stays private either way. ' +
+            'its result names the draft and asks where it should go. On native tools, text beside a private think stays private either way. ' +
             'A change applies from your next response on at the latest.',
         },
         settings: {

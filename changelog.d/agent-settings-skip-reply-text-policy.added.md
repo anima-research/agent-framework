@@ -5,8 +5,10 @@
   `'private'`. `update` sets the agent's choice, and `reset` takes it off
   when it names the field in `settings` or names nothing. The choice
   overrides the config, persists with the agent's other runtime settings,
-  and applies from the agent's next response on at the latest: a
-  `skip_reply` in the response that changes it is under the old value. A
+  and applies from the agent's next response on at the latest. On native
+  tools, a `skip_reply` in the response that changes it is under the old
+  value. On the XML tool path, the hold at the turn's end reads the value
+  in force then, so a change in the same response applies to it. A
   change made while a response is being written, by the host or by a script
   still running from an earlier turn, can apply to that response. The
   guard, a cut-off round, the XML tool path's hold at the turn's end and

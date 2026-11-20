@@ -74,7 +74,7 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
           'What becomes of plain text that a skip_reply would leave unsent. private (the default unless the recipe sets it): ' +
           'it stays private and is not held. ask: it is held as a draft. On native tools, where the text is in the same response ' +
           'as the skip_reply and would otherwise have gone out, the first skip_reply you call directly in a turn also does not run: ' +
-          'its result names the draft and asks where it should go. Text beside a private think stays private either way. ' +
+          'its result names the draft and asks where it should go. On native tools, text beside a private think stays private either way. ' +
           'A change applies from your next response on at the latest.',
       },
     );
@@ -130,6 +130,27 @@ it('agent_settings is one typed tool for the hot runtime surface', async () => {
       sameRoundSkipReplyTextPolicy: 'private',
       transition: 'stable',
     });
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("sameRoundSkipReplyTextPolicy: a host's update takes 'private' or 'ask' and refuses any other value", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-skip-reply-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: strategy() }],
+    modules: [],
+  });
+  try {
+    assert.equal(framework.updateAgentRuntimeSettings('agent', { sameRoundSkipReplyTextPolicy: 'ask' }).sameRoundSkipReplyTextPolicy, 'ask');
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', { sameRoundSkipReplyTextPolicy: 'Ask' as never }),
+      /sameRoundSkipReplyTextPolicy must be 'private' or 'ask'/,
+    );
+    assert.equal(framework.getAgentRuntimeSettings('agent').sameRoundSkipReplyTextPolicy, 'ask');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
