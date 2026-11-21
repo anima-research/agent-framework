@@ -965,15 +965,20 @@ describe("the private think policy without a channel registry, across a restart,
     assert.ok(afterCut(run).includes(HELD));
   });
 
-  // `{{unsent}}` alone writes no words of the agent's own: it stands for a
-  // bounced draft, which the held round leaves where it was.
-  for (const [label, settings] of [["proseRouting: 'explicit'", { proseRouting: 'explicit' }], ['the default routing', {}]] as const) {
-    it(`says nothing of held words when the cut round wrote only {{unsent}} (${label})`, async () => {
-      const run = await turn('xml', [XML_EAST_ROUND, { xml: '{{unsent}}\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, ...settings });
-      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
-      assert.ok(!afterCut(run).includes(HELD));
-    });
-  }
+  // Under explicit routing `{{unsent}}` alone writes no words of the agent's
+  // own: it stands for a bounced draft, which the held round leaves where it
+  // was. Elsewhere it is substituted nowhere and would be posted as written,
+  // so it is words like any other (#640 R6-3).
+  it("says nothing of held words when the cut round wrote only {{unsent}} (proseRouting: 'explicit')", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '{{unsent}}\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'explicit' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+  it("says the held round's words weren't posted when it wrote only {{unsent}} under the default routing, which would post it as written", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '{{unsent}}\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(afterCut(run).includes(HELD));
+  });
 
   // A destination whose only words are `{{unsent}}` sends none of the
   // agent's own, though an aside beside it wrote some (kept private).
@@ -1203,6 +1208,26 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     const run = await turn('xml', [XML_EAST_ROUND, thinkThenSkip('Second words.')], PRIVATE_ASK, { thinkContinues: true });
     assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
     assert.deepEqual(skipHeld(run), ['First I step east.']);
+  });
+
+  // #640 R6-2: a cut that also cut a skip_reply, under 'ask' with the private
+  // think policy, when the next call is left undecided: the round's words are
+  // kept back as the think's might be, so they aren't drafted either, and the
+  // agent is told they weren't posted. A name that can't be think's is a
+  // skip_reply's text like any other, held as a draft.
+  const cutBesideSkip = (tail: string): Reply => ({ xml: `A note for the room.\n\n<function_calls>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n<invoke name="${tail}`, stop: 'max_tokens' });
+  const HELD_WORDS = "wasn't posted either";
+  for (const tail of ['', 'thi']) {
+    it(`'ask' + private: a cut at <invoke name="${tail} beside a cut skip_reply says the round's words weren't posted, and drafts none`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, cutBesideSkip(tail)], PRIVATE_ASK);
+      assert.ok(!skipHeld(run).includes('A note for the room.'), JSON.stringify(skipHeld(run)));
+      assert.ok(run.requests.slice(2).join('\n').includes(HELD_WORDS), 'the agent is told its words were kept back');
+    });
+  }
+  it("'ask' + private, control: a cut at <invoke name=\"robo beside a cut skip_reply holds the round's words as a draft and says nothing of them", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, cutBesideSkip('robo')], PRIVATE_ASK);
+    assert.ok(skipHeld(run).includes('A note for the room.'), JSON.stringify(skipHeld(run)));
+    assert.ok(!run.requests.slice(2).join('\n').includes(HELD_WORDS));
   });
 
   // The earlier-round shape: nothing about the skip_reply's own round names think.

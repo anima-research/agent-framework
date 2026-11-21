@@ -30491,17 +30491,25 @@ export class AgentFramework {
             // they would otherwise have been posted or held as drafts, since
             // the sentence names the policy as the cause. Disabled routing (a
             // silent turn's too), no channels and a refused call in the round
-            // keep them back on their own; locus, hybrid and locked routing
+            // keep them back on their own, but for a refused skip_reply under
+            // 'ask', which holds a round's words as drafts at the turn's end
+            // (#1024), so there the policy is the cause (#640 R6-2); locus,
+            // hybrid and locked routing
             // send them (locked to its lock, or as drafts with none: #640
             // R4-1), and explicit routing sends all but a `>>skip_reply`'s
             // (R5-1). In hybrid a `>>>skip_reply` before them keeps them
             // private, read from the hold and from this response's routable
             // prose before them, which the turn's end hasn't parsed yet (R4-2).
             const cutRuns = cut ? splitProseRuns(cut.content.slice(cut.start)) : [];
-            const heldUnsaid = cutThinkPrivate && !liveProseRouting && !cutPrivate && !!this.channelRegistry
+            const heldUnsaid = cutThinkPrivate && !liveProseRouting && (!cutPrivate || skipHoldsAtEnd()) && !!this.channelRegistry
               && turnProseRouting !== 'disabled'
               && !cut!.calls.some((call) => call.name === 'think')
-              && cut!.content.slice(cut!.start).some((b) => b.type === 'text' && !!ownWords((b as { text?: string }).text ?? ''))
+              // `{{unsent}}` stands for a bounced draft only where it is substituted
+              // (explicit routing); elsewhere it would be posted as written (R6-3).
+              && cut!.content.slice(cut!.start).some((b) => {
+                const text = (b as { text?: string }).text ?? '';
+                return b.type === 'text' && !!(turnProseRouting === 'explicit' ? ownWords(text) : text.trim());
+              })
               && (turnProseRouting !== 'explicit' || explicitWouldSend(cutRuns))
               && (turnProseRouting !== 'hybrid' || hybridWouldSend(
                 streamRouting.hybridHold,
