@@ -360,6 +360,59 @@ const splitHybridEnvelopes = (rawText: string): string[] => {
   return envelopes.filter((e) => e.trim()).map((e) => e.replace(/^\s+(?=>>>)/, ''));
 };
 
+/** The words of an agent's own in a text: `{{unsent}}` stands for a bounced
+ *  draft, which a held round leaves where it was. */
+const ownWords = (text: string): string => text.replace(/\{\{unsent\}\}/g, '').trim();
+
+/**
+ * Whether explicit routing would send any of a cut round's words, had they not
+ * been held: a `>>` destination with words after it, or unprefixed words,
+ * which go to the turn's sticky target or, with none, back to the agent as a
+ * draft. Only `>>skip_reply` keeps its words.
+ */
+const explicitWouldSend = (cutRuns: readonly string[]): boolean =>
+  cutRuns.some((run) => splitExplicitEnvelopes(run).some((envelope) => {
+    const parsed = parseProsePrefix(envelope);
+    return parsed.kind !== 'private' && !!ownWords(parsed.body);
+  }));
+
+/**
+ * Whether hybrid routing would send any of a cut round's words, had they not
+ * been held: the router's hold, moved by the envelopes of the response's
+ * earlier routable prose and then the cut round's own, in order, as the
+ * turn's end walks them. After `>>>skip_reply` the rest stays private until a
+ * `>>>` names a destination; one that doesn't resolve, or a malformed `>>>`,
+ * holds the words as drafts, which is sending them somewhere too.
+ */
+const hybridWouldSend = (
+  hold: 'private' | 'failed' | undefined,
+  earlierRuns: readonly string[],
+  cutRuns: readonly string[],
+): boolean => {
+  let state = hold;
+  const sends = (envelope: string): boolean => {
+    const parsed = parseHybridProsePrefix(envelope);
+    if (parsed.kind === 'private') {
+      state = 'private';
+      return false;
+    }
+    if (parsed.kind === 'target') {
+      // A destination with no words after it sends nothing yet.
+      state = undefined;
+      return !!ownWords(parsed.body);
+    }
+    if (envelope.startsWith('>>>')) {
+      state = undefined;
+      return true;
+    }
+    return state !== 'private';
+  };
+  for (const run of earlierRuns) for (const envelope of splitHybridEnvelopes(run)) sends(envelope);
+  let any = false;
+  for (const run of cutRuns) for (const envelope of splitHybridEnvelopes(run)) if (sends(envelope)) any = true;
+  return any;
+};
+
 /** Why a round's calls silence its prose: `skip_reply` deliberately keeps it
  *  private; an explicit send holds it back as resendable drafts, where the
  *  agent's sends silence at all (AgentConfig.sendSilencing). */
@@ -1600,6 +1653,14 @@ interface TurnRouting {
   roundsRan?: true;
   unflushedRounds?: number;
   unpostedSpeech?: true;
+  /** A flushed round's words stayed private (privateRoundBlocks): the notice says so, when there is one. */
+  privateSpeechKept?: true;
+  /**
+   * A round of the turn came on membrane's XML tool path. Kept on the turn,
+   * not its stream, so a restart's or retry's first response reads it too
+   * (#640 R3-2).
+   */
+  xmlPathSeen?: true;
   privateEnd?: true;
   skipReplyAsked?: true;
   silent?: true;
@@ -5089,6 +5150,11 @@ export class AgentFramework {
    *  (`roundContent`, its results left out); null where the round has no `roundContent` (XML or fallback). Keyed by
    *  the blocks themselves, so it goes wherever they go. */
   private readonly pendingRoundSent = new WeakMap<ContentBlock[], ContentBlock[] | null>();
+  /** Pending rounds' blocks whose words the turn-end delivery drops by their place, a private think's: their
+   *  words aren't speech left unposted, so the tool boundary's flush asks no `[speech-not-posted]` notice for them
+   *  (#640 R1-2), and one another round asks for says they stay private (R2-1). Filled where the round is added to
+   *  privateThinkRounds, before the flush. */
+  private readonly privateRoundBlocks = new WeakSet<ContentBlock[]>();
   /** Per agent, a round that called code_execution or sent, and waits for
    *  those calls' results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
@@ -19624,7 +19690,11 @@ export class AgentFramework {
           }
           if (flushedTurn && replySent === null && !flushedTurn.privateEnd && !flushedTurn.silent
             && pendingBlocks!.some((b) => b.type === 'text' && (b as { text?: string }).text?.trim())) {
-            flushedTurn.unpostedSpeech = true;
+            // A private round's words aren't speech left unposted, but the
+            // notice covers the turn's rounds, so it names them as private
+            // when another round's words were left unposted (#640 R2-1).
+            if (this.privateRoundBlocks.has(pendingBlocks!)) flushedTurn.privateSpeechKept = true;
+            else flushedTurn.unpostedSpeech = true;
           }
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id), tc.name)
@@ -23583,9 +23653,9 @@ export class AgentFramework {
    * sends nothing else, 'kept', its plain speech is kept and counted
    * instead); a
    * deliberate silence (skip_reply, a silent turn, or a private think in
-   * the same native round, where that policy applies: an XML-mode round has
-   * no verbatim content to route live, so its prose is routed at the turn's
-   * end as ordinary speech) keeps it private —
+   * the same round, where that policy applies: an XML-mode round has no
+   * verbatim content to route live, so the turn's end drops its prose by the
+   * round's place) keeps it private —
    * counted for the receipt, never drafted, but where `round.skipHold` asks
    * for a skip_reply round's text as drafts (sameRoundSkipReplyTextPolicy).
    * `segments` are the runs exactly as written (splitProseRuns), so a draft
@@ -24779,13 +24849,17 @@ export class AgentFramework {
         [{
           type: 'text',
           text: `[${NOTICE_TAG.speechNotPosted}] Nothing you wrote before your tool calls in the rounds just above was posted. ` +
-            `If any of it should go out, send it again.`,
+            (routing.privateSpeechKept
+              ? 'What you wrote beside think in those rounds stays private under your same-round think policy, so leave it ' +
+                'out; if anything else should go out, send it again.'
+              : 'If any of it should go out, send it again.'),
         }],
         { system: true, kind: 'speech-not-posted' } as MessageMetadata,
         undefined,
         present,
       );
       delete routing.unpostedSpeech;
+      delete routing.privateSpeechKept;
     } catch (err) {
       console.error(`[speech-not-posted] could not record the notice for ${agent.name}:`, err);
     }
@@ -28404,6 +28478,7 @@ export class AgentFramework {
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       if (continued?.start) routing.start = continued.start;
       if (continued?.triggerRows !== undefined) routing.triggerRows = continued.triggerRows;
+      if (continued?.xmlPathSeen) routing.xmlPathSeen = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -29371,6 +29446,17 @@ export class AgentFramework {
     // later rounds remain deliverable: the turn-end delivery drops that round's
     // text by its place, the round's index among this stream's tool rounds.
     const refusedWakeRounds = new Set<number>();
+    // Likewise a round that called think() under the private same-round
+    // policy: the native path withholds its prose as the round ends, and the
+    // turn-end delivery drops it by its place where nothing routed it live
+    // (#296; XML mode and membranes without roundContent).
+    const privateThinkRounds = new Set<number>();
+    // Those of them the turn was silenced at as they ended: their prose is
+    // counted as kept private, as holdSilencedProse counts it natively.
+    const silencedPrivateThinkRounds = new Set<number>();
+    // Those kept back only because their script hadn't returned, so may yet
+    // have called think: the turn-end log says so rather than "beside think()".
+    const unreturnedScriptRounds = new Set<number>();
     // The rounds of refusedWakeRounds that a skip_reply keeps private, as
     // opposed to a private think: under 'ask' their text is held where
     // nothing routed it live (skipHoldsAtEnd).
@@ -29471,6 +29557,39 @@ export class AgentFramework {
 
     const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
       && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
+    // The prose a private think's rounds keep back on the fallback path,
+    // counted as routeRound counts a private round's on the native path:
+    // suppressed under disabled routing; kept private where the turn was
+    // silenced as the round ended, a count explicit routing never reads;
+    // otherwise only logged. `base` is what this delivery drops anyway, so
+    // only the think's own runs count. A round that's both a private think's
+    // and a refused call's counts as the think's, as it does natively. Both
+    // ends of a fallback turn settle through here: the natural end, and the
+    // cancel path a permitted skip_reply takes under 'ask' (#640 R6-1).
+    const settlePrivateThinkRuns = (content: readonly ContentBlock[], base: ReadonlySet<number>): void => {
+      if (liveProseRouting || privateThinkRounds.size === 0) return;
+      const runsWithout = (rounds: ReadonlySet<number>): number => splitProseRuns(withoutRoundsProse(content, new Set([...base, ...rounds]))).length;
+      const runsBesideThink = runsWithout(new Set());
+      const withheld = runsBesideThink - runsWithout(privateThinkRounds);
+      if (withheld <= 0) return;
+      const kept = silencedPrivateThinkRounds.size > 0 ? runsBesideThink - runsWithout(silencedPrivateThinkRounds) : 0;
+      // Those kept back because a watched script hadn't returned: the native
+      // path's withhold counts a round's prose as suppressed then, whatever
+      // the routing, and never routes it to be counted again.
+      const unreturned = unreturnedScriptRounds.size > 0 ? runsBesideThink - runsWithout(unreturnedScriptRounds) : 0;
+      const besideWhat = [...privateThinkRounds].some((r) => unreturnedScriptRounds.has(r))
+        ? 'beside think() or a script that had not returned'
+        : 'beside think()';
+      console.error(
+        `[routing] ${agent.name}: ${withheld} prose segment(s) ${besideWhat} NOT routed (same_round_think_text_policy=private)`,
+      );
+      if (turnProseRouting === 'disabled') {
+        this.recordProseSuppression(streamRouting, withheld);
+      } else {
+        streamRouting.keptPrivate += kept;
+        if (unreturned > 0) this.recordProseSuppression(streamRouting, unreturned);
+      }
+    };
     const holdSkipRuns = async (
       runs: string[],
       admitted: AdmittedEnvelope[][],
@@ -29553,7 +29672,10 @@ export class AgentFramework {
           // As at a natural end: earlier deliveries, an earlier turn's
           // included, settle the router's state before this text meets it.
           await turnSpeechChain;
-          const runs = splitProseRuns(partial);
+          // A private think's rounds stay private here too: never held as
+          // drafts, counted as at the turn's natural end (#640 R6-1).
+          const runs = splitProseRuns(withoutRoundsProse(partial, privateThinkRounds));
+          settlePrivateThinkRuns(partial, new Set());
           const admitted = turnProseRouting === 'explicit' ? runs.map((run) => this.admitProse(run.trim(), streamRouting)) : [];
           try {
             await holdSkipRuns(runs, admitted, { routing: streamRouting, notice: 'later' }, resolveTurnLocus(), 'turn');
@@ -29766,11 +29888,9 @@ export class AgentFramework {
             // Whether this stream can carry messages injected with the round's
             // results: true on membrane's native path and false on its XML
             // prefill path. The tool boundary reads it from the agent's state.
-            agent.enterWaitingForTools(
-              calls,
-              stream,
-              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages,
-            );
+            const carriesInjected = (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages;
+            if (carriesInjected === false) streamRouting.xmlPathSeen = true;
+            agent.enterWaitingForTools(calls, stream, carriesInjected);
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
             // instead of batching every segment to the end of the turn. Long
@@ -29868,11 +29988,18 @@ export class AgentFramework {
               answer([]);
             };
             const routeRound = (calls: readonly RoundCall[]): void => {
-              if (!this.channelRegistry) return;
               const toolNames = calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
                 toolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
+              // Marked before the registry's return: a framework with no
+              // channels still keeps a private round's words out of the
+              // notice that asks for unposted words again (#640 R3-1).
+              if (hasSameRoundPrivateThink) {
+                privateThinkRounds.add(toolRound);
+                this.privateRoundBlocks.add(assistantBlocks);
+              }
+              if (!this.channelRegistry) return;
               const before = silence;
               // A refused skip_reply, called directly or from the round's
               // script, keeps its own round private and silences nothing
@@ -29898,6 +30025,7 @@ export class AgentFramework {
               const draftsCause = draftsRound
                 && !calls.some((c) => c.permitted && c.cause === 'send' && c.name !== 'drafts');
               const roundOpts: ProseRound = draftsRound ? { ...holdOpts, draftsRound } : holdOpts;
+              if (hasSameRoundPrivateThink && roundSilence) silencedPrivateThinkRounds.add(toolRound);
               const withoutSkip = mergeSilence(before, roundSilenceOf(calls.filter((c) => c.cause !== 'private'), toolRound));
               const heldUnder = (to: ChannelRef | null): boolean => withoutSkip === 'private' || (!!withoutSkip && !!sendHoldAt(withoutSkip, to));
               const keptBy = draftsCause && withoutSkip && withoutSkip !== 'private' ? withoutSkip : undefined;
@@ -30049,6 +30177,13 @@ export class AgentFramework {
                   const reached = sendsOf(answered(), toolRound);
                   silence = mergeSilence(silence, reached);
                   turnSends = mergeSends(turnSends, reached);
+                  // Its script may yet have called think, so where the turn's
+                  // end would route its prose, that prose stays back.
+                  if (requestSnapshot.sameRoundThinkTextPolicy === 'private') {
+                    privateThinkRounds.add(toolRound);
+                    this.privateRoundBlocks.add(assistantBlocks);
+                    unreturnedScriptRounds.add(toolRound);
+                  }
                   if (roundSegments.length === 0) return;
                   console.error(
                     `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) withheld: ${why}`,
@@ -30327,17 +30462,70 @@ export class AgentFramework {
               }
             }
 
-            const cut = waitedAtComplete ? undefined : cutOffRound(response);
+            const cut = waitedAtComplete ? undefined : cutOffRound(response, {
+              // Once a round of the turn came on membrane's XML path, a cut
+              // inside an opener's name may be a tool block's, so under the
+              // private policy it is held (#640 R2-3, across streams R3-2).
+              // Prose that ends in `<f` or `<a` is held too, failing closed.
+              partialOpener: !!streamRouting.xmlPathSeen && requestSnapshot.sameRoundThinkTextPolicy === 'private',
+            });
             if (cut) response = { ...response, content: cut.content };
             const cutIds = new Set(cut?.calls.map((call) => call.id));
             const cutCalls = cut?.calls.map((call) => this.roundCallOf(agent.name, call, true)) ?? [];
             const cutPrivate = cutCalls.some((call) => call.refused);
-            // Not for XML-built calls: the same-round think policy applies only
-            // to a round with verbatim content, which membrane gives a native
-            // round and never an XML one, so it never reaches an XML round,
-            // cut or not.
-            const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut && !cut.xml
-              && cut.calls.some((call) => call.name === 'think');
+            // Under the private policy a round the cut left undecided is kept
+            // back as a think's is, erring only toward keeping words private
+            // (#640 R1-1): the cut came inside a tag that could still have
+            // become think's, or no call was named and no unfinished tag rules
+            // think out. A partial name that can't be think's routes as before.
+            const cutThinkPrivate = requestSnapshot.sameRoundThinkTextPolicy === 'private' && !!cut
+              && (cut.calls.some((call) => call.name === 'think') || cut.nextCall === 'may'
+                || (cut.unnamed && cut.nextCall === 'none'));
+            // An undecided cut with no call in it counts no round, so its words
+            // are kept back by their place here (the XML fallback only: native
+            // calls carry their whole name from their start).
+            const heldUndecided = cutThinkPrivate && !!cut?.unnamed && !liveProseRouting;
+            // Words held only because the cut left the next call undecided
+            // (not a think the round named) may have been meant to go out, so
+            // the agent is told they weren't posted (#640 R3-3): only where
+            // they would otherwise have been posted or held as drafts, since
+            // the sentence names the policy as the cause. Disabled routing (a
+            // silent turn's too), no channels and a refused call in the round
+            // keep them back on their own, but for a refused skip_reply under
+            // 'ask', which holds a round's words as drafts at the turn's end
+            // (#1024), so there the policy is the cause (#640 R6-2); locus,
+            // hybrid and locked routing
+            // send them (locked to its lock, or as drafts with none: #640
+            // R4-1), and explicit routing sends all but a `>>skip_reply`'s
+            // (R5-1). In hybrid a `>>>skip_reply` before them keeps them
+            // private, read from the hold and from this response's routable
+            // prose before them, which the turn's end hasn't parsed yet (R4-2).
+            const cutRuns = cut ? splitProseRuns(cut.content.slice(cut.start)) : [];
+            const heldUnsaid = cutThinkPrivate && !liveProseRouting && (!cutPrivate || skipHoldsAtEnd()) && !!this.channelRegistry
+              && turnProseRouting !== 'disabled'
+              && !cut!.calls.some((call) => call.name === 'think')
+              // `{{unsent}}` stands for a bounced draft only where it is substituted
+              // (explicit routing); elsewhere it would be posted as written (R6-3).
+              && cut!.content.slice(cut!.start).some((b) => {
+                const text = (b as { text?: string }).text ?? '';
+                return b.type === 'text' && !!(turnProseRouting === 'explicit' ? ownWords(text) : text.trim());
+              })
+              && (turnProseRouting !== 'explicit' || explicitWouldSend(cutRuns))
+              // The earlier rounds replayed as the turn's end will route them:
+              // under 'ask' a refused skip_reply's round is held, not dropped,
+              // and holding it moves the hybrid hold as sending would, so only
+              // a private think's rounds leave the replay then (R6, the fresh
+              // reader's find).
+              && (turnProseRouting !== 'hybrid' || hybridWouldSend(
+                streamRouting.hybridHold,
+                splitProseRuns(withoutRoundsProse(cut!.content.slice(0, cut!.start), skipHoldsAtEnd() ? privateThinkRounds : new Set([...refusedWakeRounds, ...privateThinkRounds]))),
+                cutRuns,
+              ));
+            // Explicit routing's sticky target lasts only the turn, so a resend
+            // names its destination (R5-1, the fresh reader's find).
+            const HELD_UNSAID = 'What you wrote before it wasn\'t posted either: under your same-round think policy it\'s kept back ' +
+              'in case it was written beside think, and nothing keeps it for you to send later. If that call wasn\'t think, ' +
+              `send what should go out again${turnProseRouting === 'explicit' ? ', with its `>>` destination' : ''}.`;
             const cutHeld = cutPrivate && !cutThinkPrivate && !cut?.xml && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
               && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
             const cutResults = cut && cut.calls.length > 0 ? await this.cutOffResults(agent, cut.calls) : undefined;
@@ -30353,10 +30541,14 @@ export class AgentFramework {
               }
               hadToolCalls = true;
               const cutRound = toolRounds++;
-              if (turnProseRouting !== 'disabled' && ((cutPrivate && !(cutHeld && !liveProseRouting)) || (cutThinkPrivate && !liveProseRouting))) {
+              if (turnProseRouting !== 'disabled' && cutPrivate && !(cutHeld && !liveProseRouting)) {
                 refusedWakeRounds.add(cutRound);
                 // Text beside a private think stays private: it isn't held.
                 if (!cutThinkPrivate) skipPrivateRounds.add(cutRound);
+              }
+              if (cutThinkPrivate && !liveProseRouting) {
+                privateThinkRounds.add(cutRound);
+                if (silence) silencedPrivateThinkRounds.add(cutRound);
               }
               if (liveProseRouting) silence = mergeSilence(silence, roundSilenceOf(cutCalls, cutRound));
               console.error(
@@ -30364,6 +30556,10 @@ export class AgentFramework {
                 `(${cut.calls.map((call) => call.name).join(', ')}); stored with refused results, not run`,
               );
             } else if (cut?.unnamed) {
+              if (heldUndecided) {
+                privateThinkRounds.add(toolRounds);
+                if (silence) silencedPrivateThinkRounds.add(toolRounds);
+              }
               console.error(
                 `[tool-boundary] agent=${agent.name}: response ended at max_tokens inside a tool-call block before any call was named; nothing ran`,
               );
@@ -30433,13 +30629,19 @@ export class AgentFramework {
               agent.toolResultGuard.storeResults(cutResults.blocks, cutResults.wire, cutResults.completed,
                 this.silentTurnRowMetadata(agent.name), cutResults.keptCap);
               agent.toolResultGuard.settleTurnEnded();
+              if (heldUnsaid) {
+                storeOwnRow(agent, 'user', [{
+                  type: 'text',
+                  text: `[${NOTICE_TAG.toolBoundary}] Your response was cut off at the output limit while a call after these was being written. ${HELD_UNSAID}`,
+                }], { system: true, kind: 'cut-off-held-words', ...this.silentTurnRowMetadata(agent.name) });
+              }
             } else if (cut?.unnamed) {
               // The agent's own row, as the contained-wrapper notice above is
               // (#291's audience stamp): presented to it as it is stored.
               storeOwnRow(agent, 'user', [{
                 type: 'text',
                 text: `[${NOTICE_TAG.toolBoundary}] Your response was cut off at the output limit inside a tool-call block, before any call in it ` +
-                  'was named, so nothing ran. To make a call, send less in one response.',
+                  'was named, so nothing ran. To make a call, send less in one response.' + (heldUnsaid ? ` ${HELD_UNSAID}` : ''),
               }], { system: true, kind: 'cut-off-tool-block', ...this.silentTurnRowMetadata(agent.name) });
             }
 
@@ -30465,8 +30667,11 @@ export class AgentFramework {
               ? []
               : response.content.filter(isTextBlock);
 
-            const speechContent = hadToolCalls ? [] : allText;
-            const thoughts = hadToolCalls ? allText : [];
+            // The words of an undecided cut kept back by their place are a
+            // round's, as a cut think's are, even where no call ran.
+            const proseTurn = hadToolCalls || heldUndecided;
+            const speechContent = proseTurn ? [] : allText;
+            const thoughts = proseTurn ? allText : [];
 
             // Explicit text is admitted as its round ends, before anything
             // below waits (a module's speech callback, the turn's earlier
@@ -30486,13 +30691,19 @@ export class AgentFramework {
                 ? splitProseRuns(response.content)
                 : speechRun.trim() ? [speechRun] : [];
             const finalSpeechSegments = finalSpeechRuns.map((run) => run.trim());
-            const finalGroups = !hadToolCalls || allText.length === 0
+            // The rounds whose prose the turn's end drops by their place: refused
+            // wakes, and on the fallback path a private think's. Under 'ask' a
+            // skip_reply's round is held as drafts instead, but never a private
+            // think's: text beside a private think stays private.
+            const proseDropped = new Set([...refusedWakeRounds, ...privateThinkRounds]);
+            const skipHeldRounds = new Set([...skipPrivateRounds].filter((r) => !privateThinkRounds.has(r)));
+            const finalGroups = !proseTurn || allText.length === 0
               ? []
               : liveProseRouting
                 ? [{ held: false, runs: splitProseRuns(terminalContent) }]
                 : skipHoldsAtEnd()
-                  ? proseRunGroups(response.content, skipPrivateRounds, refusedWakeRounds)
-                  : [{ held: false, runs: splitProseRuns(withoutRoundsProse(response.content, refusedWakeRounds)) }];
+                  ? proseRunGroups(response.content, skipHeldRounds, proseDropped)
+                  : [{ held: false, runs: splitProseRuns(withoutRoundsProse(response.content, proseDropped)) }];
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.
@@ -30519,6 +30730,7 @@ export class AgentFramework {
             // Speech dispatch happens after but doesn't depend on the status
             // field.
             delete streamRouting.unpostedSpeech;
+            delete streamRouting.privateSpeechKept;
             agent.reset();
             if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
@@ -30743,22 +30955,23 @@ export class AgentFramework {
                   }
                 }
               }
-            } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
+            } else if (this.channelRegistry && proseTurn && allText.length > 0) {
               // Tool-call turn that also produced prose. When live routing was
               // active (native roundContent), each mid-turn round's prose was
               // already delivered when that round yielded — only the TRAILING
               // prose (blocks after the last tool round) remains here. On the
               // XML tool path (no roundContent, so nothing was live-routed)
-              // the whole turn's parsed segments are routed, once, now, in
-              // groups by round: under 'ask', a round a skip_reply kept
-              // private is held in its place (finalGroups). The global
+              // the historical behavior applies: the whole turn's parsed
+              // segments are routed, but for the rounds kept back by their place
+              // (refused wakes, private thinks), once, now, in groups by round:
+              // under 'ask', a round a skip_reply kept private is held in its
+              // place (finalGroups). The global
               // speech/thoughts split is left untouched (module/TUI rendering
               // unaffected) — this only governs what reaches the channel.
               //
               // Native round routing uses the live sticky flag, which a fresh
-              // injected message can reset. The XML tool path has no
-              // reliable round boundaries, so retain its historical turn-wide
-              // scan to avoid double-posting.
+              // injected message can reset. The XML tool path decides silence by
+              // its historical turn-wide scan, to avoid double-posting.
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { id?: unknown; name?: unknown; input?: unknown; unparseableInput?: string })
@@ -30776,6 +30989,11 @@ export class AgentFramework {
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
               const trailingWhen = liveProseRouting ? 'end' : 'turn';
               const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
+
+
+              // The runs a private think's rounds kept back, counted (settlePrivateThinkRuns).
+              settlePrivateThinkRuns(response.content, new Set([...refusedWakeRounds].filter((r) => !privateThinkRounds.has(r))));
+
               const thinkPrivate = cutThinkPrivate && liveProseRouting;
               const deliverRuns = async (runs: string[], admitted: AdmittedEnvelope[][]): Promise<boolean> => {
                 const segments = runs.map((run) => run.trim());
@@ -33927,6 +34145,7 @@ export class AgentFramework {
     if (skipping) {
       skipping.privateEnd = true;
       delete skipping.unpostedSpeech;
+      delete skipping.privateSpeechKept;
     }
     const wake = readSkipReplyWake(enrichedCall.input);
     if (wake.kind === 'wake' && this.eventGate) {

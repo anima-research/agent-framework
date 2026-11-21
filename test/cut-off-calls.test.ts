@@ -12,14 +12,14 @@ import { TOOL_RESULT_GUARD_AUDIT_STATE } from '../src/tool-result-guard.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 
 type Block = { text: string } | { thinking: string } | { call: string; json: string[]; whole: boolean };
-type Reply = { blocks: Block[]; stop: 'max_tokens' | 'tool_use' | 'end_turn' } | { xml: string; stop: 'max_tokens' | 'stop_sequence' | 'end_turn' };
+type Reply = { blocks: Block[]; stop: 'max_tokens' | 'tool_use' | 'end_turn' } | { xml: string; stop: 'max_tokens' | 'stop_sequence' | 'end_turn' } | { fail: number };
 
 const NEXT = 'The next answer.';
 const RAN_NOT = "didn't run, because the response it was in was cut off at the output limit";
 const ADVICE = 'send less in one response';
 const UNNAMED = '[tool-boundary] Your response was cut off at the output limit inside a tool-call block, before any call in it was named, so nothing ran.';
 
-function sse(reply: Reply): string {
+function sse(reply: Exclude<Reply, { fail: number }>): string {
   const out: string[] = [];
   const event = (type: string, data: Record<string, unknown>) => out.push(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
   event('message_start', { message: { id: 'msg_test', type: 'message', role: 'assistant', model: 'test', content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } });
@@ -86,7 +86,7 @@ interface Run {
 }
 
 /** What a turn's harness adds beside the agent's settings: framework config, modules, a first wake that is a heartbeat, labels the stand-in registry resolves, and the channel tools it offers (a script sees only those). */
-type TurnOptions = { framework?: Record<string, unknown>; modules?: Module[]; heartbeat?: boolean; resolves?: Record<string, string>; channelTools?: ToolDefinition[] };
+type TurnOptions = { framework?: Record<string, unknown>; modules?: Module[]; heartbeat?: boolean; resolves?: Record<string, string>; channelTools?: ToolDefinition[]; registry?: boolean; targets?: string[]; thinkContinues?: boolean };
 
 async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: TurnOptions = {}): Promise<Run> {
   const requests: string[] = [];
@@ -102,6 +102,11 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       }
       requests.push(raw);
       const reply = queue.shift() ?? (mode === 'xml' ? { xml: NEXT, stop: 'end_turn' as const } : { blocks: [{ text: NEXT }], stop: 'end_turn' as const });
+      if ('fail' in reply) {
+        res.writeHead(reply.fail, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'test failure' } }));
+        return;
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end(sse(reply));
     });
@@ -136,7 +141,9 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
     },
     resolveProseTarget: (spec: string) => (opts.resolves?.[spec]
       ? { serverId: 'stub', channelId: opts.resolves[spec] }
-      : { error: `no channel matches "${spec}"` }),
+      : opts.targets?.includes(spec)
+        ? { serverId: 'stub', channelId: spec }
+        : { error: `no channel matches "${spec}"` }),
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => ({ serverId: 'stub', channelId: 'world:commons' }),
     getDefaultPublishChannel: () => null,
@@ -145,14 +152,18 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
     getChannelTools: () => opts.channelTools ?? [],
     channelsNamed: (name: string) => [{ serverId: 'stub', channelId: name }],
     nameShown: (channel: { channelId: string }) => channel.channelId,
-    handleChannelToolCall: async () => {
+    handleChannelToolCall: async (name: string) => {
+      // A think that answers and lets the turn go on, where a row needs one.
+      if (opts.thinkContinues && name === 'think') return { success: true, data: { noted: true } };
       skipReplies++;
       return { success: true, endTurn: true, data: { skipped: true } };
     },
   };
-  (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
-    get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
-  });
+  if (opts.registry !== false) {
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(registry, {
+      get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
+    });
+  }
   const failedTraces: Run['failedTraces'] = [];
   framework.onTrace((event) => {
     if (event.type === 'tool:failed') failedTraces.push(event as Run['failedTraces'][number]);
@@ -532,14 +543,37 @@ describe('XML tools: a response that ends at the output limit inside a tool-call
     assert.equal(run.requests.length, 2);
   });
 
-  it('routes the words of a cut-off round whose think membrane read whole as an XML round\'s, outside the private think policy', async () => {
+  // #296: the private think policy reaches an XML round, cut off or not.
+  it('keeps back the words of a cut-off round whose think membrane read whole as an XML round\'s, under the private think policy', async () => {
     const ns = 'an' + 'tml:';
     const run = await turn('xml', [{ xml: `Words here.\n\n<${ns}function_calls>\n<${ns}invoke name="think">\n<${ns}parameter name="thought">hm</${ns}parameter>\n</${ns}invoke>\n</${ns}function_calls>\nMore words`, stop: 'max_tokens' }],
       { sameRoundThinkTextPolicy: 'private' });
     assertRefusedPair(run, [{ name: 'think', says: RAN_NOT }]);
-    assert.ok(run.routed.some((text) => text.includes('Words here.')), JSON.stringify(run.routed));
+    assert.ok(!run.routed.some((text) => text.includes('Words here.')), JSON.stringify(run.routed));
     assert.equal(run.routed.at(-1), NEXT);
     assert.equal(run.requests.length, 2);
+  });
+
+  // #296: an XML round cut off with a private think counts as native's does.
+  const xmlThinkCut = (words: string): Reply => {
+    const ns = 'an' + 'tml:';
+    return { xml: `${words}\n\n<${ns}function_calls>\n<${ns}invoke name="think">\n<${ns}parameter name="thought">hm</${ns}parameter>\n</${ns}invoke>\n</${ns}function_calls>\nMore words`, stop: 'max_tokens' };
+  };
+  const xmlSend: Reply = { xml: 'Telling the room.\n\n<function_calls>\n<invoke name="robot--send_message">\n<parameter name="text">hi</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+
+  it("counts an XML round cut off with a private think as kept private on a turn an earlier send silenced", async () => {
+    const run = await turn('xml', [xmlSend, xmlThinkCut('Musing to myself.')], { sameRoundThinkTextPolicy: 'private' });
+    assert.ok(!run.routed.some((text) => text.includes('Musing to myself.')), JSON.stringify(run.routed));
+    assert.match(receipts(run).join(' | '), /kept private/, receipts(run).join(' | '));
+  });
+
+  it("counts an XML round cut off with a private think once, under disabled routing", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, xmlThinkCut('Musing to myself.')], { proseRouting: 'disabled', sameRoundThinkTextPolicy: 'private' });
+    assert.deepEqual(run.routed, []);
+    // Three: the east round's words, the think round's, and the words after
+    // its block, before the output limit. Counted once each.
+    assert.match(receipts(run)[0] ?? '', /\b3 plain-speech segment\(s\) kept in the transcript/, receipts(run).join(' | '));
+    assert.equal(run.requests.length, 3);
   });
 
   it('tells the agent nothing ran when an earlier round ran and the next block was cut off before any call was named', async () => {
@@ -616,6 +650,386 @@ describe('an ephemeral run whose response ends at the output limit with calls in
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// #640 R1-1: under the private think policy, a round whose block is cut off
+// before the last call's name is read whole may be a think's, so its words are
+// kept back, failing closed; a partial name that can't be `think` routes as
+// before.
+describe("XML tools: a cut that leaves the last call's name undecided, under the private think policy", () => {
+  const PRIVATE = { sameRoundThinkTextPolicy: 'private' };
+
+  it("keeps back a round's words when its block is cut inside the first call's name", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("keeps back a round's words when the cut is inside a second call's name, after a whole one", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n<invoke name="thi', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.moves, [], 'the cut-off round runs nothing');
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("keeps back only the cut round's words after an earlier round that ran", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.moves, [{ dir: 'east' }]);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+  });
+
+  it("keeps back a round's words when the cut is after the name but before its tag closes", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="think"', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("keeps back a round's words when the block is cut before its first tag", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+  });
+
+  it("routes a round's words when the partial name can't become think", async () => {
+    const run = await turn('xml', [{ xml: 'Heading north now.\n\n<function_calls>\n<invoke name="robo', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, ['Heading north now.', NEXT]);
+  });
+
+  it("routes the same cut's words under the public policy", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="thi', stop: 'max_tokens' }]);
+    assert.deepEqual(run.routed, ['Private musing.', NEXT]);
+  });
+
+  // #640 R2-2: membrane's grammar takes a self-closing head as a whole call,
+  // and think's thought is optional, so a cut between its `/` and `>` may be
+  // think's too.
+  for (const [label, head] of [['<invoke name="think"/', '<invoke name="think"/'], ['<invoke name="think" /', '<invoke name="think" /']] as const) {
+    it(`keeps back a round's words when the cut is inside a self-closing think head (${label})`, async () => {
+      const run = await turn('xml', [{ xml: `Private musing.\n\n<function_calls>\n${head}`, stop: 'max_tokens' }], PRIVATE);
+      assert.deepEqual(run.routed, [NEXT]);
+    });
+  }
+
+  it("routes a self-closing head's cut words under the public policy", async () => {
+    const run = await turn('xml', [{ xml: 'Private musing.\n\n<function_calls>\n<invoke name="think"/', stop: 'max_tokens' }]);
+    assert.deepEqual(run.routed, ['Private musing.', NEXT]);
+  });
+
+  // #640 R2-3: once a stream's earlier round came on membrane's XML path
+  // (which declares it can't carry injected messages), a cut inside the
+  // opener's own name is a tool block's too, so under the private policy the
+  // round is held from `<f` (or `<a`) on. A stream's first response gives no
+  // such sign, and membrane reads a cut as inside a tool block only from the
+  // whole opener, so there it routes, the tag's fragment with it (membrane's).
+  for (const tail of ['<function_call', '<f', '<function_cal', '<antml:function_ca', '<antml'] as const) {
+    it(`keeps back a later round cut inside its opener's name (${tail}), after an XML round`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml: `Private musing.\n\n${tail}`, stop: 'max_tokens' }], PRIVATE);
+      assert.deepEqual(run.moves, [{ dir: 'east' }]);
+      assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+      assert.ok(!replyTexts(run).some((t) => t.includes(tail)), `the fragment leaves the stored reply: ${replyTexts(run).join(' | ')}`);
+    });
+  }
+
+  it("routes a later round's words when the cut leaves only a '<', after an XML round", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, ['First I step east.', 'Private musing.\n\n<', NEXT]);
+  });
+
+  it("routes a later round cut inside its opener's name under the public policy", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_call', stop: 'max_tokens' }]);
+    assert.deepEqual(run.routed, ['First I step east.', 'Private musing.\n\n<function_call', NEXT]);
+  });
+
+  for (const tail of ['<function_call', '<'] as const) {
+    it(`routes a stream's first response cut before its opener is whole (${tail}), under the private policy too`, async () => {
+      const run = await turn('xml', [{ xml: `Private musing.\n\n${tail}`, stop: 'max_tokens' }], PRIVATE);
+      assert.deepEqual(run.routed, [`Private musing.\n\n${tail}`, NEXT]);
+    });
+  }
+});
+
+// #640 R3: the same-round think policy's words in the configurations the R2
+// tests didn't vary: a framework with no channel registry (no MCPL servers),
+// a stream restarted after an XML round, and a cut that leaves its round's
+// words held without saying so.
+describe("the private think policy without a channel registry, across a restart, and when a cut holds a round", () => {
+  const PRIVATE = { sameRoundThinkTextPolicy: 'private' };
+  const SPEECH_NOT_POSTED = '[speech-not-posted]';
+  const PLAIN = 'If any of it should go out, send it again.';
+  const KEPT = 'stays private under your same-round think policy';
+  const XML_THINK_ROUND: Reply = { xml: 'Private musing.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  const notices = (run: Run) => run.rows.flatMap((row) => row.content)
+    .filter((block) => block.type === 'text' && String(block.text).startsWith(SPEECH_NOT_POSTED)).map((block) => String(block.text));
+
+  // R3-1: with no registry the private marks were set after the registry's
+  // return, so a private round read as speech left unposted.
+  it("a restart after a private think round writes no notice inviting its words out, with no registry", async () => {
+    const run = await turn('xml', [XML_THINK_ROUND], { ...PRIVATE, maxStreamTokens: 5 }, { registry: false });
+    assert.ok(run.requests.length >= 2, 'premise: the stream restarted after the round');
+    assert.ok(!run.requests[1]!.includes(PLAIN), 'the continuation does not ask for the private words again');
+    assert.deepEqual(notices(run).filter((n) => n.includes(PLAIN)), []);
+  });
+
+  it("a failure after a private think round writes no notice inviting its words out, with no registry", async () => {
+    const run = await turn('xml', [XML_THINK_ROUND, { fail: 400 }], { ...PRIVATE, retries: 0 }, { registry: false });
+    assert.deepEqual(notices(run).filter((n) => n.includes(PLAIN)), [], notices(run).join(' | '));
+  });
+
+  it("a failure after a mixed turn names the private round's words as private, with no registry", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, XML_THINK_ROUND, { fail: 400 }], { ...PRIVATE, retries: 0 }, { registry: false });
+    assert.equal(notices(run).length, 1, notices(run).join(' | '));
+    assert.ok(notices(run)[0]!.includes(KEPT), notices(run)[0]);
+  });
+
+  it("the public twin of the mixed failure names all its words, with no registry", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, XML_THINK_ROUND, { fail: 400 }], { retries: 0 }, { registry: false });
+    assert.equal(notices(run).length, 1, notices(run).join(' | '));
+    assert.ok(notices(run)[0]!.includes(PLAIN) && !notices(run)[0]!.includes(KEPT), notices(run)[0]);
+  });
+
+  // R3-2: a turn that has shown it is on the XML path stays so across its
+  // streams, so a restart's first response cut inside its opener is held.
+  it("keeps back a restart's first response cut inside its opener's name, after an XML round", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_call', stop: 'max_tokens' }], { ...PRIVATE, maxStreamTokens: 5 });
+    assert.ok(run.requests.length >= 3, 'premise: the stream restarted after the first round');
+    // A restart on the XML path leaves round 1's words to the restart's notice; only the next answer routes.
+    assert.deepEqual(run.routed, [NEXT]);
+    assert.ok(!replyTexts(run).some((t) => t.includes('<function_call')), replyTexts(run).join(' | '));
+  });
+
+  it("routes a restart's first response cut inside its opener under the public policy", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_call', stop: 'max_tokens' }], { maxStreamTokens: 5 });
+    assert.deepEqual(run.routed, ['Private musing.\n\n<function_call', NEXT]);
+  });
+
+  // R3-3: a round held because the cut left its next call undecided says so,
+  // beside the cut's notice or its refused results, since the agent may not
+  // have been writing beside think.
+  const HELD = "wasn't posted either";
+  const afterCut = (run: Run) => run.requests.slice(2).join('\n');
+  it("says the held round's words weren't posted when an unnamed cut holds them", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, ['First I step east.', NEXT]);
+    assert.ok(afterCut(run).includes(HELD), 'the agent is told its words were kept back');
+    const notice = run.rows.flatMap((row) => row.content).map((block) => String(block.text ?? '')).find((text) => text.includes(HELD));
+    assert.ok(notice && !/draft/i.test(notice), `and is promised no draft: ${notice}`);
+  });
+
+  it("says the held round's words weren't posted beside a named cut's refused results", async () => {
+    const run = await turn('xml', [{ xml: 'Heading north, everyone.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">north</parameter>\n</invoke>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.deepEqual(run.routed, [NEXT]);
+    assert.ok(run.requests[1]!.includes(HELD), 'the agent is told its words were kept back');
+  });
+
+  it("says nothing of held words when the cut's words were routed (a name that can't be think)", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north.\n\n<function_calls>\n<invoke name="robo', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when the cut round wrote none", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  // The sentence names the think policy as the cause, so it is written only
+  // where the words would otherwise have been posted or held as drafts (the
+  // fresh reader's find).
+  const UNNAMED_NORTH: Reply = { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+  for (const [label, settings, opts] of [
+    ["proseRouting: 'disabled'", { proseRouting: 'disabled' }, {}],
+    ['no channel registry', {}, { registry: false }],
+  ] as const) {
+    it(`says nothing of held words where they wouldn't have been posted or held anyway (${label})`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, ...settings }, opts);
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
+    });
+  }
+
+  it("says nothing of held words beside a refused skip_reply named in the cut round", async () => {
+    const run = await turn('xml', [{ xml: 'A note to myself, not for the room.\n\n<function_calls>\n<invoke name="skip_reply">\n</invoke>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(!run.routed.some((t) => t.includes('A note to myself')));
+    assert.ok(!run.requests.slice(1).join('\n').includes(HELD));
+  });
+
+  it("says the held round's words weren't posted under hybrid routing too", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // R4-1: a locked turn's words go to its lock (or are held as drafts with
+  // no lock) as a locus turn's go to its locus, so it is told too.
+  it("says the held round's words weren't posted under locked routing", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'locked', proseLock: 'world:commons' }, { targets: ['world:commons'] });
+    assert.ok(run.routed.includes('First I step east.'), `premise: the lock routes the turn's words: ${run.routed.join(' | ')}`);
+    assert.ok(afterCut(run).includes(HELD));
+    assert.ok(!afterCut(run).includes('`>>` destination'), 'only explicit routing names a destination');
+  });
+
+  it("says the held round's words weren't posted under locked routing with no lock (held as drafts)", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'locked' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // R4-2: after a hybrid `>>>skip_reply` the rest of the turn stays private,
+  // so held words wouldn't have gone out anyway; a later `>>>` target lifts
+  // that hold, and the sentence comes back.
+  const XML_PRIVATE_EAST: Reply = { xml: '>>>skip_reply Just a note to myself.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  it("says nothing of held words after a hybrid >>>skip_reply earlier in the response", async () => {
+    const pub = await turn('xml', [XML_PRIVATE_EAST, { xml: 'Now north, everyone.', stop: 'end_turn' }], { proseRouting: 'hybrid' });
+    assert.ok(!pub.routed.some((t) => t.includes('Now north')), `premise: the hold keeps them private: ${pub.routed.join(' | ')}`);
+    const run = await turn('xml', [XML_PRIVATE_EAST, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when the cut round's own words open with >>>skip_reply", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '>>>skip_reply Now north, privately.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when a later >>> target lifted an earlier >>>skip_reply", async () => {
+    const lifted: Reply = { xml: '>>>skip_reply Just a note to myself.\n>>>world:commons Hello, all.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [lifted, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when the cut round's own >>> target lifts an earlier >>>skip_reply", async () => {
+    const run = await turn('xml', [XML_PRIVATE_EAST, { xml: '>>>world:commons Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // A `>>>skip_reply !` hold ends with its response: the continuation's
+  // plain words route (the public twin shows it), so held ones are told.
+  it("says the held round's words weren't posted in a continuation after a response that ended on >>>skip_reply !", async () => {
+    const pub = await turn('xml', [{ xml: '>>>skip_reply ! Just a note to myself.', stop: 'end_turn' }, { xml: 'Now north, everyone.', stop: 'end_turn' }], { proseRouting: 'hybrid' });
+    assert.deepEqual(pub.routed, ['Now north, everyone.', NEXT], "premise: the continuation's words route");
+    const run = await turn('xml', [{ xml: '>>>skip_reply ! Just a note to myself.', stop: 'end_turn' }, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the continuation was cut, and told so');
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when the earlier >>>skip_reply sat beside a private think (its text routes nothing)", async () => {
+    const thinkRound: Reply = { xml: '>>>skip_reply Mumbling.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [thinkRound, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' }, { thinkContinues: true });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says the held round's words weren't posted when a malformed >>> after an earlier >>>skip_reply lifted the hold", async () => {
+    const malformed: Reply = { xml: '>>>skip_reply Just a note to myself.\n>>>\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [malformed, UNNAMED_NORTH], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // The fresh reader's R4 finds: explicit routing sends a `>>` destination's
+  // words, and a destination with no words after it sends nothing. R5-1:
+  // unprefixed words go somewhere too, to the turn's sticky target or back to
+  // the agent as a draft, so a held round's are told of as well.
+  it("says the held round's words weren't posted under explicit routing when they had a >> destination", async () => {
+    const cutTo: Reply = { xml: '>>world:commons Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const pub = await turn('xml', [XML_EAST_ROUND, cutTo], { proseRouting: 'explicit' }, { targets: ['world:commons'] });
+    assert.ok(pub.routed.includes('Now north, everyone.'), `premise: the destination routes them: ${pub.routed.join(' | ')}`);
+    const run = await turn('xml', [XML_EAST_ROUND, cutTo], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
+    assert.ok(!run.routed.some((t) => t.includes('Now north')));
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  const XML_TARGET_EAST: Reply = { xml: '>>world:commons Heading out.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  const NAMED_NORTH: Reply = { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">north</parameter>\n</invoke>\n<invoke name="', stop: 'max_tokens' };
+  for (const [cutLabel, cutReply] of [['an unnamed cut', UNNAMED_NORTH], ['a named cut', NAMED_NORTH]] as const) {
+    it(`says the held round's unprefixed words weren't posted under explicit routing with a sticky target (${cutLabel})`, async () => {
+      const pub = await turn('xml', [XML_TARGET_EAST, cutReply], { proseRouting: 'explicit' }, { targets: ['world:commons'] });
+      assert.ok(pub.routed.includes('Now north, everyone.'), `premise: the sticky target routes them: ${pub.routed.join(' | ')}`);
+      const run = await turn('xml', [XML_TARGET_EAST, cutReply], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
+      assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
+      assert.ok(afterCut(run).includes(HELD));
+      // A sticky target lasts the turn, so a resend needs its destination.
+      assert.ok(afterCut(run).includes('with its `>>` destination'), 'explicit routing names the destination a resend needs');
+    });
+
+    it(`says the held round's unprefixed words weren't posted under explicit routing with no target yet (${cutLabel})`, async () => {
+      const pub = await turn('xml', [XML_EAST_ROUND, cutReply], { proseRouting: 'explicit' });
+      assert.ok(afterCut(pub).includes('Your text (20 chars)'), 'premise: without the policy the cut round\'s words bounce, with a notice');
+      const run = await turn('xml', [XML_EAST_ROUND, cutReply], { ...PRIVATE, proseRouting: 'explicit' });
+      assert.ok(!afterCut(run).includes('Your text (20 chars)'), 'premise: held back, they never reach the bounce');
+      assert.ok(afterCut(run).includes(HELD));
+    });
+  }
+
+  it("says the held round's words weren't posted under explicit routing when a >>skip_reply aside followed them", async () => {
+    const mixed: Reply = { xml: 'Now north, everyone.\n>>skip_reply An aside.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const pub = await turn('xml', [XML_EAST_ROUND, mixed], { proseRouting: 'explicit' });
+    assert.ok(afterCut(pub).includes('Your text (20 chars)'), "premise: without the policy the words before the aside bounce, with a notice");
+    const run = await turn('xml', [XML_EAST_ROUND, mixed], { ...PRIVATE, proseRouting: 'explicit' });
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // Under explicit routing `{{unsent}}` alone writes no words of the agent's
+  // own: it stands for a bounced draft, which the held round leaves where it
+  // was. Elsewhere it is substituted nowhere and would be posted as written,
+  // so it is words like any other (#640 R6-3).
+  it("says nothing of held words when the cut round wrote only {{unsent}} (proseRouting: 'explicit')", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '{{unsent}}\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'explicit' });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+  it("says the held round's words weren't posted when it wrote only {{unsent}} under the default routing, which would post it as written", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: '{{unsent}}\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  // A destination whose only words are `{{unsent}}` sends none of the
+  // agent's own, though an aside beside it wrote some (kept private).
+  for (const [label, settings, xml] of [
+    ["proseRouting: 'explicit'", { proseRouting: 'explicit' }, '>>skip_reply An aside.\n>>world:commons {{unsent}}\n\n<function_calls>\n<invoke name="'],
+    ["proseRouting: 'hybrid'", { proseRouting: 'hybrid' }, '>>>skip_reply An aside.\n>>>world:commons {{unsent}}\n\n<function_calls>\n<invoke name="'],
+  ] as const) {
+    it(`says nothing of held words when the cut round's only destination wrote {{unsent}} beside an aside (${label})`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml, stop: 'max_tokens' }], { ...PRIVATE, ...settings }, { targets: ['world:commons'] });
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
+    });
+  }
+
+  for (const [label, xml] of [
+    ['a >> destination with no words', '>>world:commons\n\n<function_calls>\n<invoke name="'],
+    ['a >>skip_reply aside', '>>skip_reply Just a note to myself.\n\n<function_calls>\n<invoke name="'],
+  ] as const) {
+    it(`says nothing of held words under explicit routing when the cut held only ${label}`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, { xml, stop: 'max_tokens' }], { ...PRIVATE, proseRouting: 'explicit' }, { targets: ['world:commons'] });
+      assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+      assert.ok(!afterCut(run).includes(HELD));
+    });
+  }
+
+  // R5-2: any envelope of the cut round that would have gone out counts, not
+  // only its last.
+  it("says the held round's words weren't posted when a hybrid >>>skip_reply followed them in the cut round", async () => {
+    const mixed: Reply = { xml: 'Now north, everyone.\n>>>skip_reply An aside.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const pub = await turn('xml', [XML_EAST_ROUND, mixed], { proseRouting: 'hybrid' });
+    assert.ok(pub.routed.some((t) => t.includes('Now north, everyone.')), `premise: the words before the aside route: ${pub.routed.join(' | ')}`);
+    const run = await turn('xml', [XML_EAST_ROUND, mixed], { ...PRIVATE, proseRouting: 'hybrid' });
+    assert.ok(!run.routed.some((t) => t.includes('Now north')), run.routed.join(' | '));
+    assert.ok(afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when a hybrid cut held only a >>> destination with no words", async () => {
+    const headerOnly: Reply = { xml: '>>>world:commons\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+    const run = await turn('xml', [XML_EAST_ROUND, headerOnly], { ...PRIVATE, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(afterCut(run).includes('before any call in it was named'), 'premise: the unnamed cut notice was written');
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words under the public policy", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Now north, everyone.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' }]);
+    assert.ok(!afterCut(run).includes(HELD));
+  });
+
+  it("says nothing of held words when the cut call was think's own", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, { xml: 'Private musing.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">h', stop: 'max_tokens' }], PRIVATE);
+    assert.ok(!afterCut(run).includes(HELD));
   });
 });
 
@@ -774,12 +1188,88 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     assert.deepEqual(skipHeld(run), ['Same-response words.'], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
   });
 
-  it("the same-round think policy acts on native tools only: on this path, text beside think is held like any other", async () => {
-    const run = await turn('xml', [
-      { xml: 'Beside a think.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n', stop: 'stop_sequence' },
-    ], { ...ASK, sameRoundThinkTextPolicy: 'private' });
-    assert.deepEqual(skipHeld(run), ['Beside a think.'], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+  // #640 R6-1: the same-round think policy acts on this path too. When a
+  // permitted skip_reply ends the turn, the cancel path holds the turn's text
+  // as drafts; a private think's rounds are left out of it and counted as kept
+  // private, as at the turn's natural end and natively. (main's #1024 pinned
+  // the opposite here, before the policy reached the fallback.)
+  const PRIVATE_ASK = { ...ASK, sameRoundThinkTextPolicy: 'private' };
+  const thinkThenSkip = (text: string): Reply => ({ xml: `${text}\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n`, stop: 'stop_sequence' });
+  const thinkRound = (text: string): Reply => ({ xml: `${text}\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n`, stop: 'stop_sequence' });
+
+  it("the same-round think policy acts on this path too: text beside think in the skip_reply's round is not held, and is counted as kept private", async () => {
+    const run = await turn('xml', [thinkThenSkip('Beside a think.')], PRIVATE_ASK, { thinkContinues: true });
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.deepEqual(skipHeld(run), [], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+    assert.ok(receipts(run).some((r) => r.includes('1 plain-speech segment(s) kept private')), receipts(run).join(' | '));
   });
+
+  it("a private think's round after an ordinary one: only the ordinary round's text is held", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, thinkThenSkip('Second words.')], PRIVATE_ASK, { thinkContinues: true });
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.deepEqual(skipHeld(run), ['First I step east.']);
+  });
+
+  // #640 R6-2: a cut that also cut a skip_reply, under 'ask' with the private
+  // think policy, when the next call is left undecided: the round's words are
+  // kept back as the think's might be, so they aren't drafted either, and the
+  // agent is told they weren't posted. A name that can't be think's is a
+  // skip_reply's text like any other, held as a draft.
+  const cutBesideSkip = (tail: string): Reply => ({ xml: `A note for the room.\n\n<function_calls>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n<invoke name="${tail}`, stop: 'max_tokens' });
+  const HELD_WORDS = "wasn't posted either";
+  for (const tail of ['', 'thi']) {
+    it(`'ask' + private: a cut at <invoke name="${tail} beside a cut skip_reply says the round's words weren't posted, and drafts none`, async () => {
+      const run = await turn('xml', [XML_EAST_ROUND, cutBesideSkip(tail)], PRIVATE_ASK);
+      assert.ok(!skipHeld(run).includes('A note for the room.'), JSON.stringify(skipHeld(run)));
+      assert.ok(run.requests.slice(2).join('\n').includes(HELD_WORDS), 'the agent is told its words were kept back');
+    });
+  }
+  it("'ask' + private, control: a cut at <invoke name=\"robo beside a cut skip_reply holds the round's words as a draft and says nothing of them", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, cutBesideSkip('robo')], PRIVATE_ASK);
+    assert.ok(skipHeld(run).includes('A note for the room.'), JSON.stringify(skipHeld(run)));
+    assert.ok(!run.requests.slice(2).join('\n').includes(HELD_WORDS));
+  });
+
+  // Hybrid under 'ask': an earlier refused skip_reply's round is held at the
+  // turn's end, not dropped, so its `>>>` envelopes still move the router's
+  // hold. The held-words line reads that hold from the same rounds: a
+  // `>>>skip_reply` there makes the cut's words private anyway (no line), and
+  // a `>>>target` there lifts an earlier hold (the line). The fresh reader of
+  // R6's answers found both.
+  const plainCut: Reply = { xml: 'Plain words for the room.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+  it("hybrid, 'ask' + private: an earlier held round's >>>skip_reply keeps the cut's words private, so no line says they weren't posted", async () => {
+    const run = await turn('xml', [refusedWake('>>>skip_reply An aside.'), plainCut], { ...PRIVATE_ASK, proseRouting: 'hybrid' });
+    assert.ok(!run.requests.slice(2).join('\n').includes(HELD_WORDS), 'no line: the words were private anyway');
+  });
+  it("hybrid, 'ask' + private: an earlier held round's >>>target lifts the hold before it, so the line says the cut's words weren't posted", async () => {
+    const asideRound: Reply = { xml: '>>>skip_reply An aside.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [asideRound, refusedWake('>>>world:commons Back with you.'), plainCut], { ...PRIVATE_ASK, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(run.requests.slice(3).join('\n').includes(HELD_WORDS), 'the line: the hold was lifted, so the words would have gone out');
+  });
+
+  // The two rows' premises, run: the same turns with the last round whole
+  // (a move, then the turn ends), so the words take the path the cut kept
+  // them from.
+  const plainWhole: Reply = { xml: 'Plain words for the room.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">north</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  it("premise: after an earlier held round's >>>skip_reply, the same words uncut are neither posted nor drafted", async () => {
+    const run = await turn('xml', [refusedWake('>>>skip_reply An aside.'), plainWhole, { xml: '', stop: 'end_turn' }], { ...PRIVATE_ASK, proseRouting: 'hybrid' });
+    assert.ok(!run.routed.some((t) => t.includes('Plain words')), JSON.stringify(run.routed));
+    assert.ok(!run.held.some((d) => d.text.includes('Plain words')), JSON.stringify(run.held.map((d) => d.text)));
+  });
+  it("premise: after an earlier held round's >>>target lifts the hold, the same words uncut go out or are drafted", async () => {
+    const asideRound: Reply = { xml: '>>>skip_reply An aside.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [asideRound, refusedWake('>>>world:commons Back with you.'), plainWhole, { xml: '', stop: 'end_turn' }], { ...PRIVATE_ASK, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(run.routed.some((t) => t.includes('Plain words')) || run.held.some((d) => d.text.includes('Plain words')), JSON.stringify({ routed: run.routed, held: run.held.map((d) => d.text) }));
+  });
+
+  // The earlier-round shape: nothing about the skip_reply's own round names think.
+  for (const [mode, extra] of [['locus', {}], ['hybrid', { proseRouting: 'hybrid' }], ['explicit', { proseRouting: 'explicit' }], ['locked', { proseRouting: 'locked' }]] as const) {
+    it(`${mode}: a private think's round before the skip_reply's round is not held; the skip_reply's own text is`, async () => {
+      const run = await turn('xml', [thinkRound('Private musing.'), skipRound('Bye for now.')], { ...PRIVATE_ASK, ...extra }, { thinkContinues: true });
+      assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+      assert.deepEqual(skipHeld(run), ['Bye for now.']);
+    });
+  }
 
   it('a turn that another tool ends is as before: nothing is held', async () => {
     class Rest implements Module {
