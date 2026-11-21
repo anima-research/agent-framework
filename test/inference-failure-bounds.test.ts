@@ -1074,7 +1074,7 @@ test('a MembraneError from another copy of membrane is recognised by its name', 
   assert.ok(textsOf(shed.messages).includes('hello 2'), 'and the record keeps it');
   const rewind = shed.messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'refusal-rewind');
   assert.equal(rewind.length, 1, 'one consolidated rewind marker');
-  assert.match((rewind[0].content[0] as { text: string }).text, new RegExp(`^\\[${NOTICE_TAG.refusalRewind}\\] The \\d+ most recent turn\\(s\\) were set aside`));
+  assert.match((rewind[0].content[0] as { text: string }).text, new RegExp(`^\\[${NOTICE_TAG.refusalRewind}\\] The \\d+ earlier turn\\(s\\) were set aside`));
 
   // Its type is bounded like a provider code, in every sink it reaches.
   const odd = await runFailingTurn('stream throws', () => foreignMembraneError('Bad request: zz-short', `zz${'T'.repeat(MEGA)}`), { errorPolicy: noRetry });

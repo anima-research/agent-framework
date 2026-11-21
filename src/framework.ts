@@ -3403,6 +3403,75 @@ interface RewindRecord {
   removedIds: MessageId[];
 }
 
+/**
+ * A body a presented-window shed may pass over between a tool result and
+ * its call (#737): system notices only, none of them a rewind marker, a
+ * host change or a tool block.
+ */
+function isGapNotice(rows: readonly StoredMessage[], hasBlock: (m: StoredMessage, t: string) => boolean): boolean {
+  return rows.length > 0 && rows.every((m) => {
+    const meta = (m.metadata ?? {}) as Record<string, unknown>;
+    return Boolean(meta.system) && meta.kind !== 'refusal-rewind'
+      && !hasBlock(m, 'system_change') && !hasBlock(m, 'tool_use') && !hasBlock(m, 'tool_result');
+  });
+}
+
+/**
+ * Whether a call body and a result body with only notices between them are
+ * one tool exchange (#737), so a shed may take both and leave the notices:
+ * the call body holds calls and no results, the result body results and no
+ * calls; their tool IDs are the same set, each a non-empty string, once
+ * each; every row of both carries the same non-null owner stamp
+ * (`ownRowOf`) and the same audience stamp (`audience`), so a round isn't
+ * paired with another writer's, and a row with no owner stamp, whose writer
+ * is unknown, proves nothing; every row of both is in the agent's own
+ * record, not only presented from another slot's, whose record isn't read;
+ * and none of those IDs is on any other call or result the agent's record
+ * or window holds, so no other round there, earlier, reused or another
+ * writer's, can be the one the result answers. Anything else isn't proven,
+ * and the shed goes as before, without crossing the notices: the result
+ * alone, or, where the carried row is the call, the call alone.
+ */
+function gapPairProven(
+  cm: { getAllMessages(): StoredMessage[] },
+  window: readonly StoredMessage[],
+  call: readonly StoredMessage[],
+  result: readonly StoredMessage[],
+): boolean {
+  const blocks = (rows: readonly StoredMessage[]) => rows.flatMap((m) => (Array.isArray(m.content) ? m.content : []) as ContentBlock[]);
+  const ids = (rows: readonly StoredMessage[], type: 'tool_use' | 'tool_result') => blocks(rows)
+    .filter((b) => b.type === type)
+    .map((b) => (type === 'tool_use' ? (b as { id?: unknown }).id : (b as { toolUseId?: unknown }).toolUseId));
+  const valid = (list: unknown[]): list is string[] => list.length > 0
+    && list.every((id) => typeof id === 'string' && id.trim().length > 0) && new Set(list).size === list.length;
+  const callIds = ids(call, 'tool_use'), resultIds = ids(result, 'tool_result');
+  if (ids(call, 'tool_result').length || ids(result, 'tool_use').length) return false;
+  if (!valid(callIds) || !valid(resultIds) || callIds.length !== resultIds.length
+    || !resultIds.every((id) => callIds.includes(id))) return false;
+  const writer = (m: StoredMessage) => {
+    const stamp = audienceOf(m.metadata);
+    return JSON.stringify([stamp?.ownRowOf ?? null, stamp ? [...stamp.audience].sort() : null]);
+  };
+  // Only an owner stamp names a writer. A row with no stamp, or with an
+  // audience and no owner (a module's write, say), is of unknown ownership:
+  // two such rows aren't one writer's, so they prove nothing.
+  if ([...call, ...result].some((m) => !audienceOf(m.metadata)?.ownRowOf)) return false;
+  const writers = new Set([...call, ...result].map(writer));
+  if (writers.size !== 1) return false;
+  // Each ID once as a call and once as a result, over the record and the
+  // window (which can hold another slot's rows), each row counted once.
+  const rows = new Map<MessageId, StoredMessage>();
+  for (const m of cm.getAllMessages()) rows.set(m.id, m);
+  // A body from another slot's record (a persistent subconscious's view of
+  // its primary, say) can't be proven: that record, where the ID could be
+  // reused, isn't read here. Such a pair pairs only as on main.
+  if ([...call, ...result].some((m) => !rows.has(m.id))) return false;
+  for (const m of window) rows.set(m.id, m);
+  const seen = [...rows.values()];
+  const uses = (type: 'tool_use' | 'tool_result') => ids(seen, type).filter((id) => callIds.includes(id as string)).length;
+  return uses('tool_use') === callIds.length && uses('tool_result') === callIds.length;
+}
+
 /** How an agent's `/unstick` came out, as `unstick-outcome` answers it: at the
  *  session's end, or at a turn that fails inside the session, which ends
  *  nothing (`turn-failed`). Labels only: a refusal's category, a failed
@@ -15125,7 +15194,8 @@ export class AgentFramework {
    * With `carried` (the stored bodies a refused request's compile carried,
    * by each body's first message id), only a message that request carried
    * counts, or the stored result of a call it carried, which goes with that
-   * call as one exchange; a row that carries nothing a request sends
+   * call as one exchange when that pair is found or proven (below; if not,
+   * the call goes alone and the result stays); a row that carries nothing a request sends
    * (asNextRequestCarries) is passed over and left in place. It adds no
    * marker; the caller keeps one consolidated marker for the episode
    * (updateRewindMarker). The returned record's descriptor says what was
@@ -15142,6 +15212,14 @@ export class AgentFramework {
    * out), and another agent's stored context injection. On a window that is
    * still the record, the rows are removed from it, as before the index,
    * and leave every other window that held them.
+   *
+   * A tool result is paired with the tool_use body right before it. On a
+   * presented window, and only there, system notices between a result body
+   * and the call body before them are passed over too (#737), when the pair
+   * is proven (gapPairProven); the notices stay in the window. Any other
+   * shape pairs as before: a result with no call so paired goes alone,
+   * which can leave its call in the window, and a carried call whose later
+   * result isn't so paired goes alone, which leaves that result.
    *
    * Shared by the refusal rewind, automatic or forced by `/unstick`, and by
    * the shed after inference exhaustion (quarantinePoisonedHistory).
@@ -15163,22 +15241,43 @@ export class AgentFramework {
       if (!windowed) return false;
       return hasBlock(m, 'system_change') || !this.agentSees(agent, m.metadata);
     };
+    // The tool_use body a result body starting at `start` is paired with:
+    // the body right before it when that holds a tool_use; on a presented
+    // window, the call body before a run of system notices when the pair is
+    // proven (#737). Else none, and the result goes alone, as before.
+    const callBefore = (start: number): { from: number; to: number } | null => {
+      if (start <= 0) return null;
+      const turn = bodyRangeIn(all, start - 1);
+      const rows = (r: { from: number; to: number }) => all.slice(r.from, r.to + 1);
+      if (rows(turn).some((m) => hasBlock(m, 'tool_use'))) return turn;
+      if (!windowed) return null;
+      let call = turn;
+      while (isGapNotice(rows(call), hasBlock)) {
+        if (call.from <= 0) return null;
+        call = bodyRangeIn(all, call.from - 1);
+      }
+      if (call === turn) return null;
+      return gapPairProven(cm, all, rows(call), all.slice(start, bodyRangeIn(all, start).to + 1)) ? call : null;
+    };
 
     // We shed strictly newest-first, in sequence (in window order on a
     // presented window) — INCLUDING the agent's own turns (poison lives in
     // tool_use/narration turns too), because newest-first reaches whatever is
-    // poisoning the context if allowed to run deep enough. The one invariant:
-    // shed COMPLETE exchanges. Shedding a `tool_result` also sheds its paired
-    // `tool_use` assistant turn, so we never leave an orphaned tool_use /
-    // signed `thinking` block — which the API rejects with a 400 ("thinking
-    // blocks in the latest assistant message cannot be modified"). We do NOT
+    // poisoning the context if allowed to run deep enough. The aim: shed
+    // COMPLETE exchanges. Shedding a `tool_result` also sheds the `tool_use`
+    // assistant turn it is paired with (callBefore), so we don't leave an
+    // orphaned tool_use / signed `thinking` block — which the API rejects
+    // with a 400 ("thinking blocks in the latest assistant message cannot be
+    // modified"). Where no pair is found or proven (callBefore returns
+    // null), the result goes alone, as before #737, and the call can stay
+    // for membrane to answer with `[pending]`; where the carried row is the
+    // call, the call goes alone and its result stays. A known limit. We do NOT
     // add a marker here; the caller keeps one consolidated marker
     // (updateRewindMarker).
     const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
     const callCarried = (start: number) => {
-      if (start <= 0) return false;
-      const turn = bodyRangeIn(all, start - 1);
-      return all.slice(turn.from, turn.to + 1).some((m) => hasBlock(m, 'tool_use')) && wasCarried(turn.from, turn.to);
+      const turn = callBefore(start);
+      return turn !== null && wasCarried(turn.from, turn.to);
     };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
@@ -15213,7 +15312,7 @@ export class AgentFramework {
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
-    // Determine the complete exchange to shed, newest first.
+    // Determine what to shed, newest first.
     const removedIds: MessageId[] = members.map((m) => m.id).reverse();
     // Where the exchange starts: this body, or the tool_use turn paired with it.
     let from = first;
@@ -15221,17 +15320,15 @@ export class AgentFramework {
     const heads: MessageId[] = [all[first]!.id];
     let descriptor: string;
     if (toolBlocks.length > 0) {
-      // Pair the tool_result with the tool_use assistant turn right before
-      // it, the whole of it: a turn stored as a body carries its tool_use on
-      // its first shard, not its last.
-      if (first - 1 >= 0) {
-        const turn = bodyRangeIn(all, first - 1);
+      // Pair the tool_result with its tool_use assistant turn (callBefore),
+      // the whole of it: a turn stored as a body carries its tool_use on its
+      // first shard, not its last. Notices passed over between them stay.
+      const turn = callBefore(first);
+      if (turn) {
         const turnMembers = all.slice(turn.from, turn.to + 1);
-        if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
-          from = turn.from;
-          appendAll(removedIds, turnMembers.map((m) => m.id).reverse());
-          heads.unshift(all[turn.from]!.id);
-        }
+        from = turn.from;
+        appendAll(removedIds, turnMembers.map((m) => m.id).reverse());
+        heads.unshift(all[turn.from]!.id);
       }
       const sz = toolBlocks.reduce(
         (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
@@ -15245,12 +15342,13 @@ export class AgentFramework {
         `(${textLen} chars${images ? `, ${images} image(s)` : ''})`;
     }
     if (windowed) {
-      // One call for the whole exchange, so it is never half applied.
+      // One call for everything selected, so it is never half applied.
       cm.retractRows(heads, { undone: true });
       this.emitTrace({ type: 'presentation:retracted', agentName: agent.name, messageIds: [...removedIds].reverse(), reason: 'shed' });
       return { descriptor, removedIds };
     }
-    // One removal for the whole exchange, so it is never half applied.
+    // One removal for the whole exchange, so it is never half applied
+    // (callBefore crosses no notice here, so the range is the exchange).
     removeStoredMessages(cm, all[from], msg);
     this.retractRemovedElsewhere(cm, removedIds, 'rewind');
     return { descriptor, removedIds };
@@ -15259,10 +15357,20 @@ export class AgentFramework {
   /**
    * Maintain exactly ONE consolidated marker for the current rewind episode,
    * updated in place as more turns are shed. Six rewinds ⇒ one message that
-   * says "the 6 most recent turns were set aside", not six separate notes — so
-   * the context converges (shed N, add 1) instead of growing, and the marker
-   * sits at the tail giving the model something actionable to answer once the
-   * refusal clears. Returns the running count.
+   * says "The 6 earlier turn(s) were set aside", not six separate notes — so the
+   * context converges (shed N, add 1) instead of growing. The first rewind
+   * of an episode appends the marker at the tail; later ones update that row
+   * in place, so rows stored since can follow it. It says only that earlier
+   * content was set aside: the shed passes over notices and rows a request
+   * didn't carry, so what it took is not always the newest, nor always all
+   * on the failed request. It gives the model something actionable to answer
+   * once the refusal clears. It opens "[tag] The N", as it did before, so a
+   * reader matching that prefix still finds it. The originals stay in the
+   * record on a presented window; a window that is still the record (legacy
+   * mode) removes them. The marker says which, by the agent's mode when it
+   * is written, the mode of the shed just before it; an episode whose
+   * rewinds ran in both modes is described by its latest. Returns the
+   * running count.
    */
   private updateRewindMarker(
     agent: Agent,
@@ -15272,10 +15380,14 @@ export class AgentFramework {
     const cm = agent.getContextManager();
     const ep = this.rewindEpisode.get(agent.name);
     const count = (ep?.count ?? 0) + 1;
+    // The shed just before this call ran in the mode presents() gives now.
+    const kept = this.presents(agent)
+      ? `The originals remain in the raw record.`
+      : `The originals were removed.`;
     const text =
-      `[${NOTICE_TAG.refusalRewind}] The ${count} most recent turn(s) were set aside because ` +
-      `the requests that carried them couldn't be completed. Their content isn't shown here, ` +
-      `and the originals remain in the raw record. You are clear to continue — if you ` +
+      `[${NOTICE_TAG.refusalRewind}] The ${count} earlier turn(s) were set aside after ` +
+      `requests couldn't be completed. Their content isn't shown here. ${kept} ` +
+      `You are clear to continue — if you ` +
       `were mid-task, take a different approach; otherwise carry on with whatever ` +
       `is now in front of you, or briefly acknowledge the gap and ask what's next.`;
     const blocks: ContentBlock[] = [{ type: 'text', text }];
@@ -35913,9 +36025,11 @@ export class AgentFramework {
    *      tool_use/tool_result pairing or an oversized attachment), retrying
    *      the same context is likely to fail the same way, and every new push
    *      event would wake the agent onto that same history. At the hard-down
-   *      threshold, automatically quarantine: shed the newest complete
-   *      exchange (the same forced-rewind primitive `/unstick` uses —
-   *      shedNewestTurn never orphans a tool_use/thinking block) and retry,
+   *      threshold, automatically quarantine: shed the newest exchange (the
+   *      same forced-rewind primitive `/unstick` uses; shedNewestTurn takes
+   *      a tool result with its paired call where it finds or proves the
+   *      pair, and otherwise sheds the result alone, which can leave its
+   *      tool_use for membrane to answer with `[pending]`) and retry,
    *      bounded by the same rewind cap so the breaker can never eat the
    *      whole history.
    */
@@ -36498,7 +36612,8 @@ export class AgentFramework {
 
   /**
    * Automatic poison-history quarantine (the actual "breaker"). Sheds the
-   * newest complete exchange from the agent's history — reusing the same
+   * newest turn from the agent's history, with its paired call where the
+   * pair is found or proven (a result can go alone) — reusing the same
    * primitives as the refusal auto-rewind / `/unstick` (shedNewestTurn +
    * the single consolidated episode marker) — and queues a retry so the
    * rewound history is verified immediately instead of waiting for the next

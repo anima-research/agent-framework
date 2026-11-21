@@ -302,10 +302,20 @@ export interface AgentConfig {
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
    * When `autoRewind` is on, a refused turn triggers an automatic rewind: the
-   * framework redacts the triggering turn (the tool result or message that
-   * tripped the classifier), injects a metadata-only marker in its place (which
-   * carries none of the offending content, so it cannot itself re-trip), and
-   * re-runs — up to `maxRewinds` times before giving up. This keeps the agent
+   * framework sets aside the newest turn the refused request carried (or the
+   * stored result of a call it carried), a tool result with the call it is
+   * paired with where a pair is found (the call body right before it, or,
+   * on a presented window, one before a run of system notices when the pair
+   * is proven); otherwise the result goes alone and its call can stay, or,
+   * when the carried row is the call, the call goes alone and its result
+   * stays. On a presented window the originals stay in the raw record; a
+   * window that is still the record (legacy mode) removes them, and the
+   * notice says which. That isn't necessarily the content that tripped the
+   * classifier. The first rewind of an episode appends one notice at the tail
+   * of the context saying that earlier content was set aside, and later ones
+   * update that notice in place; it carries none of that content, so it cannot
+   * itself re-trip. The turn then re-runs, up to `maxRewinds` times before
+   * giving up. This keeps the agent
    * on its own model (no fallback-model substitution) while self-healing around
    * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
    */
@@ -335,7 +345,7 @@ export interface AgentConfig {
      * Native tool mode only — see the XML-mode warning in Membrane.
      */
     retries?: number;
-    /** Auto-rewind the triggering turn on refusal and retry. Default false. */
+    /** On refusal, set aside the newest turn the refused request carried (or the stored result of a call it carried, with that call, when that pair is found or proven; otherwise the call goes alone and the result stays) and retry. Default false. */
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;
