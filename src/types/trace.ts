@@ -163,7 +163,7 @@ export type TraceEvent =
        * The reason the agent's `[inference-failed]` note may give, before the
        * note's own 600-character cut, and bounded as `error` is. Present only
        * when the failure's message holds no provider's text: a progress
-       * bound's cut, a stream's abort, or context-manager's refusal of a
+       * bound's cut, a stream's abort or silent close, or context-manager's refusal of a
        * compile. Absent otherwise, and a note then gives no reason.
        */
       shownReason?: string;

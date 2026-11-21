@@ -14050,7 +14050,7 @@ export class AgentFramework {
    * turn's rejection never carries a provider's message: a provider's failure
    * is told by membrane's type and the HTTP status, a safety failure only as
    * a request that couldn't be completed, a progress bound's cut, a stream's
-   * abort and context-manager's refusal of a compile in their own words, and
+   * abort or silent close and context-manager's refusal of a compile in their own words, and
    * any other failure as the turn failing. Where an error ended the turn, the
    * rejection's `cause` is a bounded copy of it: a plain `Error` with its
    * `name`, its message and stack cut to 2,000 characters, and, from a
@@ -29188,7 +29188,7 @@ export class AgentFramework {
     // is decided by the paths themselves: `completed` by default; `aborted`
     // for a stream that a stop, the framework's cancel or a replacement
     // ended, as each case tells them; `failed` where a failure is
-    // established, in the `error` and `aborted` cases and the catch.
+    // established, in the `error` and `aborted` cases, a silent close and the catch.
     // Best-effort notifications — consumers dedupe by inferenceId and keep a
     // timeout.
     let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
@@ -31060,6 +31060,7 @@ export class AgentFramework {
             type: 'inference:exhausted',
             agentName: agent.name,
             error: terminal,
+            shownReason: terminal,
           });
           // Not transient, so nothing re-arms it; a re-armed turn's operator is told why its re-arming ends.
           this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);

@@ -37,8 +37,8 @@ class InputModule implements Module {
   readonly name = 'input';
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
-  getTools(): ToolDefinition[] { return []; }
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, isError: true, error: 'none' }; }
+  getTools(): ToolDefinition[] { return [{ name: 'look', description: 'Synthetic lookup', inputSchema: { type: 'object', properties: {} } }]; }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true, data: 'looked' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
     return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: true };
@@ -69,16 +69,46 @@ class SilentStream implements YieldingStream {
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> { /* no events */ }
 }
 
+/** Completes a tool round, then closes without a terminal event. */
+class ToolRoundThenSilentStream implements YieldingStream {
+  isWaitingForTools = true;
+  pendingToolCallIds = ['silent-look'];
+  toolDepth = 0;
+  results: unknown[] = [];
+  private resume!: () => void;
+  private readonly toolResults = new Promise<void>(resolve => { this.resume = resolve; });
+  provideToolResults(results: unknown[]): void {
+    this.results = results;
+    this.isWaitingForTools = false;
+    this.pendingToolCallIds = [];
+    this.toolDepth = 1;
+    this.resume();
+  }
+  cancel(): void { this.resume(); }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    const call = { id: 'silent-look', name: 'input--look', input: {} };
+    yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 3, cacheCreationTokens: 0, cacheReadTokens: 0 } } as StreamEvent;
+    yield { type: 'tool-calls', calls: [call], context: {
+      rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '',
+      roundContent: [{ type: 'tool_use', ...call }], supportsInjectedMessages: true,
+    } } as StreamEvent;
+    await this.toolResults;
+  }
+}
+const toolThenSilentEnd = {} as StreamEvent;
+
 /** In `ends`, a stream that ends as a SilentStream does. */
 const silentEnd = {} as StreamEvent;
 
 /** Each stream it opens ends as the next of `ends` says; past them, a completion. */
 class ScriptedMembrane extends MockMembrane {
+  readonly partials: ToolRoundThenSilentStream[] = [];
   constructor(private readonly ends: StreamEvent[]) { super(); }
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
     const last = this.ends.shift();
     if (last === silentEnd) return new SilentStream();
+    if (last === toolThenSilentEnd) { const stream = new ToolRoundThenSilentStream(); this.partials.push(stream); return stream; }
     return last ? new EndingStream(last) : new MockYieldingStream([createMockResponse([{ type: 'text', text: 'Done' }])]);
   }
 }
@@ -317,6 +347,44 @@ test('a stream that ends with no event, and nobody cancelled, ends failed, and a
   } finally {
     await teardown();
   }
+});
+
+test('a silent close after tool results records usage, reason, failed phase and a usable next wake', { timeout: 60_000 }, async () => {
+  const { framework, membrane, traces, phases, teardown } = await frameworkOver([toolThenSilentEnd], noRetry);
+  try {
+    framework.start();
+    framework.nudgeAgent('resident', 'operator');
+    assert.ok(await settles(() => phases().some(p => p.includes('failed')) && framework.getHostModeStatus().activeTurns === 0));
+    assert.deepEqual(phases(), [['started', 'failed']]);
+    assert.equal(membrane.partials[0]!.results.length, 1, 'the tool ran and its result reached the stream');
+    assert.ok(JSON.stringify(membrane.partials[0]!.results).includes('looked'));
+    const entries = framework.queryInferenceLogs({ agentName: 'resident' }).entries;
+    assert.equal(entries.length, 1, 'one log row, without duplicate usage');
+    assert.equal(entries[0]!.entry.success, false);
+    assert.deepEqual(entries[0]!.entry.tokenUsage, { input: 12, output: 3, cacheCreation: 0, cacheRead: 0 });
+    const failures = traces.filter(t => t.type === 'inference:exhausted');
+    assert.equal(failures.length, 1);
+    assert.equal((failures[0] as unknown as { shownReason: string }).shownReason, 'Stream ended without a final response');
+    framework.nudgeAgent('resident', 'operator');
+    assert.ok(await settles(() => phases().length === 2 && phases()[1]!.includes('completed')));
+    const notes = membrane.calls[1]!.messages.flatMap(m => m.content)
+      .flatMap(b => b.type === 'text' && b.text.startsWith('[inference-failed]') ? [b.text] : []);
+    assert.equal(notes.length, 1);
+    assert.ok(notes[0]!.includes('Stream ended without a final response'), 'next inference receives the complete failure reason');
+    assert.deepEqual(phases(), [['started', 'failed'], ['started', 'completed']]);
+  } finally { await teardown(); }
+});
+
+test('an ephemeral silent stream rejects with its cause before the idle watchdog', { timeout: 10_000 }, async () => {
+  const { framework, phases, teardown } = await frameworkOver([silentEnd], noRetry);
+  try {
+    framework.start();
+    const { agent, contextManager } = await framework.createEphemeralAgent({ name: 'job', model: 'test-model', systemPrompt: 'system' });
+    contextManager.addMessage('User', [{ type: 'text', text: 'Synthetic task' }]);
+    await assert.rejects(framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 2_000, idlePollMs: 10 }),
+      { message: 'Stream ended without a final response' });
+    assert.deepEqual(phases(), [['started', 'failed']]);
+  } finally { await teardown(); }
 });
 
 test('a silent stream log write failure still releases its turn without retrying', { timeout: 60_000 }, async () => {
