@@ -1230,6 +1230,38 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     assert.ok(!run.requests.slice(2).join('\n').includes(HELD_WORDS));
   });
 
+  // Hybrid under 'ask': an earlier refused skip_reply's round is held at the
+  // turn's end, not dropped, so its `>>>` envelopes still move the router's
+  // hold. The held-words line reads that hold from the same rounds: a
+  // `>>>skip_reply` there makes the cut's words private anyway (no line), and
+  // a `>>>target` there lifts an earlier hold (the line). The fresh reader of
+  // R6's answers found both.
+  const plainCut: Reply = { xml: 'Plain words for the room.\n\n<function_calls>\n<invoke name="', stop: 'max_tokens' };
+  it("hybrid, 'ask' + private: an earlier held round's >>>skip_reply keeps the cut's words private, so no line says they weren't posted", async () => {
+    const run = await turn('xml', [refusedWake('>>>skip_reply An aside.'), plainCut], { ...PRIVATE_ASK, proseRouting: 'hybrid' });
+    assert.ok(!run.requests.slice(2).join('\n').includes(HELD_WORDS), 'no line: the words were private anyway');
+  });
+  it("hybrid, 'ask' + private: an earlier held round's >>>target lifts the hold before it, so the line says the cut's words weren't posted", async () => {
+    const asideRound: Reply = { xml: '>>>skip_reply An aside.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [asideRound, refusedWake('>>>world:commons Back with you.'), plainCut], { ...PRIVATE_ASK, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(run.requests.slice(3).join('\n').includes(HELD_WORDS), 'the line: the hold was lifted, so the words would have gone out');
+  });
+
+  // The two rows' premises, run: the same turns with the last round whole
+  // (a move, then the turn ends), so the words take the path the cut kept
+  // them from.
+  const plainWhole: Reply = { xml: 'Plain words for the room.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">north</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+  it("premise: after an earlier held round's >>>skip_reply, the same words uncut are neither posted nor drafted", async () => {
+    const run = await turn('xml', [refusedWake('>>>skip_reply An aside.'), plainWhole, { xml: '', stop: 'end_turn' }], { ...PRIVATE_ASK, proseRouting: 'hybrid' });
+    assert.ok(!run.routed.some((t) => t.includes('Plain words')), JSON.stringify(run.routed));
+    assert.ok(!run.held.some((d) => d.text.includes('Plain words')), JSON.stringify(run.held.map((d) => d.text)));
+  });
+  it("premise: after an earlier held round's >>>target lifts the hold, the same words uncut go out or are drafted", async () => {
+    const asideRound: Reply = { xml: '>>>skip_reply An aside.\n\n<function_calls>\n<invoke name="robot--move">\n<parameter name="dir">east</parameter>\n</invoke>\n', stop: 'stop_sequence' };
+    const run = await turn('xml', [asideRound, refusedWake('>>>world:commons Back with you.'), plainWhole, { xml: '', stop: 'end_turn' }], { ...PRIVATE_ASK, proseRouting: 'hybrid' }, { targets: ['world:commons'] });
+    assert.ok(run.routed.some((t) => t.includes('Plain words')) || run.held.some((d) => d.text.includes('Plain words')), JSON.stringify({ routed: run.routed, held: run.held.map((d) => d.text) }));
+  });
+
   // The earlier-round shape: nothing about the skip_reply's own round names think.
   for (const [mode, extra] of [['locus', {}], ['hybrid', { proseRouting: 'hybrid' }], ['explicit', { proseRouting: 'explicit' }], ['locked', { proseRouting: 'locked' }]] as const) {
     it(`${mode}: a private think's round before the skip_reply's round is not held; the skip_reply's own text is`, async () => {

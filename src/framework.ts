@@ -30511,9 +30511,14 @@ export class AgentFramework {
                 return b.type === 'text' && !!(turnProseRouting === 'explicit' ? ownWords(text) : text.trim());
               })
               && (turnProseRouting !== 'explicit' || explicitWouldSend(cutRuns))
+              // The earlier rounds replayed as the turn's end will route them:
+              // under 'ask' a refused skip_reply's round is held, not dropped,
+              // and holding it moves the hybrid hold as sending would, so only
+              // a private think's rounds leave the replay then (R6, the fresh
+              // reader's find).
               && (turnProseRouting !== 'hybrid' || hybridWouldSend(
                 streamRouting.hybridHold,
-                splitProseRuns(withoutRoundsProse(cut!.content.slice(0, cut!.start), new Set([...refusedWakeRounds, ...privateThinkRounds]))),
+                splitProseRuns(withoutRoundsProse(cut!.content.slice(0, cut!.start), skipHoldsAtEnd() ? privateThinkRounds : new Set([...refusedWakeRounds, ...privateThinkRounds]))),
                 cutRuns,
               ));
             // Explicit routing's sticky target lasts only the turn, so a resend
