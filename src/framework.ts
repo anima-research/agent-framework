@@ -15298,7 +15298,7 @@ export class AgentFramework {
     // The shed just before this call ran in the mode presents() gives now.
     const kept = this.presents(agent)
       ? `The originals remain in the raw record.`
-      : `This context is itself the record (legacy mode), so they were removed from it.`;
+      : `The originals were removed.`;
     const text =
       `[${NOTICE_TAG.refusalRewind}] The ${count} earlier turn(s) were set aside after ` +
       `requests couldn't be completed. Their content isn't shown here. ${kept} ` +

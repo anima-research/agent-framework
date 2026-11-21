@@ -395,9 +395,11 @@ describe('a presented-window shed pairs a result with its call across system not
   it("the record's shed doesn't cross a notice: the result alone, the call and notice kept", async () => {
     const h = await boot();
     (h.framework as unknown as { presents: () => boolean }).presents = () => false;
-    const call = h.internals.addMessage('mira', [callBlock('a')]);
+    // Stamped as mira's own rows, so the pair would be proven on a presented
+    // window: only the mode keeps this shed from crossing the notice.
+    const call = storeOwnRow(h.agent('mira'), 'mira', [callBlock('a')]);
     const notice = h.internals.addMessage('user', [text('notice')], { system: true });
-    const result = h.internals.addMessage('user', [resultBlock('a')]);
+    const result = storeOwnRow(h.agent('mira'), 'user', [resultBlock('a')]);
     assert.deepEqual(h.internals.shedNewestTurn(h.agent('mira'))?.removedIds, [result]);
     assert.ok(!h.cm('mira').getMessage(result), 'the result is removed from the record');
     assert.ok(h.cm('mira').getMessage(call) && h.cm('mira').getMessage(notice), 'the call and the notice stay');

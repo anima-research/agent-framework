@@ -16,11 +16,11 @@
   the same audience stamp. A row with no owner stamp (one stored before
   stamps, or a module's write, which is stamped with an audience only) has
   an unknown writer and proves no pair. A result body right after a call
-  body pairs with it as in 0.34.0, whatever its IDs or stamps. Any other
-  shape across notices sheds as in 0.34.0: the result alone, which can
+  body pairs with it as before, whatever its IDs or stamps. Any other
+  shape across notices sheds as before: the result alone, which can
   still leave its call, or, when the request carried the call and not
   its result, the call alone, which leaves the result.
   On a presented window the record keeps every row, as before. A window
   that is still the record (legacy mode: after a failed write-down, or
-  when a strategy couldn't follow a branch move) sheds as in 0.34.0, does
+  when a strategy couldn't follow a branch move) sheds as before, does
   not look across notices, and removes the shed rows from the record.
