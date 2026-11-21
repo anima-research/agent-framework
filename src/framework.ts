@@ -29557,6 +29557,39 @@ export class AgentFramework {
 
     const skipHoldsAtEnd = (): boolean => !liveProseRouting && !!this.channelRegistry && agent.getEffectiveSameRoundSkipReplyTextPolicy() === 'ask'
       && !trigger?.suppressProse && !streamRouting.silent && turnProseRouting !== 'disabled';
+    // The prose a private think's rounds keep back on the fallback path,
+    // counted as routeRound counts a private round's on the native path:
+    // suppressed under disabled routing; kept private where the turn was
+    // silenced as the round ended, a count explicit routing never reads;
+    // otherwise only logged. `base` is what this delivery drops anyway, so
+    // only the think's own runs count. A round that's both a private think's
+    // and a refused call's counts as the think's, as it does natively. Both
+    // ends of a fallback turn settle through here: the natural end, and the
+    // cancel path a permitted skip_reply takes under 'ask' (#640 R6-1).
+    const settlePrivateThinkRuns = (content: readonly ContentBlock[], base: ReadonlySet<number>): void => {
+      if (liveProseRouting || privateThinkRounds.size === 0) return;
+      const runsWithout = (rounds: ReadonlySet<number>): number => splitProseRuns(withoutRoundsProse(content, new Set([...base, ...rounds]))).length;
+      const runsBesideThink = runsWithout(new Set());
+      const withheld = runsBesideThink - runsWithout(privateThinkRounds);
+      if (withheld <= 0) return;
+      const kept = silencedPrivateThinkRounds.size > 0 ? runsBesideThink - runsWithout(silencedPrivateThinkRounds) : 0;
+      // Those kept back because a watched script hadn't returned: the native
+      // path's withhold counts a round's prose as suppressed then, whatever
+      // the routing, and never routes it to be counted again.
+      const unreturned = unreturnedScriptRounds.size > 0 ? runsBesideThink - runsWithout(unreturnedScriptRounds) : 0;
+      const besideWhat = [...privateThinkRounds].some((r) => unreturnedScriptRounds.has(r))
+        ? 'beside think() or a script that had not returned'
+        : 'beside think()';
+      console.error(
+        `[routing] ${agent.name}: ${withheld} prose segment(s) ${besideWhat} NOT routed (same_round_think_text_policy=private)`,
+      );
+      if (turnProseRouting === 'disabled') {
+        this.recordProseSuppression(streamRouting, withheld);
+      } else {
+        streamRouting.keptPrivate += kept;
+        if (unreturned > 0) this.recordProseSuppression(streamRouting, unreturned);
+      }
+    };
     const holdSkipRuns = async (
       runs: string[],
       admitted: AdmittedEnvelope[][],
@@ -29639,7 +29672,10 @@ export class AgentFramework {
           // As at a natural end: earlier deliveries, an earlier turn's
           // included, settle the router's state before this text meets it.
           await turnSpeechChain;
-          const runs = splitProseRuns(partial);
+          // A private think's rounds stay private here too: never held as
+          // drafts, counted as at the turn's natural end (#640 R6-1).
+          const runs = splitProseRuns(withoutRoundsProse(partial, privateThinkRounds));
+          settlePrivateThinkRuns(partial, new Set());
           const admitted = turnProseRouting === 'explicit' ? runs.map((run) => this.admitProse(run.trim(), streamRouting)) : [];
           try {
             await holdSkipRuns(runs, admitted, { routing: streamRouting, notice: 'later' }, resolveTurnLocus(), 'turn');
@@ -30655,27 +30691,6 @@ export class AgentFramework {
                 : skipHoldsAtEnd()
                   ? proseRunGroups(response.content, skipHeldRounds, proseDropped)
                   : [{ held: false, runs: splitProseRuns(withoutRoundsProse(response.content, proseDropped)) }];
-            // The prose a private think's rounds kept back on the fallback
-            // path, counted with the trailing prose below as routeRound counts
-            // a private round's on the native path.
-            // A round that's both a private think's and a refused call's counts
-            // as the think's, as it does natively.
-            const refusedOnly = new Set([...refusedWakeRounds].filter((r) => !privateThinkRounds.has(r)));
-            const runsBesideThink = !liveProseRouting && proseTurn && privateThinkRounds.size > 0
-              ? splitProseRuns(withoutRoundsProse(response.content, refusedOnly)).length
-              : 0;
-            const privateThinkWithheld = runsBesideThink > 0
-              ? runsBesideThink - splitProseRuns(withoutRoundsProse(response.content, proseDropped)).length
-              : 0;
-            const privateThinkKept = privateThinkWithheld > 0 && silencedPrivateThinkRounds.size > 0
-              ? runsBesideThink - splitProseRuns(withoutRoundsProse(response.content, new Set([...refusedOnly, ...silencedPrivateThinkRounds]))).length
-              : 0;
-            // Those of them kept back because a watched script hadn't returned:
-            // the native path's withhold counts a round's prose as suppressed
-            // then, whatever the routing, and never routes it to be counted again.
-            const unreturnedWithheld = privateThinkWithheld > 0 && unreturnedScriptRounds.size > 0
-              ? runsBesideThink - splitProseRuns(withoutRoundsProse(response.content, new Set([...refusedOnly, ...unreturnedScriptRounds]))).length
-              : 0;
             const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
             // The final text is delivered under this turn's routing, as its
             // queued rounds are.
@@ -30963,24 +30978,8 @@ export class AgentFramework {
               const trailingHold: ProseRound = { routing: finalRouting, notice: 'later', onPublished: endPublished };
 
 
-              // As routeRound counts a private think's round: suppressed under
-              // disabled routing; kept private where the turn was silenced as
-              // the round ended, a count explicit routing never reads; otherwise
-              // only logged.
-              if (privateThinkWithheld > 0) {
-                const besideWhat = [...privateThinkRounds].some((r) => unreturnedScriptRounds.has(r))
-                  ? 'beside think() or a script that had not returned'
-                  : 'beside think()';
-                console.error(
-                  `[routing] ${agent.name}: ${privateThinkWithheld} prose segment(s) ${besideWhat} NOT routed (same_round_think_text_policy=private)`,
-                );
-                if (turnProseRouting === 'disabled') {
-                  this.recordProseSuppression(streamRouting, privateThinkWithheld);
-                } else {
-                  streamRouting.keptPrivate += privateThinkKept;
-                  if (unreturnedWithheld > 0) this.recordProseSuppression(streamRouting, unreturnedWithheld);
-                }
-              }
+              // The runs a private think's rounds kept back, counted (settlePrivateThinkRuns).
+              settlePrivateThinkRuns(response.content, new Set([...refusedWakeRounds].filter((r) => !privateThinkRounds.has(r))));
 
               const thinkPrivate = cutThinkPrivate && liveProseRouting;
               const deliverRuns = async (runs: string[], admitted: AdmittedEnvelope[][]): Promise<boolean> => {

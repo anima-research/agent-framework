@@ -1183,12 +1183,36 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     assert.deepEqual(skipHeld(run), ['Same-response words.'], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
   });
 
-  it("the same-round think policy acts on native tools only: on this path, text beside think is held like any other", async () => {
-    const run = await turn('xml', [
-      { xml: 'Beside a think.\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n', stop: 'stop_sequence' },
-    ], { ...ASK, sameRoundThinkTextPolicy: 'private' });
-    assert.deepEqual(skipHeld(run), ['Beside a think.'], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+  // #640 R6-1: the same-round think policy acts on this path too. When a
+  // permitted skip_reply ends the turn, the cancel path holds the turn's text
+  // as drafts; a private think's rounds are left out of it and counted as kept
+  // private, as at the turn's natural end and natively. (main's #1024 pinned
+  // the opposite here, before the policy reached the fallback.)
+  const PRIVATE_ASK = { ...ASK, sameRoundThinkTextPolicy: 'private' };
+  const thinkThenSkip = (text: string): Reply => ({ xml: `${text}\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n<invoke name="skip_reply">\n<parameter name="reason">done</parameter>\n</invoke>\n`, stop: 'stop_sequence' });
+  const thinkRound = (text: string): Reply => ({ xml: `${text}\n\n<function_calls>\n<invoke name="think">\n<parameter name="thought">hm</parameter>\n</invoke>\n`, stop: 'stop_sequence' });
+
+  it("the same-round think policy acts on this path too: text beside think in the skip_reply's round is not held, and is counted as kept private", async () => {
+    const run = await turn('xml', [thinkThenSkip('Beside a think.')], PRIVATE_ASK, { thinkContinues: true });
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.deepEqual(skipHeld(run), [], JSON.stringify(blocks(run, 'tool_result').map(toolResultText)));
+    assert.ok(receipts(run).some((r) => r.includes('1 plain-speech segment(s) kept private')), receipts(run).join(' | '));
   });
+
+  it("a private think's round after an ordinary one: only the ordinary round's text is held", async () => {
+    const run = await turn('xml', [XML_EAST_ROUND, thinkThenSkip('Second words.')], PRIVATE_ASK, { thinkContinues: true });
+    assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+    assert.deepEqual(skipHeld(run), ['First I step east.']);
+  });
+
+  // The earlier-round shape: nothing about the skip_reply's own round names think.
+  for (const [mode, extra] of [['locus', {}], ['hybrid', { proseRouting: 'hybrid' }], ['explicit', { proseRouting: 'explicit' }], ['locked', { proseRouting: 'locked' }]] as const) {
+    it(`${mode}: a private think's round before the skip_reply's round is not held; the skip_reply's own text is`, async () => {
+      const run = await turn('xml', [thinkRound('Private musing.'), skipRound('Bye for now.')], { ...PRIVATE_ASK, ...extra }, { thinkContinues: true });
+      assert.equal(run.skipReplies, 1, 'premise: the skip_reply ran');
+      assert.deepEqual(skipHeld(run), ['Bye for now.']);
+    });
+  }
 
   it('a turn that another tool ends is as before: nothing is held', async () => {
     class Rest implements Module {
