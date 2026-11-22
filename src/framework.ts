@@ -1019,7 +1019,7 @@ import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-pr
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
 import { ToolsetsModule, resolveAct, withLookHint, type TakenChange } from './mcpl/toolsets-module.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
-import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern } from './mcpl/protocol-family.js';
+import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern, type McpServerInfo } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { boundedForLog, describeCause, hostStoppedWhileHandling } from './mcpl/errors.js';
 import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
@@ -39165,6 +39165,12 @@ export class AgentFramework {
     family: 'legacy' | 'modern' | null;
     /** The MCP revision its last handshake established; null until one has. */
     protocolVersion: string | null;
+    /** The server's own name and version, as the last handshake of its
+     *  connection gave them in MCP's `serverInfo` ({@link McpServerInfo}).
+     *  Null when that handshake gave neither, and while the server has no
+     *  connection that has made a handshake: before its first one, and once
+     *  its connection is gone, as for a closed tab. */
+    serverInfo: McpServerInfo | null;
     /** How it is reached; null when the configuration names no usable transport. */
     transport: 'stdio' | 'websocket' | 'http' | null;
     /** Why connecting refuses this configuration, before anything is spawned
@@ -39216,7 +39222,7 @@ export class AgentFramework {
   }> {
     const result: Array<{
       id: string; connected: boolean; closedTab: boolean; retrying: boolean;
-      family: 'legacy' | 'modern' | null; protocolVersion: string | null;
+      family: 'legacy' | 'modern' | null; protocolVersion: string | null; serverInfo: McpServerInfo | null;
       transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
       toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
       effectiveGrant: string[]; maskedCapabilities: string[];
@@ -39247,6 +39253,7 @@ export class AgentFramework {
         binding = null;
       }
       const problems = serverConfigProblems(config);
+      const serverInfo = modern?.serverInfo ?? connection?.serverInfo ?? null;
       // Attribute through the dispatch resolver, the one rule that picks a
       // tool's server.
       const ownTools = (this.mcplTools ?? []).flatMap((t) => {
@@ -39260,6 +39267,7 @@ export class AgentFramework {
         retrying: !connected && (modern?.willReconnect ?? connection?.willReconnect ?? false),
         family: binding?.family ?? null,
         protocolVersion: modern?.protocolVersion ?? connection?.protocolVersion ?? null,
+        serverInfo: serverInfo && { ...serverInfo },
         transport: binding?.transport ?? null,
         refused: problems.length > 0 ? problems.join('; ') : null,
         toolPrefix: prefix,

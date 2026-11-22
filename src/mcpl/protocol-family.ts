@@ -27,6 +27,7 @@
  * twice, and a server's era is a stable fact its configuration can state.
  */
 import { NOTICE_TAG } from '../notice-tags.js';
+import { markedText, oneLine } from '../supplied-text.js';
 import { DENY_BY_DEFAULT, capabilityPatternMatches } from './capability-grant.js';
 import { DEFAULT_EAGER_FETCH_MAX_BYTES, DEFAULT_MAX_TOTAL_BYTES } from './reference-fetcher.js';
 import { DEFAULT_MAX_INPUT_BYTES } from './tool-lifecycle.js';
@@ -206,6 +207,31 @@ export function serverTextRedactor(config: Pick<McplServerConfig, 'url' | 'token
 /** What a redaction gives in place of text when the configuration it
  *  redacts with can't be read ({@link redactServerText}). */
 export const WITHHELD_TEXT = `[${NOTICE_TAG.withheld}: the server's configuration couldn't be read to redact this]`;
+
+/**
+ * What a server's handshake said the server is: the name and the version in
+ * MCP's `serverInfo`. Each is the server's own text: redacted with its
+ * configuration, kept to one line, and with each opening of a framework
+ * notice tag marked, as other supplied text is. Each is null where the
+ * server gave no text.
+ */
+export interface McpServerInfo {
+  readonly name: string | null;
+  readonly version: string | null;
+}
+
+export function serverInfoOf(info: unknown, config: Pick<McplServerConfig, 'url' | 'token' | 'env' | 'tokenTransport'>): McpServerInfo | null {
+  if (typeof info !== 'object' || info === null) return null;
+  const redact = serverTextRedactor(config).now();
+  const text = (value: unknown): string | null => {
+    if (typeof value !== 'string') return null;
+    const line = oneLine(redact(value)).trim();
+    return line === '' ? null : markedText(line);
+  };
+  const name = 'name' in info ? text(info.name) : null;
+  const version = 'version' in info ? text(info.version) : null;
+  return name === null && version === null ? null : { name, version };
+}
 
 /** What {@link redactedData} gives in place of data nested deeper than it
  *  walks. */

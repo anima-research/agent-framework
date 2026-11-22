@@ -88,7 +88,7 @@ import {
 
 import { HeldStderr, STDERR_END_WAIT_MS, StdioTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { McplProtocolVersionError, McplRequestError, McplUnreapedLaunchError, stderrTailOf, withStderr } from './server-connection.js';
-import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_HTTP_PROTOCOL_VERSIONS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, logDroppedLine, maskedError, noteDialSent, redactServerText, redactedData, serverTextRedactor, type ServerTextRedactor } from './protocol-family.js';
+import { LEGACY_MCP_PROTOCOL_VERSION, MAX_TIMER_MS, MODERN_HTTP_PROTOCOL_VERSIONS, MODERN_MCP_PROTOCOL_VERSION, checkServerConfig, describeCredentialError, logDroppedLine, maskedError, noteDialSent, redactServerText, redactedData, serverInfoOf, serverTextRedactor, type McpServerInfo, type ServerTextRedactor } from './protocol-family.js';
 import type { McplServerConfig, McpToolDefinition } from './types.js';
 import { boundedForLog } from './errors.js';
 import { logDetail, logValue, logValueRedacted, loggedCode } from './log-value.js';
@@ -643,6 +643,9 @@ export class ModernMcpConnection extends EventEmitter {
   /** The revision the last connect established (over HTTP, the one it
    *  negotiated); null before any has. */
   protocolVersion: string | null = null;
+  /** The server's own name and version, as the last connect's handshake
+   *  gave them; null when it gave neither, and before any connect. */
+  serverInfo: McpServerInfo | null = null;
 
   private session: Session | null = null;
   /** A connect in flight, owned so `close()` can end it. */
@@ -1002,6 +1005,7 @@ export class ModernMcpConnection extends EventEmitter {
     this.session = session;
     this.adoptedAt = performance.now();
     this.protocolVersion = session.client.getNegotiatedProtocolVersion() ?? null;
+    this.serverInfo = serverInfoOf(session.client.getServerVersion(), this.config);
     if (!session.http || era === 'modern') this.reconnectAttempts = 0;
     // On a 2025 revision list changes arrive unsolicited, on the session's
     // standalone stream: there's no subscription to keep.
