@@ -126,7 +126,7 @@ export {
   serverConfigWarnings,
   checkServerConfig,
 } from './protocol-family.js';
-export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './protocol-family.js';
+export type { McpProtocolFamily, McpServerInfo, McpTransportKind, ServerBinding } from './protocol-family.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)

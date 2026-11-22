@@ -44,8 +44,7 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     closedTab: false,
     retrying: false,
     family: 'legacy',
-    // The stub never handshook, so no revision is established, and the
-    // server has said nothing of what it is.
+    // The stub never handshook, so no revision is established.
     protocolVersion: null,
     serverInfo: null,
     transport: 'stdio',

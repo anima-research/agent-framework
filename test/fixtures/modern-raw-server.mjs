@@ -21,7 +21,7 @@
 //                        can read (its capabilities aren't an object), and lists only 2025-11-25
 //   unreadable-current-revision  the same, listing 2026-07-28
 //   no-server-info       server/discover gives no serverInfo (name raw-fixture, version 1 otherwise)
-//   server-info-later    launches after the first give version 2
+//   server-info-later    the second launch gives version 2, and later launches give no serverInfo
 //   server-info-text     the name holds a line break, and the version quotes $API_TOKEN
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), separators (text holding U+2028 and
@@ -56,8 +56,8 @@ const SUB = 'io.modelcontextprotocol/subscriptionId';
 let listens = 0;
 let subscription = null;
 
-const serverInfo = flags.has('server-info-text')
-  ? { name: 'raw\nfixture', version: `1 ${process.env.API_TOKEN ?? ''}` }
+const serverInfo = flags.has('no-server-info') || (flags.has('server-info-later') && launch > 2) ? null
+  : flags.has('server-info-text') ? { name: 'raw\nfixture', version: `1 ${process.env.API_TOKEN ?? ''}` }
   : { name: 'raw-fixture', version: flags.has('server-info-later') && launch > 1 ? '2' : '1' };
 
 const discovered = (id) => result(id, {
@@ -65,7 +65,7 @@ const discovered = (id) => result(id, {
   capabilities: { tools: { listChanged: true } },
   ttlMs: 60000,
   cacheScope: 'private',
-  ...(flags.has('no-server-info') ? {} : { _meta: { 'io.modelcontextprotocol/serverInfo': serverInfo } }),
+  ...(serverInfo === null ? {} : { _meta: { 'io.modelcontextprotocol/serverInfo': serverInfo } }),
 });
 
 /** Close stdin and stay up, so the next write to this process fails with

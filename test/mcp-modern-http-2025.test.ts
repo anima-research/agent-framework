@@ -297,6 +297,7 @@ for (const version of ['2025-03-26', '2025-06-18', '2025-11-25']) {
     const fixture = await start2025({ versions: [version] });
     const connection = await connect(fixture);
     assert.equal(connection.protocolVersion, version);
+    assert.deepEqual(connection.serverInfo, { name: 'modern-fixture', version: '1.0.0' });
     const names = (await connection.listTools()).map((tool) => tool.name);
     assert.ok(names.includes('echo') && names.includes('slow'), names.join());
     assert.deepEqual((await connection.callTool('echo', { text: 'hi' })).content, [{ type: 'text', text: 'echo:hi' }]);

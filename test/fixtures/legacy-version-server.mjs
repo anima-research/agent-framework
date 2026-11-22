@@ -23,8 +23,8 @@
 // noting each SIGTERM it gets in <startLog>.sigterm.
 //
 // SERVER_INFO (JSON) is the `ok` answer's serverInfo, which it has none of
-// otherwise. With a startLog, SERVER_INFO_LATER replaces it on each start
-// after the first.
+// otherwise. A JSON array gives one for each start recorded in startLog, and
+// its last for each later start. A null gives none.
 //
 // tools/list pages: by default three pages (cursors p2, p3). MODE_LIST picks
 // an edge case: loop (always nextCursor "same"), empty (nextCursor "" then a
@@ -42,8 +42,9 @@ if (startLog) {
   appendFileSync(startLog, `start ${process.pid}\n`);
   if (mode.startsWith('ok-then-')) mode = priorStarts === 0 ? 'ok' : mode.slice('ok-then-'.length);
 }
-const serverInfoText = priorStarts > 0 && process.env.SERVER_INFO_LATER !== undefined ? process.env.SERVER_INFO_LATER : process.env.SERVER_INFO;
-const serverInfo = serverInfoText === undefined ? {} : { serverInfo: JSON.parse(serverInfoText) };
+const serverInfoGiven = process.env.SERVER_INFO === undefined ? null : JSON.parse(process.env.SERVER_INFO);
+const serverInfoNow = Array.isArray(serverInfoGiven) ? serverInfoGiven[Math.min(priorStarts, serverInfoGiven.length - 1)] : serverInfoGiven;
+const serverInfo = serverInfoNow === null ? {} : { serverInfo: serverInfoNow };
 if (process.env.IGNORE_SIGTERM === '1') {
   process.on('SIGTERM', () => { if (startLog) appendFileSync(`${startLog}.sigterm`, `sigterm ${process.pid}\n`); });
 }
