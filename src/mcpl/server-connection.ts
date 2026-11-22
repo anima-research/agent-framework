@@ -24,7 +24,9 @@ import {
   logDroppedLine,
   redactServerText,
   redactedData,
+  serverInfoOf,
   serverTextRedactor,
+  type McpServerInfo,
   type ServerTextRedactor,
 } from './protocol-family.js';
 
@@ -458,6 +460,11 @@ export class McplServerConnection extends EventEmitter {
   /** The MCP revision established by the last successful handshake (always
    *  2024-11-05 for this engine), or null before the first one. */
   protocolVersion: string | null = null;
+
+  /** The server's own name and version, as the answer to the last
+   *  successful handshake gave them; null when it gave neither, and before
+   *  the first one. */
+  serverInfo: McpServerInfo | null = null;
 
   /** Host-owned per-server authority for host/command (config
    *  allowHostCommands, default false). No capability path exists and the
@@ -1268,13 +1275,14 @@ export class McplServerConnection extends EventEmitter {
       owner.holdUnreaped(error.transport, error.cleanup);
       throw new McplUnreapedLaunchError(owner, error.failure, error.cleanup);
     }
-    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, serverInfo, toolsetDeclarations } = established;
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
     connection.toolsetDeclarations = toolsetDeclarations;
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
     connection.protocolVersion = protocolVersion;
+    connection.serverInfo = serverInfo;
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
@@ -1325,7 +1333,7 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string; toolsetDeclarations: Record<string, unknown> | null }> {
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string; serverInfo: McpServerInfo | null; toolsetDeclarations: Record<string, unknown> | null }> {
     const closedWhileConnecting = () => new Error(`MCPL server "${config.id}" was closed while connecting`);
     if (signal?.aborted) throw closedWhileConnecting();
     let transport: McplTransport;
@@ -1374,7 +1382,7 @@ export class McplServerConnection extends EventEmitter {
 
       // Await the initialize response, racing an early transport close/error,
       // a timeout and the owner's close. Every path cleans up its listeners.
-      const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string }>((resolve, reject) => {
+      const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion, serverInfo } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string; serverInfo: McpServerInfo | null }>((resolve, reject) => {
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
@@ -1465,6 +1473,7 @@ export class McplServerConnection extends EventEmitter {
             mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
             mcpToolsAdvertised: caps?.tools !== undefined,
             protocolVersion: answered,
+            serverInfo: serverInfoOf(result?.serverInfo, config),
           });
         };
         const onClose = (info: TransportCloseInfo) => {
@@ -1531,7 +1540,7 @@ export class McplServerConnection extends EventEmitter {
       // I/O callback can emit.
       transport.off('error', logAfterSettled);
       return {
-        transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion,
+        transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion, serverInfo,
         toolsetDeclarations: toolsetDeclarationsOf(rawCapabilities),
       };
     } catch (err) {
@@ -2156,7 +2165,7 @@ export class McplServerConnection extends EventEmitter {
       if (!permanent) this.scheduleReconnect();
       return;
     }
-    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, serverInfo, toolsetDeclarations } = established;
 
     if (signal.aborted) {
       // Closed by the host while the handshake finished: this launch never
@@ -2188,6 +2197,7 @@ export class McplServerConnection extends EventEmitter {
     this.droppedCapabilities = droppedCapabilities;
     this.mcpToolsAdvertised = mcpToolsAdvertised;
     this.protocolVersion = protocolVersion;
+    this.serverInfo = serverInfo;
     this.allowHostCommands = this.config?.allowHostCommands === true;
     this.closed = false;
     this.nextRequestId = 1;
