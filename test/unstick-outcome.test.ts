@@ -348,10 +348,10 @@ test("a host command hook runs unstick for a control-role server through runBuil
     t.mock.method(registry, 'getServer', (id: string) => id === control.id ? control : null);
     (rig.framework as unknown as { mcplServerRegistry: McplServerRegistry }).mcplServerRegistry = registry;
     const report = t.mock.method(control, 'sendToolsCall', async () => ({ content: [] }));
-    control.allowHostCommands = { only: ['operator'] };
+    control.hostCommandRole = 'operator';
     control.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
     (rig.framework as unknown as { wireMcplEvents(c: unknown, config: unknown): void })
-      .wireMcplEvents(control, { id: 'zz-control', allowHostCommands: { only: ['operator'] } });
+      .wireMcplEvents(control, { id: 'zz-control', hostCommandRole: 'operator' });
     control.ready();
     const send = (id: number, params: Record<string, unknown>) =>
       transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id, method: 'host/command', params }));

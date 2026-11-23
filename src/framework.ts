@@ -1022,7 +1022,7 @@ import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { MAX_TIMER_MS, WITHHELD_TEXT, asText, credentialRedactor, redactUrl, redactServerText, resolveServerBinding, serverConfigProblems, serverCredentialPatterns, serverTextRedactor, type CredentialPattern, type McpServerInfo } from './mcpl/protocol-family.js';
 import { MALFORMED_CONTENT_NOTICE, normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
 import { boundedForLog, describeCause, hostStoppedWhileHandling } from './mcpl/errors.js';
-import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport, isOperatorOnlyHostCommands } from './mcpl/transport.js';
+import { assertServerConfigBooleans, buildWebSocketUrl, isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -15482,7 +15482,7 @@ export class AgentFramework {
   private hostCommandHandler: HostCommandHandler | null = null;
 
   /** Register (or clear) the host control-plane handler. Only servers configured
-   * with `allowHostCommands: {only: ['operator']}` can reach it. Parameters
+   * with `hostCommandRole: 'operator'` can reach it. Parameters
    * pass through unchanged; the host owns authentication, grammar and replies.
    * Delivery stays live while quiesced and does not ingest chat or wake a model.
    */
@@ -15552,10 +15552,12 @@ export class AgentFramework {
       // No legacy fallback, even when the hook is unset or rejects a command.
       if (params.command !== 'operator') return { ok: false, error: 'Control role accepts only operator' };
       if (!this.hostCommandHandler) return { ok: false, error: 'No host command handler registered' };
-      return this.hostCommandHandler(serverId, params as Record<string, unknown>, (builtIn) => {
-        if (this.stopHasBegun()) return Promise.resolve({ ok: false, error: 'host is stopping' });
+      const result = await this.hostCommandHandler(serverId, params as Record<string, unknown>, (builtIn) => {
+        if (this.stopHasBegun()) return Promise.resolve({ ok: false, error: 'host shutdown has begun' });
         return this.handleHostCommand(serverId, builtIn ?? {});
       });
+      if (result === undefined) throw new Error('Host command handler returned no result');
+      return result;
     }
     if (
       params.command !== 'undo' &&
@@ -38732,7 +38734,7 @@ export class AgentFramework {
    * subsystem is not initialized, the id is already connected, or the
    * connection/handshake fails. A config whose `inheritEnv` (on a stdio
    * server) or `reconnect` holds anything but true, false or null is refused.
-   * `allowHostCommands` also accepts `{only: ['operator']}`, as in `create()`.
+   * Use `hostCommandRole: 'operator'` for hook-only access, as in `create()`.
    */
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
@@ -39318,7 +39320,7 @@ export class AgentFramework {
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
-        ...(isOperatorOnlyHostCommands(config.allowHostCommands) ? { hostCommandRole: 'operator' as const } : {}),
+        ...(config.hostCommandRole === 'operator' ? { hostCommandRole: 'operator' as const } : {}),
         toolObserveFilter: connection?.toolObserveFilter ?? null,
         toolClasses: ownTools.map(({ tool, serverTool }) => {
           const { classes, source } = this.effectiveToolClass(tool, true);
@@ -39735,7 +39737,7 @@ export class AgentFramework {
         this.refuseServerItem('host/command', connection.id, responder);
         return;
       }
-      const result = await this.handleHostCommand(connection.id, params ?? {}, isOperatorOnlyHostCommands(connection.allowHostCommands));
+      const result = await this.handleHostCommand(connection.id, params ?? {}, connection.hostCommandRole === 'operator');
       responder.respond(result);
     });
 

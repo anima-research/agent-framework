@@ -404,7 +404,8 @@ shows its `family`, `protocolVersion` and `transport`. Its config differs in
 three ways:
 - It has no MCPL surface (grant, push, channels, inference requests, feature
   sets). A setting that asks for that surface can't apply, so it is a
-  configuration error: `allowHostCommands: true`, an `enabledCapabilities`
+  configuration error: `allowHostCommands: true`, `hostCommandRole: 'operator'`,
+  an `enabledCapabilities`
   pattern that matches a capability denied by default, `channelSubscription:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
   `toolLifecycle` `observe` or `inputs` block, a
@@ -1012,7 +1013,10 @@ optional shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`)
 for deployments that front the port with a proxy.
 
 For a connector dedicated to host-owned operator control, configure
-`allowHostCommands: {only: ['operator']}` instead and register:
+`hostCommandRole: 'operator'` on its MCPL server config and leave
+`allowHostCommands` off. Setting both `hostCommandRole: 'operator'` and
+`allowHostCommands: true` is a configuration error. Register the handler in
+the embedding host:
 
 ```typescript
 framework.setHostCommandHandler(async (serverId, params, runBuiltIn) => {
@@ -1029,8 +1033,13 @@ Only selected control-role servers reach the hook; all other commands from
 those servers are refused, with no legacy fallback. `listMcplServers()` keeps
 `allowHostCommands` boolean: a control-role server reports `false` for direct
 built-in access and has the additional field `hostCommandRole: 'operator'`.
-Boolean `true` retains only the existing built-in surface; omitted/false config
-still denies commands.
+Use both status fields if you need to show whether a server can send any
+host command. `allowHostCommands: true` still grants only the existing
+built-ins; without either opt-in, all host commands are denied.
+
+A request sent before registration is refused, not queued. For a connector
+that can send commands at startup, register the handler before calling
+`connectMcplServer()` rather than listing the connector in `create()`.
 Delivery and tool replies remain live while quiesced, outside chat ingestion
 and model wakes. The hook receives the connection's `serverId` separately and
 passes params unchanged. A chat connector can include the sender ID, realm
@@ -1049,8 +1058,9 @@ With a `channelId`, `unstick` attempts a best-effort report through the control
 server's `send_message`. Use `unstick-outcome` to get the result without relying
 on channel delivery.
 Once `stop()` has begun, `runBuiltIn` answers
-`{ok: false, error: 'host is stopping'}`. Shutdown waits for admitted handlers,
-so do not await `stop()` from within a handler.
+`{ok: false, error: 'host shutdown has begun'}`, even after shutdown completes.
+Shutdown waits for admitted handlers, so do not await `stop()` from within
+a handler.
 
 ### Live surgery and Discord awareness marks
 

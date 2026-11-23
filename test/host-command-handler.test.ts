@@ -54,15 +54,16 @@ async function harness(t: TestContext) {
   };
   internals.mcplServerRegistry = registry;
   t.after(async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); });
-  function server(id: string, authority: McplServerConfig['allowHostCommands']) {
+  function server(id: string, authority: Pick<McplServerConfig, 'allowHostCommands' | 'hostCommandRole'> = {}) {
     const transport = new ControlTransport();
     const Connection = McplServerConnection as unknown as new (
       id: string, capabilities: null, transport: McplTransport,
     ) => McplServerConnection;
     const connection = new Connection(id, null, transport);
-    connection.allowHostCommands = authority ?? false;
+    connection.allowHostCommands = authority.allowHostCommands === true;
+    connection.hostCommandRole = authority.hostCommandRole;
     (registry as unknown as { servers: Map<string, McplServerConnection> }).servers.set(id, connection);
-    internals.wireMcplEvents(connection, { id, allowHostCommands: authority });
+    internals.wireMcplEvents(connection, { id, ...authority });
     connection.ready();
     return { connection, transport, request: transport.request.bind(transport) };
   }
@@ -77,7 +78,7 @@ const envelope = {
 
 test('selected control server delivers unchanged numeric actor/origin while quiesced, without ingestion or a wake', { timeout: 15_000 }, async (t) => {
   const { framework, membrane, server } = await harness(t);
-  const control = server('zulip-control', { only: ['operator'] });
+  const control = server('zulip-control', { hostCommandRole: 'operator' });
   const cm = framework.getAgent('agent')!.getContextManager();
   const before = structuredClone(cm.getAllMessages());
   let calls = 0;
@@ -114,8 +115,7 @@ test('selected control server delivers unchanged numeric actor/origin while quie
 
 test('selected server cannot reach any built-in or unknown command, even without a handler', { timeout: 15_000 }, async (t) => {
   const { framework, server } = await harness(t);
-  const role: { only: ['operator'] } = { only: ['operator'] };
-  const control = server('zulip-control', role);
+  const control = server('zulip-control', { hostCommandRole: 'operator' });
   let calls = 0;
   framework.setHostCommandHandler(async () => { calls++; return { ok: true }; });
   for (const handler of [true, false]) {
@@ -132,15 +132,15 @@ test('selected server cannot reach any built-in or unknown command, even without
   assert.equal(unset.result.ok, false);
   assert.match(unset.result.error, /No host command handler/);
 
-  role.only.pop();
+  control.connection.hostCommandRole = undefined;
   assert.equal((await control.request({ command: 'host-status' })).error?.code, -32002,
     'a role that is no longer valid must not fall through to admin commands');
 });
 
 test('omitted config denies; true preserves legacy behavior and cannot reach the hook', { timeout: 15_000 }, async (t) => {
   const { framework, server } = await harness(t);
-  const denied = server('untrusted', undefined);
-  const legacy = server('discord', true);
+  const denied = server('untrusted');
+  const legacy = server('discord', { allowHostCommands: true });
   let calls = 0;
   framework.setHostCommandHandler(async () => { calls++; return { ok: true }; });
   for (const handler of [true, false]) {
@@ -154,10 +154,12 @@ test('omitted config denies; true preserves legacy behavior and cannot reach the
   assert.equal(calls, 0);
 });
 
-test('hook rejection is contained by existing request error handling', { timeout: 15_000 }, async (t) => {
+test('hook rejection and missing result are contained by existing request error handling', { timeout: 15_000 }, async (t) => {
   const { framework, server } = await harness(t);
-  const control = server('zulip-control', { only: ['operator'] });
+  const control = server('zulip-control', { hostCommandRole: 'operator' });
   framework.setHostCommandHandler(async () => { throw new Error('handler failed'); });
+  assert.equal((await control.request(envelope)).error.code, -32603);
+  framework.setHostCommandHandler((async () => {}) as unknown as HostCommandHandler);
   assert.equal((await control.request(envelope)).error.code, -32603);
   framework.setHostCommandHandler(async () => ({ ok: false, message: 'unsupported' }));
   assert.deepEqual((await control.request(envelope)).result, { ok: false, message: 'unsupported' });
@@ -165,7 +167,7 @@ test('hook rejection is contained by existing request error handling', { timeout
 
 test('runBuiltIn answers refusals as handleHostCommand does, refuses operator, and refuses once stop() has begun', { timeout: 15_000 }, async (t) => {
   const { framework, server } = await harness(t);
-  const control = server('zulip-control', { only: ['operator'] });
+  const control = server('zulip-control', { hostCommandRole: 'operator' });
   let run!: Parameters<HostCommandHandler>[2];
   const answers: unknown[] = [];
   framework.setHostCommandHandler(async (_serverId, _params, runBuiltIn) => {
@@ -186,7 +188,7 @@ test('runBuiltIn answers refusals as handleHostCommand does, refuses operator, a
   ]);
   assert.equal((answers[4] as { ok: boolean }).ok, true);
   await framework.stop();
-  assert.deepEqual(await run({ command: 'host-status' }), { ok: false, error: 'host is stopping' });
+  assert.deepEqual(await run({ command: 'host-status' }), { ok: false, error: 'host shutdown has begun' });
 });
 
 test('the framework refuses a non-operator command for the control role on its own, behind the connection gate', { timeout: 15_000 }, async (t) => {

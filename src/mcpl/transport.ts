@@ -27,7 +27,7 @@ import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
 import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverConfigProblems, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
-import { assertBooleanSetting, kindOf } from '../config-checks.js';
+import { assertBooleanSetting, assertOneOfSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
@@ -1005,19 +1005,10 @@ function dialsNetwork(config: McplServerConfig): boolean {
   }
 }
 
-/** The settings of McplServerConfig that accept boolean values. */
+/** The settings of McplServerConfig whose type is boolean. */
 type BooleanSetting = {
   [K in keyof McplServerConfig]-?: NonNullable<McplServerConfig[K]> extends boolean ? K : never;
 }[keyof McplServerConfig];
-
-/** The sole restricted host/command role; malformed values never grant it. */
-export function isOperatorOnlyHostCommands(value: unknown): value is { only: ['operator'] } {
-  if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return false;
-  const keys = Object.keys(value);
-  const only = (value as { only?: unknown }).only;
-  return keys.length === 1 && keys[0] === 'only' && Array.isArray(only)
-    && only.length === 1 && only[0] === 'operator';
-}
 
 /** What `true` does for each boolean setting, as its refusal says it. A
  *  boolean setting added to McplServerConfig doesn't compile until it has
@@ -1026,6 +1017,7 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
   credentialRequired: 'true requires a provider credential on every WebSocket dial without fallback; false or leaving it out keeps legacy behavior',
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
+  allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
   toolHints: 'true advertises MCPL tool hints (RFC-014) to an MCPL server, so its dynamic tools are announced in the conversation and called through toolsets--act; leaving it out does the same wherever the name toolsets is free; false lists every tool as before and advertises none',
 };
 
@@ -1040,10 +1032,9 @@ function checkedCredentialRequired(config: McplServerConfig): boolean | undefine
 
 /**
  * Refuse a server config whose `inheritEnv`, `reconnect`, `allowHostCommands`,
- * `credentialRequired` or `toolHints` holds anything but true or false
- * (`allowHostCommands` also accepts `{only: ['operator']}`). A config read
- * from JSON can carry a quoted "false" where the type says boolean. Only
- * boolean `true` turns a boolean variant on, so quotes hide what it does. null counts
+ * `credentialRequired` or `toolHints` holds anything but true or false. A config read from JSON can carry a quoted
+ * "false" where the type says boolean, and every reader of these settings takes
+ * only `true` as on, so the quotes would hide what the value does. null counts
  * as not set, so a generated config that writes an unset setting as null
  * keeps working. `inheritEnv` is checked only for a stdio server, since a
  * network server, WebSocket or HTTP, never reads it. The error names the
@@ -1055,10 +1046,10 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
     if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
     assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
   }
-  const authority = config.allowHostCommands;
-  if (authority !== undefined && authority !== null && typeof authority !== 'boolean' && !isOperatorOnlyHostCommands(authority)) {
-    const booleanForm = typeof authority === 'string' ? 'true or false (unquoted)' : 'true or false';
-    throw new Error(`MCPL server "${config.id}" allowHostCommands must be ${booleanForm}, or {only: ['operator']}; got ${kindOf(authority)}`);
+  assertOneOfSetting(`MCPL server "${config.id}" hostCommandRole`, config.hostCommandRole, ['operator'],
+    "'operator' allows only the host's operator hook; leaving it out grants no hook access");
+  if (config.hostCommandRole === 'operator' && config.allowHostCommands === true) {
+    throw new Error(`MCPL server "${config.id}" hostCommandRole cannot be set with allowHostCommands: true`);
   }
   // Not a boolean, but read the same way: a value that isn't one of the
   // three would otherwise be taken for the default.

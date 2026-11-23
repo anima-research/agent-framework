@@ -1,10 +1,10 @@
-- Hosts can register `setHostCommandHandler(handler | null)` for MCPL servers
-  configured with `allowHostCommands: {only: ['operator']}`. This control role
-  forwards only `operator` envelopes unchanged, including while quiesced, and
-  cannot reach legacy admin commands. Boolean/default authority is unchanged.
-  The handler's third argument, `runBuiltIn(params)`, lets the host run a
-  built-in verb it chooses — including `unstick` and `unstick-outcome` — with
-  the same checks and answers as an `allowHostCommands: true` server.
-  `HostCommandParams` and `HostCommandResult` are exported.
-  `listMcplServers()` keeps `allowHostCommands` boolean. A control-role server
-  reports `false` for direct built-in access and adds `hostCommandRole: 'operator'`.
+- Embedding hosts can register a `setHostCommandHandler` hook for MCPL servers
+  configured with `hostCommandRole: 'operator'`. The role admits only the
+  `operator` verb of `host/command`, including while the host is quiesced,
+  without putting it into chat or waking a model. The host can opt to run a
+  built-in command through `runBuiltIn` with the same checks and answers as
+  direct built-in access.
+  `allowHostCommands` remains boolean and grants unchanged built-in authority
+  when true. Configuring both opt-ins on the same server is an error.
+  `listMcplServers()` reports direct built-in access in `allowHostCommands`
+  and reports hook-only access separately in `hostCommandRole`.

@@ -141,7 +141,7 @@ test('listMcplServers lists a refused configuration as refused, shows urls redac
 test('listMcplServers tells the operator-only control role apart from full host-command authority', () => {
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.mcplServerConfigs = new Map<string, Record<string, unknown>>([
-    ['control', { id: 'control', command: 'node', allowHostCommands: { only: ['operator'] } }],
+    ['control', { id: 'control', command: 'node', hostCommandRole: 'operator' }],
     ['admin', { id: 'admin', command: 'node', allowHostCommands: true }],
     ['off', { id: 'off', command: 'node', allowHostCommands: false }],
     ['omitted', { id: 'omitted', command: 'node' }],

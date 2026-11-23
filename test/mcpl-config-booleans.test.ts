@@ -1,7 +1,9 @@
 /**
- * MCPL boolean settings accept true, false or omission (including null).
- * `allowHostCommands` also accepts the restricted role `{only: ['operator']}`.
- * The framework entry-point checks are covered in mcpl-runtime-lifecycle.test.ts.
+ * The boolean settings of an MCPL server's config (#379): `inheritEnv`,
+ * `reconnect` and `allowHostCommands` each take true or false, or are left
+ * out, and null counts as left out. The framework's entry points refuse any
+ * other value (test/mcpl-runtime-lifecycle.test.ts), and every reader takes
+ * only `true` as on.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,6 +20,7 @@ const WHAT_TRUE_DOES = {
   credentialRequired: 'true requires a provider credential on every WebSocket dial without fallback; false or leaving it out keeps legacy behavior',
   inheritEnv: "true passes the server the host's whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables",
   reconnect: "true retries in the background when the server can't be reached or its connection drops, and false or leaving it out doesn't",
+  allowHostCommands: "true lets the server run the host's admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them",
 };
 
 const STDIO = { id: 'discord', command: 'discord-mcpl' };
@@ -26,7 +29,7 @@ const WEBSOCKET = { id: 'remote', url: 'ws://127.0.0.1:1' };
 const check = (config: Record<string, unknown>) => assertServerConfigBooleans(config as unknown as McplServerConfig);
 
 test('each boolean setting takes true, false, null or nothing, on either transport', () => {
-  for (const setting of [...Object.keys(WHAT_TRUE_DOES), 'allowHostCommands']) {
+  for (const setting of Object.keys(WHAT_TRUE_DOES)) {
     for (const value of [undefined, null, true, false]) {
       check({ ...STDIO, [setting]: value });
       check({ ...WEBSOCKET, [setting]: value });
@@ -36,34 +39,27 @@ test('each boolean setting takes true, false, null or nothing, on either transpo
 
 test('any other value is refused, naming the server, the setting and the kind of value but not the value', () => {
   const refused: Array<[unknown, string]> = [
-    ['true', 'a string'],
-    ['false', 'a string'],
-    ['', 'a string'],
-    ['xoxb-pasted-token', 'a string'],
-    [0, 'a number'],
-    [1, 'a number'],
-    [[], 'an array'],
-    [{}, 'an object'],
-    [Object.create(null), 'an object'],
-    [new Map(), 'a Map'],
-    [new (class Item {})(), 'an Item'],
-    [Object.create({}), 'an Object'],
-    [new (class {})(), "an object that isn't plain"],
+    ['true', 'true or false, unquoted, not a string'],
+    ['false', 'true or false, unquoted, not a string'],
+    ['', 'true or false, unquoted, not a string'],
+    ['xoxb-pasted-token', 'true or false, unquoted, not a string'],
+    [0, 'true or false, not a number'],
+    [1, 'true or false, not a number'],
+    [[], 'true or false, not an array'],
+    [{}, 'true or false, not an object'],
+    [Object.create(null), 'true or false, not an object'],
+    [new Map(), 'true or false, not a Map'],
+    [new (class Item {})(), 'true or false, not an Item'],
+    [Object.create({}), 'true or false, not an Object'],
+    [new (class {})(), "true or false, not an object that isn't plain"],
   ];
   for (const [setting, whatTrueDoes] of Object.entries(WHAT_TRUE_DOES)) {
-    for (const [value, kind] of refused) {
-      const wanted = typeof value === 'string' ? 'true or false, unquoted,' : 'true or false,';
+    for (const [value, wanted] of refused) {
       assert.throws(() => check({ ...STDIO, [setting]: value }), (err: Error) => {
-        assert.equal(err.message, `MCPL server "discord" ${setting} must be ${wanted} not ${kind}: ${whatTrueDoes}`);
+        assert.equal(err.message, `MCPL server "discord" ${setting} must be ${wanted}: ${whatTrueDoes}`);
         return true;
       }, `${setting}: ${JSON.stringify(value)}`);
     }
-  }
-  for (const [value, kind] of refused) {
-    const booleanForm = typeof value === 'string' ? 'true or false (unquoted)' : 'true or false';
-    assert.throws(() => check({ ...STDIO, allowHostCommands: value }), {
-      message: `MCPL server "discord" allowHostCommands must be ${booleanForm}, or {only: ['operator']}; got ${kind}`,
-    });
   }
 });
 
@@ -82,7 +78,7 @@ test('inheritEnv is checked only for a stdio server, since a network server neve
   assert.throws(() => check({ ...WEBSOCKET, reconnect: 'false' }),
     /MCPL server "remote" reconnect must be true or false, unquoted, not a string: /);
   assert.throws(() => check({ ...WEBSOCKET, allowHostCommands: 'true' }),
-    { message: "MCPL server \"remote\" allowHostCommands must be true or false (unquoted), or {only: ['operator']}; got a string" });
+    /MCPL server "remote" allowHostCommands must be true or false, unquoted, not a string: /);
 });
 
 // The .mjs fixture is not compiled/copied by tsc, so when this test runs from
@@ -202,7 +198,7 @@ test('a server the host closes leaves the registry, with reconnect: true too, si
   }
 });
 
-test('a quoted allowHostCommands reads as off, at connect and again at a reconnect', { timeout: 30_000 }, async () => {
+test('an allowHostCommands that is not true reads as off, at connect and again at a reconnect', { timeout: 30_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcpl-booleans-'));
   const flag = join(dir, 'up');
   writeFileSync(flag, '');
@@ -223,14 +219,18 @@ test('a quoted allowHostCommands reads as off, at connect and again at a reconne
   }
 });
 
-
-test('the operator-only control role is accepted exactly; malformed roles are refused', () => {
+test('hostCommandRole accepts only operator, null or omission and cannot accompany full authority', () => {
   for (const config of [STDIO, WEBSOCKET]) {
-    check({ ...config, allowHostCommands: { only: ['operator'] } });
-    for (const role of [{ only: [] }, { only: ['undo'] }, { only: ['operator', 'undo'] },
-      { only: 'operator' }, { only: ['operator'], extra: true }]) {
-      assert.throws(() => check({ ...config, allowHostCommands: role }), /allowHostCommands must be/);
+    check({ ...config, hostCommandRole: 'operator' });
+    check({ ...config, hostCommandRole: null });
+    check({ ...config, hostCommandRole: 'operator', allowHostCommands: false });
+    for (const hostCommandRole of [true, 'admin', '', {}, ['operator'], { only: ['operator'] }]) {
+      assert.throws(() => check({ ...config, hostCommandRole }), /hostCommandRole must be 'operator'/);
     }
+    assert.throws(() => check({ ...config, hostCommandRole: 'operator', allowHostCommands: true }),
+      /hostCommandRole cannot be set with allowHostCommands: true/);
+    assert.throws(() => check({ ...config, allowHostCommands: { only: ['operator'] } }),
+      /allowHostCommands must be true or false/);
   }
 });
 
@@ -240,22 +240,31 @@ test('the operator-only role survives connect and reconnect', { timeout: 30_000 
   writeFileSync(flag, '');
   let connection: McplServerConnection | undefined;
   try {
-    connection = await McplServerConnection.connect(
-      { ...flaky(flag, true), allowHostCommands: { only: ['operator'] } }, HOST_CAPS);
-    assert.deepEqual(connection.allowHostCommands, { only: ['operator'] });
+    const config: McplServerConfig = { ...flaky(flag, true), hostCommandRole: 'operator' };
+    const configuredAuthority: boolean | undefined = config.allowHostCommands;
+    assert.equal(configuredAuthority, undefined);
+    connection = await McplServerConnection.connect(config, HOST_CAPS);
+    const liveAuthority: boolean = connection.allowHostCommands;
+    assert.equal(liveAuthority, false);
+    assert.equal(connection.hostCommandRole, 'operator');
     const live = connection;
     const reconnected = new Promise<void>((resolve) => live.once('reconnect', () => resolve()));
     live.ready();
     live.sendToolsList().catch(() => {});
     // Clear the live value before the next handshake to prove reconnect
     // reads the configured role instead of merely keeping the old value.
-    live.allowHostCommands = false;
+    live.hostCommandRole = undefined;
     await reconnected;
-    assert.deepEqual(live.allowHostCommands, { only: ['operator'] });
+    assert.equal(live.hostCommandRole, 'operator');
+    assert.equal(live.allowHostCommands, false);
     live.readyControlPlane();
     let denied = 0;
     live.emit('host-command', { command: 'undo' }, { respondError() { denied++; } });
     assert.equal(denied, 1, 'reconnect did not widen the restricted role');
+    let admitted = 0;
+    live.on('host-command', () => { admitted++; });
+    live.emit('host-command', { command: 'operator' });
+    assert.equal(admitted, 1, 'the operator verb still passes the connection gate');
   } finally {
     await connection?.close();
     rmSync(dir, { recursive: true, force: true });

@@ -11,7 +11,7 @@
 
 import { EventEmitter } from 'node:events';
 
-import { openTransport, STDERR_END_WAIT_MS, isOperatorOnlyHostCommands, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { openTransport, STDERR_END_WAIT_MS, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED, boundedForLog, describeCause } from './errors.js';
@@ -469,7 +469,9 @@ export class McplServerConnection extends EventEmitter {
   /** Host-owned per-server authority for host/command (config
    *  allowHostCommands, default false). No capability path exists and the
    *  grant cannot confer it — server params never decide admin authority. */
-  allowHostCommands: NonNullable<McplServerConfig['allowHostCommands']> = false;
+  allowHostCommands = false;
+  /** Separate authority: only the operator verb reaches the host hook. */
+  hostCommandRole?: 'operator';
 
   /**
    * The effective capability grant (§5.4) — the sole authorization
@@ -1057,14 +1059,13 @@ export class McplServerConnection extends EventEmitter {
       // config confers it (PR #79 review blocker 9: any server could
       // request undo/hide/unstick).
       if (name === 'host-command') {
-        const authority = this.allowHostCommands;
-        const operatorOnly = isOperatorOnlyHostCommands(authority);
+        const operatorOnly = this.hostCommandRole === 'operator';
         const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
-        if (authority !== true && !operatorOnly) {
+        if (this.allowHostCommands !== true && !operatorOnly) {
           if (responder?.respondError) {
-            responder.respondError(CAPABILITY_DISABLED, 'host/command requires host-owned authority (McplServerConfig.allowHostCommands)', {});
+            responder.respondError(CAPABILITY_DISABLED, 'host/command requires host-owned authority (McplServerConfig.allowHostCommands or hostCommandRole)', {});
           } else {
-            console.error(`[mcpl] ${this.id}: discarded host/command — allowHostCommands not set`);
+            console.error(`[mcpl] ${this.id}: discarded host/command — no host-owned authority`);
           }
           return true;
         }
@@ -1291,8 +1292,8 @@ export class McplServerConnection extends EventEmitter {
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
     connection.protocolVersion = protocolVersion;
     connection.serverInfo = serverInfo;
-    connection.allowHostCommands = config.allowHostCommands === true || isOperatorOnlyHostCommands(config.allowHostCommands)
-      ? config.allowHostCommands : false;
+    connection.allowHostCommands = config.allowHostCommands === true;
+    connection.hostCommandRole = config.hostCommandRole === 'operator' ? 'operator' : undefined;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Its configuration, which a reconnect reads and every log line of the
@@ -2207,8 +2208,8 @@ export class McplServerConnection extends EventEmitter {
     this.mcpToolsAdvertised = mcpToolsAdvertised;
     this.protocolVersion = protocolVersion;
     this.serverInfo = serverInfo;
-    this.allowHostCommands = this.config?.allowHostCommands === true || isOperatorOnlyHostCommands(this.config?.allowHostCommands)
-      ? this.config.allowHostCommands : false;
+    this.allowHostCommands = this.config?.allowHostCommands === true;
+    this.hostCommandRole = this.config?.hostCommandRole === 'operator' ? 'operator' : undefined;
     this.closed = false;
     this.nextRequestId = 1;
     this.pendingRequests.clear();

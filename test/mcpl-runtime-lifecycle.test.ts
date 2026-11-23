@@ -606,7 +606,8 @@ test('create() refuses invalid server settings before it spawns any server', asy
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ['inheritEnv', { inheritEnv: 'false' }, 'true or false, unquoted, not a string'],
     ['reconnect', { reconnect: 'true' }, 'true or false, unquoted, not a string'],
-    ['allowHostCommands', { allowHostCommands: { only: [] } }, "true or false, or {only: ['operator']}"],
+    ['allowHostCommands', { allowHostCommands: { only: ['operator'] } }, 'true or false, not an object'],
+    ['hostCommandRole', { hostCommandRole: 'admin' }, "'operator', not another string"],
   ];
   try {
     for (const [setting, extra, wanted] of cases) {
@@ -635,7 +636,8 @@ test('connectMcplServer refuses invalid server settings, and registers nothing',
     for (const [setting, value, wanted] of [
       ['inheritEnv', 'false', 'true or false, unquoted, not a string'],
       ['reconnect', 'false', 'true or false, unquoted, not a string'],
-      ['allowHostCommands', { only: [] }, "true or false, or {only: ['operator']}"],
+      ['allowHostCommands', { only: ['operator'] }, 'true or false, not an object'],
+      ['hostCommandRole', 'admin', "'operator', not another string"],
     ] as const) {
       await assert.rejects(
         framework.connectMcplServer(serverConfig('second', { [setting]: value }) as never),
@@ -651,7 +653,8 @@ test('restartMcplServer refuses invalid server settings before it disconnects th
     for (const [setting, value, wanted] of [
       ['inheritEnv', 'true', 'true or false, unquoted, not a string'],
       ['reconnect', 'true', 'true or false, unquoted, not a string'],
-      ['allowHostCommands', { only: [] }, "true or false, or {only: ['operator']}"],
+      ['allowHostCommands', { only: ['operator'] }, 'true or false, not an object'],
+      ['hostCommandRole', 'admin', "'operator', not another string"],
     ] as const) {
       await assert.rejects(
         framework.restartMcplServer('first', serverConfig('first', { [setting]: value }) as never),
