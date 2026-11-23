@@ -1026,9 +1026,11 @@ framework.setHostCommandHandler(async (serverId, params, runBuiltIn) => {
 ```
 
 Only selected control-role servers reach the hook; all other commands from
-those servers are refused, with no legacy fallback. `listMcplServers()` reports
-their `allowHostCommands` as `'operator-only'`. Boolean `true` retains
-only the existing built-in surface; omitted/false config still denies commands.
+those servers are refused, with no legacy fallback. `listMcplServers()` keeps
+`allowHostCommands` boolean: a control-role server reports `false` for direct
+built-in access and has the additional field `hostCommandRole: 'operator'`.
+Boolean `true` retains only the existing built-in surface; omitted/false config
+still denies commands.
 Delivery and tool replies remain live while quiesced, outside chat ingestion
 and model wakes. The hook receives the connection's `serverId` separately and
 passes params unchanged. A chat connector can include the sender ID, realm
@@ -1043,8 +1045,9 @@ The hook's third argument, `runBuiltIn(params)`, runs one built-in verb
 checks and answers an `allowHostCommands: true` server gets, attributed to the
 hook's `serverId`. Only the host handler is given this callback; it does not
 grant the server direct access to the built-ins.
-An `unstick` given a `channelId` posts its report to that channel through the
-control server's `send_message`; omit it to answer only via `unstick-outcome`.
+With a `channelId`, `unstick` attempts a best-effort report through the control
+server's `send_message`. Use `unstick-outcome` to get the result without relying
+on channel delivery.
 Once `stop()` has begun, `runBuiltIn` answers
 `{ok: false, error: 'host is stopping'}`. Shutdown waits for admitted handlers,
 so do not await `stop()` from within a handler.
@@ -1204,7 +1207,7 @@ still holds them keeps them.
   ledger is `failed`. A framework with neither `storePath` nor
   `discordAwarenessOutboxPath` has no ledger: it refuses a marks choice as
   `invalid`, and so do its controls.
-- **Over `host/command`** (servers granted `allowHostCommands`): an `undo` by
+- **Over `host/command`** (servers granted `allowHostCommands: true`): an `undo` by
   messages takes `marks: 'none' | 'addressed' | 'all'` (default `none`; any
   other value is refused) and returns `markers`. It holds the store like
   every surgery, so it is refused while any agent sharing the store is

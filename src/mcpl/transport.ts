@@ -27,7 +27,7 @@ import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
 import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverConfigProblems, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
-import { assertBooleanSetting } from '../config-checks.js';
+import { assertBooleanSetting, kindOf } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
@@ -1008,7 +1008,7 @@ function dialsNetwork(config: McplServerConfig): boolean {
 /** The settings of McplServerConfig that accept boolean values. */
 type BooleanSetting = {
   [K in keyof McplServerConfig]-?: NonNullable<McplServerConfig[K]> extends boolean ? K : never;
-}[keyof McplServerConfig] | 'allowHostCommands';
+}[keyof McplServerConfig];
 
 /** The sole restricted host/command role; malformed values never grant it. */
 export function isOperatorOnlyHostCommands(value: unknown): value is { only: ['operator'] } {
@@ -1026,7 +1026,6 @@ const SERVER_CONFIG_BOOLEANS: Record<BooleanSetting, string> = {
   credentialRequired: 'true requires a provider credential on every WebSocket dial without fallback; false or leaving it out keeps legacy behavior',
   inheritEnv: 'true passes the server the host\'s whole environment, and false or leaving it out passes only the allowlisted and LC_* host variables',
   reconnect: 'true retries in the background when the server can\'t be reached or its connection drops, and false or leaving it out doesn\'t',
-  allowHostCommands: 'true lets the server run the host\'s admin commands, such as undo, hide, unstick and quiesce, and false or leaving it out refuses them',
   toolHints: 'true advertises MCPL tool hints (RFC-014) to an MCPL server, so its dynamic tools are announced in the conversation and called through toolsets--act; leaving it out does the same wherever the name toolsets is free; false lists every tool as before and advertises none',
 };
 
@@ -1054,8 +1053,12 @@ function checkedCredentialRequired(config: McplServerConfig): boolean | undefine
 export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
     if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
-    if (setting === 'allowHostCommands' && isOperatorOnlyHostCommands(config.allowHostCommands)) continue;
     assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
+  }
+  const authority = config.allowHostCommands;
+  if (authority !== undefined && authority !== null && typeof authority !== 'boolean' && !isOperatorOnlyHostCommands(authority)) {
+    const booleanForm = typeof authority === 'string' ? 'true or false (unquoted)' : 'true or false';
+    throw new Error(`MCPL server "${config.id}" allowHostCommands must be ${booleanForm}, or {only: ['operator']}; got ${kindOf(authority)}`);
   }
   // Not a boolean, but read the same way: a value that isn't one of the
   // three would otherwise be taken for the default.

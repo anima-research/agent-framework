@@ -39225,11 +39225,11 @@ export class AgentFramework {
     maskedCapabilities: string[];
     /** Advertised paths removed by a host deny-by-default rule (§13.4). */
     deniedCapabilities: string[];
-    /** Host-owned authority; deliberately separate from the portable grant.
-     *  `'operator-only'` for the `{only: ['operator']}` control role, which
-     *  reaches only the host's command hook, not the built-in admin commands
-     *  `true` grants. */
-    allowHostCommands: boolean | 'operator-only';
+    /** Host-owned authority to call built-in admin commands directly;
+     *  deliberately separate from the portable grant. */
+    allowHostCommands: boolean;
+    /** The configured restricted role, which reaches only the host's command hook. */
+    hostCommandRole?: 'operator';
     /**
      * RFC-007 §10: the server's current tools/observe filter — its own
      * statement of which calls and argument fields it uses, shown next to
@@ -39267,7 +39267,7 @@ export class AgentFramework {
       transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
       toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
       effectiveGrant: string[]; maskedCapabilities: string[];
-      deniedCapabilities: string[]; allowHostCommands: boolean | 'operator-only';
+      deniedCapabilities: string[]; allowHostCommands: boolean; hostCommandRole?: 'operator';
       toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
       toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
       manifestState: {
@@ -39317,7 +39317,8 @@ export class AgentFramework {
         effectiveGrant: connection?.grant.effectiveList() ?? [],
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
-        allowHostCommands: isOperatorOnlyHostCommands(config.allowHostCommands) ? 'operator-only' : config.allowHostCommands === true,
+        allowHostCommands: config.allowHostCommands === true,
+        ...(isOperatorOnlyHostCommands(config.allowHostCommands) ? { hostCommandRole: 'operator' as const } : {}),
         toolObserveFilter: connection?.toolObserveFilter ?? null,
         toolClasses: ownTools.map(({ tool, serverTool }) => {
           const { classes, source } = this.effectiveToolClass(tool, true);

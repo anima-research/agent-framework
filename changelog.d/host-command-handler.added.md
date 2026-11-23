@@ -6,5 +6,5 @@
   built-in verb it chooses — including `unstick` and `unstick-outcome` — with
   the same checks and answers as an `allowHostCommands: true` server.
   `HostCommandParams` and `HostCommandResult` are exported.
-  `listMcplServers()` reports such a server's `allowHostCommands` as
-  `'operator-only'`; `true` and `false` servers report as before.
+  `listMcplServers()` keeps `allowHostCommands` boolean. A control-role server
+  reports `false` for direct built-in access and adds `hostCommandRole: 'operator'`.

@@ -150,10 +150,13 @@ test('listMcplServers tells the operator-only control role apart from full host-
   framework.mcplTools = [];
   framework.mcplPrefixMap = new Map();
   const listed = (framework as AgentFramework).listMcplServers();
-  assert.deepEqual(listed.map((s) => [s.id, s.allowHostCommands]), [
-    ['control', 'operator-only'],
-    ['admin', true],
-    ['off', false],
-    ['omitted', false],
+  assert.deepEqual(listed.map((s) => {
+    const allowHostCommands: boolean = s.allowHostCommands;
+    return [s.id, allowHostCommands, s.hostCommandRole];
+  }), [
+    ['control', false, 'operator'],
+    ['admin', true, undefined],
+    ['off', false, undefined],
+    ['omitted', false, undefined],
   ]);
 });

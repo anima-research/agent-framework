@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/framework.js';
+import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
@@ -70,7 +71,7 @@ class LineTransport extends McplTransport {
 type Step = NormalizedResponse[] | (() => Error);
 type Answer = Record<string, unknown>;
 
-async function unstickRig(script: Step[], agents: string[] = ['scout']) {
+async function unstickRig(script: Step[], agents: string[] = ['scout'], captureReports = true) {
   const dir = mkdtempSync(join(tmpdir(), 'unstick-outcome-'));
   const membrane = new MockMembrane();
   const order: string[] = [];
@@ -90,8 +91,10 @@ async function unstickRig(script: Step[], agents: string[] = ['scout']) {
     modules: [new Surface(order)], errorPolicy: noRetries, exhaustedTurnRearmMs: false,
   } as never);
   const posted: string[] = [];
-  (framework as unknown as { postToChannel: (s: string, c: string, content: string) => Promise<void> })
-    .postToChannel = async (_serverId, _channelId, content) => { posted.push(content); };
+  if (captureReports) {
+    (framework as unknown as { postToChannel: (s: string, c: string, content: string) => Promise<void> })
+      .postToChannel = async (_serverId, _channelId, content) => { posted.push(content); };
+  }
   const host = (params: Record<string, unknown>) => (framework as unknown as {
     handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Answer>;
   }).handleHostCommand('zz-srv', params);
@@ -332,8 +335,8 @@ test("an unstick-outcome with no session and no answer, or with no agentName, an
   } finally { await rig.close(); }
 });
 
-test("a host command hook runs unstick for a control-role server through runBuiltIn and gets its outcome, while the server itself still reaches only the hook", async () => {
-  const rig = await unstickRig([[], [refusedAs(CATEGORY)], [refusedAs(CATEGORY)]]);
+test("a host command hook runs unstick for a control-role server through runBuiltIn and gets its outcome, while the server itself still reaches only the hook", async (t) => {
+  const rig = await unstickRig([[], [refusedAs(CATEGORY)], [refusedAs(CATEGORY)]], ['scout'], false);
   try {
     const replies = new Map<number, Answer>();
     const transport = new LineTransport((line) => {
@@ -341,6 +344,10 @@ test("a host command hook runs unstick for a control-role server through runBuil
       if (typeof message.id === 'number') replies.set(message.id, message.result ?? { error: message.error });
     });
     const control = new (McplServerConnection as unknown as new (id: string, config: null, transport: McplTransport) => McplServerConnection)('zz-control', null, transport);
+    const registry = new McplServerRegistry();
+    t.mock.method(registry, 'getServer', (id: string) => id === control.id ? control : null);
+    (rig.framework as unknown as { mcplServerRegistry: McplServerRegistry }).mcplServerRegistry = registry;
+    const report = t.mock.method(control, 'sendToolsCall', async () => ({ content: [] }));
     control.allowHostCommands = { only: ['operator'] };
     control.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
     (rig.framework as unknown as { wireMcplEvents(c: unknown, config: unknown): void })
@@ -351,7 +358,7 @@ test("a host command hook runs unstick for a control-role server through runBuil
     const seen: unknown[] = [];
     rig.framework.setHostCommandHandler(async (serverId, params, runBuiltIn) => {
       assert.equal(serverId, 'zz-control');
-      const answer = await runBuiltIn({ command: String(params.text), agentName: 'scout' });
+      const answer = await runBuiltIn({ command: String(params.text), agentName: 'scout', channelId: 'zz-chan' });
       seen.push(answer);
       return { ok: answer.ok, message: JSON.stringify(answer) };
     });
@@ -373,5 +380,10 @@ test("a host command hook runs unstick for a control-role server through runBuil
     await until(() => replies.has(3), 'the hook-run unstick-outcome');
     assert.deepEqual(seen[1], { ok: true, outcome: 'cleared', rewinds: 1 });
     assert.deepEqual(replies.get(3), { ok: true, message: JSON.stringify(seen[1]) });
+    assert.equal(report.mock.callCount(), 1, 'the outcome is posted through the control connection');
+    const [tool, args] = report.mock.calls[0].arguments;
+    assert.equal(tool, 'send_message');
+    assert.equal(args?.channelId, 'zz-chan');
+    assert.match(String(args?.content), /Unstuck \*\*scout\*\*/);
   } finally { await rig.close(); }
 });

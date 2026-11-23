@@ -366,10 +366,12 @@ test('a modern server deployed with a host\'s MCPL deny-list connects, since wha
 
 test('MCPL policy on a modern server is a configuration error at connect', async () => {
   await withModern(async ({ framework }) => {
-    await assert.rejects(
-      framework.connectMcplServer({ id: 'bad', url: 'https://example.invalid/mcp', allowHostCommands: true }),
-      /"allowHostCommands" asks for MCPL behaviour/,
-    );
+    for (const allowHostCommands of [true, { only: ['operator'] }] satisfies [true, { only: ['operator'] }]) {
+      await assert.rejects(
+        framework.connectMcplServer({ id: 'bad', url: 'https://example.invalid/mcp', allowHostCommands }),
+        /"allowHostCommands" asks for MCPL behaviour/,
+      );
+    }
     await assert.rejects(
       framework.connectMcplServer({ id: 'bad2', url: 'https://example.invalid/mcp', protocol: 'modern' }),
       /applies only to stdio/,
