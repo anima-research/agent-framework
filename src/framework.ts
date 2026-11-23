@@ -37862,20 +37862,18 @@ export class AgentFramework {
   }
 
   private tellNoGrant(connection: McplServerConnection, refusal: McplNoGrantRefusal): void {
-    if (this.noGrantTold.has(connection) || this.agents.size === 0) return;
+    if (connection.noGrantTold || this.agents.size === 0) return;
     const words = NO_GRANT_WORDS[refusal.end];
     const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it. ` +
       `The server holds no grant, because ${words.cause}. So its pushes and channel messages don't reach you. ${words.tail} ` +
       'The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.';
     try {
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant', serverId: connection.id });
-      this.noGrantTold.add(connection);
+      connection.noGrantTold = true;
     } catch (error) {
       console.error(`[mcpl] ${connection.id}: the notice that it holds no grant could not be written:`, error);
     }
   }
-
-  private readonly noGrantTold = new WeakSet<McplServerConnection>();
 
   /**
    * RFC-014 §8.3: a tool change with no result or event to ride on (a
@@ -38390,7 +38388,7 @@ export class AgentFramework {
           }
         } else {
           connection.establishGrant(newGrant);
-          this.noGrantTold.delete(connection);
+          connection.noGrantTold = false;
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
@@ -38570,7 +38568,7 @@ export class AgentFramework {
       } else {
         // Expansion activates on receipt (§6.7).
         connection.establishGrant(grant);
-        this.noGrantTold.delete(connection);
+        connection.noGrantTold = false;
         if (receipt?.accepted === true && receipt.mode === 'degraded') {
           for (const uf of receipt.unavailableFeatures ?? []) {
             console.error(recorded(

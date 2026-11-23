@@ -507,6 +507,13 @@ export class McplServerConnection extends EventEmitter {
    *  framework does); a grant and a transport boundary clear it. */
   noGrantEnd: McplNoGrantEnd | null = null;
 
+  /** Whether the agent has been told that this connection holds no grant, in
+   *  its current spell without one. Whoever tells the agent sets it (the
+   *  framework does, once its notice is written), and clears it when the
+   *  server accepts a grant. A transport boundary and the empty grant that a
+   *  refusal sets keep it. */
+  noGrantTold = false;
+
   /**
    * RFC-007 §6: the server's `tools/observe` filter — interest, never
    * authority (it only narrows what the grant allows). Null = no filter in
