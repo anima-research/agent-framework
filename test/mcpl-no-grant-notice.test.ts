@@ -100,7 +100,7 @@ async function roundTrip(fw: Fw): Promise<void> {
   assert.notEqual(result.isError, true, `the server's tool answers: ${JSON.stringify(result)}`);
 }
 
-test('case 1: a server that never answers the policy Request: its first refused push writes one notice in the host\'s words, and starts no turn', async (t) => {
+test('case 1: a server that never answers the policy Request: its first refused push writes one notice in the host\'s words, which starts no turn and is in the next turn\'s request', async (t) => {
   const { server, fw } = await setup(t, unanswered);
   server.peer.notify('push/event', ring('r1', 'RING-ONE'));
   await waitFor(() => notices(fw).length === 1, 'the notice');
@@ -109,6 +109,9 @@ test('case 1: a server that never answers the policy Request: its first refused 
   await roundTrip(fw);
   assert.ok(!windowText(fw.framework).some((x) => x.includes('RING-ONE')), 'nothing the push carried is in the context');
   assert.equal(fw.membrane.calls.length, 0, 'no turn started');
+  assert.equal(fw.framework.nudgeAgent('scout', 'test').ok, true);
+  await waitFor(() => fw.membrane.calls.length > 0, 'the agent\'s next turn');
+  assert.ok(JSON.stringify(fw.membrane.calls[0]).includes('sent push/event, and the host refused it'), 'the next turn\'s request holds the notice');
 });
 
 test('case 2: one notice for each connect: 100 more refused pushes, and a transport that drops and comes back, write no second notice', async (t) => {
