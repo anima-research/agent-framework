@@ -38583,7 +38583,9 @@ export class AgentFramework {
         console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
         return;
       }
-      if (err instanceof McplRequestError) connection.noGrantEnd = err.outcome === 'error-response' ? 'errored' : 'unanswered';
+      if (err instanceof McplRequestError) {
+        connection.noGrantEnd = err.outcome === 'error-response' ? 'errored' : err.outcome === 'no-response' ? 'unanswered' : 'host-error';
+      }
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
