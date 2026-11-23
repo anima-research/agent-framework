@@ -1,6 +1,7 @@
 // The agent's structured view of an extract, not a transformation of the
 // stored conversation or of native blocks on their way back to a provider.
 const EXTRACT = 'history--extract';
+const ACT = 'toolsets--act';
 const WITHHELD = '[History extract withheld: malformed JSON contains a private thinking block.]';
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -16,17 +17,30 @@ interface ExtractRow {
   content: unknown;
 }
 
-export function projectRawMessages<T extends ExtractRow>(messages: T[]): T[] {
+function extractCalls(blocks: Iterable<unknown>): Map<string, string | null> {
   const calls = new Map<string, string | null>();
-  for (const { content } of messages) {
-    if (!Array.isArray(content)) continue;
-    for (const b of content as unknown[]) {
-      if (record(b) && b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
-        // A repeated id in a disjoint history window isn't an unambiguous pair.
-        calls.set(b.id, calls.has(b.id) ? null : b.name);
-      }
-    }
+  for (const b of blocks) {
+    if (!record(b) || b.type !== 'tool_use' || typeof b.id !== 'string' || typeof b.name !== 'string') continue;
+    const act = b.name === ACT && record(b.input)
+      && typeof b.input.tool === 'string' && b.input.tool.trim() === EXTRACT
+      && !(typeof b.input.server === 'string' && b.input.server.trim());
+    // A repeated id in a disjoint history window isn't an unambiguous pair.
+    calls.set(b.id, !calls.has(b.id) && (b.name === EXTRACT || act) ? b.name : null);
   }
+  return calls;
+}
+
+function isExtractResult(b: Record<string, unknown>, calls: Map<string, string | null>): boolean {
+  if (b.type !== 'tool_result' || typeof b.toolUseId !== 'string' || !b.toolUseId) return false;
+  // A direct result names itself, even mid-round or with a repeated call id.
+  // Unnamed and toolsets--act results need an unambiguous call in the page.
+  if (b.toolName === EXTRACT) return true;
+  const paired = calls.get(b.toolUseId);
+  return !!paired && (b.toolName === undefined || b.toolName === paired);
+}
+
+export function projectRawMessages<T extends ExtractRow>(messages: T[]): T[] {
+  const calls = extractCalls(messages.flatMap(({ content }) => Array.isArray(content) ? content as unknown[] : []));
 
   const replacedXml = new Set<string>();
   const projected = messages.map((message) => {
@@ -35,13 +49,7 @@ export function projectRawMessages<T extends ExtractRow>(messages: T[]): T[] {
     const blocks = content.flatMap((b) => {
       if (!record(b)) return [b];
       if (privateBlock(b)) return [];
-      if (b.type !== 'tool_result' || typeof b.toolUseId !== 'string' || !b.toolUseId) return [b];
-      // Framework-written results persist their tool name beside their call
-      // id. This still identifies a result when the page starts mid-round.
-      // Legacy unnamed results need a matching tool_use in this extract.
-      const paired = calls.get(b.toolUseId);
-      if (b.toolName !== undefined && b.toolName !== EXTRACT) return [b];
-      if ((paired === undefined ? b.toolName : paired) !== EXTRACT) return [b];
+      if (!isExtractResult(b, calls)) return [b];
 
       const body = projectResultBody(b.content);
       if (body === b.content) return [b];
@@ -107,17 +115,28 @@ function projectResultText(text: string): string {
 }
 
 // For cut or otherwise malformed JSON, look for a private block declaration
-// in the parseable prefix, at messages[].content[] only. A token in a string,
-// tool argument, result body, or unrelated property doesn't count.
+// in the parseable prefix, at messages[].content[] only. Recurse into text
+// from recognized extract results, not arbitrary strings or tool arguments.
 function hasPrivateBlockMarker(text: string): boolean {
-  type Location = 'page' | 'messages' | 'message' | 'content' | 'block' | undefined;
-  const tokens = /[ \t\r\n]*("(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|[{}\[\]:,]|true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/y;
+  type Location = 'page' | 'messages' | 'message' | 'content' | 'block' | 'result' | 'resultText' | undefined;
+  const blocks: Record<string, unknown>[] = [];
+  const tokens = /[ \t\r\n]*("(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*(")?|[{}\[\]:,]|true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/y;
   let start = 0;
+  let unfinishedString: string | undefined;
   const read = () => {
     start = tokens.lastIndex;
-    return tokens.exec(text)?.[1];
+    const match = tokens.exec(text);
+    // Keep the usable prefix without treating it as a complete token.
+    unfinishedString = match?.[1]?.startsWith('"') && !match[2] ? match[1] : undefined;
+    return unfinishedString === undefined ? match?.[1] : undefined;
   };
   let token = read();
+  const stringValue = (allowPrefix: boolean): string | null => {
+    if (token?.startsWith('"')) return JSON.parse(token);
+    // The lexer stops before any incomplete escape, so this decodes just
+    // the available text, including escaped JSON inside the result.
+    return allowPrefix && unfinishedString !== undefined ? JSON.parse(unfinishedString + '"') : null;
+  };
   const take = () => {
     const previous = token;
     token = read();
@@ -129,38 +148,55 @@ function hasPrivateBlockMarker(text: string): boolean {
     return true;
   };
 
-  function scan(at: Location, depth: number): boolean {
+  function scan(at: Location, depth: number, body?: Record<string, unknown>[]): boolean {
     // This is a conservative fallback, not a recovery parser for arbitrary JSON.
     if (depth > 128) throw new SyntaxError();
+    if (at === 'result') {
+      const value = stringValue(true);
+      if (value !== null) body!.push({ type: 'text', text: value });
+    }
     if (eat('{')) {
       if (eat('}')) return false;
-      let type: string | undefined;
+      // Keep only the fields needed to identify results and their text, even
+      // if the cut comes before the enclosing block or array closes.
+      const fields: Record<string, unknown> = {};
+      if (at === 'block') blocks.push(fields);
+      if (at === 'resultText') body!.push(fields);
       let thinking = false;
       let data = false;
       do {
         if (!token?.startsWith('"')) throw new SyntaxError();
         const key: string = JSON.parse(take()!);
         if (!eat(':')) throw new SyntaxError();
+        if ((at === 'block' && ['type', 'id', 'name', 'toolUseId', 'toolName'].includes(key))
+          || (at === 'resultText' && (key === 'type' || key === 'text'))) {
+          fields[key] = stringValue(at === 'resultText' && key === 'text');
+        }
         if (at === 'block') {
-          if (key === 'type') type = token?.startsWith('"') ? JSON.parse(token) : undefined;
           // A cut can land in the block's string value itself.
           if (key === 'thinking' || key === 'data') {
             const startsString = token?.startsWith('"') ?? /^[ \t\r\n]*"/.test(text.slice(start));
             if (key === 'thinking') thinking = startsString;
             else data = startsString;
           }
-          if ((type === 'thinking' && thinking) || (type === 'redacted_thinking' && data)) return true;
+          if ((fields.type === 'thinking' && thinking) || (fields.type === 'redacted_thinking' && data)) return true;
         }
         const child = at === 'page' && key === 'messages' ? 'messages'
-          : at === 'message' && key === 'content' ? 'content' : undefined;
-        if (scan(child, depth + 1)) return true;
+          : at === 'message' && key === 'content' ? 'content'
+          : at === 'block' && key === 'content' ? 'result' : undefined;
+        const resultBody = child === 'result' ? [] : undefined;
+        if (resultBody) fields.content = resultBody;
+        const valueStart = start;
+        if (scan(child, depth + 1, resultBody)) return true;
+        if (at === 'block' && key === 'input') fields.input = JSON.parse(text.slice(valueStart, start));
       } while (eat(','));
       if (!eat('}')) throw new SyntaxError();
     } else if (eat('[')) {
       if (eat(']')) return false;
-      const child = at === 'messages' ? 'message' : at === 'content' ? 'block' : undefined;
+      const child = at === 'messages' ? 'message' : at === 'content' ? 'block'
+        : at === 'result' ? 'resultText' : undefined;
       do {
-        if (scan(child, depth + 1)) return true;
+        if (scan(child, depth + 1, body)) return true;
       } while (eat(','));
       if (!eat(']')) throw new SyntaxError();
     } else {
@@ -171,8 +207,12 @@ function hasPrivateBlockMarker(text: string): boolean {
   }
 
   try {
-    return scan('page', 0);
+    if (scan('page', 0)) return true;
   } catch {
-    return false;
+    // The input ends in a cut or syntax error; check the prefix we did read.
   }
+  const calls = extractCalls(blocks);
+  return blocks.some((b) => isExtractResult(b, calls) && Array.isArray(b.content)
+    && b.content.some((item) => item.type === 'text' && typeof item.text === 'string'
+      && hasPrivateBlockMarker(item.text)));
 }

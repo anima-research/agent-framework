@@ -236,6 +236,76 @@ describe('HistoryModule raw projection (#717)', () => {
     assert.deepEqual(second, first);
   });
 
+  it('withholds a truncated extract with private thinking inside a nested extract result', async () => {
+    const leaf = JSON.stringify(extractSnapshot([THINKING]));
+    const nestedBodies: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: 'unpaired', toolName: EXTRACT_CALL.name, content: leaf, isError: false },
+      resultBlock(EXTRACT_CALL.id, [textBlock(leaf)]),
+      resultBlock(ORDINARY_CALL.id, leaf, ORDINARY_CALL.name),
+    ];
+    const results = nestedBodies.map((nested, i) => {
+      const page = JSON.stringify(extractSnapshot([EXTRACT_CALL, ORDINARY_CALL], [nested]));
+      const literal = JSON.stringify(leaf);
+      const head = page.slice(0, page.indexOf(literal) + literal.length);
+      return resultBlock(`outer${i}`, head + '\n\n[truncated — full content: workspace file old.txt]', EXTRACT_CALL.name);
+    });
+    const { messages } = await rawExtract([msg('m1', 1000, 'user', results)]);
+    const withheld = '[History extract withheld: malformed JSON contains a private thinking block.]';
+    assert.deepEqual(messages[0]?.content, [
+      { ...results[0], content: withheld }, { ...results[1], content: withheld }, results[2],
+    ]);
+  });
+
+  it('checks unfinished nested extract strings without checking unrelated results', async () => {
+    const privateText = 'private nested reasoning';
+    const leaf = JSON.stringify(extractSnapshot([textBlock('public text'), { ...THINKING, thinking: privateText }]));
+    // Store the tool name before the content, so the cut preserves it.
+    const nested: ContentBlock[] = [
+      { type: 'tool_result', toolUseId: 'unpaired', toolName: EXTRACT_CALL.name, content: leaf, isError: false },
+      resultBlock(EXTRACT_CALL.id, [textBlock(leaf)]),
+      { type: 'tool_result', toolUseId: 'other', toolName: ORDINARY_CALL.name, content: leaf, isError: false },
+    ];
+    const results = nested.map((block, i) => {
+      const page = JSON.stringify(extractSnapshot([EXTRACT_CALL], [block]));
+      const head = page.slice(0, page.indexOf(privateText) + 7);
+      return resultBlock(`outer${i}`, head + '\n\n[truncated — full content: workspace file old.txt]', EXTRACT_CALL.name);
+    });
+    const { messages } = await rawExtract([msg('m1', 1000, 'user', results)]);
+    const withheld = '[History extract withheld: malformed JSON contains a private thinking block.]';
+    assert.deepEqual(messages[0]?.content, [
+      { ...results[0], content: withheld }, { ...results[1], content: withheld }, results[2],
+    ]);
+  });
+
+  it('trusts an extract result name even when its call ID is ambiguous', async () => {
+    const body = JSON.stringify(extractSnapshot([THINKING, textBlock('nested text')]));
+    const named = resultBlock(EXTRACT_CALL.id, body, EXTRACT_CALL.name);
+    const unnamed = resultBlock(EXTRACT_CALL.id, body);
+    const { messages } = await rawExtract([
+      msg('m1', 1000, 'Claude', [EXTRACT_CALL]),
+      msg('m2', 2000, 'Claude', [{ ...ORDINARY_CALL, id: EXTRACT_CALL.id }]),
+      msg('m3', 3000, 'user', [named, unnamed]),
+    ]);
+    assert.deepEqual(messages[2]?.content, [
+      { ...named, content: JSON.stringify(extractSnapshot([textBlock('nested text')])) }, unnamed,
+    ]);
+  });
+
+  it('projects older results from toolsets--act only when it targeted history--extract', async () => {
+    const act = { ...EXTRACT_CALL, name: 'toolsets--act', input: { tool: EXTRACT_CALL.name, args: EXTRACT_CALL.input } };
+    const ordinary = { ...act, id: ORDINARY_CALL.id, input: { ...act.input, tool: ORDINARY_CALL.name } };
+    const body = JSON.stringify(extractSnapshot([THINKING, textBlock('nested text')]));
+    const extractResult = resultBlock(act.id, body, act.name);
+    const ordinaryResult = resultBlock(ordinary.id, body, ordinary.name);
+    const { messages } = await rawExtract([
+      msg('m1', 1000, 'Claude', [act, ordinary]),
+      msg('m2', 2000, 'user', [extractResult, ordinaryResult]),
+    ]);
+    assert.deepEqual(messages[1]?.content, [
+      { ...extractResult, content: JSON.stringify(extractSnapshot([textBlock('nested text')])) }, ordinaryResult,
+    ]);
+  });
+
   it('withholds a malformed paired extract only for a private block in the message content', async () => {
     const thinking = JSON.stringify(extractSnapshot([textBlock('public text'), THINKING]));
     const malformed = thinking.slice(0, thinking.indexOf('placeholder') + 3);
@@ -245,7 +315,7 @@ describe('HistoryModule raw projection (#717)', () => {
     const unrelatedJson = JSON.stringify({ content: [THINKING] }).slice(0, -1);
     const typeOnly = JSON.stringify(extractSnapshot([])).replace('"content":[]', '"content":[{"type":"thinking"}]');
     const clean = JSON.stringify(extractSnapshot([ORDINARY_CALL]), null, 2) + '\n';
-    const textResults = [malformed, redacted, inputLookalike, textLookalike, unrelatedJson, typeOnly, clean];
+    const textResults = [malformed, redacted, inputLookalike, textLookalike, unrelatedJson, typeOnly, typeOnly.slice(0, -1), clean];
     const calls = textResults.map((_, i) => ({ ...EXTRACT_CALL, id: `t${i}` }));
     const results = textResults.map((body, i) => resultBlock(calls[i]!.id, i === 1 ? [textBlock(body)] : body));
     const missingPair = resultBlock('unpaired', malformed);
@@ -272,6 +342,7 @@ describe('HistoryModule raw projection (#717)', () => {
       msg('m2', 2000, 'user', [{ ...extractResult, rawXml }, { ...ordinaryResult, rawXml }]),
     ];
     const { messages } = await rawExtract(rows);
+    assert.deepEqual(messages[0]?.content, [EXTRACT_CALL, ORDINARY_CALL]);
     assert.deepEqual(messages[1]?.content, [
       resultBlock(EXTRACT_CALL.id, JSON.stringify(extractSnapshot([ORDINARY_CALL])), EXTRACT_CALL.name),
       ordinaryResult,

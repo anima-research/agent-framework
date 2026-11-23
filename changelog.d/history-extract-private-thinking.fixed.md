@@ -1,1 +1,2 @@
-- `history--extract` still returns structured text, tool arguments and results in raw mode, but leaves out private thinking blocks, including in recognized older extracts. The stored conversation is unchanged.
+- `history--extract` still returns structured text, tool arguments and results in raw mode, but leaves out private thinking blocks, including in recognized older extracts. If an older extract was cut inside a nested result string that shows a private block marker, the body is withheld. The stored conversation is unchanged.
+  Its updated tool description changes prompt bytes and can cause a prompt-cache miss on upgrade for agents offered the tool, even if they never call it.
