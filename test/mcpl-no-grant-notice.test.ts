@@ -47,6 +47,17 @@ function shortPolicyWait(t: TestContext): void {
   t.after(() => { proto.sendFeatureSetsUpdateRequest = original; });
 }
 
+function stderrLines(t: TestContext): string[] {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+    original(...args);
+  };
+  t.after(() => { console.error = original; });
+  return lines;
+}
+
 async function radio(t: TestContext, policy: Policy, advertised: Json | null = advert()) {
   const server = await startScriptedServer({
     advert: advertised,
@@ -199,6 +210,20 @@ test('case 9: a refused channels/register writes the notice, naming that method,
   assert.equal(notices(fw).length, 1);
 });
 
+test('case 10: a host with no agent writes no notice, and logs no failure for the refused messages', async (t) => {
+  shortPolicyWait(t);
+  const lines = stderrLines(t);
+  const server = await radio(t, unanswered);
+  const starting = makeFramework([{ id: 'radio', toolPrefix: 'radio', url: server.url }], { agents: [], modules: [] });
+  t.after(async () => { await (await starting).stop(); });
+  await starting;
+  for (const id of ['r1', 'r2']) {
+    const answer = await server.peer.request('push/event', ring(id, 'one'));
+    assert.ok(answer.error, 'refused for lack of a grant');
+  }
+  assert.deepEqual(lines.filter((line) => line.includes('holds no grant')), []);
+});
+
 test('case 11: a server that answers the policy Request with an error: the notice has the words for an error answer', async (t) => {
   const { server, fw } = await setup(t, answersWithError);
   server.peer.notify('push/event', ring('r1', 'one'));
@@ -206,7 +231,8 @@ test('case 11: a server that answers the policy Request with an error: the notic
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
 });
 
-test('case 12: a server that refuses the policy after a manifest change: the notice has the words for a refusal', async (t) => {
+test('case 12: a server that refuses the policy after a manifest change: the notice has the words for a refusal, and the host\'s log has its reason', async (t) => {
+  const lines = stderrLines(t);
   let policies = 0;
   const { server, fw } = await setup(t, (msg, peer) => {
     policies++;
@@ -222,6 +248,7 @@ test('case 12: a server that refuses the policy after a manifest change: the not
   assert.ok(answer.error, 'refused under the empty grant');
   await waitFor(() => notices(fw).length === 1, 'the notice');
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.refused, REFUSED_TAIL));
+  assert.ok(lines.some((line) => line.includes('refused post-manifest policy (SERVER-REASON-8)')), 'the host\'s log has the server\'s reason');
 });
 
 test('case 13: a server that declares no MCPL and sends push/event: the notice has the words for no MCPL', async (t) => {
