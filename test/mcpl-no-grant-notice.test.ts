@@ -1,0 +1,245 @@
+import { test, type TestContext } from 'node:test';
+import assert from 'node:assert/strict';
+
+import { McplServerConnection } from '../src/index.js';
+import type { McplServerConfig } from '../src/mcpl/types.js';
+import {
+  startScriptedServer, makeFramework, waitFor, windowText, callTool,
+  type Json, type ScriptedPeer,
+} from './helpers/toolset-servers.js';
+
+const POLICY_WAIT_MS = 300;
+const TOOLS: Json[] = [{ name: 'status', description: 'Status of the radio.', inputSchema: { type: 'object', properties: {} } }];
+const NOTICE_KIND = 'mcpl-no-grant';
+const advert = (): Json => ({ featureSets: { 'radio.events': { description: 'Rings of the bell.', uses: ['pushEvents'] } } });
+
+const notice = (method: string, cause: string, tail: string) =>
+  `[mcpl] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant, because ${cause}. ` +
+  `So its pushes and channel messages don't reach you. ${tail} The host says this one time for each time that it connects the server.`;
+const UPDATE = 'Its tools are not affected. A server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const CAUSE = {
+  unanswered: "it did not answer the host's policy request",
+  errored: "it answered the host's policy request with an error",
+  refused: 'it refused the policy that the host offered',
+  noMcpl: 'it declared no MCPL in its handshake, so the host offered it no policy',
+  hostError: "the host hit an error while it set up the server's policy",
+};
+const REFUSED_TAIL = "Its tools are not affected. The host's log has the server's reason, if it gave one.";
+
+type Policy = (msg: Json, peer: ScriptedPeer) => void;
+type Fw = Awaited<ReturnType<typeof makeFramework>>;
+
+const unanswered: Policy = () => {};
+const accepts: Policy = (msg, peer) => peer.reply(msg.id, { accepted: true });
+const answersWithError: Policy = (msg, peer) => peer.error(msg.id, -32601, 'Method not found');
+const refuses: Policy = (msg, peer) => peer.reply(msg.id, { accepted: false, fallback: 'mcp-only', reason: 'SERVER-REASON-7' });
+
+const ring = (eventId: string, text: string): Json => ({
+  featureSet: 'radio.events', eventId, timestamp: new Date().toISOString(), payload: { content: [{ type: 'text', text }] },
+});
+
+function shortPolicyWait(t: TestContext): void {
+  const proto = McplServerConnection.prototype;
+  const original = proto.sendFeatureSetsUpdateRequest;
+  proto.sendFeatureSetsUpdateRequest = function (params) {
+    return original.call(this, params, POLICY_WAIT_MS);
+  };
+  t.after(() => { proto.sendFeatureSetsUpdateRequest = original; });
+}
+
+async function radio(t: TestContext, policy: Policy, advertised: Json | null = advert()) {
+  const server = await startScriptedServer({
+    advert: advertised,
+    tools: TOOLS,
+    onPolicy: policy,
+    on: (msg, peer) => {
+      if (msg.method === 'tools/call') peer.reply(msg.id, { content: [{ type: 'text', text: 'on air' }] });
+      else if (msg.method === 'mcpl/manifest') peer.reply(msg.id, { version: '0.5', pushEvents: true, ...advertised });
+      else if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  t.after(() => server.close());
+  return server;
+}
+
+function host(t: TestContext, url: string, config: Partial<McplServerConfig> = {}): Promise<Fw> {
+  const starting = makeFramework([{ id: 'radio', toolPrefix: 'radio', url, ...config }], { modules: [] });
+  t.after(async () => { await (await starting).stop(); });
+  return starting;
+}
+
+async function setup(t: TestContext, policy: Policy, config: Partial<McplServerConfig> = {}, advertised: Json | null = advert()) {
+  shortPolicyWait(t);
+  const server = await radio(t, policy, advertised);
+  const fw = await host(t, server.url, config);
+  return { server, fw };
+}
+
+function noticeRows(fw: Fw) {
+  return fw.framework.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => m.metadata?.kind === NOTICE_KIND);
+}
+
+function notices(fw: Fw): string[] {
+  return noticeRows(fw).map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n'));
+}
+
+async function roundTrip(fw: Fw): Promise<void> {
+  const result = await callTool(fw.framework, 'radio--status', {});
+  assert.notEqual(result.isError, true, `the server's tool answers: ${JSON.stringify(result)}`);
+}
+
+test('case 1: a server that never answers the policy Request: its first refused push writes one notice in the host\'s words, and starts no turn', async (t) => {
+  const { server, fw } = await setup(t, unanswered);
+  server.peer.notify('push/event', ring('r1', 'RING-ONE'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, UPDATE));
+  assert.equal(Reflect.get(noticeRows(fw)[0]!.metadata ?? {}, 'serverId'), 'radio');
+  await roundTrip(fw);
+  assert.ok(!windowText(fw.framework).some((x) => x.includes('RING-ONE')), 'nothing the push carried is in the context');
+  assert.equal(fw.membrane.calls.length, 0, 'no turn started');
+});
+
+test('case 2: one notice for each connect: 100 more refused pushes, and a transport that drops and comes back, write no second notice', async (t) => {
+  const { server, fw } = await setup(t, unanswered, { reconnect: true, reconnectIntervalMs: 50 });
+  const first = server.peer;
+  first.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the first notice');
+  for (let i = 0; i < 100; i++) first.notify('push/event', ring(`more-${i}`, 'more'));
+  await roundTrip(fw);
+  assert.equal(notices(fw).length, 1, 'no notice for the 100 more');
+  first.ws.terminate();
+  await waitFor(() => server.peers.length === 2, 'the host reconnects');
+  const answer = await server.peer.request('push/event', ring('after', 'after the reconnect'));
+  assert.ok(answer.error, 'refused on the next transport too');
+  assert.equal(notices(fw).length, 1, 'no notice for the next transport of the same connect');
+});
+
+test('case 3: a restart is a new connect: its first refused message writes a second notice', async (t) => {
+  const { server, fw } = await setup(t, unanswered);
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the first notice');
+  await fw.framework.restartMcplServer('radio');
+  assert.equal(server.peers.length, 2, 'the restart connected again');
+  const answer = await server.peer.request('push/event', ring('r2', 'after the restart'));
+  assert.ok(answer.error, 'refused after the restart');
+  await waitFor(() => notices(fw).length === 2, 'a second notice');
+});
+
+test('case 4: a push sent as a request gets the error answer of today, and the resident gets the one notice', async (t) => {
+  const { server, fw } = await setup(t, unanswered);
+  const answer = await server.peer.request('push/event', ring('r1', 'RING'));
+  const error = answer.error as Json | undefined;
+  assert.equal(error?.code, -32002);
+  assert.equal(error?.message, 'push-event rejected: capability "pushEvents" initial policy not yet established (§5.3)');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+});
+
+test('case 5: a server that refuses the initial policy: the notice has the words for a refusal, and nothing of its reason', async (t) => {
+  const { server, fw } = await setup(t, refuses);
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.refused, REFUSED_TAIL));
+  assert.ok(!windowText(fw.framework).some((x) => x.includes('SERVER-REASON-7')), 'the server\'s reason is not in the context');
+});
+
+test('case 6: a policy established without pushEvents: a refused push writes no notice', async (t) => {
+  const { server, fw } = await setup(t, accepts, {}, { pushEvents: false });
+  const answer = await server.peer.request('push/event', ring('r1', 'one'));
+  assert.ok(answer.error, 'refused, since the grant lacks pushEvents');
+  await roundTrip(fw);
+  assert.equal(notices(fw).length, 0);
+});
+
+test('case 7: a push sent while the policy exchange is under way at the first connect is held and delivered, with no notice', async (t) => {
+  let release: (() => void) | undefined;
+  const server = await radio(t, (msg, peer) => { release = () => peer.reply(msg.id, { accepted: true }); });
+  const starting = host(t, server.url);
+  await waitFor(() => release !== undefined, 'the policy Request');
+  server.peer.notify('push/event', ring('held', 'HELD-RING'));
+  release!();
+  const fw = await starting;
+  await waitFor(() => windowText(fw.framework).some((x) => x.includes('HELD-RING')), 'the held push delivered');
+  assert.equal(notices(fw).length, 0);
+});
+
+test('case 7: a push sent while the policy exchange is under way after a reconnect is held and delivered, with no notice', async (t) => {
+  let release: (() => void) | undefined;
+  let policies = 0;
+  const server = await radio(t, (msg, peer) => {
+    policies++;
+    if (policies === 1) peer.reply(msg.id, { accepted: true });
+    else release = () => peer.reply(msg.id, { accepted: true });
+  });
+  const fw = await host(t, server.url, { reconnect: true, reconnectIntervalMs: 50 });
+  server.peer.ws.terminate();
+  await waitFor(() => release !== undefined, 'the next transport\'s policy Request');
+  server.peer.notify('push/event', ring('held', 'HELD-AFTER-RECONNECT'));
+  release!();
+  await waitFor(() => windowText(fw.framework).some((x) => x.includes('HELD-AFTER-RECONNECT')), 'the held push delivered');
+  assert.equal(notices(fw).length, 0);
+});
+
+test('case 8: a server with no grant that only offers tools: its tools answer, and no notice is written', async (t) => {
+  const { fw } = await setup(t, unanswered);
+  await roundTrip(fw);
+  assert.equal(notices(fw).length, 0);
+});
+
+test('case 9: a refused channels/register writes the notice, naming that method, and a later refused push writes no second one', async (t) => {
+  const { server, fw } = await setup(t, unanswered);
+  const answer = await server.peer.request('channels/register', {
+    channels: [{ id: 'chat:radio', type: 'chat', label: 'radio', direction: 'bidirectional' }],
+  });
+  assert.ok(answer.error, 'refused for lack of a grant');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('channels/register', CAUSE.unanswered, UPDATE));
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await roundTrip(fw);
+  assert.equal(notices(fw).length, 1);
+});
+
+test('case 11: a server that answers the policy Request with an error: the notice has the words for an error answer', async (t) => {
+  const { server, fw } = await setup(t, answersWithError);
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
+});
+
+test('case 12: a server that refuses the policy after a manifest change: the notice has the words for a refusal', async (t) => {
+  let policies = 0;
+  const { server, fw } = await setup(t, (msg, peer) => {
+    policies++;
+    if (policies === 1) peer.reply(msg.id, { accepted: true });
+    else peer.reply(msg.id, { accepted: false, fallback: 'mcp-only', reason: 'SERVER-REASON-8' });
+  });
+  const granted = await server.peer.request('push/event', ring('r1', 'GRANTED-RING'));
+  assert.equal(granted.error, undefined, 'a push is admitted under the first policy');
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => policies === 2, 'the policy Request after the manifest change');
+  await roundTrip(fw);
+  const answer = await server.peer.request('push/event', ring('r2', 'one'));
+  assert.ok(answer.error, 'refused under the empty grant');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.refused, REFUSED_TAIL));
+});
+
+test('case 13: a server that declares no MCPL and sends push/event: the notice has the words for no MCPL', async (t) => {
+  const { server, fw } = await setup(t, unanswered, {}, null);
+  const answer = await server.peer.request('push/event', ring('r1', 'one'));
+  assert.ok(answer.error, 'refused, since nothing is granted');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.noMcpl, 'Its tools are not affected. A server that sends MCPL messages must declare MCPL.'));
+});
+
+test('case 14: a reconnect whose policy step throws on the host leaves the connection live: the notice has the words for the host\'s error', async (t) => {
+  const advertised = advert();
+  const { server, fw } = await setup(t, accepts, { reconnect: true, reconnectIntervalMs: 50 }, advertised);
+  advertised.featureSets = [null];
+  server.peer.ws.terminate();
+  await waitFor(() => server.peers.length === 2, 'the host reconnects');
+  const answer = await server.peer.request('push/event', ring('r1', 'one'));
+  assert.ok(answer.error, 'refused, since the policy step left no grant');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.hostError, "The host's log has the error. A restart of the server may clear it."));
+});

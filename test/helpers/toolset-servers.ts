@@ -73,12 +73,13 @@ export type Json = Record<string, unknown>;
  * resolves with its answer.
  */
 export async function startScriptedServer(opts: {
-  advert: Json;
+  advert: Json | null;
   tools: Json[];
   /** tools/list's `_meta["mcpl/rev"]`, read at each list. */
   listRev?: () => number | undefined;
   /** Answers a tools/list itself when it returns true. */
   onList?: (msg: Json, peer: ScriptedPeer) => boolean;
+  onPolicy?: (msg: Json, peer: ScriptedPeer) => void;
   on?: (msg: Json, peer: ScriptedPeer) => void;
 }) {
   const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
@@ -97,7 +98,7 @@ export async function startScriptedServer(opts: {
           peer.hostCaps = ((msg.params as Json)?.capabilities as Json | undefined)?.experimental as Json | undefined;
           peer.reply(msg.id, {
             protocolVersion: '2024-11-05',
-            capabilities: { tools: {}, experimental: { mcpl: { version: '0.5', pushEvents: true, ...opts.advert } } },
+            capabilities: opts.advert === null ? { tools: {} } : { tools: {}, experimental: { mcpl: { version: '0.5', pushEvents: true, ...opts.advert } } },
             serverInfo: { name: 'scripted', version: '1' },
           });
           return;
@@ -105,7 +106,9 @@ export async function startScriptedServer(opts: {
           return;
         case 'featureSets/update':
           peer.policy.push(msg.params as Json);
-          if (msg.id !== undefined) peer.reply(msg.id, { accepted: true });
+          if (msg.id === undefined) return;
+          if (opts.onPolicy) opts.onPolicy(msg, peer);
+          else peer.reply(msg.id, { accepted: true });
           return;
         case 'tools/list': {
           if (opts.onList?.(msg, peer)) return;
