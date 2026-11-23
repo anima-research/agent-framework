@@ -240,6 +240,64 @@ describe('HistoryModule raw projection (#717)', () => {
     assert.deepEqual(second, first);
   });
 
+  it('projects an unnamed nested extract using a stored call outside both pages', async () => {
+    const leaf = JSON.stringify(extractSnapshot([THINKING, textBlock('nested text')]));
+    const nested = resultBlock(EXTRACT_CALL.id, [textBlock(leaf)]);
+    const older = extractSnapshot([nested]);
+    const outer = resultBlock('outer', JSON.stringify(older), EXTRACT_CALL.name);
+    const rows = [
+      msg('m1', 1000, 'Claude', [EXTRACT_CALL]),
+      msg('m2', 2000, 'user', [outer]),
+    ];
+    const { messages } = await rawExtract(rows, { offset: 1, limit: 1 });
+    const cleanLeaf = JSON.stringify(extractSnapshot([textBlock('nested text')]));
+    older.messages[0]!.content = [{ ...nested, content: [textBlock(cleanLeaf)] }];
+    assert.deepEqual(messages.map((m) => m.id), ['m2']);
+    assert.deepEqual(messages[0]?.content, [{ ...outer, content: JSON.stringify(older) }]);
+  });
+
+  it('withholds a malformed prefix when the unnamed nested result pairs outside both pages', async () => {
+    const leaf = JSON.stringify(extractSnapshot([THINKING]));
+    const older = JSON.stringify(extractSnapshot([resultBlock(EXTRACT_CALL.id, leaf)]));
+    const cut = older.slice(0, older.indexOf('placeholder') + 3);
+    const outer = resultBlock('outer', cut, EXTRACT_CALL.name);
+    const { messages } = await rawExtract([
+      msg('m1', 1000, 'Claude', [EXTRACT_CALL]),
+      msg('m2', 2000, 'user', [outer]),
+    ], { offset: 1, limit: 1 });
+    assert.deepEqual(messages[0]?.content, [
+      { ...outer, content: '[History extract withheld: malformed JSON contains a private thinking block.]' },
+    ]);
+  });
+
+  it('scans stored calls lazily and at most once per raw call across nested pages', async (t) => {
+    const leaf = JSON.stringify(extractSnapshot([THINKING]));
+    const page = JSON.stringify(extractSnapshot([resultBlock(EXTRACT_CALL.id, leaf)]));
+    const cut = page.slice(0, page.indexOf('placeholder') + 3);
+    const { cm } = buildStub([
+      msg('m1', 1000, 'Claude', [EXTRACT_CALL]),
+      msg('m2', 2000, 'user', [resultBlock('named', leaf, EXTRACT_CALL.name)]),
+      msg('m3', 3000, 'user', [
+        resultBlock('valid', page, EXTRACT_CALL.name),
+        resultBlock('truncated', cut, EXTRACT_CALL.name),
+        resultBlock('another', page, EXTRACT_CALL.name),
+      ]),
+    ]);
+    const scan = t.mock.method(cm, 'getMessageWindow');
+    const h = new HistoryModule();
+    h.bind(cm);
+    const extract = async (offset: number) => {
+      const result = await h.handleToolCall(call('extract', { format: 'raw', offset, limit: 1 }));
+      assert.equal(result.success, true, result.error);
+    };
+    await extract(1);
+    assert.equal(scan.mock.callCount(), 0, 'explicitly named result with no ambiguous descendants');
+    await extract(2);
+    assert.equal(scan.mock.callCount(), 1, 'one store read for all nested lookups in this small fixture');
+    await extract(2);
+    assert.equal(scan.mock.callCount(), 2, 'the index is not cached across calls');
+  });
+
   it('withholds a truncated extract with private thinking inside a nested extract result', async () => {
     const leaf = JSON.stringify(extractSnapshot([THINKING]));
     const nestedBodies: ContentBlock[] = [
@@ -313,15 +371,17 @@ describe('HistoryModule raw projection (#717)', () => {
   it('projects older results from toolsets--act only when it targeted history--extract', async () => {
     const act = { ...EXTRACT_CALL, name: 'toolsets--act', input: { tool: EXTRACT_CALL.name, args: EXTRACT_CALL.input } };
     const ordinary = { ...act, id: ORDINARY_CALL.id, input: { ...act.input, tool: ORDINARY_CALL.name } };
+    const scoped = { ...act, id: 'scoped', input: { ...act.input, server: ' remote ' } };
     const body = JSON.stringify(extractSnapshot([THINKING, textBlock('nested text')]));
     const extractResult = resultBlock(act.id, body, act.name);
     const ordinaryResult = resultBlock(ordinary.id, body, ordinary.name);
+    const scopedResult = resultBlock(scoped.id, body, scoped.name);
     const { messages } = await rawExtract([
-      msg('m1', 1000, 'Claude', [act, ordinary]),
-      msg('m2', 2000, 'user', [extractResult, ordinaryResult]),
+      msg('m1', 1000, 'Claude', [act, ordinary, scoped]),
+      msg('m2', 2000, 'user', [extractResult, ordinaryResult, scopedResult]),
     ]);
     assert.deepEqual(messages[1]?.content, [
-      { ...extractResult, content: JSON.stringify(extractSnapshot([textBlock('nested text')])) }, ordinaryResult,
+      { ...extractResult, content: JSON.stringify(extractSnapshot([textBlock('nested text')])) }, ordinaryResult, scopedResult,
     ]);
   });
 
