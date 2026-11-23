@@ -3467,7 +3467,7 @@ export { suppressedRow } from './presentation.js';
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
 
-const NO_GRANT_UPDATE = 'Its tools are not affected. A server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const NO_GRANT_UPDATE = 'Its tools are not affected. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
 const NO_GRANT_WORDS = {
   unanswered: { cause: "it did not answer the host's policy request", tail: NO_GRANT_UPDATE },
   errored: { cause: "it answered the host's policy request with an error", tail: NO_GRANT_UPDATE },
@@ -37866,7 +37866,7 @@ export class AgentFramework {
     const words = NO_GRANT_WORDS[refusal.end];
     const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it. ` +
       `The server holds no grant, because ${words.cause}. So its pushes and channel messages don't reach you. ${words.tail} ` +
-      'The host says this one time for each time that it connects the server.';
+      'The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.';
     try {
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant', serverId: connection.id });
       this.noGrantTold.add(connection);
@@ -38390,6 +38390,7 @@ export class AgentFramework {
           }
         } else {
           connection.establishGrant(newGrant);
+          this.noGrantTold.delete(connection);
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
@@ -38569,6 +38570,7 @@ export class AgentFramework {
       } else {
         // Expansion activates on receipt (§6.7).
         connection.establishGrant(grant);
+        this.noGrantTold.delete(connection);
         if (receipt?.accepted === true && receipt.mode === 'degraded') {
           for (const uf of receipt.unavailableFeatures ?? []) {
             console.error(recorded(

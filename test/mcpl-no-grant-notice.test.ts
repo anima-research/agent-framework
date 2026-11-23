@@ -16,8 +16,8 @@ const advert = (): Json => ({ featureSets: { 'radio.events': { description: 'Rin
 
 const notice = (method: string, cause: string, tail: string) =>
   `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant, because ${cause}. ` +
-  `So its pushes and channel messages don't reach you. ${tail} The host says this one time for each time that it connects the server.`;
-const UPDATE = 'Its tools are not affected. A server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+  `So its pushes and channel messages don't reach you. ${tail} The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
+const UPDATE = 'Its tools are not affected. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
 const CAUSE = {
   unanswered: "it did not answer the host's policy request",
   errored: "it answered the host's policy request with an error",
