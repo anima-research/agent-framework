@@ -3,7 +3,7 @@
  * `reconnect` and `allowHostCommands` each take true or false, or are left
  * out, and null counts as left out. The framework's entry points refuse any
  * other value (test/mcpl-runtime-lifecycle.test.ts), and every reader takes
- * only `true` as on.
+ * only `true` as on. The restricted host control role is tested separately.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -213,6 +213,42 @@ test('an allowHostCommands that is not true reads as off, at connect and again a
     live.sendToolsList().catch(() => {}); // the fixture exits on tools/list, and reconnect: true brings it back
     await reconnected;
     assert.equal(live.allowHostCommands, false, 'off again after the reconnect');
+  } finally {
+    await connection?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test('the operator-only control role is accepted exactly; malformed roles are refused', () => {
+  for (const config of [STDIO, WEBSOCKET]) {
+    check({ ...config, allowHostCommands: { only: ['operator'] } });
+    for (const role of [{ only: [] }, { only: ['undo'] }, { only: ['operator', 'undo'] },
+      { only: 'operator' }, { only: ['operator'], extra: true }]) {
+      assert.throws(() => check({ ...config, allowHostCommands: role }), /allowHostCommands must be/);
+    }
+  }
+});
+
+test('the operator-only role survives connect and reconnect', { timeout: 30_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-control-role-'));
+  const flag = join(dir, 'up');
+  writeFileSync(flag, '');
+  let connection: McplServerConnection | undefined;
+  try {
+    connection = await McplServerConnection.connect(
+      { ...flaky(flag, true), allowHostCommands: { only: ['operator'] } }, HOST_CAPS);
+    assert.deepEqual(connection.allowHostCommands, { only: ['operator'] });
+    const live = connection;
+    const reconnected = new Promise<void>((resolve) => live.once('reconnect', () => resolve()));
+    live.ready();
+    live.sendToolsList().catch(() => {});
+    await reconnected;
+    assert.deepEqual(live.allowHostCommands, { only: ['operator'] });
+    live.readyControlPlane();
+    let denied = 0;
+    live.emit('host-command', { command: 'undo' }, { respondError() { denied++; } });
+    assert.equal(denied, 1, 'reconnect did not widen the restricted role');
   } finally {
     await connection?.close();
     rmSync(dir, { recursive: true, force: true });

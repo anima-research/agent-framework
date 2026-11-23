@@ -347,13 +347,12 @@ export interface McplServerConfig {
   /**
    * Host-owned authority for the `host/command` admin surface (undo / hide /
    * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
-   * grant cannot confer it — only this config, decided by the operator, can
-   * (PR #79 review blocker 9). The one legitimate fleet user is
-   * discord-mcpl's slash-command relay. Only `true` turns it on, and null
-   * counts as not set. `create()`, `connectMcplServer` and
-   * `restartMcplServer` refuse any other value, such as a quoted "true".
+   * grant cannot confer it — only this config, decided by the operator, can.
+   * `true` keeps the legacy admin surface. `{only: ['operator']}` selects
+   * the host control role: only `operator` reaches the host-registered
+   * handler, with no fallback to built-in commands. null counts as unset.
    */
-  allowHostCommands?: boolean;
+  allowHostCommands?: boolean | { only: ['operator'] };
 
   /**
    * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
