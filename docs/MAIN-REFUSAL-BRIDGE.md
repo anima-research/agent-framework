@@ -14,7 +14,7 @@ message. Provider retry policy and the ops refusal-streak threshold are unchange
   instance identity, logical turn id, category, frozen answer provenance if known,
   and `rewind: 'handled' | 'unhandled'`. Only the latter may produce a reaction.
 - `isCurrent(signal)` rejects a removed/replaced agent instance.
-- `serverBinding(id)` checks the original inbound source's endpoint binding;
+- `serverBinding(id)` returns the current binding; hosts must compare it with `signal.origin.binding`;
   `serverEpoch(id)` identifies the config **object** plus connection **object**
   within this process. It is not a transport epoch, child PID, reconnect detector,
   or security/realm/executable attestation. Automatic in-place crash/reconnect
@@ -24,7 +24,7 @@ message. Provider retry policy and the ops refusal-streak threshold are unchange
   Neither value is a published provenance link or a persistent identity.
 
 The signal is made only on the main stream's final refusal path, after membrane
-has exhausted its provider retries and after the existing rewind decision. A
+has exhausted any retries enabled for that attempt (none during guarded tool-result recovery) and after the existing rewind decision. A
 handled rewind is reported without an effect; its retry keeps the original
 origin. Auxiliary `complete()` calls and ephemeral agents in `run` mode do not enter
 this handoff. Ephemeral conversations do enter it, matching legacy behavior. Provider retry execution itself is membrane's responsibility; mock

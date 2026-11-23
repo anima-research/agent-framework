@@ -128,12 +128,21 @@ test('rewind-handled signal skips effects, unhandled retry retains original admi
   } finally { await r.close(); }
 });
 
-test('ownership is exclusive and dispose is idempotent', async () => {
-  const r = await rig();
+test('ownership is exclusive and a stale disposer cannot revoke a reacquired handler', async () => {
+  const r = await rig(false, false, false);
+  const handler = (signal: MainRefusal) => { r.signals.push(signal); };
   try {
+    const first = r.bridge.takeOwnership(handler);
     assert.throws(() => r.bridge.takeOwnership(() => {}), /already/);
-    r.restore(); r.restore();
-    const release = r.bridge.takeOwnership(() => {}); release();
+    first();
+    const second = r.bridge.takeOwnership(handler);
+    try {
+      first();
+      r.membrane.pushResponse(refused());
+      r.framework.pushEvent(incoming('A'));
+      await r.framework.runUntilIdle();
+      assert.equal(r.signals.length, 1, 'the reacquired handler still owns reactions');
+    } finally { second(); }
   } finally { await r.close(); }
 });
 
@@ -279,19 +288,20 @@ test('rewind retry merged with a new inbound message has unknown origin', async 
   } finally { release?.(); await r.close(); }
 });
 
-test('quiesce coalesces distinct addressed co-resident wakes without selecting the newest origin', async () => {
+test('quiesce coalesces co-resident wakes with the same answer ID but conflicting thread provenance', async () => {
   const r = await rig(false, false, true, true);
   try {
     await r.framework.quiesce();
-    r.framework.pushEvent(incoming('A', undefined, { targetAgents: ['agent', 'resident'] }));
-    r.framework.pushEvent(incoming('B', undefined, { targetAgents: ['agent', 'resident'] }));
+    r.framework.pushEvent(incoming('A', undefined, { targetAgents: ['agent', 'resident'], threadId: 'thread-1' }));
+    r.framework.pushEvent(incoming('A', undefined, { targetAgents: ['agent', 'resident'], threadId: 'thread-2' }));
     await r.framework.runUntilIdle();
     assert.equal(r.membrane.calls.length, 0);
     const pending = (r.framework as unknown as {
-      pendingRequests: Array<{ agentName: string; readsRow?: string }>;
+      pendingRequests: Array<{ agentName: string; readsRow?: string; answersMessageId?: string }>;
     }).pendingRequests.filter(p => p.agentName === 'resident');
     assert.equal(pending.length, 1, 'the co-resident wakes actually collapsed');
     assert.equal(pending[0].readsRow, undefined, 'co-resident does not own the delivery row');
+    assert.equal(pending[0].answersMessageId, 'A', 'routing keeps the common answer ID');
     r.membrane.pushResponse(refused()); r.membrane.pushResponse(refused());
     await r.framework.resume();
     await r.framework.runUntilIdle();

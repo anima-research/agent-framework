@@ -4512,7 +4512,7 @@ export class AgentFramework {
    *  seam, unset here: the receipt work (shelf-354) assigns it inside the
    *  framework, and tests set it by cast. */
   private inboundAcceptanceObserver?: InboundAcceptanceObserver;
-  private mainRefusalHandler?: MainRefusalHandler;
+  private mainRefusalOwner?: { handler: MainRefusalHandler };
   private readonly refusalInstances = new WeakMap<object, string>();
 
   /** Explicit whole-framework handover; never inferred from one server config.
@@ -4522,9 +4522,10 @@ export class AgentFramework {
     return {
       version: 1,
       takeOwnership: (handler) => {
-        if (this.mainRefusalHandler) throw new Error('Main refusal reactions already have a host owner');
-        this.mainRefusalHandler = handler;
-        return () => { if (this.mainRefusalHandler === handler) this.mainRefusalHandler = undefined; };
+        if (this.mainRefusalOwner) throw new Error('Main refusal reactions already have a host owner');
+        const owner = { handler };
+        this.mainRefusalOwner = owner;
+        return () => { if (this.mainRefusalOwner === owner) this.mainRefusalOwner = undefined; };
       },
       isCurrent: (refusal) => {
         const agent = this.agents.get(refusal.agentName);
@@ -30705,7 +30706,7 @@ export class AgentFramework {
               // is suppressed at the surface via
               // DISCORD_SUPPRESSED_REACTIONS_BASELINE; without that, marking a
               // refusal feeds the next one.)
-              const handler = this.mainRefusalHandler;
+              const handler = this.mainRefusalOwner?.handler;
               if (handler) {
                 if (refusalContext) {
                   void this.dispatchMainRefusal(handler, Object.freeze({
