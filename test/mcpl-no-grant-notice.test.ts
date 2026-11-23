@@ -124,7 +124,7 @@ test('case 1: a server that never answers the policy Request: its first refused 
   assert.ok(JSON.stringify(fw.membrane.calls[0]).includes('sent push/event, and the host refused it'), 'the next turn\'s request holds the notice');
 });
 
-test('case 2: one notice for each connect: 100 more refused pushes, and a transport that drops and comes back, write no second notice', async (t) => {
+test('case 2: one notice for each spell without a grant: 100 more refused pushes, and a transport that drops and comes back with no grant, write no second notice', async (t) => {
   const { server, fw } = await setup(t, unanswered, { reconnect: true, reconnectIntervalMs: 50 });
   const first = server.peer;
   first.notify('push/event', ring('r1', 'one'));
@@ -272,7 +272,7 @@ test('case 12: a server that refuses the policy after a manifest change: the not
 test('case 12, with no reason: the host\'s log says that the server gave none', (t) =>
   refusedAfterManifestChange(t, {}, 'refused post-manifest policy (no reason)'));
 
-test('a server that gets a grant at a later exchange is no longer told that it holds none', async (t) => {
+test('case 15: a server that gets a grant at a later exchange is no longer told that it holds none', async (t) => {
   let policies = 0;
   const { server, fw } = await setup(t, (msg, peer) => {
     policies++;
@@ -287,6 +287,28 @@ test('a server that gets a grant at a later exchange is no longer told that it h
   const refused = await server.peer.request('inference/request', { messages: [] });
   assert.ok(refused.error, 'refused, since the grant lacks inferenceRequest');
   assert.equal(notices(fw).length, 0);
+});
+
+test('case 16: a server that got a grant and lost it again is told again, on the same connection', async (t) => {
+  let policies = 0;
+  const { server, fw } = await setup(t, (msg, peer) => {
+    policies++;
+    if (policies === 2) peer.reply(msg.id, { accepted: true });
+    else peer.error(msg.id, -32601, 'Method not found');
+  }, { reconnect: true, reconnectIntervalMs: 50 });
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the first notice');
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => policies === 2, 'the policy Request after the manifest change');
+  await roundTrip(fw);
+  const granted = await server.peer.request('push/event', ring('r2', 'GRANTED-RING'));
+  assert.equal(granted.error, undefined, 'a push is admitted under the grant');
+  server.peer.ws.terminate();
+  await waitFor(() => handshakes(server) === 2, 'the host reconnects and finishes its handshake');
+  const answer = await server.peer.request('push/event', ring('r3', 'after the reconnect'));
+  assert.ok(answer.error, 'refused, since the reconnect\'s policy Request got an error');
+  await waitFor(() => notices(fw).length === 2, 'a second notice, for the second spell');
+  assert.equal(notices(fw)[1], notice('push/event', CAUSE.errored, UPDATE));
 });
 
 test('case 13: a server that declares no MCPL and sends push/event: the notice has the words for no MCPL', async (t) => {
