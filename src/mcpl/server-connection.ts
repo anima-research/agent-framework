@@ -273,15 +273,9 @@ export type HintRead =
   /** A standalone tools/hints (carrier 3). */
   | { kind: 'hints'; params: unknown };
 
-/** How a transport's §5.3 policy exchange ended with no grant in force: the
- *  policy Request got no answer, or an error answer; the server refused the
- *  policy; the server declared no MCPL, so none was offered; or the host's
- *  own policy step threw. */
 export type McplNoGrantEnd = 'unanswered' | 'errored' | 'refused' | 'no-mcpl' | 'host-error';
 
-/** The `'no-grant-refusal'` event's argument. */
 export interface McplNoGrantRefusal {
-  /** The MCPL method of the refused message, such as `push/event`. */
   method: string;
   end: McplNoGrantEnd;
 }
@@ -453,7 +447,8 @@ function unmatchedResponse(
  *                            does).
  * - `'no-grant-refusal'`   — The admission gate refused a message for lack of
  *                            a capability while `noGrantEnd` is set:
- *                            `McplNoGrantRefusal`. Raised for each such
+ *                            `{ method, end }`, the refused message's MCPL
+ *                            method and `noGrantEnd`. Raised for each such
  *                            message, after the refusal, past the gate.
  */
 export class McplServerConnection extends EventEmitter {
@@ -503,10 +498,13 @@ export class McplServerConnection extends EventEmitter {
   /** True once the §5.3 initial policy Request has been answered. */
   policyEstablished = false;
 
-  /** How this transport's policy exchange ended, when it ended with no grant
-   *  in force; null until then, and while a grant is in force. Whoever runs
-   *  the exchange sets it (the framework does); a grant and a transport
-   *  boundary clear it. */
+  /** How this transport's §5.3 policy exchange ended, when it ended with no
+   *  grant in force: `unanswered` or `errored` for a policy Request that got
+   *  no answer or an error answer, `refused` for a refused policy, `no-mcpl`
+   *  for a server that declared no MCPL, so none was offered, and
+   *  `host-error` for a host error in the policy step. Null until then, and
+   *  while a grant is in force. Whoever runs the exchange sets it (the
+   *  framework does); a grant and a transport boundary clear it. */
   noGrantEnd: McplNoGrantEnd | null = null;
 
   /**

@@ -1,2 +1,2 @@
-- Text a participant or a server supplied is marked where it opens with `[mcpl`, as it is at the framework's other notice openings, since the framework now writes `[mcpl]` notices.
+- Text a participant or a server supplied is marked where it opens with `[no-grant`, as it is at the framework's other notice openings, since the framework now writes `[no-grant]` notices.
 - The stderr line for a policy that a server refuses after a manifest change gives the server's reason, or "no reason", as the line for a refused first policy does.

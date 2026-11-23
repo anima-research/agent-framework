@@ -15,7 +15,7 @@ const NOTICE_KIND = 'mcpl-no-grant';
 const advert = (): Json => ({ featureSets: { 'radio.events': { description: 'Rings of the bell.', uses: ['pushEvents'] } } });
 
 const notice = (method: string, cause: string, tail: string) =>
-  `[mcpl] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant, because ${cause}. ` +
+  `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant, because ${cause}. ` +
   `So its pushes and channel messages don't reach you. ${tail} The host says this one time for each time that it connects the server.`;
 const UPDATE = 'Its tools are not affected. A server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
 const CAUSE = {

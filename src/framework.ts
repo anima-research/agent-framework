@@ -37864,7 +37864,7 @@ export class AgentFramework {
   private tellNoGrant(connection: McplServerConnection, refusal: McplNoGrantRefusal): void {
     if (this.noGrantTold.has(connection) || this.agents.size === 0) return;
     const words = NO_GRANT_WORDS[refusal.end];
-    const text = `[${NOTICE_TAG.mcpl}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it. ` +
+    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it. ` +
       `The server holds no grant, because ${words.cause}. So its pushes and channel messages don't reach you. ${words.tail} ` +
       'The host says this one time for each time that it connects the server.';
     try {
