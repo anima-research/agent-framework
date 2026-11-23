@@ -2,6 +2,7 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { McplServerConnection } from '../src/index.js';
+import { foreignRowAsSent } from '../src/foreign-rounds.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import {
   startScriptedServer, makeFramework, waitFor, windowText, callTool,
@@ -80,7 +81,7 @@ function host(t: TestContext, url: string, config: Partial<McplServerConfig> = {
 }
 
 async function setup(t: TestContext, policy: Policy, config: Partial<McplServerConfig> = {}, advertised: Json | null = advert()) {
-  shortPolicyWait(t);
+  if (policy === unanswered) shortPolicyWait(t);
   const server = await radio(t, policy, advertised);
   const fw = await host(t, server.url, config);
   return { server, fw };
@@ -94,6 +95,15 @@ function noticeRows(fw: Fw) {
 function notices(fw: Fw): string[] {
   return noticeRows(fw).map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n'));
 }
+
+function connectionOf(fw: Fw): McplServerConnection {
+  const registry: unknown = Reflect.get(fw.framework, 'mcplServerRegistry');
+  const connection: unknown = registry !== null && typeof registry === 'object' ? Reflect.get(registry, 'getServer')?.call(registry, 'radio') : undefined;
+  assert.ok(connection instanceof McplServerConnection);
+  return connection;
+}
+
+const handshakes = (server: { received: Json[] }) => server.received.filter((m) => m.method === 'notifications/initialized').length;
 
 async function roundTrip(fw: Fw): Promise<void> {
   const result = await callTool(fw.framework, 'radio--status', {});
@@ -122,10 +132,12 @@ test('case 2: one notice for each connect: 100 more refused pushes, and a transp
   for (let i = 0; i < 100; i++) first.notify('push/event', ring(`more-${i}`, 'more'));
   await roundTrip(fw);
   assert.equal(notices(fw).length, 1, 'no notice for the 100 more');
+  assert.equal(connectionOf(fw).noGrantEnd, 'unanswered', 'the 100 more were refused with the end still recorded');
   first.ws.terminate();
-  await waitFor(() => server.peers.length === 2, 'the host reconnects');
+  await waitFor(() => handshakes(server) === 2, 'the host reconnects and finishes its handshake');
   const answer = await server.peer.request('push/event', ring('after', 'after the reconnect'));
   assert.ok(answer.error, 'refused on the next transport too');
+  assert.equal(connectionOf(fw).noGrantEnd, 'unanswered', 'the next transport recorded its own end');
   assert.equal(notices(fw).length, 1, 'no notice for the next transport of the same connect');
 });
 
@@ -234,13 +246,13 @@ test('case 11: a server that answers the policy Request with an error: the notic
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
 });
 
-test('case 12: a server that refuses the policy after a manifest change: the notice has the words for a refusal, and the host\'s log has its reason', async (t) => {
+async function refusedAfterManifestChange(t: TestContext, refusal: Json, logged: string): Promise<void> {
   const lines = stderrLines(t);
   let policies = 0;
   const { server, fw } = await setup(t, (msg, peer) => {
     policies++;
     if (policies === 1) peer.reply(msg.id, { accepted: true });
-    else peer.reply(msg.id, { accepted: false, fallback: 'mcp-only', reason: 'SERVER-REASON-8' });
+    else peer.reply(msg.id, { accepted: false, fallback: 'mcp-only', ...refusal });
   });
   const granted = await server.peer.request('push/event', ring('r1', 'GRANTED-RING'));
   assert.equal(granted.error, undefined, 'a push is admitted under the first policy');
@@ -251,14 +263,21 @@ test('case 12: a server that refuses the policy after a manifest change: the not
   assert.ok(answer.error, 'refused under the empty grant');
   await waitFor(() => notices(fw).length === 1, 'the notice');
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.refused, REFUSED_TAIL));
-  assert.ok(lines.some((line) => line.includes('refused post-manifest policy (SERVER-REASON-8)')), 'the host\'s log has the server\'s reason');
-});
+  assert.ok(lines.some((line) => line.includes(logged)), `the host's log has "${logged}"`);
+}
+
+test('case 12: a server that refuses the policy after a manifest change: the notice has the words for a refusal, and the host\'s log has its reason', (t) =>
+  refusedAfterManifestChange(t, { reason: 'SERVER-REASON-8' }, 'refused post-manifest policy (SERVER-REASON-8)'));
+
+test('case 12, with no reason: the host\'s log says that the server gave none', (t) =>
+  refusedAfterManifestChange(t, {}, 'refused post-manifest policy (no reason)'));
 
 test('a server that gets a grant at a later exchange is no longer told that it holds none', async (t) => {
   let policies = 0;
   const { server, fw } = await setup(t, (msg, peer) => {
     policies++;
-    if (policies > 1) peer.reply(msg.id, { accepted: true });
+    if (policies === 1) peer.error(msg.id, -32601, 'Method not found');
+    else peer.reply(msg.id, { accepted: true });
   });
   server.peer.notify('mcpl/manifestChanged', {});
   await waitFor(() => policies === 2, 'the policy Request after the manifest change');
@@ -283,9 +302,14 @@ test('case 14: a reconnect whose policy step throws on the host leaves the conne
   const { server, fw } = await setup(t, accepts, { reconnect: true, reconnectIntervalMs: 50 }, advertised);
   advertised.featureSets = [null];
   server.peer.ws.terminate();
-  await waitFor(() => server.peers.length === 2, 'the host reconnects');
+  await waitFor(() => handshakes(server) === 2, 'the host reconnects and finishes its handshake');
   const answer = await server.peer.request('push/event', ring('r1', 'one'));
   assert.ok(answer.error, 'refused, since the policy step left no grant');
   await waitFor(() => notices(fw).length === 1, 'the notice');
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.hostError, "The host's log has the error. A restart of the server may clear it."));
+});
+
+test('a watched call of a tool with a default MCPL name is sent as it was before the notice\'s tag', () => {
+  const [line] = foreignRowAsSent([{ type: 'tool_use', id: 'c1', name: 'mcpl--radio--play', input: {} }]);
+  assert.ok(line?.type === 'text' && line.text.startsWith('[mcpl--radio--play called: '), JSON.stringify(line));
 });
