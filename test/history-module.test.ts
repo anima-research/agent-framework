@@ -5,6 +5,7 @@ import type { ContextManager, StoredMessage, IndexedMessageQueryResult, ChannelC
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ToolCall } from '../src/types/events.js';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { nonErrorResultText } from '../src/tool-result-history.js';
 
 /**
  * HistoryModule's own logic is dispatch (always via
@@ -62,6 +63,7 @@ function buildStub(messages: StoredMessage[], opts: StubOptions = {}): { cm: Con
   };
 
   const cm = {
+    getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
     queryMessagesByTimeAndChannel(args: { fromMs?: number; toMs?: number; channelId?: string; limit?: number; offset?: number }): IndexedMessageQueryResult {
       calls.push({ method: 'queryMessagesByTimeAndChannel', args });
       if (opts.throwUnsupported) return unsupported();
@@ -154,6 +156,130 @@ const FIXTURE: StoredMessage[] = [
   msg('m6', 6000, 'User', [textBlock('another c1 message with searchterm inside')], 'c1'),
 ];
 
+const THINKING = { type: 'thinking', thinking: 'placeholder', signature: 'placeholder signature' } as const;
+const REDACTED = { type: 'redacted_thinking', data: 'placeholder data' } as const;
+const EXTRACT_CALL = { type: 'tool_use', id: 'extract1', name: 'history--extract', input: { format: 'raw' } } as const;
+const ORDINARY_CALL = {
+  type: 'tool_use', id: 'ordinary1', name: 'example--save', input: { example: THINKING, data: REDACTED },
+} as const;
+
+function resultBlock(id: string, content: string | ContentBlock[], toolName?: string): Extract<ContentBlock, { type: 'tool_result' }> {
+  return { type: 'tool_result', toolUseId: id, content, isError: false, ...(toolName && { toolName }) };
+}
+
+function extractSnapshot(...contents: ContentBlock[][]) {
+  return {
+    matchedCount: contents.length,
+    returned: contents.length,
+    hasMore: false,
+    messages: contents.map((content, i) => ({
+      id: `inside${i}`, timestamp: new Date(1000 + i).toISOString(), participant: 'Claude',
+      author: null, channelId: 'c1', content,
+    })),
+  };
+}
+
+async function rawExtract(rows: StoredMessage[], input: Record<string, unknown> = {}) {
+  const h = new HistoryModule();
+  h.bind(buildStub(rows).cm);
+  const result = await h.handleToolCall(call('extract', { ...input, format: 'raw' }));
+  assert.equal(result.success, true, result.error);
+  return result.data as { messages: Array<{ id: string; content: ContentBlock[]; anchor?: boolean }> };
+}
+
+describe('HistoryModule raw projection (#717)', () => {
+  it('keeps metadata, text and the tool exchange in every extract path without editing storage', async () => {
+    const result = resultBlock(ORDINARY_CALL.id, 'saved', ORDINARY_CALL.name);
+    const rows = [
+      msg('m1', 1000, 'Claude', [THINKING, textBlock('public text'), REDACTED, ORDINARY_CALL], 'c1'),
+      msg('m2', 2000, 'Claude', [result], 'c1'),
+    ];
+    const archived = structuredClone(rows);
+    const expected = [
+      {
+        id: 'm1', timestamp: rows[0]!.timestamp.toISOString(), participant: 'Claude', author: null,
+        channelId: 'c1', content: [textBlock('public text'), ORDINARY_CALL],
+      },
+      {
+        id: 'm2', timestamp: rows[1]!.timestamp.toISOString(), participant: 'Claude', author: null,
+        channelId: 'c1', content: [result],
+      },
+    ];
+    assert.deepEqual((await rawExtract(rows, { from: rows[0]!.timestamp.toISOString() })).messages, expected);
+    assert.deepEqual((await rawExtract(rows, { channelId: 'c1', author: 'Claude' })).messages, expected);
+    assert.deepEqual((await rawExtract(rows, { aroundId: 'm1', before: 0, after: 1 })).messages,
+      [{ ...expected[0], anchor: true }, expected[1]]);
+    assert.deepEqual(rows, archived);
+  });
+
+  it('projects nested extracts in strings and text blocks, even when a named result starts the page', async () => {
+    const privatePage = extractSnapshot([THINKING, textBlock('nested text'), REDACTED, ORDINARY_CALL]);
+    const leaf = nonErrorResultText({ data: privatePage });
+    const nested = resultBlock(EXTRACT_CALL.id, [textBlock(leaf), textBlock('keep this text')]);
+    const unrelated = resultBlock(ORDINARY_CALL.id, leaf, ORDINARY_CALL.name);
+    const older = extractSnapshot([EXTRACT_CALL, ORDINARY_CALL], [nested, unrelated]);
+    const storedBody = nonErrorResultText({ data: older });
+    const rows = [msg('m1', 1000, 'user', [resultBlock('extract2', storedBody, EXTRACT_CALL.name)], 'c1')];
+    const archived = structuredClone(rows);
+
+    const cleanLeaf = { ...privatePage, messages: privatePage.messages.map((m) => ({
+      ...m, content: [textBlock('nested text'), ORDINARY_CALL],
+    })) };
+    const cleanNested = resultBlock(EXTRACT_CALL.id, [textBlock(JSON.stringify(cleanLeaf)), textBlock('keep this text')]);
+    older.messages[1]!.content = [cleanNested, unrelated];
+    const expected = resultBlock('extract2', JSON.stringify(older), EXTRACT_CALL.name);
+    const first = await rawExtract(rows, { aroundId: 'm1', before: 0, after: 0 });
+    assert.deepEqual(first.messages[0]?.content, [expected]);
+    assert.deepEqual(rows, archived);
+    const second = await rawExtract([{ ...rows[0]!, content: first.messages[0]!.content }],
+      { aroundId: 'm1', before: 0, after: 0 });
+    assert.deepEqual(second, first);
+  });
+
+  it('withholds a malformed paired extract only for a private block in the message content', async () => {
+    const thinking = JSON.stringify(extractSnapshot([textBlock('public text'), THINKING]));
+    const malformed = thinking.slice(0, thinking.indexOf('placeholder') + 3);
+    const redacted = JSON.stringify(extractSnapshot([REDACTED])).split('placeholder')[0]!;
+    const inputLookalike = JSON.stringify(extractSnapshot([ORDINARY_CALL])).slice(0, -1);
+    const textLookalike = JSON.stringify(extractSnapshot([textBlock(thinking)])).slice(0, -1);
+    const unrelatedJson = JSON.stringify({ content: [THINKING] }).slice(0, -1);
+    const typeOnly = JSON.stringify(extractSnapshot([])).replace('"content":[]', '"content":[{"type":"thinking"}]');
+    const clean = JSON.stringify(extractSnapshot([ORDINARY_CALL]), null, 2) + '\n';
+    const textResults = [malformed, redacted, inputLookalike, textLookalike, unrelatedJson, typeOnly, clean];
+    const calls = textResults.map((_, i) => ({ ...EXTRACT_CALL, id: `t${i}` }));
+    const results = textResults.map((body, i) => resultBlock(calls[i]!.id, i === 1 ? [textBlock(body)] : body));
+    const missingPair = resultBlock('unpaired', malformed);
+    const differentTool = resultBlock(ORDINARY_CALL.id, malformed);
+    const rows = [
+      msg('m1', 1000, 'Claude', [...calls, ORDINARY_CALL]),
+      msg('m2', 2000, 'user', [...results, missingPair, differentTool]),
+    ];
+    const { messages } = await rawExtract(rows);
+    const withheld = '[History extract withheld: malformed JSON contains a private thinking block.]';
+    assert.deepEqual(messages[0]?.content, [...calls, ORDINARY_CALL]);
+    assert.deepEqual(messages[1]?.content, [
+      resultBlock('t0', withheld), resultBlock('t1', withheld), ...results.slice(2), missingPair, differentTool,
+    ]);
+  });
+
+  it('leaves the results paired when removing their duplicate XML replay copy', async () => {
+    const body = JSON.stringify(extractSnapshot([THINKING, ORDINARY_CALL]));
+    const rawXml = `<function_results><result>${body}</result><result>saved</result></function_results>`;
+    const extractResult = resultBlock(EXTRACT_CALL.id, body, EXTRACT_CALL.name);
+    const ordinaryResult = resultBlock(ORDINARY_CALL.id, 'saved');
+    const rows = [
+      msg('m1', 1000, 'Claude', [EXTRACT_CALL, ORDINARY_CALL]),
+      msg('m2', 2000, 'user', [{ ...extractResult, rawXml }, { ...ordinaryResult, rawXml }]),
+    ];
+    const { messages } = await rawExtract(rows);
+    assert.deepEqual(messages[1]?.content, [
+      resultBlock(EXTRACT_CALL.id, JSON.stringify(extractSnapshot([ORDINARY_CALL])), EXTRACT_CALL.name),
+      ordinaryResult,
+    ]);
+    assert.deepEqual(rows[1]?.content, [{ ...extractResult, rawXml }, { ...ordinaryResult, rawXml }]);
+  });
+});
+
 describe('HistoryModule', () => {
   describe('stats', () => {
     it('reports all-time message counts and range-scoped token stats separately', async () => {
@@ -232,7 +358,7 @@ describe('HistoryModule', () => {
       assert.equal(data.matchedCount, 2);
     });
 
-    it('format:"text" flattens content; format:"raw" returns blocks as-is', async () => {
+    it('format:"text" flattens content; format:"raw" keeps structured blocks without private thinking', async () => {
       const { cm } = buildStub(FIXTURE);
       const h = new HistoryModule();
       h.bind(cm);
@@ -245,9 +371,7 @@ describe('HistoryModule', () => {
       const rawResult = await h.handleToolCall(call('extract', { channelId: 'c2', format: 'raw' }));
       const rawData = rawResult.data as { messages: Array<{ id: string; content: unknown }> };
       const m4Raw = rawData.messages.find((m) => m.id === 'm4')!;
-      assert.ok(Array.isArray(m4Raw.content));
-      assert.equal((m4Raw.content as ContentBlock[]).length, 2);
-      assert.equal((m4Raw.content as ContentBlock[])[0]?.type, 'thinking');
+      assert.deepEqual(m4Raw.content, [textBlock('final answer')]);
     });
 
     it('caps limit at the hard maximum before it reaches context-manager', async () => {

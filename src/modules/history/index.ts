@@ -84,6 +84,7 @@ import { speechOf } from '../../send-tools.js';
 import { safeSlice } from '../../safe-slice.js';
 import { audienceOf } from '../../dendrite/audience.js';
 import { storedInjectionMarkOf } from '../../stored-injections.js';
+import { projectRawMessages } from './extract-content.js';
 
 // ============================================================================
 // Tool input shapes
@@ -739,8 +740,9 @@ export class HistoryModule implements Module {
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
           'readable string (a call of a tool the framework names for sending, editing or saying a message, such as ' +
           'send_message, as its name and its words when it carries words, such as "[telegram--send_message] …", its name ending ", error" when its result, stored after it, is flagged as an error; ' +
-          'other tool_use/tool_result/thinking/images as bracketed labels, a tool_result flagged as an error ending ", error"); ' +
-          'format:"raw" returns the content blocks unmodified. ' +
+          'other tool calls, tool results, thinking and images as bracketed labels, a tool result flagged as an error ending ", error"). ' +
+          'format:"raw" keeps structured content, including text, tool arguments and tool results, ' +
+          'but leaves out private thinking blocks, including in recognized copies of older extracts. ' +
           'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
           'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
           'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset/limit ' +
@@ -1338,7 +1340,7 @@ export class HistoryModule implements Module {
                 };
               })()
             : {}),
-          messages: page.map((msg) => projectMessage(msg, format, (m) => this.failedSpeech(m), view?.mark(msg))),
+          messages: this.projectExtractPage(page, format, view),
         },
       };
     }
@@ -1367,7 +1369,7 @@ export class HistoryModule implements Module {
         returned: page.length,
         ...(leftOut > 0 ? { leftOut } : {}),
         hasMore: result.messages.length > limit,
-        messages: page.map((msg) => projectMessage(msg, format, (m) => this.failedSpeech(m), view?.mark(msg))),
+        messages: this.projectExtractPage(page, format, view),
       },
     };
   }
@@ -1473,12 +1475,25 @@ export class HistoryModule implements Module {
         channelId: channelId ?? null,
         returned: window.length,
         ...(leftOut > 0 ? { leftOut } : {}),
-        messages: window.map((m) => ({
-          ...projectMessage(m, format, (n) => this.failedSpeech(n), view?.mark(m)),
-          ...(String(m.id) === anchorId ? { anchor: true } : {}),
+        messages: this.projectExtractPage(window, format, view).map((m) => ({
+          ...m,
+          ...(m.id === anchorId ? { anchor: true } : {}),
         })),
       },
     };
+  }
+
+  private projectExtractPage(page: StoredMessage[], format: 'text' | 'raw', view?: CallerView) {
+    const messages = page.map((msg) => ({
+      id: String(msg.id),
+      timestamp: msg.timestamp.toISOString(),
+      participant: msg.participant,
+      author: authorName(msg),
+      channelId: getChannelId(msg) ?? null,
+      ...windowField(view?.mark(msg)),
+      content: format === 'raw' ? msg.content : flattenContent(msg.content, this.failedSpeech(msg)),
+    }));
+    return format === 'raw' ? projectRawMessages(messages) : messages;
   }
 
   // ==========================================================================
@@ -2786,18 +2801,6 @@ interface CallerView {
 /** `{ window }` for a defined mark, nothing otherwise, so an entry in the caller's window is as it always was. */
 function windowField(mark: WindowMark | undefined): { window?: WindowMark } {
   return mark === undefined ? {} : { window: mark };
-}
-
-function projectMessage(msg: StoredMessage, format: 'text' | 'raw', failedOf: (msg: StoredMessage) => ReadonlySet<string>, mark?: WindowMark): Record<string, unknown> {
-  return {
-    id: String(msg.id),
-    timestamp: msg.timestamp.toISOString(),
-    participant: msg.participant,
-    author: authorName(msg),
-    channelId: getChannelId(msg) ?? null,
-    ...windowField(mark),
-    content: format === 'raw' ? msg.content : flattenContent(msg.content, failedOf(msg)),
-  };
 }
 
 const NO_FAILURES: ReadonlySet<string> = new Set();

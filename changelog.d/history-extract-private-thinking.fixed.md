@@ -1,0 +1,1 @@
+- `history--extract` still returns structured text, tool arguments and results in raw mode, but leaves out private thinking blocks, including in recognized older extracts. The stored conversation is unchanged.
