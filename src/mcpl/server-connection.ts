@@ -273,6 +273,19 @@ export type HintRead =
   /** A standalone tools/hints (carrier 3). */
   | { kind: 'hints'; params: unknown };
 
+/** How a transport's §5.3 policy exchange ended with no grant in force: the
+ *  policy Request got no answer, or an error answer; the server refused the
+ *  policy; the server declared no MCPL, so none was offered; or the host's
+ *  own policy step threw. */
+export type McplNoGrantEnd = 'unanswered' | 'errored' | 'refused' | 'no-mcpl' | 'host-error';
+
+/** The `'no-grant-refusal'` event's argument. */
+export interface McplNoGrantRefusal {
+  /** The MCPL method of the refused message, such as `push/event`. */
+  method: string;
+  end: McplNoGrantEnd;
+}
+
 /** Requests whose results can carry hint state, remembered for a late answer (RFC-014 §6.1). */
 const HINTED_METHODS: ReadonlySet<string> = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list']);
 
@@ -438,6 +451,10 @@ function unmatchedResponse(
  *                            connection runs the §5.3 policy exchange again,
  *                            then opens the planes (the framework's listener
  *                            does).
+ * - `'no-grant-refusal'`   — The admission gate refused a message for lack of
+ *                            a capability while `noGrantEnd` is set:
+ *                            `McplNoGrantRefusal`. Raised for each such
+ *                            message, after the refusal, past the gate.
  */
 export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
@@ -485,6 +502,12 @@ export class McplServerConnection extends EventEmitter {
 
   /** True once the §5.3 initial policy Request has been answered. */
   policyEstablished = false;
+
+  /** How this transport's policy exchange ended, when it ended with no grant
+   *  in force; null until then, and while a grant is in force. Whoever runs
+   *  the exchange sets it (the framework does); a grant and a transport
+   *  boundary clear it. */
+  noGrantEnd: McplNoGrantEnd | null = null;
 
   /**
    * RFC-007 §6: the server's `tools/observe` filter — interest, never
@@ -566,6 +589,7 @@ export class McplServerConnection extends EventEmitter {
   establishGrant(grant: CapabilityGrant): void {
     this.grant = grant;
     this.policyEstablished = true;
+    this.noGrantEnd = null;
     // RFC-007 §6.5: revoking observe discards the filter; the server sends
     // it again if the capability is granted later.
     if (!grant.has('toolLifecycle.observe')) this.toolObserveFilter = null;
@@ -577,6 +601,7 @@ export class McplServerConnection extends EventEmitter {
   private resetPolicyForTransportBoundary(): void {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
+    this.noGrantEnd = null;
     this.transportEpoch++;
     this.transportEnded.abort();
     this.transportEnded = new AbortController();
@@ -1073,6 +1098,10 @@ export class McplServerConnection extends EventEmitter {
           responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
         } else {
           console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
+        }
+        if (this.noGrantEnd !== null) {
+          const refusal: McplNoGrantRefusal = { method: McplServerConnection.methodOf(name), end: this.noGrantEnd };
+          super.emit('no-grant-refusal', refusal);
         }
         return true;
       }
@@ -2381,6 +2410,11 @@ export class McplServerConnection extends EventEmitter {
   // ==========================================================================
   // Private: inbound message routing
   // ==========================================================================
+
+  private static methodOf(event: string): string {
+    return Object.keys(McplServerConnection.METHOD_TO_EVENT)
+      .find((method) => McplServerConnection.METHOD_TO_EVENT[method] === event) ?? event;
+  }
 
   /**
    * Map from JSON-RPC method name to the EventEmitter event name.

@@ -1,0 +1,1 @@
+- Text a participant or a server supplied is marked where it opens with `[mcpl`, as it is at the framework's other notice openings, since the framework now writes `[mcpl]` notices.

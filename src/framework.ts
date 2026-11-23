@@ -1013,7 +1013,7 @@ import {
 import { SuppressionReview, type ReviewRuleInfo, type SuppressionReviewSummary } from './gate/suppression-review.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplNoGrantEnd, type McplNoGrantRefusal, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
@@ -3466,6 +3466,15 @@ export { suppressedRow } from './presentation.js';
  * since a notice never wakes the agent.
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
+
+const NO_GRANT_UPDATE = 'Its tools are not affected. A server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const NO_GRANT_WORDS = {
+  unanswered: { cause: "it did not answer the host's policy request", tail: NO_GRANT_UPDATE },
+  errored: { cause: "it answered the host's policy request with an error", tail: NO_GRANT_UPDATE },
+  refused: { cause: 'it refused the policy that the host offered', tail: "Its tools are not affected. The host's log has the server's reason, if it gave one." },
+  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: 'Its tools are not affected. A server that sends MCPL messages must declare MCPL.' },
+  'host-error': { cause: "the host hit an error while it set up the server's policy", tail: "The host's log has the error. A restart of the server may clear it." },
+} satisfies Record<McplNoGrantEnd, { cause: string; tail: string }>;
 
 /** The largest file dump_suppressed writes (bytes), under the workspace's default 5 MB file limit. */
 const DUMP_MAX_BYTES = 4 * 1024 * 1024;
@@ -37557,6 +37566,7 @@ export class AgentFramework {
     try {
       await this.registerMcplServerFeatures(config, connection);
     } catch (error) {
+      if (connection.transportEpoch === epoch && !connection.policyEstablished) connection.noGrantEnd = 'host-error';
       if (opts.closeOnFailure) await this.closeFailedRuntimeConnect(connection, 'policy registration');
       throw error;
     } finally {
@@ -37850,6 +37860,22 @@ export class AgentFramework {
       console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
     });
   }
+
+  private tellNoGrant(connection: McplServerConnection, refusal: McplNoGrantRefusal): void {
+    if (this.noGrantTold.has(connection) || this.agents.size === 0) return;
+    const words = NO_GRANT_WORDS[refusal.end];
+    const text = `[${NOTICE_TAG.mcpl}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it. ` +
+      `The server holds no grant, because ${words.cause}. So its pushes and channel messages don't reach you. ${words.tail} ` +
+      'The host says this one time for each time that it connects the server.';
+    try {
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant', serverId: connection.id });
+      this.noGrantTold.add(connection);
+    } catch (error) {
+      console.error(`[mcpl] ${connection.id}: the notice that it holds no grant could not be written:`, error);
+    }
+  }
+
+  private readonly noGrantTold = new WeakSet<McplServerConnection>();
 
   /**
    * RFC-014 §8.3: a tool change with no result or event to ride on (a
@@ -38359,6 +38385,7 @@ export class AgentFramework {
             closeForGood = true;
           } else {
             connection.establishGrant(CapabilityGrant.empty());
+            connection.noGrantEnd = 'refused';
             this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, CapabilityGrant.empty());
           }
         } else {
@@ -38469,7 +38496,10 @@ export class AgentFramework {
     config: import('./mcpl/types.js').McplServerConfig,
     connection: McplServerConnection,
   ): Promise<void> {
-    if (!connection.capabilities) return;
+    if (!connection.capabilities) {
+      connection.noGrantEnd = 'no-mcpl';
+      return;
+    }
     // Taken before any await, so every record of what the server says below
     // uses one derivation, whatever becomes of the server meanwhile (removed,
     // or replaced by a restart).
@@ -38531,7 +38561,10 @@ export class AgentFramework {
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
         // dark, plain MCP tools keep working. MUST NOT widen in response to
         // the refusal — a human can change config; the policy engine cannot.
-        if (fallback !== 'close') return;
+        if (fallback !== 'close') {
+          connection.noGrantEnd = 'refused';
+          return;
+        }
         closeForGood = true;
       } else {
         // Expansion activates on receipt (§6.7).
@@ -38549,6 +38582,7 @@ export class AgentFramework {
         console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
         return;
       }
+      if (err instanceof McplRequestError) connection.noGrantEnd = err.outcome === 'error-response' ? 'errored' : 'unanswered';
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
@@ -39487,6 +39521,8 @@ export class AgentFramework {
     connection.on('stderr', (params: { line: string }) => {
       this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });
+
+    connection.on('no-grant-refusal', (refusal: McplNoGrantRefusal) => this.tellNoGrant(connection, refusal));
 
     // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
     // -32601 (superseded by SPEC §17's host-diffed manifest fetch); no
