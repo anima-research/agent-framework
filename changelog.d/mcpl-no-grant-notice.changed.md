@@ -1,2 +1,2 @@
-- Text a participant or a server supplied is marked where it opens with `[no-grant`, as it is at the framework's other notice openings, since the framework now writes `[no-grant]` notices.
-- The stderr line for a policy that a server refuses after a manifest change gives the server's reason, or "no reason", as the line for a refused first policy does.
+- The framework now writes `[no-grant]` notices. It marks `[no-grant` in text from a participant or a server, as it marks its other notice openings.
+- After a manifest change, the host sends a new policy, and the server can refuse it. The stderr line for that refusal now gives the server's reason. When the server gave none, the line says "no reason". The line for a refused first policy works the same way.
