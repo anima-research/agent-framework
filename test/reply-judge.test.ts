@@ -397,6 +397,9 @@ describe('reply judge: surrogate pairs', () => {
         assert.ok(text.isWellFormed(), `well formed: ${JSON.stringify(text.slice(0, 40))}`);
         assert.ok(!text.includes('\uFFFD'), `no emoji replaced: ${JSON.stringify(text.slice(0, 40))}`);
       }
+      const all = requestTexts(request).join('\n');
+      assert.match(all, NOTE, 'the cut text reaches the request');
+      assert.ok(all.includes(FLOWER), 'its emoji reach the request');
     }
   }
 
@@ -464,17 +467,25 @@ describe('reply judge: surrogate pairs', () => {
     assertEmojiWhole(await bothAlignments((pad) => ({ system: pad + FLOWER.repeat(15_000), messages: conversation(2) })));
   });
 
-  it('sends U+FFFD for a lone half that no cut made, in the context or in the rule\'s instructions', async () => {
+  it('sends U+FFFD for a lone half that no cut made, wherever the request carries it', async () => {
     const { membrane, requests } = fakeMembrane();
     const judge = new ReplyJudge({
       membraneFor: () => membrane, chooseAgent: (n) => n[0],
-      preview: async () => ({ messages: [msg('user1', 'a broken \uD83C flower')], config: { model: 'x', maxTokens: 1 } }),
+      preview: async () => ({
+        system: 'You are a \uDF3C scout.',
+        messages: [msg('user1', 'an early \uDF3C flower'), ...conversation(60), msg('user1', 'a broken \uD83C flower')],
+        config: { model: 'x', maxTokens: 1 },
+      }),
     });
-    await judge.judge(judgeRequest({ instructions: 'wake me for \uDF3C only' }));
-    const all = requestTexts(requests[0]!);
-    assert.ok(all.every((t) => t.isWellFormed()));
-    assert.ok(all.some((t) => t.includes('a broken \uFFFD flower')));
-    assert.ok(all.some((t) => t.includes('wake me for \uFFFD only')));
+    await judge.judge(judgeRequest({ agentNames: ['Sc\uD83Cout'], instructions: 'wake me for \uDF3C only' }));
+    const request = requests[0]!;
+    assert.ok(requestTexts(request).every((t) => t.isWellFormed()));
+    const text = (m: NormalizedMessage | undefined): string => (m?.content[0] as { text: string } | undefined)?.text ?? '';
+    assert.ok(typeof request.system === 'string' && request.system.includes('Sc\uFFFDout'), "the judge's own system prompt");
+    assert.ok(text(request.messages.find((m) => m.cacheBreakpoint)).includes('an early \uFFFD flower'), 'a closed chunk');
+    assert.ok(text(request.messages.at(-3)).includes('a broken \uFFFD flower'), 'the open chunk');
+    assert.ok(text(request.messages.at(-2)).includes('You are a \uFFFD scout.'), "the agent's system prompt");
+    assert.ok(text(request.messages.at(-1)).includes('wake me for \uFFFD only'), "the rule's instructions");
   });
 
   it('sends a whole emoji that no cut reaches as itself', async () => {
