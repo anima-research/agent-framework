@@ -177,6 +177,15 @@ test('case 6: a policy established without pushEvents: a refused push writes no 
   assert.equal(notices(fw).length, 0);
 });
 
+test('a push held while a policy exchange runs, which then ends with no grant, is refused at the flush and writes the notice', async (t) => {
+  shortPolicyWait(t);
+  const server = await radio(t, (_msg, peer) => peer.notify('push/event', ring('held', 'HELD-RING')));
+  const fw = await host(t, server.url);
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, UPDATE));
+  assert.ok(!windowText(fw.framework).some((x) => x.includes('HELD-RING')), 'nothing the push carried is in the context');
+});
+
 test('case 7: a push sent while the policy exchange is under way at the first connect is held and delivered, with no notice', async (t) => {
   let release: (() => void) | undefined;
   const server = await radio(t, (msg, peer) => { release = () => peer.reply(msg.id, { accepted: true }); });
@@ -285,7 +294,9 @@ test('case 15: a server that gets a grant at a later exchange is no longer told 
   const granted = await server.peer.request('push/event', ring('r1', 'GRANTED-RING'));
   assert.equal(granted.error, undefined, 'a push is admitted under the later grant');
   const refused = await server.peer.request('inference/request', { messages: [] });
-  assert.ok(refused.error, 'refused, since the grant lacks inferenceRequest');
+  const error = refused.error as Json | undefined;
+  assert.equal(error?.code, -32002, 'refused at the gate');
+  assert.equal(error?.message, 'inference-request rejected: capability "inferenceRequest" not in the effective grant');
   assert.equal(notices(fw).length, 0);
 });
 
