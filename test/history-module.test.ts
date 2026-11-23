@@ -64,6 +64,10 @@ function buildStub(messages: StoredMessage[], opts: StubOptions = {}): { cm: Con
 
   const cm = {
     getMessage: (id: string) => messages.find((m) => m.id === id) ?? null,
+    getMessageCount: () => messages.length,
+    getMessageWindow: (offset: number, limit: number) => ({
+      messages: messages.slice(offset, offset + limit), startIndex: offset, totalCount: messages.length,
+    }),
     queryMessagesByTimeAndChannel(args: { fromMs?: number; toMs?: number; channelId?: string; limit?: number; offset?: number }): IndexedMessageQueryResult {
       calls.push({ method: 'queryMessagesByTimeAndChannel', args });
       if (opts.throwUnsupported) return unsupported();
@@ -277,7 +281,7 @@ describe('HistoryModule raw projection (#717)', () => {
     ]);
   });
 
-  it('trusts an extract result name even when its call ID is ambiguous', async () => {
+  it('projects unnamed and explicitly named extract results with a duplicate call ID', async () => {
     const body = JSON.stringify(extractSnapshot([THINKING, textBlock('nested text')]));
     const named = resultBlock(EXTRACT_CALL.id, body, EXTRACT_CALL.name);
     const unnamed = resultBlock(EXTRACT_CALL.id, body);
@@ -286,9 +290,24 @@ describe('HistoryModule raw projection (#717)', () => {
       msg('m2', 2000, 'Claude', [{ ...ORDINARY_CALL, id: EXTRACT_CALL.id }]),
       msg('m3', 3000, 'user', [named, unnamed]),
     ]);
-    assert.deepEqual(messages[2]?.content, [
-      { ...named, content: JSON.stringify(extractSnapshot([textBlock('nested text')])) }, unnamed,
+    const clean = JSON.stringify(extractSnapshot([textBlock('nested text')]));
+    assert.deepEqual(messages[2]?.content, [{ ...named, content: clean }, { ...unnamed, content: clean }]);
+  });
+
+  it('projects a toolsets--act extract result when pagination leaves its call off the page', async () => {
+    const act = { ...EXTRACT_CALL, name: 'toolsets--act', input: { tool: EXTRACT_CALL.name } };
+    const body = JSON.stringify(extractSnapshot([THINKING, textBlock('nested text')]));
+    const result = resultBlock(act.id, body, act.name);
+    const rows = [
+      msg('m1', 1000, 'Claude', [act], 'c1'),
+      msg('m2', 2000, 'user', [result], 'c1'),
+    ];
+    const { messages } = await rawExtract(rows, { channelId: 'c1', offset: 1, limit: 1 });
+    assert.deepEqual(messages.map((m) => m.id), ['m2']);
+    assert.deepEqual(messages[0]?.content, [
+      { ...result, content: JSON.stringify(extractSnapshot([textBlock('nested text')])) },
     ]);
+    assert.deepEqual(rows[1]?.content, [result]);
   });
 
   it('projects older results from toolsets--act only when it targeted history--extract', async () => {

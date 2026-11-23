@@ -1493,7 +1493,17 @@ export class HistoryModule implements Module {
       ...windowField(view?.mark(msg)),
       content: format === 'raw' ? msg.content : flattenContent(msg.content, this.failedSpeech(msg)),
     }));
-    return format === 'raw' ? projectRawMessages(messages) : messages;
+    return format === 'raw' ? projectRawMessages(messages, () => this.extractCallHistory()) : messages;
+  }
+
+  private *extractCallHistory(): Iterable<StoredMessage> {
+    const cm = this.cm as ContextManager;
+    const count = cm.getMessageCount();
+    // One pass over stored call provenance, without inflating attachments
+    // or materializing the whole history at once.
+    for (let offset = 0; offset < count; offset += 1000) {
+      yield* cm.getMessageWindow(offset, 1000, { resolveBlobs: false }).messages;
+    }
   }
 
   // ==========================================================================

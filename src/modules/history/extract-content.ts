@@ -17,30 +17,40 @@ interface ExtractRow {
   content: unknown;
 }
 
-function extractCalls(blocks: Iterable<unknown>): Map<string, string | null> {
-  const calls = new Map<string, string | null>();
+function extractCalls(blocks: Iterable<unknown>): Map<string, string> {
+  const calls = new Map<string, string>();
   for (const b of blocks) {
     if (!record(b) || b.type !== 'tool_use' || typeof b.id !== 'string' || typeof b.name !== 'string') continue;
     const act = b.name === ACT && record(b.input)
       && typeof b.input.tool === 'string' && b.input.tool.trim() === EXTRACT
       && !(typeof b.input.server === 'string' && b.input.server.trim());
-    // A repeated id in a disjoint history window isn't an unambiguous pair.
-    calls.set(b.id, !calls.has(b.id) && (b.name === EXTRACT || act) ? b.name : null);
+    // Any extract match wins, even with duplicate IDs. Prefer ACT because
+    // an explicitly named EXTRACT result doesn't need a matching call.
+    if (act || (b.name === EXTRACT && !calls.has(b.id))) calls.set(b.id, b.name);
   }
   return calls;
 }
 
-function isExtractResult(b: Record<string, unknown>, calls: Map<string, string | null>): boolean {
+function isExtractResult(b: Record<string, unknown>, lookup: (id: string) => string | undefined): boolean {
   if (b.type !== 'tool_result' || typeof b.toolUseId !== 'string' || !b.toolUseId) return false;
   // A direct result names itself, even mid-round or with a repeated call id.
-  // Unnamed and toolsets--act results need an unambiguous call in the page.
   if (b.toolName === EXTRACT) return true;
-  const paired = calls.get(b.toolUseId);
+  if (b.toolName !== undefined && b.toolName !== ACT) return false;
+  const paired = lookup(b.toolUseId);
   return !!paired && (b.toolName === undefined || b.toolName === paired);
 }
 
-export function projectRawMessages<T extends ExtractRow>(messages: T[]): T[] {
-  const calls = extractCalls(messages.flatMap(({ content }) => Array.isArray(content) ? content as unknown[] : []));
+function* messageBlocks(rows: Iterable<ExtractRow>): Iterable<unknown> {
+  for (const { content } of rows) {
+    if (Array.isArray(content)) yield* content;
+  }
+}
+
+export function projectRawMessages<T extends ExtractRow>(messages: T[], storedRows?: () => Iterable<ExtractRow>): T[] {
+  // Scan once, only if a result needs call provenance. Snapshots without a
+  // store of their own still use the calls in their embedded page.
+  let calls: Map<string, string> | undefined;
+  const lookup = (id: string) => (calls ??= extractCalls(messageBlocks(storedRows?.() ?? messages))).get(id);
 
   const replacedXml = new Set<string>();
   const projected = messages.map((message) => {
@@ -49,7 +59,7 @@ export function projectRawMessages<T extends ExtractRow>(messages: T[]): T[] {
     const blocks = content.flatMap((b) => {
       if (!record(b)) return [b];
       if (privateBlock(b)) return [];
-      if (!isExtractResult(b, calls)) return [b];
+      if (!isExtractResult(b, lookup)) return [b];
 
       const body = projectResultBody(b.content);
       if (body === b.content) return [b];
@@ -212,7 +222,7 @@ function hasPrivateBlockMarker(text: string): boolean {
     // The input ends in a cut or syntax error; check the prefix we did read.
   }
   const calls = extractCalls(blocks);
-  return blocks.some((b) => isExtractResult(b, calls) && Array.isArray(b.content)
+  return blocks.some((b) => isExtractResult(b, (id) => calls.get(id)) && Array.isArray(b.content)
     && b.content.some((item) => item.type === 'text' && typeof item.text === 'string'
       && hasPrivateBlockMarker(item.text)));
 }
