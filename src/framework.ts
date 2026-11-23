@@ -38374,7 +38374,7 @@ export class AgentFramework {
         if (receipt && receipt.accepted === false) {
           const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
           const fallback = refusal.fallback;
-          console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
+          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`);
           this.emitTrace({
             type: 'mcpl:policy-refused',
             serverId: connection.id,
