@@ -27,6 +27,7 @@
 
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, DetailedUsage, Membrane, NormalizedMessage, NormalizedRequest, NormalizedResponse } from '@animalabs/membrane';
+import { safeSlice } from '../safe-slice.js';
 import type { FailedLastTurn, JudgeEventSummary, JudgeFn, JudgeRequest, JudgeVerdict, ReplyJudgeOptions, UpcomingWake } from './types.js';
 
 export class JudgeFailure extends Error {
@@ -162,7 +163,9 @@ function safeJson(value: unknown): string {
 export function cut(text: string, max: number): string {
   if (text.length <= max) return text;
   const keep = Math.floor((max - 40) / 2);
-  return `${text.slice(0, keep)} […${text.length - 2 * keep} characters cut…] ${text.slice(-keep)}`;
+  const head = safeSlice(text, 0, keep);
+  const tail = safeSlice(text, text.length - keep, text.length);
+  return `${head} […${text.length - head.length - tail.length} characters cut…] ${tail}`;
 }
 
 /** A cheap, stable key for an entry (FNV-1a over its text, with its length). */
@@ -369,7 +372,7 @@ export class ReplyJudge {
       failed = undefined;
     }
 
-    const system = judgeSystemPrompt(agentName);
+    const system = judgeSystemPrompt(agentName).toWellFormed();
     const question = judgeQuestion(
       { ...request, upcomingWakes: upcoming }, agentName, now, Math.floor(this.maxInputTokens * EVENTS_SHARE * this.charsPerToken), failed,
     );
@@ -420,15 +423,17 @@ export class ReplyJudge {
     }
     const open = current;
 
-    const messages: NormalizedMessage[] = chunks.map((text, i) => ({
+    // A provider refuses a request that holds half of a surrogate pair.
+    const userText = (text: string, cacheBreakpoint: boolean): NormalizedMessage => ({
       participant: 'user',
-      content: [{ type: 'text', text }],
-      // After the last closed chunk: the prefix every later request shares.
-      ...(i === chunks.length - 1 ? { cacheBreakpoint: true } : {}),
-    }));
-    if (open) messages.push({ participant: 'user', content: [{ type: 'text', text: open }] });
-    messages.push({ participant: 'user', content: [{ type: 'text', text: about }] });
-    messages.push({ participant: 'user', content: [{ type: 'text', text: question }] });
+      content: [{ type: 'text', text: text.toWellFormed() }],
+      ...(cacheBreakpoint ? { cacheBreakpoint: true } : {}),
+    });
+    // After the last closed chunk: the prefix every later request shares.
+    const messages = chunks.map((text, i) => userText(text, i === chunks.length - 1));
+    if (open) messages.push(userText(open, false));
+    messages.push(userText(about, false));
+    messages.push(userText(question, false));
 
     const chars = system.length + messages.reduce((n, m) => n + (m.content[0] as { text: string }).text.length, 0);
     return {
