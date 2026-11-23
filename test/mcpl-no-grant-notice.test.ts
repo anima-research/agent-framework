@@ -254,6 +254,22 @@ test('case 12: a server that refuses the policy after a manifest change: the not
   assert.ok(lines.some((line) => line.includes('refused post-manifest policy (SERVER-REASON-8)')), 'the host\'s log has the server\'s reason');
 });
 
+test('a server that gets a grant at a later exchange is no longer told that it holds none', async (t) => {
+  let policies = 0;
+  const { server, fw } = await setup(t, (msg, peer) => {
+    policies++;
+    if (policies > 1) peer.reply(msg.id, { accepted: true });
+  });
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => policies === 2, 'the policy Request after the manifest change');
+  await roundTrip(fw);
+  const granted = await server.peer.request('push/event', ring('r1', 'GRANTED-RING'));
+  assert.equal(granted.error, undefined, 'a push is admitted under the later grant');
+  const refused = await server.peer.request('inference/request', { messages: [] });
+  assert.ok(refused.error, 'refused, since the grant lacks inferenceRequest');
+  assert.equal(notices(fw).length, 0);
+});
+
 test('case 13: a server that declares no MCPL and sends push/event: the notice has the words for no MCPL', async (t) => {
   const { server, fw } = await setup(t, unanswered, {}, null);
   const answer = await server.peer.request('push/event', ring('r1', 'one'));
