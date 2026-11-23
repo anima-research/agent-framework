@@ -1,7 +1,7 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { McplServerConnection } from '../src/index.js';
+import { McplRequestError, McplServerConnection } from '../src/index.js';
 import { foreignRowAsSent } from '../src/foreign-rounds.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import {
@@ -320,6 +320,20 @@ test('case 16: a server that got a grant and lost it again is told again, on the
   assert.ok(answer.error, 'refused, since the reconnect\'s policy Request got an error');
   await waitFor(() => notices(fw).length === 2, 'a second notice, for the second spell');
   assert.equal(notices(fw)[1], notice('push/event', CAUSE.errored, UPDATE));
+});
+
+test('a policy Request that the host could not send: the notice has the words for the host\'s error, not the server\'s silence', async (t) => {
+  const proto = McplServerConnection.prototype;
+  const original = proto.sendFeatureSetsUpdateRequest;
+  proto.sendFeatureSetsUpdateRequest = async () => {
+    throw new McplRequestError('The request wasn\'t sent: this host couldn\'t write it to the "radio" server, so nothing ran. Try again later.', 'not-sent');
+  };
+  t.after(() => { proto.sendFeatureSetsUpdateRequest = original; });
+  const { server, fw } = await setup(t, accepts);
+  const answer = await server.peer.request('push/event', ring('r1', 'one'));
+  assert.ok(answer.error, 'refused, since nothing is granted');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.hostError, "The host's log has the error. A restart of the server may clear it."));
 });
 
 test('case 13: a server that declares no MCPL and sends push/event: the notice has the words for no MCPL', async (t) => {
