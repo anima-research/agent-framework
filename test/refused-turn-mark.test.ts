@@ -56,7 +56,7 @@ class RunsUntilStopped implements YieldingStream {
   }
 }
 
-async function rig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>; agents?: unknown[]; fixture?: Record<string, unknown> } = {}) {
+async function baseRig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>; agents?: unknown[]; fixture?: Record<string, unknown> } = {}, owner = false) {
   const marks: Array<{ name?: unknown; arguments?: Record<string, unknown> }> = [];
   const f = await fixture({
     ...opts.fixture,
@@ -65,6 +65,17 @@ async function rig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>;
     toolsCall: (params) => { marks.push(params as { name?: unknown; arguments?: Record<string, unknown> }); return { content: [] }; },
   });
   t.after(f.close);
+  if (owner) {
+    f.framework.getMainRefusalBridge().takeOwnership(signal => {
+      if (signal.rewind !== 'unhandled' || !signal.origin) return;
+      // Record the target a host would use; built-in effects still go through
+      // toolsCall above, so a double dispatch fails the same assertions.
+      marks.push({ name: 'add_reaction', arguments: {
+        channelId: signal.origin.channelId.split(':').at(-1),
+        messageId: signal.origin.messageRef,
+      } });
+    });
+  }
   const streams: Array<() => YieldingStream> = [];
   f.membrane.streamYielding = (request: NormalizedRequest): YieldingStream => {
     f.membrane.calls.push(request);
@@ -108,6 +119,10 @@ async function rig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>;
   return { f, fw, streams, records, marks, marked, stored, incoming, adminMention, answered, markSent };
 }
 
+// Run identical target assertions with and without bridge ownership.
+for (const owner of [false, true]) {
+const rig = (t: TestContext, opts: Parameters<typeof baseRig>[1] = {}) => baseRig(t, opts, owner);
+describe(owner ? 'host owner' : 'built-in owner', () => {
 describe('a refused turn is marked on the message it answers, and its failure names that message\'s channel', () => {
   it('a mention pushed from a closed channel after a message answered in an open one: the mark goes on the mention, and the record names its channel', async (t) => {
     const r = await rig(t);
@@ -183,6 +198,32 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await r.markSent();
     assert.deepEqual(r.marked(), []);
     assert.equal(r.records[0]!.locus, ADMIN);
+  });
+
+  it('a singleton judged event answered while judging still has no target in either owner path', async (t) => {
+    const r = await rig(t, { framework: { gate: { onboarding: false, config: {
+      policies: [{ name: 'judge', match: { scope: ['mcpl:channel-incoming'] },
+        behavior: { judge: { debounceMs: 100 } } }], default: 'skip',
+    } } } as never });
+    let resolve!: (value: { reply: boolean; reason: string; inputTokens: number }) => void;
+    let asked = false;
+    let answered = false;
+    let checkedAnswered = false;
+    const gate = (r.f.framework as unknown as { eventGate: {
+      judgeFn: () => Promise<{ reply: boolean; reason: string; inputTokens: number }>;
+      isAnsweredFn: () => boolean;
+    } }).eventGate;
+    gate.judgeFn = () => { asked = true; return new Promise(done => { resolve = done; }); };
+    gate.isAnsweredFn = () => { checkedAnswered ||= answered; return answered; };
+    r.streams.push(() => new MockYieldingStream([refusal()]));
+    await r.incoming(ROOM, 'm-judged');
+    await eventually(() => asked, 'the judge is deciding');
+    answered = true;
+    resolve({ reply: true, reason: 'reply', inputTokens: 1 });
+    await eventually(() => r.records.length === 1, 'the judged turn refused');
+    await r.f.framework.runUntilIdle();
+    assert.equal(checkedAnswered, true, 'the placement moved from after to named');
+    assert.deepEqual(r.marked(), []);
   });
 
   it('a mention whose server\'s wakes are undecided wakes its turn through wake onboarding: the turn answers the mention, and its refusal marks it', async (t) => {
@@ -526,7 +567,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await eventually(() => r.records.length === 2, 'the refusal, and its retry\'s');
     await r.f.framework.runUntilIdle();
     assert.equal(r.f.membrane.calls.length, 2, 'premise: the turn and its retry each made one call');
-    assert.equal(reacting.length, 1, 'premise: the retry\'s refusal, which no rewind takes, reached the reaction');
+    assert.equal(reacting.length, owner ? 0 : 1, 'only the built-in path calls the legacy hook for the retry');
     await Promise.all(reacting);
     assert.deepEqual(r.records.map((x) => x.locus), [null, null]);
     assert.deepEqual(r.marked(), []);
@@ -1073,3 +1114,5 @@ describe('a retry ranks with addressed wakes only while the agent is sent its me
     });
   }
 });
+});
+}
