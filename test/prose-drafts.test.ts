@@ -5907,6 +5907,72 @@ describe('a skip_reply beside a call of its step that failed', () => {
     }
   });
 
+  it('two failed calls of one tool: the tool is named one time, and the words speak of both answers', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), failed('l2'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), "This skip_reply didn't run: lab--lookup failed in the same step, and their answers say why. " +
+        'To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a skip_reply waits for every other call of its step, not only the first to answer', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    try {
+      const turn = h.turn([
+        createMockResponse([failed('l1'), lookup('l2', { hold: 'h2' }), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      await h.until(() => module.holding('h2') && answeredBeforeTheTurnEnds(h, 'l1'), 'l1 has answered, and l2 still runs');
+      assert.ok(!answeredBeforeTheTurnEnds(h, 'k1'), 'k1 waits while l2 runs');
+      module.release('h2');
+      await turn;
+      assert.equal(answerOf(h, 'k1'), refusal('lab--lookup'));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("beside a call that succeeds, a skip_reply's wake is armed once the call answers", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], gate: true });
+    try {
+      const turn = h.turn([createMockResponse([lookup('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use')]);
+      await h.until(() => module.holding('h1'), 'the lookup waits');
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no wake while the lookup runs');
+      module.release('h1');
+      await turn;
+      assert.ok(gateOf(h).selfWakeTimers.has('scout'), 'the wake is armed once the lookup has answered');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the one refusal is per turn: the next turn refuses again', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      await h.turn([
+        createMockResponse([failed('l2'), skip('k3')], 'tool_use'),
+        createMockResponse([skip('k4')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--lookup'));
+      assert.equal(answerOf(h, 'k3'), refusal('lab--lookup'));
+      assert.ok(roundTaken(h, 'k4'), 'the model was called again in the second turn');
+    } finally {
+      await h.close();
+    }
+  });
+
   it('a turn stopped while skip_reply waits runs nothing later: no wake is armed', async () => {
     const module = lab();
     const h = await harness({ modules: [module], gate: true });
