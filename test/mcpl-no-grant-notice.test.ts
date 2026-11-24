@@ -178,11 +178,13 @@ test('case 6: a policy established without pushEvents: a refused push writes no 
 });
 
 test('a push held while a policy exchange runs, which then ends with no grant, is refused at the flush and writes the notice', async (t) => {
-  shortPolicyWait(t);
-  const server = await radio(t, (_msg, peer) => peer.notify('push/event', ring('held', 'HELD-RING')));
+  const server = await radio(t, (msg, peer) => {
+    peer.notify('push/event', ring('held', 'HELD-RING'));
+    peer.error(msg.id, -32601, 'Method not found');
+  });
   const fw = await host(t, server.url);
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, UPDATE));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
   assert.ok(!windowText(fw.framework).some((x) => x.includes('HELD-RING')), 'nothing the push carried is in the context');
 });
 
@@ -240,11 +242,14 @@ test('case 10: a host with no agent writes no notice, and logs no failure for th
   const server = await radio(t, unanswered);
   const starting = makeFramework([{ id: 'radio', toolPrefix: 'radio', url: server.url }], { agents: [], modules: [] });
   t.after(async () => { await (await starting).stop(); });
-  await starting;
+  const fw = await starting;
+  const refusals: unknown[] = [];
+  connectionOf(fw).on('no-grant-refusal', (refusal: unknown) => refusals.push(refusal));
   for (const id of ['r1', 'r2']) {
     const answer = await server.peer.request('push/event', ring(id, 'one'));
     assert.ok(answer.error, 'refused for lack of a grant');
   }
+  assert.deepEqual(refusals, [{ method: 'push/event', end: 'unanswered' }, { method: 'push/event', end: 'unanswered' }], 'each refusal raised the event');
   assert.deepEqual(lines.filter((line) => line.includes('holds no grant')), []);
 });
 
