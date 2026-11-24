@@ -454,6 +454,30 @@ test('case 14: a reconnect whose policy step throws on the host leaves the conne
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.hostError, "The host's log has the error. A restart of the server may clear it."));
 });
 
+test('a granted server whose manifest drops pushEvents and holds a feature set that the host fails to read: the host\'s error ends the exchange, and its next push writes the notice', async (t) => {
+  let manifest: Json = { version: '0.5', pushEvents: true, ...advert() };
+  const server = await startScriptedServer({
+    advert: advert(),
+    tools: TOOLS,
+    onPolicy: accepts,
+    on: (msg, peer) => {
+      if (msg.method === 'mcpl/manifest') peer.reply(msg.id, manifest);
+      else if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  t.after(() => server.close());
+  const fw = await host(t, server.url);
+  const admitted = await server.peer.request('push/event', ring('r1', 'GRANTED-RING'));
+  assert.equal(admitted.error, undefined, 'a push is admitted under the first grant');
+  manifest = { version: '0.5', featureSets: [null] };
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => connectionOf(fw).noGrantEnd === 'host-error', 'the end that the host\'s error leaves');
+  const answer = await server.peer.request('push/event', ring('r2', 'two'));
+  assert.ok(answer.error, 'refused, since the grant left in force lacks pushEvents');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.hostError, "The host's log has the error. A restart of the server may clear it."));
+});
+
 test('a watched call of a tool with a default MCPL name is sent as it was before the notice\'s tag', () => {
   const [line] = foreignRowAsSent([{ type: 'tool_use', id: 'c1', name: 'mcpl--radio--play', input: {} }]);
   assert.ok(line?.type === 'text' && line.text.startsWith('[mcpl--radio--play called: '), JSON.stringify(line));
