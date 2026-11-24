@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type StreamEvent, type YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
-import type { Module } from '../src/index.js';
+import type { Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
@@ -5822,5 +5822,616 @@ describe('sameRoundSkipReplyTextPolicy', () => {
         rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe('a skip_reply beside a call of its step that failed', () => {
+  class LabModule implements Module {
+    readonly name = 'lab';
+    private readonly gates = new Map<string, () => void>();
+    async start(_ctx: ModuleContext): Promise<void> {}
+    async stop(): Promise<void> {}
+    getTools(): ToolDefinition[] {
+      const inputSchema: ToolDefinition['inputSchema'] = { type: 'object', properties: { fail: { type: 'boolean' }, delayMs: { type: 'number' }, hold: { type: 'string' } } };
+      return [
+        { name: 'lookup', description: 'Look something up.', inputSchema },
+        { name: 'send_file', description: 'Send a file.', inputSchema },
+      ];
+    }
+    async handleToolCall(call: ToolCall): Promise<ToolResult> {
+      const input = (call.input ?? {}) as { fail?: boolean; delayMs?: number; hold?: string };
+      if (input.delayMs) await new Promise((r) => setTimeout(r, input.delayMs));
+      if (input.hold) await new Promise<void>((r) => this.gates.set(input.hold!, r));
+      return input.fail ? { success: false, error: 'nothing found', isError: true } : { success: true, data: { found: 'it' } };
+    }
+    async onProcess(): Promise<Record<string, never>> { return {}; }
+    release(key: string): void { this.gates.get(key)?.(); }
+    releaseAll(): void { for (const open of this.gates.values()) open(); }
+    holding(key: string): boolean { return this.gates.has(key); }
+  }
+  const lab = () => new LabModule();
+  const lookup = (id: string, input: Record<string, unknown> = {}) => call(id, 'lab--lookup', input);
+  const sendFile = (id: string, input: Record<string, unknown> = {}) => call(id, 'lab--send_file', input);
+  const failed = (id: string) => sendFile(id, { fail: true });
+  const skip = (id: string, input: Record<string, unknown> = {}) => call(id, 'skip_reply', input);
+  const result = (id: string, content: string) => ({ type: 'tool_result', toolUseId: id, content }) as ContentBlock;
+  const endings = (h: Awaited<ReturnType<typeof harness>>): (() => number) => {
+    let ended = 0;
+    h.framework.onTrace((event) => { if (event.type === 'inference:turn_ended') ended++; });
+    return () => ended;
+  };
+  const refusal = (...tools: string[]) => {
+    const named = tools.length === 1 ? tools[0]! : `${tools.slice(0, -1).join(', ')} and ${tools.at(-1)!}`;
+    return `This skip_reply didn't run: ${named} failed in the same step, and ${tools.length === 1 ? 'its answer says' : 'their answers say'} why. ` +
+      'To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.';
+  };
+  const roundTaken = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean =>
+    h.messages().some((m) => m.content.some((b) => b.type === 'tool_use' && (b as { id?: string }).id === id));
+  const answerOf = (h: Awaited<ReturnType<typeof harness>>, id: string): string | undefined => {
+    const block = h.messages().flatMap((m) => m.content)
+      .filter((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === id).at(-1);
+    if (!block) return undefined;
+    const content = (block as { content?: unknown }).content;
+    return typeof content === 'string' ? content
+      : Array.isArray(content) ? content.map((b) => (b as { text?: string }).text ?? '').join('') : undefined;
+  };
+  const gateOf = (h: Awaited<ReturnType<typeof harness>>) => (h.framework as unknown as {
+    eventGate: { selfWakeTimers: Map<string, unknown>; getSleepState(): { until: number } | null };
+  }).eventGate;
+  const waitsOf = (h: Awaited<ReturnType<typeof harness>>) => h.framework as unknown as {
+    stepWaits: Map<string, unknown>;
+    releaseAgentRuntime(agent: unknown): void;
+  };
+  const answeredBeforeTheTurnEnds = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean => {
+    const state = h.framework.getAgent('scout')!.state;
+    return state.status === 'waiting_for_tools' && state.completed.some((c) => c.id === id);
+  };
+  const lifecycle = (h: Awaited<ReturnType<typeof harness>>): (() => string[]) => {
+    const sent: ToolLifecycleParams[] = [];
+    const observer = {
+      id: 'observer', grant: new CapabilityGrant(new Set(['toolLifecycle.observe']), []), toolObserveFilter: null, transportEpoch: 0,
+      sendToolLifecycle: (p: ToolLifecycleParams) => { sent.push(p); },
+    };
+    (h.framework as unknown as { toolLifecycleEmitter: ToolLifecycleEmitter }).toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => [observer as never], configFor: () => undefined, describe: () => ({ class: [] }),
+    });
+    return () => sent.map((p) => `${p.toolCallId.split('~')[0]}:${p.phase}`);
+  };
+
+  it("a send that fails beside skip_reply: skip_reply doesn't run, the model reads both answers, and a skip_reply alone then ends the turn", async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('error');
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([unplacedSend('s1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.ok(roundTaken(h, 'k2'), 'the model was called again, with both answers');
+      const [send, skipped] = h.toolResults();
+      assert.match(send!, /Discord refused/, 'the send\'s own answer reached the model');
+      assert.equal(skipped, refusal('discord--send_message'));
+      assert.equal(ended(), 1, 'the second skip_reply ended the turn');
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a failed call that is no send changes nothing: skip_reply runs at once, and the turn ends', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    const ended = endings(h);
+    const phases = lifecycle(h);
+    try {
+      const before = h.membrane.calls.length;
+      const turn = h.turn([createMockResponse([lookup('q1', { fail: true, hold: 'h1' }), skip('k1')], 'tool_use')]);
+      await h.until(() => module.holding('h1') && phases().includes('k1:started'), 'skip_reply runs while the lookup still runs');
+      module.release('h1');
+      await turn;
+      assert.equal(h.membrane.calls.length - before, 1, 'one model call');
+      assert.equal(ended(), 1);
+      assert.ok(!(answerOf(h, 'k1') ?? '').startsWith("This skip_reply didn't run"), answerOf(h, 'k1'));
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('a send that the host refuses counts as failed; a refused call that is no send changes nothing', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([{ ...sendFile('l1'), unparseableInput: '{"fail": tr' } as ContentBlock, skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k2'));
+      const before = h.membrane.calls.length;
+      await h.turn([
+        createMockResponse([{ ...lookup('q1'), unparseableInput: '{"fail": tr' } as ContentBlock, skip('k3')], 'tool_use'),
+        createMockResponse([skip('k4')], 'tool_use'),
+      ]);
+      assert.equal(h.membrane.calls.length - before, 1, 'the refused lookup beside skip_reply: one model call, as today');
+      assert.ok(!(answerOf(h, 'k3') ?? '').startsWith("This skip_reply didn't run"), answerOf(h, 'k3'));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a drafts resend that fails is a send: skip_reply beside it is refused; a drafts list is no send", async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: ['d-none'], destination: ROOM }), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('drafts'));
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([drafts('r2', { action: 'list' }), skip('k3')], 'tool_use')]);
+      assert.equal(h.membrane.calls.length - before, 1, 'a drafts list beside skip_reply: one model call, as today');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('beside a send that takes a while, skip_reply runs after it and ends the turn, with no added model call', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    const ended = endings(h);
+    const phases = lifecycle(h);
+    try {
+      const before = h.membrane.calls.length;
+      const turn = h.turn([createMockResponse([skip('k1'), sendFile('l1', { hold: 'h1' })], 'tool_use')]);
+      await h.until(() => module.holding('h1'), 'the send waits');
+      assert.ok(!phases().includes('k1:started'), `skip_reply waits while the send runs: ${phases().join(' ')}`);
+      module.release('h1');
+      await turn;
+      assert.equal(h.membrane.calls.length - before, 1, 'one model call');
+      assert.equal(ended(), 1);
+      const order = phases();
+      assert.ok(order.includes('l1:completed') && order.indexOf('k1:started') > order.indexOf('l1:completed'),
+        `skip_reply ran after the send it was called before: ${order.join(' ')}`);
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('beside a send that succeeds, the send goes out and skip_reply ends the turn, with no added model call', async () => {
+    const h = await harness({ sendTool: true });
+    const ended = endings(h);
+    try {
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([unplacedSend('s1'), skip('k1')], 'tool_use')]);
+      assert.equal(h.membrane.calls.length - before, 1, 'one model call');
+      assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL], 'the send went out');
+      assert.equal(ended(), 1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('skip_reply alone ends the turn as it does today', async () => {
+    const h = await harness({ modules: [lab()] });
+    const ended = endings(h);
+    try {
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([skip('k1', { reason: 'nothing to add' })], 'tool_use')]);
+      assert.equal(h.membrane.calls.length - before, 1);
+      assert.equal(ended(), 1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a refused skip_reply arms no wake and doesn't keep the turn's end private: the next round's text is posted", async () => {
+    const h = await harness({ modules: [lab()], gate: true });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1', { wake_in_seconds: 60 })], 'tool_use'),
+        createMockResponse([text('Posted after all.')]),
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'Posted after all.']]);
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no self-wake is armed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const order of [['k1', 'l1', 'k2'], ['l1', 'k1', 'k2'], ['k1', 'k2', 'l1']]) {
+    it(`two skip_reply calls beside a failed call (${order.join(', ')}) both get the refusal, and the model is called again`, async () => {
+      const h = await harness({ modules: [lab()] });
+      const ended = endings(h);
+      try {
+        await h.turn([
+          createMockResponse(order.map((id) => (id === 'l1' ? failed(id) : skip(id))), 'tool_use'),
+          createMockResponse([skip('k3')], 'tool_use'),
+        ]);
+        const results = h.toolResults();
+        for (const id of ['k1', 'k2']) assert.equal(results[order.indexOf(id)], refusal('lab--send_file'), id);
+        assert.ok(roundTaken(h, 'k3'), 'the model was called again');
+        assert.equal(ended(), 1);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  for (const order of [['l1', 'k1', 'z1'], ['z1', 'k1', 'l1'], ['k1', 'z1', 'l1']]) {
+    it(`beside a failed call and a sleep (${order.join(', ')}), skip_reply is refused and the sleep runs and ends the turn`, async () => {
+      const h = await harness({ modules: [lab()], gate: true });
+      const ended = endings(h);
+      try {
+        const before = h.membrane.calls.length;
+        await h.turn([
+          createMockResponse(order.map((id) => (id === 'l1' ? failed(id) : id === 'k1' ? skip(id) : call(id, 'sleep', { seconds: 60 }))), 'tool_use'),
+          createMockResponse([text('Never asked for.')]),
+        ]);
+        assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+        assert.ok(gateOf(h).getSleepState() !== null, 'the sleep ran');
+        assert.equal(ended(), 1);
+        assert.equal(h.membrane.calls.length - before, 1, 'the sleep ended the turn: the model was not called again');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('it refuses one time in a turn: a second skip_reply beside a second failed call runs and ends the turn', async () => {
+    const h = await harness({ modules: [lab()] });
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
+        createMockResponse([skip('k3')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k2'), 'the model was called again');
+      const second = answerOf(h, 'k2');
+      assert.ok(second !== undefined && !second.startsWith("This skip_reply didn't run"), second);
+      assert.ok(!roundTaken(h, 'k3'), 'the second skip_reply ended the turn');
+      assert.equal(ended(), 1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('several failed calls are each named one time', async () => {
+    const h = await harness({ modules: [lab()], sendTool: true });
+    await h.sendMode('error');
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), unplacedSend('s1'), failed('l2'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(h.toolResults()[3], refusal('lab--send_file', 'discord--send_message'), 'each named one time, in the order of the calls');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('two failed calls of one tool: the tool is named one time, and the words speak of both answers', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), failed('l2'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), "This skip_reply didn't run: lab--send_file failed in the same step, and their answers say why. " +
+        'To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a skip_reply waits for every send of its step, not only the first to answer', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    try {
+      const turn = h.turn([
+        createMockResponse([failed('l1'), sendFile('l2', { hold: 'h2' }), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      await h.until(() => module.holding('h2') && answeredBeforeTheTurnEnds(h, 'l1'), 'l1 has answered, and l2 still runs');
+      assert.ok(!answeredBeforeTheTurnEnds(h, 'k1'), 'k1 waits while l2 runs');
+      module.release('h2');
+      await turn;
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it("beside a send that succeeds, a skip_reply's wake is armed once the send answers", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], gate: true });
+    try {
+      const turn = h.turn([createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use')]);
+      await h.until(() => module.holding('h1'), 'the send waits');
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no wake while the send runs');
+      module.release('h1');
+      await turn;
+      assert.ok(gateOf(h).selfWakeTimers.has('scout'), 'the wake is armed once the send has answered');
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('the one refusal is per turn: the next turn refuses again', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      await h.turn([
+        createMockResponse([failed('l2'), skip('k3')], 'tool_use'),
+        createMockResponse([skip('k4')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.equal(answerOf(h, 'k3'), refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k4'), 'the model was called again in the second turn');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a turn stopped while skip_reply waits runs nothing later: no wake is armed', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], gate: true });
+    let dropped = false;
+    h.framework.onTrace((event) => { if (event.type === 'tool:result_dropped' && event.callId === 'l1') dropped = true; });
+    try {
+      h.membrane.pushResponse(createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use'));
+      const before = h.membrane.calls.length;
+      h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-stop', mode: 'addressed', text: 'message' });
+      await h.until(() => h.membrane.calls.length > before && module.holding('h1'), 'the send waits');
+      assert.ok(h.framework.abortInference('scout', 'test stop'), 'premise: the turn was stopped');
+      module.release('h1');
+      await h.until(() => dropped, "the send's late answer is dropped");
+      await h.framework.runUntilIdle();
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'the skip_reply never ran: no self-wake is armed');
+      assert.ok(!waitsOf(h).stepWaits.has('scout'), "the stream's end dropped its step wait");
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it("deregistering an agent while its skip_reply waits drops the agent's step wait", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    try {
+      h.membrane.pushResponse(createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1')], 'tool_use'));
+      h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-release', mode: 'addressed', text: 'message' });
+      await h.until(() => module.holding('h1') && waitsOf(h).stepWaits.has('scout'), 'the skip_reply waits');
+      waitsOf(h).releaseAgentRuntime(h.framework.getAgent('scout'));
+      assert.ok(!waitsOf(h).stepWaits.has('scout'), 'no step wait is left');
+      module.release('h1');
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('a retried silent turn keeps the refusal it already used', async () => {
+    const h = await harness({ modules: [lab()], retries: 1 });
+    try {
+      breakAfterToolRound(h.membrane, 'error', {
+        beforeFailure: () => {
+          h.membrane.pushResponse(createMockResponse([failed('l2'), skip('k2')], 'tool_use'));
+          h.membrane.pushResponse(createMockResponse([skip('k3')], 'tool_use'));
+        },
+      });
+      await h.turn([createMockResponse([failed('l1'), skip('k1')], 'tool_use')], 'scout', 'silent');
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'), 'premise: the first step used the refusal');
+      assert.ok(roundTaken(h, 'k2'), 'premise: the retry ran');
+      const second = answerOf(h, 'k2');
+      assert.ok(second !== undefined && !second.startsWith("This skip_reply didn't run"), second);
+      assert.ok(!roundTaken(h, 'k3'), "the retry's skip_reply ended the turn");
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a script's skip_reply runs at once: the rule holds only the model's own calls", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], codeExecution: true });
+    const ended = endings(h);
+    try {
+      const turn = h.turn([
+        createMockResponse([sendFile('l1', { fail: true, hold: 'h1' }), call('ce1', 'code_execution', { code: 'await tools.skip_reply({});' })], 'tool_use'),
+        createMockResponse([text('Never asked for.')]),
+      ]);
+      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'ce1'), "the script ends while the send still runs: its skip_reply didn't wait");
+      module.release('h1');
+      await turn;
+      assert.equal(ended(), 1);
+      assert.ok(!h.toolResults().some((r) => r.includes("This skip_reply didn't run")));
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it("a skip_reply the host refuses for its arguments is answered at once and leaves the rule its refusal", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    const ended = endings(h);
+    try {
+      const turn = h.turn([
+        createMockResponse([sendFile('l1', { fail: true, hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use'),
+        createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
+        createMockResponse([skip('k3')], 'tool_use'),
+      ]);
+      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'k1'), 'k1 is answered while the send still runs');
+      module.release('h1');
+      await turn;
+      const results = h.toolResults();
+      assert.match(results[1]!, /wake/, 'the wake refusal, as today');
+      assert.ok(!results[1]!.startsWith("This skip_reply didn't run"), results[1]);
+      assert.equal(results[3], refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k3'));
+      assert.equal(ended(), 1);
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  describe("with sameRoundSkipReplyTextPolicy 'ask'", () => {
+    const asking = { agents: [{ name: 'scout', sameRoundSkipReplyTextPolicy: 'ask' as const }] };
+    it("held text and a failed call in one step give one refusal: the policy's words whole, and one sentence added", async () => {
+      const alone = await harness({ ...asking, modules: [lab()] });
+      let policyWords = '';
+      let aloneDraft = '';
+      try {
+        await alone.turn([
+          createMockResponse([text('Hello there.'), skip('k1')], 'tool_use'),
+          createMockResponse([skip('k2')], 'tool_use'),
+        ]);
+        policyWords = alone.toolResults()[0]!;
+        aloneDraft = alone.drafts().find((d) => d.text === 'Hello there.')!.id;
+      } finally {
+        await alone.close();
+      }
+      assert.ok(policyWords.startsWith('[drafts]') && policyWords.includes(aloneDraft), `premise: the policy alone refused: ${policyWords}`);
+      const h = await harness({ ...asking, modules: [lab()] });
+      const ended = endings(h);
+      try {
+        await h.turn([
+          createMockResponse([text('Hello there.'), failed('l1'), skip('k1')], 'tool_use'),
+          createMockResponse([text('Another note.'), failed('l2'), skip('k2')], 'tool_use'),
+          createMockResponse([skip('k3')], 'tool_use'),
+        ]);
+        const results = h.toolResults();
+        const held = h.drafts().find((d) => d.text === 'Hello there.')!;
+        assert.equal(results[1], `${policyWords.replaceAll(aloneDraft, held.id)} lab--send_file also failed in the same step, and its answer says why.`);
+        assert.ok(roundTaken(h, 'k2'), 'the model was called again');
+        const later = answerOf(h, 'k2');
+        assert.ok(later !== undefined && !later.includes("didn't run"), `no later skip_reply is refused: ${later}`);
+        assert.ok(!roundTaken(h, 'k3'));
+        assert.equal(ended(), 1);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("the policy's refusal in one step, then a failed call beside skip_reply in the next: the rule's refusal, and a third skip_reply runs", async () => {
+      const h = await harness({ ...asking, modules: [lab()] });
+      const ended = endings(h);
+      try {
+        await h.turn([
+          createMockResponse([text('Hello there.'), skip('k1')], 'tool_use'),
+          createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
+          createMockResponse([skip('k3')], 'tool_use'),
+        ]);
+        const results = h.toolResults();
+        assert.ok(results[0]!.startsWith('[drafts]'), 'premise: the policy refused k1');
+        assert.equal(results[2], refusal('lab--send_file'));
+        assert.ok(roundTaken(h, 'k3'));
+        assert.equal(ended(), 1);
+      } finally {
+        await h.close();
+      }
+    });
+  });
+
+  it("native tool mode: text in the refused call's step stays private, and a later step's text is posted", async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([text('After it, posted.')]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a failed call beside skip_reply refuses it, and plain text after the refusal is posted as in a turn without it", async () => {
+    const h = await harness({ modules: [lab()], xml: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
+        { ...createMockResponse([text('Beside the refused skip.'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--send_file')), text('After it, posted.')]), toolCalls: [] },
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  const sendToRoom = (id: string) => call(id, 'discord--send_message', { channelId: ROOM, text: 'an explicit note' });
+
+  it("native tool mode: a refusal gives back the silence from before it, so a send's silence still holds a later step's text", async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: true }], modules: [lab()], sendTool: true });
+    try {
+      await h.turn([
+        createMockResponse([sendToRoom('s1')], 'tool_use'),
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([text('Held by the send.')]),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM], 'premise: the send went out');
+      assert.deepEqual(h.publishes(), []);
+      assert.ok(h.drafts().some((d) => d.text === 'Held by the send.'), 'the send kept the text back as a draft');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a refusal gives back the silence from before it, so a send's silence still holds the trailing text", async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: true }], modules: [lab()], sendTool: true, xml: true });
+    try {
+      await h.turn([
+        createMockResponse([sendToRoom('s1')], 'tool_use'),
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        { ...createMockResponse([sendToRoom('s1-reparsed'), result('s1-reparsed', 'sent'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--send_file')), text('Held by the send.')]), toolCalls: [] },
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.deepEqual(h.publishes(), []);
+      assert.ok(h.drafts().some((d) => d.text === 'Held by the send.'), 'the send kept the text back as a draft');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode with sameRoundSkipReplyTextPolicy 'ask': the refused call's round's text is held at the turn's end, and later text is posted", async () => {
+    const h = await harness({ agents: [{ name: 'scout', sameRoundSkipReplyTextPolicy: 'ask' }], modules: [lab()], xml: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
+        { ...createMockResponse([text('Beside the refused skip.'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--send_file')), text('After it, posted.')]), toolCalls: [] },
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Beside the refused skip.', 'skip-reply']]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the refused call reports nothing to a tool-lifecycle observer, and the skip_reply that then runs reports started and completed', async () => {
+    const h = await harness({ modules: [lab()] });
+    const phases = lifecycle(h);
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      const of = (id: string) => phases().filter((p) => p.startsWith(`${id}:`));
+      assert.deepEqual(of('k1'), [], 'the refused call reports nothing');
+      assert.deepEqual(of('k2'), ['k2:started', 'k2:completed']);
+    } finally {
+      await h.close();
+    }
   });
 });

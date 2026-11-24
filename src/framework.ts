@@ -171,7 +171,7 @@ import { markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, supplie
 import { NOTICE_TAG } from './notice-tags.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { SILENCING_SENDS, bareToolName } from './send-tools.js';
+import { SILENCING_SENDS, bareToolName, isSpeechTool } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -226,7 +226,7 @@ import { CHILD_ENTRY, ChildCapacity, maxResultBytes, type ToolAnswer } from './c
 import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
-import { proseRunGroups, splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { proseRunGroups, splitProseRuns, toolUsesOfRounds, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
@@ -340,9 +340,13 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  return call.name === 'drafts'
-    && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+  return isDraftsResend(call);
 };
+
+const isDraftsResend = (call: { name: string; input?: unknown }): boolean => call.name === 'drafts'
+  && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+
+const isSendCall = (call: { name: string; input?: unknown }): boolean => isSpeechTool(call.name) || isDraftsResend(call);
 
 /** Hybrid prose envelopes: every line starting with `>>>` opens a new one.
  *  Leading whitespace before a `>>>` is dropped; blank envelopes are skipped. */
@@ -1608,6 +1612,7 @@ interface TurnRouting {
   unpostedSpeech?: true;
   privateEnd?: true;
   skipReplyAsked?: true;
+  skipReplyFailedCall?: true;
   silent?: true;
   liveSpeech?: true;
   speechRouting?: number;
@@ -1757,6 +1762,10 @@ function turnInputs(
 type SpeechPublished = (to: PublishDestination, text: string, messageId: string | undefined) => void;
 
 type SkipHeld = { held: Draft[]; target?: ChannelRef; wouldHold: boolean };
+
+type SkipVerdict = { held: SkipHeld[]; failed: string[] };
+
+type StepWait = { agent: Agent; streamId: number; sends: string[]; settle: (failed: string[]) => void };
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
@@ -5099,7 +5108,8 @@ export class AgentFramework {
   /** Per agent, a round that called code_execution or sent, and waits for
    *  those calls' results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
-  private readonly skipReplyAsks = new Map<string, Promise<SkipHeld[]>>();
+  private readonly skipReplyHolds = new Map<string, { streamId: number; verdict: Promise<SkipVerdict> }>();
+  private readonly stepWaits = new Map<string, StepWait>();
   /** Each code_execution result, by the round that dispatched its call: it
    *  settles only that round, even if a newer round reuses its call id. */
   private scriptRoundOfResult: WeakMap<ToolResult, ScriptRound> = new WeakMap();
@@ -13441,6 +13451,7 @@ export class AgentFramework {
     // agent's wakes), and neither wake goes to a name that's gone.
     this.eventGate?.agentGone(name);
     this.agents.delete(name);
+    this.forgetSkipReplyHolds(name);
     this.forgetPresentation(agent);
     this.agentConfigs.delete(name);
     this.deadlineCuts.delete(name);
@@ -14397,6 +14408,7 @@ export class AgentFramework {
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
         this.agents.delete(agent.name);
+        this.forgetSkipReplyHolds(agent.name);
         this.forgetPresentation(agent);
         this.deadlineCuts.delete(agent.name);
         this.freshCallsCut.delete(agent.name);
@@ -19566,6 +19578,7 @@ export class AgentFramework {
       }
       if (agent && agent.state.status === 'waiting_for_tools') {
         agent.provideToolResult(event.callId, event.result);
+        this.settleStepWait(agent);
 
         // Check if agent is now ready (state may have changed after provideToolResult)
         // Cast to AgentState to bypass TypeScript's control flow narrowing
@@ -28479,6 +28492,7 @@ export class AgentFramework {
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       if (continued?.start) routing.start = continued.start;
       if (continued?.triggerRows !== undefined) routing.triggerRows = continued.triggerRows;
+      if (continued?.skipReplyFailedCall) routing.skipReplyFailedCall = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -29450,6 +29464,7 @@ export class AgentFramework {
     // opposed to a private think: under 'ask' their text is held where
     // nothing routed it live (skipHoldsAtEnd).
     const skipPrivateRounds = new Set<number>();
+    const failedCallRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -29921,12 +29936,42 @@ export class AgentFramework {
               : -1;
             const askingCall = askingAt >= 0 ? roundCalls[askingAt] : undefined;
             let answerAsk: ((held: SkipHeld[]) => void) | undefined;
-            if (askingAt >= 0) {
-              this.skipReplyAsks.set(`${agent.name}\u0000${calls[askingAt]!.id}`, new Promise((resolve) => { answerAsk = resolve; }));
-            }
-            let askedSilence: TurnSilence | null = null;
+            const asked = askingAt >= 0 ? new Promise<SkipHeld[]>((resolve) => { answerAsk = resolve; }) : undefined;
             const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
               && agent.state.status === 'waiting_for_tools';
+            const waitingAt = !this.channelRegistry || streamRouting.skipReplyFailedCall || !calls.some(isSendCall)
+              ? []
+              : calls.flatMap((c, i) => (c.name === 'skip_reply' && roundCalls[i]!.permitted && !roundCalls[i]!.refused ? [i] : []));
+            const heldAt = [...new Set([...(askingAt >= 0 ? [askingAt] : []), ...waitingAt])];
+            const waitingCalls = new Set(waitingAt.map((i) => roundCalls[i]!));
+            const heldIds = new Set(heldAt.map((i) => calls[i]!.id));
+            let askedSilence: TurnSilence | null = null;
+            let failedSilence: TurnSilence | null | undefined;
+            let failedCallRefused = false;
+            const failed = waitingAt.length === 0 ? undefined : new Promise<string[]>((settle) => {
+              this.stepWaits.set(agent.name, {
+                agent, streamId: myStreamId, sends: calls.filter(isSendCall).map((c) => c.id), settle,
+              });
+            }).then((names) => {
+              if (names.length > 0 && waits()) {
+                streamRouting.skipReplyFailedCall = true;
+                failedCallRefused = true;
+                if (failedSilence !== undefined) silenceBeforeRefusal = failedSilence;
+                refusedWakeRounds.add(toolRound);
+                skipPrivateRounds.add(toolRound);
+                failedCallRounds.add(toolRound);
+              }
+              return names;
+            });
+            for (const i of heldAt) {
+              this.skipReplyHolds.set(`${agent.name}\u0000${calls[i]!.id}`, {
+                streamId: myStreamId,
+                verdict: Promise.all([
+                  i === askingAt && asked ? asked : Promise.resolve([]),
+                  waitingAt.includes(i) && failed ? failed : Promise.resolve([]),
+                ]).then(([held, failedNames]) => ({ held, failed: failedNames })),
+              });
+            }
             const settleAsk = (held: SkipHeld[]): void => {
               const answer = answerAsk;
               if (!answer) return;
@@ -29934,7 +29979,7 @@ export class AgentFramework {
               if (!waits()) return;
               if (held.some((h) => !h.wouldHold)) {
                 streamRouting.skipReplyAsked = true;
-                silenceBeforeRefusal = askedSilence;
+                silenceBeforeRefusal = failedCallRefused ? failedSilence ?? null : askedSilence;
                 answer(held);
                 return;
               }
@@ -29968,6 +30013,10 @@ export class AgentFramework {
               }
               silence = mergeSilence(silence, roundSilenceOf(calls, toolRound));
               if (askingCall) askedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && c !== askingCall), toolRound));
+              if (waitingCalls.size > 0) {
+                failedSilence = mergeSilence(before, roundSilenceOf(calls.filter((c) => !c.refused && !waitingCalls.has(c)), toolRound));
+                if (failedCallRefused) silenceBeforeRefusal = failedSilence;
+              }
               turnSends = mergeSends(turnSends, sendsOf(calls, toolRound));
               const roundSilence = silence;
               const draftsRound = calls.some((c) => c.permitted && c.name === 'drafts'); // #701
@@ -30139,13 +30188,14 @@ export class AgentFramework {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
               // `started` goes out once dispatch returns, or for a skip_reply
-              // the guard asks about, once its answer runs it. Refusal sites
+              // that waits for the guard's answer or for the other calls of
+              // its step, once it runs. Refusal sites
               // inside dispatch run synchronously and call refuse() first, as
               // the guard's refusal does, so a call the host refuses produces
               // no events.
               this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call, streamRouting.turnId);
-              if (call !== calls[askingAt]) this.toolLifecycleEmitter?.open(agent.name, call.id);
+              if (!heldIds.has(call.id)) this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             if (scriptCallIds.length === 0 && sendCallIds.length === 0) routeRound(roundCalls);
@@ -30288,6 +30338,7 @@ export class AgentFramework {
               for (const pendingId of stillRunning) {
                 agent.provideToolResult(pendingId, { ...notReceived });
               }
+              this.stepWaits.delete(agent.name);
               // Store the round and its results, with the same bounded spill
               // policy as the ordinary path (issue #89: this guard path must
               // not become the one door a giant blob still walks through).
@@ -30835,6 +30886,7 @@ export class AgentFramework {
               // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
+              const failedCallBlocks: ReadonlySet<object> = toolUsesOfRounds(response.content, failedCallRounds);
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { id?: unknown; name?: unknown; input?: unknown; unparseableInput?: string })
@@ -30846,7 +30898,7 @@ export class AgentFramework {
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
                 ? null
-                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c)), agent.getEffectiveSendSilencing());
+                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c) && !(c.name === 'skip_reply' && failedCallBlocks.has(c))), agent.getEffectiveSendSilencing());
               const trailingSilence: TurnSilence | null = liveProseRouting
                 ? silence
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
@@ -31707,6 +31759,8 @@ export class AgentFramework {
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
       this.decideWaitingRound(agent, myStreamId, 'its stream ended');
+      const stepWait = this.stepWaits.get(agent.name);
+      if (stepWait?.agent === agent && stepWait.streamId === myStreamId) this.stepWaits.delete(agent.name);
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,
@@ -34026,15 +34080,45 @@ export class AgentFramework {
     this.dispatchChannelToolCall(agentName, enrichedCall);
   }
 
-  private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[]): void {
-    const routing = this.callingTurnOf(agentName, call);
-    const own = routing ? this.ownChannels(routing) : [];
-    const drafts = held.flatMap((h) => h.held);
-    const error = `${held.map((h) => this.draftsHeldNotice(agentName, h.held, 'skip-reply', undefined, h.target, own)).join(' ')} ` +
-      `Where should ${drafts.length > 1 ? 'they' : 'it'} go, if anywhere? This skip_reply didn't run, so your turn goes on: ` +
-      `to end it and keep the draft${drafts.length > 1 ? 's' : ''}, call skip_reply again, with wake_in_seconds again if you set a wake. ` +
-      "A line meant only for yourself fits in skip_reply's reason.";
-    console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
+  private forgetSkipReplyHolds(name: string): void {
+    this.stepWaits.delete(name);
+    for (const key of this.skipReplyHolds.keys()) {
+      if (key.startsWith(`${name}\u0000`)) this.skipReplyHolds.delete(key);
+    }
+  }
+
+  private settleStepWait(agent: Agent): void {
+    const wait = this.stepWaits.get(agent.name);
+    if (!wait) return;
+    const state = agent.state;
+    if (wait.agent !== agent || wait.streamId !== agent.streamId || state.status !== 'waiting_for_tools') {
+      this.stepWaits.delete(agent.name);
+      return;
+    }
+    if (wait.sends.some((id) => state.pending.has(id))) return;
+    this.stepWaits.delete(agent.name);
+    const failed = new Map(state.completed.filter((c) => c.result.isError === true).map((c) => [c.id, c.name]));
+    wait.settle(wait.sends.flatMap((id) => failed.get(id) ?? []));
+  }
+
+  private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[], failed: string[]): void {
+    const tools = [...new Set(failed)];
+    const named = tools.length <= 1 ? tools.join('') : `${tools.slice(0, -1).join(', ')} and ${tools[tools.length - 1]}`;
+    const why = `${named} ${held.length > 0 ? 'also ' : ''}failed in the same step, and ${failed.length > 1 ? 'their answers say' : 'its answer says'} why.`;
+    let error: string;
+    if (held.length > 0) {
+      const routing = this.callingTurnOf(agentName, call);
+      const own = routing ? this.ownChannels(routing) : [];
+      const drafts = held.flatMap((h) => h.held);
+      error = `${held.map((h) => this.draftsHeldNotice(agentName, h.held, 'skip-reply', undefined, h.target, own)).join(' ')} ` +
+        `Where should ${drafts.length > 1 ? 'they' : 'it'} go, if anywhere? This skip_reply didn't run, so your turn goes on: ` +
+        `to end it and keep the draft${drafts.length > 1 ? 's' : ''}, call skip_reply again, with wake_in_seconds again if you set a wake. ` +
+        "A line meant only for yourself fits in skip_reply's reason." + (failed.length > 0 ? ` ${why}` : '');
+      console.error(`[skip-reply] agent=${agentName} skip_reply refused once (sameRoundSkipReplyTextPolicy=ask): its round's text is held as ${drafts.map((d) => d.id).join(', ')}`);
+    } else {
+      error = `This skip_reply didn't run: ${why} To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.`;
+    }
+    if (failed.length > 0) console.error(`[skip-reply] agent=${agentName} skip_reply refused once: ${named} failed in the same step`);
     const result = this.refusedResult(agentName, call.id, error);
     this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error });
     this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'channels', result });
@@ -34275,6 +34359,9 @@ export class AgentFramework {
         // wake_in_seconds without a gate, and one that isn't a number of
         // seconds with one.
         if (enrichedCall.name === 'skip_reply') {
+          const key = `${agentName}\u0000${enrichedCall.id}`;
+          const hold = this.skipReplyHolds.get(key);
+          this.skipReplyHolds.delete(key);
           const error = this.skipReplyRefusal(enrichedCall);
           if (error !== undefined) {
             const wakeValue = (enrichedCall.input as { wake_in_seconds?: unknown } | null | undefined)?.wake_in_seconds;
@@ -34284,14 +34371,13 @@ export class AgentFramework {
             this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, toolName: enrichedCall.name, agentName, moduleName: 'channels', result });
             return;
           }
-          const key = `${agentName}\u0000${enrichedCall.id}`;
-          const asked = this.skipReplyAsks.get(key);
-          this.skipReplyAsks.delete(key);
-          if (asked) {
-            void asked.then((held) => {
-              if (!this.agents.get(agentName)?.getPendingToolIds().includes(enrichedCall.id)) return;
-              if (held.length > 0) {
-                this.refuseSkipReplyOnce(agentName, enrichedCall, held);
+          const holder = this.agents.get(agentName);
+          if (hold && holder?.streamId === hold.streamId) {
+            void hold.verdict.then(({ held, failed }) => {
+              if (this.agents.get(agentName) !== holder || holder.streamId !== hold.streamId
+                || !holder.getPendingToolIds().includes(enrichedCall.id)) return;
+              if (held.length > 0 || failed.length > 0) {
+                this.refuseSkipReplyOnce(agentName, enrichedCall, held, failed);
                 return;
               }
               this.toolLifecycleEmitter?.open(agentName, enrichedCall.id);
