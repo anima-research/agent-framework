@@ -2293,6 +2293,9 @@ describe('a held draft left alone for a whole turn is set aside', () => {
       assert.equal(stateOf(h, draft!.id), 'held', 'the turn that tried to send it does not set it aside');
       await h.turn([createMockResponse([drafts('r2', { action: 'read', draftIds: [draft!.id] })], 'tool_use'), createMockResponse([])]);
       assert.equal(stateOf(h, draft!.id), 'held', 'nor does one that read it');
+      await h.turn([createMockResponse([drafts('r3', { action: 'read', draftIds: [draft!.id, 'd-nosuch1'] })], 'tool_use'), createMockResponse([])]);
+      assert.match(h.toolResults()[0]!, /No draft of yours with id d-nosuch1/, 'premise: the whole call was refused');
+      assert.equal(stateOf(h, draft!.id), 'held', 'nor one whose call was refused whole for another id');
       await h.turn([createMockResponse([drafts('l1', { action: 'list' })], 'tool_use'), createMockResponse([])]);
       assert.equal(stateOf(h, draft!.id), 'dismissed', 'a listing names no draft');
     } finally {
@@ -2305,14 +2308,19 @@ describe('a held draft left alone for a whole turn is set aside', () => {
     try {
       await h.turn(heldBack);
       const [draft] = h.drafts();
-      await h.turn([createMockResponse([call('k1', 'skip_reply', {})], 'tool_use'), createMockResponse([])]);
+      let toolEnded = 0;
+      h.framework.onTrace((ev) => { if (ev.type === 'inference:turn_ended') toolEnded++; });
+      const streams = h.membrane.calls.length;
+      await h.turn([createMockResponse([call('k1', 'skip_reply', {})], 'tool_use')]);
+      assert.equal(toolEnded, 1, 'premise: the skip_reply ended the turn');
+      assert.equal(h.membrane.calls.length, streams + 1, 'premise: no further response was asked for');
       assert.equal(stateOf(h, draft!.id), 'dismissed');
     } finally {
       await h.close();
     }
   });
 
-  it('a turn that is refused, one that fails, and a silent one set nothing aside: the resident may not have read the notice', async () => {
+  it('a turn that is refused, cut off, or fails, and a silent one, set nothing aside: the resident may not have read the notice', async () => {
     const h = await harness({ retries: 0 });
     try {
       await h.turn(heldBack);
@@ -2320,6 +2328,8 @@ describe('a held draft left alone for a whole turn is set aside', () => {
       const refusal = { ...createMockResponse([text('discarded')], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test' } } } } as NormalizedResponse;
       await h.turn([refusal]);
       assert.equal(stateOf(h, draft!.id), 'held', 'a refused turn leaves it open');
+      await h.turn([createMockResponse([text('cut off mid-')], 'max_tokens')]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'a turn cut off at the output limit leaves it open');
       failWhileToolsRun(h.membrane);
       await h.turn([createMockResponse([call('l1', 'channel_list', {})], 'tool_use')]);
       assert.equal(stateOf(h, draft!.id), 'held', 'a failed turn leaves it open');
@@ -2339,6 +2349,7 @@ describe('a held draft left alone for a whole turn is set aside', () => {
       const [draft] = h.drafts();
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(h.store().get('scout', draft!.id)!.attempts.map((a) => a.outcome?.status), ['failed'], 'premise: the attempt was made, and failed');
       assert.equal(stateOf(h, draft!.id), 'held', 'a failed resend leaves it held, and its turn does not set it aside');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       await h.turn([createMockResponse([drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);

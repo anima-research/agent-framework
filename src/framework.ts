@@ -24152,8 +24152,9 @@ export class AgentFramework {
    * the turn's `drafts` calls named (TurnRouting.draftsNamed). The resident
    * had the whole turn to resend it and left it alone, so it asks nothing
    * more of them: no call to make, and no growing list of open drafts. A turn
-   * that fails, is stopped or ends in a refusal sets nothing aside, since its
-   * resident may never have read the notice. A bounce stays open: it is a message its resident
+   * that fails, is stopped, is cut off or ends in a refusal sets nothing
+   * aside, since its resident may never have read the notice, or reached what
+   * it meant to do. A bounce stays open: it is a message its resident
    * addressed and that didn't arrive, which may wait for a destination to
    * come back, and `{{unsent}}` means it. So do a draft that may already have
    * been posted (its risk is the resident's to answer) and one queued in a
@@ -24295,6 +24296,11 @@ export class AgentFramework {
         return refuse('draftIds must be a list of draft ids such as "d-k7x3qm2", or null.');
       }
       ids = (input.draftIds as string[]).map((id) => id.trim());
+      // Naming a draft is something done with it: its turn's end doesn't set
+      // it aside (setAsideIdleDrafts), whatever becomes of the call, a
+      // refusal of the whole call included.
+      const naming = turn ?? this.openLogical.get(agentName);
+      if (naming) for (const id of ids) (naming.draftsNamed ??= new Set()).add(id);
       if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');
       if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
     }
@@ -24342,10 +24348,6 @@ export class AgentFramework {
         `is kept for at least ${AgentFramework.DRAFT_KEEP_DAYS} days after anything last happened to it). drafts(action: "list") shows your open drafts.`,
       );
     }
-    // Naming a draft is something done with it: its turn's end doesn't set it
-    // aside (setAsideIdleDrafts), whatever becomes of the call.
-    const naming = turn ?? this.openLogical.get(agentName);
-    if (naming) for (const d of drafts) (naming.draftsNamed ??= new Set()).add(d.id);
 
     if (action === 'read') {
       const blocks = drafts.map((d) => {
@@ -30967,8 +30969,10 @@ export class AgentFramework {
             } else if (!trigger?.suppressProse) {
               this.appendClosedChannelNoteAlone(agent, streamRouting);
             }
-            // A refusal is no turn of the resident's: it read nothing it could act on.
-            if (!trigger?.suppressProse && response.stopReason !== 'refusal') this.setAsideIdleDrafts(agent, streamRouting);
+            // Only a turn the model ended itself: a refusal read nothing it
+            // could act on, and a turn cut off (the output limit, the stall
+            // guard) may not have reached what it meant to do with a draft.
+            if (!trigger?.suppressProse && AUTO_CONTINUE_STOP_REASONS.has(response.stopReason)) this.setAsideIdleDrafts(agent, streamRouting);
 
             // A `!` continuation this turn asked for. This gives prose the
             // same continuation ability tool rounds have (wanted for
