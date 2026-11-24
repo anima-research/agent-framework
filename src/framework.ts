@@ -28413,6 +28413,7 @@ export class AgentFramework {
       if (continued?.unflushedRounds) routing.unflushedRounds = continued.unflushedRounds;
       if (continued?.start) routing.start = continued.start;
       if (continued?.triggerRows !== undefined) routing.triggerRows = continued.triggerRows;
+      if (continued?.skipReplyFailedCall) routing.skipReplyFailedCall = true;
       opensTurn = true;
     } else {
       const open = this.openLogical.get(agent.name);
@@ -34010,11 +34011,12 @@ export class AgentFramework {
     if (wait.others.some((id) => state.pending.has(id))) return;
     this.stepWaits.delete(agent.name);
     const failed = new Map(state.completed.filter((c) => c.result.isError === true).map((c) => [c.id, c.name]));
-    wait.settle([...new Set(wait.others.flatMap((id) => failed.get(id) ?? []))]);
+    wait.settle(wait.others.flatMap((id) => failed.get(id) ?? []));
   }
 
   private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[], failed: string[]): void {
-    const named = failed.length <= 1 ? failed.join('') : `${failed.slice(0, -1).join(', ')} and ${failed[failed.length - 1]}`;
+    const tools = [...new Set(failed)];
+    const named = tools.length <= 1 ? tools.join('') : `${tools.slice(0, -1).join(', ')} and ${tools[tools.length - 1]}`;
     const why = `${named} ${held.length > 0 ? 'also ' : ''}failed in the same step, and ${failed.length > 1 ? 'their answers say' : 'its answer says'} why.`;
     let error: string;
     if (held.length > 0) {
