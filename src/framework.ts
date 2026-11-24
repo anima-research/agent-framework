@@ -226,7 +226,7 @@ import { CHILD_ENTRY, ChildCapacity, maxResultBytes, type ToolAnswer } from './c
 import { DEFAULT_OUTPUT_BOUNDS } from './code-execution/isolate/output.js';
 import type { PreludeTool } from './code-execution/isolate/prelude.js';
 import { bounded, renderList, renderReturn, VALUE_CHARS } from './code-execution/isolate/render.js';
-import { proseRunGroups, splitProseRuns, withoutRoundsProse } from './prose-segments.js';
+import { proseRunGroups, splitProseRuns, toolUsesOfRounds, withoutRoundsProse } from './prose-segments.js';
 import { AUTO_CONTINUE_REASON, AUTO_CONTINUE_STOP_REASONS, autoContinueNotice } from './auto-continue.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
@@ -29385,7 +29385,7 @@ export class AgentFramework {
     // opposed to a private think: under 'ask' their text is held where
     // nothing routed it live (skipHoldsAtEnd).
     const skipPrivateRounds = new Set<number>();
-    const failedCallSkips = new Set<string>();
+    const failedCallRounds = new Set<number>();
     let toolRounds = 0;
     // A refused skip_reply silences only its own round: the silence before it,
     // saved with its cause as its round is routed (once its calls are
@@ -29879,7 +29879,7 @@ export class AgentFramework {
                 if (failedSilence !== undefined) silenceBeforeRefusal = failedSilence;
                 refusedWakeRounds.add(toolRound);
                 skipPrivateRounds.add(toolRound);
-                for (const i of waitingAt) failedCallSkips.add(calls[i]!.id);
+                failedCallRounds.add(toolRound);
               }
               return names;
             });
@@ -30806,6 +30806,7 @@ export class AgentFramework {
               // injected message can reset. The XML tool path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
+              const failedCallBlocks: ReadonlySet<object> = toolUsesOfRounds(response.content, failedCallRounds);
               const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => b as unknown as { id?: unknown; name?: unknown; input?: unknown; unparseableInput?: string })
@@ -30817,7 +30818,7 @@ export class AgentFramework {
               // A refused skip_reply isn't a silencing call; a plain one is.
               const fallbackCause = liveProseRouting
                 ? null
-                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c) && !(typeof c.id === 'string' && failedCallSkips.has(c.id))), agent.getEffectiveSendSilencing());
+                : silenceCauseOf(toolCalls.filter((c) => !this.refusesSelfWake(c) && !(c.name === 'skip_reply' && failedCallBlocks.has(c))), agent.getEffectiveSendSilencing());
               const trailingSilence: TurnSilence | null = liveProseRouting
                 ? silence
                 : silence === 'private' || fallbackCause === 'private' || cutHeld ? 'private' : turnSends;
@@ -31674,6 +31675,8 @@ export class AgentFramework {
       // with its scripts returned while its turn waited, is routed, each
       // unanswered send counting as one that may have posted anywhere.
       this.decideWaitingRound(agent, myStreamId, 'its stream ended');
+      const stepWait = this.stepWaits.get(agent.name);
+      if (stepWait?.agent === agent && stepWait.streamId === myStreamId) this.stepWaits.delete(agent.name);
 
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to (completeOutgoing). Every exit path does,
