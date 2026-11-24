@@ -380,7 +380,7 @@ const draftsToolDescription = (sendSilencing: boolean): string =>
   `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
   `drafts are always kept; an older one may be let go once ${Math.round(KEEP_IDLE_MS / 86_400_000)} days pass in which nothing happens to it. ` +
   'A held draft that you leave alone for a whole turn is set aside when that turn ends, as dismiss does; one that ' +
-  'bounced, or that may already have been posted, stays open until you resend or dismiss it. ' +
+  'bounced, or that may already have been posted, is left open. ' +
   'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
   'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
   'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
@@ -1501,6 +1501,8 @@ interface TurnRouting {
   turnId: number;
   /** When the turn's routing was made: a held draft that nothing has happened to since is one the turn left alone (setAsideIdleDrafts). */
   openedAt: number;
+  /** The drafts the turn's own `drafts` calls named (read, resend, dismiss). Something was done with them, so the turn's end sets none of them aside, though a resend refused before its attempt is journaled leaves no record on the draft. */
+  draftsNamed?: Set<string>;
   /**
    * The channel whose message triggered the turn (item-3 redux), which the
    * locus is resolved from when the turn opens, and which the channel
@@ -23925,8 +23927,8 @@ export class AgentFramework {
     // so only it is given its dismissal, and the others are then named.
     const aside = [
       ...(free.length > 0
-        ? [`left alone, ${risky.length > 0 ? free.map((d) => d.id).join(', ') : free.length > 1 ? 'they' : 'it'} ` +
-          `${free.length > 1 ? 'are' : 'is'} set aside when your next turn ends`]
+        ? [`left alone for a whole turn, ${risky.length > 0 ? free.map((d) => d.id).join(', ') : free.length > 1 ? 'they' : 'it'} ` +
+          `${free.length > 1 ? 'are' : 'is'} set aside when that turn ends`]
         : []),
       ...(risky.length > 0
         ? [`drafts(action: "dismiss", draftIds: [${quoted(risky)}]) sets ${risky.length > 1 ? 'them' : 'it'} aside`]
@@ -24146,11 +24148,12 @@ export class AgentFramework {
   /**
    * A turn's own end (its last response, or a tool that ends it): set aside,
    * as the resident's dismissal would, each held draft a notice named before
-   * the turn opened and nothing has happened to since. The resident had the
-   * whole turn to resend it and left it alone, so it asks nothing more of
-   * them: no call to make, and no growing list of open drafts. A turn that
-   * fails or is stopped sets nothing aside, since its resident may never have
-   * read the notice. A bounce stays open: it is a message its resident
+   * the turn opened, that nothing has happened to since, and that none of
+   * the turn's `drafts` calls named (TurnRouting.draftsNamed). The resident
+   * had the whole turn to resend it and left it alone, so it asks nothing
+   * more of them: no call to make, and no growing list of open drafts. A turn
+   * that fails, is stopped or ends in a refusal sets nothing aside, since its
+   * resident may never have read the notice. A bounce stays open: it is a message its resident
    * addressed and that didn't arrive, which may wait for a destination to
    * come back, and `{{unsent}}` means it. So do a draft that may already have
    * been posted (its risk is the resident's to answer) and one queued in a
@@ -24160,7 +24163,7 @@ export class AgentFramework {
     const setAside: string[] = [];
     try {
       for (const d of this.proseDrafts.idleSince(agent.name, routing.openedAt)) {
-        if (d.reason === 'bounced' || this.draftsInFlight.has(`${agent.name}\u0000${d.id}`)) continue;
+        if (d.reason === 'bounced' || routing.draftsNamed?.has(d.id) || this.draftsInFlight.has(`${agent.name}\u0000${d.id}`)) continue;
         this.proseDrafts.dismiss(agent.name, d.id);
         setAside.push(d.id);
       }
@@ -24339,6 +24342,10 @@ export class AgentFramework {
         `is kept for at least ${AgentFramework.DRAFT_KEEP_DAYS} days after anything last happened to it). drafts(action: "list") shows your open drafts.`,
       );
     }
+    // Naming a draft is something done with it: its turn's end doesn't set it
+    // aside (setAsideIdleDrafts), whatever becomes of the call.
+    const naming = turn ?? this.openLogical.get(agentName);
+    if (naming) for (const d of drafts) (naming.draftsNamed ??= new Set()).add(d.id);
 
     if (action === 'read') {
       const blocks = drafts.map((d) => {
@@ -24744,7 +24751,7 @@ export class AgentFramework {
         `(not sent — drafts can resend them unchanged${otherwise})`,
       );
     };
-    heldNote(held.filter((d) => d.reason !== 'bounced'), '; left alone, they are set aside when your next turn ends');
+    heldNote(held.filter((d) => d.reason !== 'bounced'), '; left alone for a whole turn, they are set aside when that turn ends');
     heldNote(held.filter((d) => d.reason === 'bounced'), ', or dismiss them');
     if (letGo.length > 0) {
       notes.push(
@@ -30960,7 +30967,8 @@ export class AgentFramework {
             } else if (!trigger?.suppressProse) {
               this.appendClosedChannelNoteAlone(agent, streamRouting);
             }
-            if (!trigger?.suppressProse) this.setAsideIdleDrafts(agent, streamRouting);
+            // A refusal is no turn of the resident's: it read nothing it could act on.
+            if (!trigger?.suppressProse && response.stopReason !== 'refusal') this.setAsideIdleDrafts(agent, streamRouting);
 
             // A `!` continuation this turn asked for. This gives prose the
             // same continuation ability tool rounds have (wanted for
