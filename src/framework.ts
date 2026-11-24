@@ -38305,11 +38305,11 @@ export class AgentFramework {
     }
 
     st.inFlight = true;
+    // A manifest, and the policy negotiated for it, belong to the transport
+    // they came on: one that closes meanwhile installs nothing, since the
+    // next transport's initialize and policy exchange start afresh.
+    const epoch = connection.transportEpoch;
     try {
-      // A manifest, and the policy negotiated for it, belong to the transport
-      // they came on: one that closes meanwhile installs nothing, since the
-      // next transport's initialize and policy exchange start afresh.
-      const epoch = connection.transportEpoch;
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -38472,6 +38472,9 @@ export class AgentFramework {
         impacts,
       });
       this.handleToolsListChanged(connection.id);
+    } catch (err) {
+      if (connection.transportEpoch === epoch && connection.noGrantEnd === null && connection.grantAdmitsNoGatedMessage()) connection.noGrantEnd = 'host-error';
+      throw err;
     } finally {
       st.inFlight = false;
       st.lastCompletedAt = Date.now();
