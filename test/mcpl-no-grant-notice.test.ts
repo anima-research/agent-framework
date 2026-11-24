@@ -18,6 +18,7 @@ const notice = (method: string, cause: string, tail: string) =>
   `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant for such messages, because ${cause}. ` +
   `So for now its pushes and channel messages don't reach you. ${tail ? `${tail} ` : ''}If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
 const UPDATE = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const OLD_SERVER = 'The server declares an MCPL version before 0.5. Such a server does not take that request, and it needs an update to MCPL 0.5.';
 const ENDED = '[no-grant] The MCPL server "radio" now holds a grant. The host accepts the messages that its grant covers.';
 const CAUSE = {
   unanswered: "it did not answer the host's policy request",
@@ -267,6 +268,27 @@ test('case 11: a server that answers the policy Request with an error: the notic
   server.peer.notify('push/event', ring('r1', 'one'));
   await waitFor(() => notices(fw).length === 1, 'the notice');
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
+});
+
+test('a server that declares an MCPL version from before 0.5, and never answers the policy Request: the notice says so as a fact', async (t) => {
+  const { server, fw } = await setup(t, unanswered, {}, { version: '0.4', ...advert() });
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, OLD_SERVER));
+});
+
+test('a server that declares a version that is no string, and never answers the policy Request: the notice keeps its words for a possible cause', async (t) => {
+  const { server, fw } = await setup(t, unanswered, {}, { version: 4, ...advert() });
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, UPDATE));
+});
+
+test('a server that declares MCPL 0.5 or later, and answers the policy Request with an error: the notice says nothing of an old server', async (t) => {
+  const { server, fw } = await setup(t, answersWithError, {}, { version: '0.5.0-draft', ...advert() });
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, ''));
 });
 
 async function refusedAfterManifestChange(t: TestContext, refusal: Json, logged: string): Promise<void> {
