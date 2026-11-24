@@ -566,6 +566,13 @@ A server that refuses the host's policy is reported as an `mcpl:policy-refused`
 trace. With `fallback: 'close'` the host closes the connection; with
 `'mcp-only'` only plain MCP tools keep working.
 
+A server holds no grant when the host's policy Request gets no answer or an
+error answer, when the server refuses the policy, when it declares no MCPL,
+or when the host's own policy step fails. The host then refuses the server's
+pushes and its other messages that need a capability. At the first such
+refusal, the agent gets a `[no-grant]` notice in its context, of kind
+`mcpl-no-grant`, which names the server and says why it holds no grant.
+
 #### Event coalescing (RFC-006)
 
 The host advertises `eventCoalescing` (both lanes, deferred rendering,

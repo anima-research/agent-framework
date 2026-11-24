@@ -110,7 +110,7 @@ import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from 
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
-import { logDetail, logValue } from './mcpl/log-value.js';
+import { logDetail, logValue, logValueRedacted } from './mcpl/log-value.js';
 import { expandCoreTags, isAmbient, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -38373,7 +38373,7 @@ export class AgentFramework {
         if (receipt && receipt.accepted === false) {
           const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
           const fallback = refusal.fallback;
-          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`);
+          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${typeof receipt.reason === 'string' ? logValueRedacted(receipt.reason, recorded) : 'no reason'}) — fallback: ${fallback}`);
           this.emitTrace({
             type: 'mcpl:policy-refused',
             serverId: connection.id,
@@ -38550,7 +38550,7 @@ export class AgentFramework {
         const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
         const fallback = refusal.fallback;
         console.error(
-          `[mcpl] ${config.id} refused initial policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`,
+          `[mcpl] ${config.id} refused initial policy (${typeof receipt.reason === 'string' ? logValueRedacted(receipt.reason, recorded) : 'no reason'}) — fallback: ${fallback}`,
         );
         this.emitTrace({
           type: 'mcpl:policy-refused',

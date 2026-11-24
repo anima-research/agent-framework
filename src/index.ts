@@ -125,7 +125,7 @@ export {
   checkServerConfig,
 } from './mcpl/index.js';
 export type { McpProtocolFamily, McpServerInfo, McpTransportKind, ServerBinding } from './mcpl/index.js';
-export type { McplHostCapabilities, McplConnectionCloseInfo } from './mcpl/index.js';
+export type { McplHostCapabilities, McplConnectionCloseInfo, McplNoGrantEnd, McplNoGrantRefusal } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
 // needs to write McplServerConfig.toolLifecycle policy and class tables, and
