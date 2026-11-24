@@ -9,46 +9,50 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 function privateBlock(block: Record<string, unknown>): boolean {
-  return (block.type === 'thinking' && typeof block.thinking === 'string')
-    || (block.type === 'redacted_thinking' && typeof block.data === 'string');
+  return block.type === 'thinking' || block.type === 'redacted_thinking';
 }
 
 interface ExtractRow {
   content: unknown;
 }
 
-// Only extract call IDs are indexed. The value distinguishes wrapped calls
-// (true) from direct calls (false), so a named ACT result needs an ACT match.
-function extractCalls(blocks: Iterable<unknown>): Map<string, boolean> {
-  const calls = new Map<string, boolean>();
+function* extractCalls(blocks: Iterable<unknown>): Generator<[string, boolean]> {
   for (const b of blocks) {
     if (!record(b) || b.type !== 'tool_use' || typeof b.id !== 'string' || typeof b.name !== 'string') continue;
     const act = b.name === ACT && record(b.input)
       && typeof b.input.tool === 'string' && b.input.tool.trim() === EXTRACT
       && !(typeof b.input.server === 'string' && b.input.server.trim());
-    // Any extract match wins, even with duplicate IDs. Prefer ACT because
-    // an explicitly named EXTRACT result doesn't need a matching call.
-    if (act || (b.name === EXTRACT && !calls.has(b.id))) calls.set(b.id, act);
+    if (act || b.name === EXTRACT) yield [b.id, act];
   }
-  return calls;
 }
 
 type ExtractCallLookup = (id: string, wrappedOnly: boolean) => boolean;
 
 function lazyExtractCalls(blocks: () => Iterable<unknown>, fallback?: ExtractCallLookup): ExtractCallLookup {
-  let calls: Map<string, boolean> | undefined;
+  const calls = new Map<string, boolean>();
+  let remaining: Generator<[string, boolean]> | undefined;
   return (id, wrappedOnly) => {
-    const wrapped = (calls ??= extractCalls(blocks())).get(id);
-    return (wrapped !== undefined && (!wrappedOnly || wrapped)) || (fallback?.(id, wrappedOnly) ?? false);
+    const wrapped = calls.get(id);
+    if (wrapped !== undefined && (!wrappedOnly || wrapped)) return true;
+    // Stop at the first eligible call. Later lookups reuse what we saw and
+    // resume the same scan. A wrapped match also satisfies unnamed results.
+    remaining ??= extractCalls(blocks());
+    for (let next = remaining.next(); !next.done; next = remaining.next()) {
+      const [callId, act] = next.value;
+      if (act || !calls.has(callId)) calls.set(callId, act);
+      if (callId === id && (!wrappedOnly || act)) return true;
+    }
+    return fallback?.(id, wrappedOnly) ?? false;
   };
 }
 
-function isExtractResult(b: Record<string, unknown>, lookup: ExtractCallLookup): boolean {
-  if (b.type !== 'tool_result' || typeof b.toolUseId !== 'string' || !b.toolUseId) return false;
+function extractResultCheck(b: Record<string, unknown>, lookup: ExtractCallLookup): (() => boolean) | undefined {
+  const { toolUseId, toolName } = b;
+  if (b.type !== 'tool_result' || typeof toolUseId !== 'string' || !toolUseId) return;
   // A direct result names itself, even mid-round or with a repeated call id.
-  if (b.toolName === EXTRACT) return true;
-  if (b.toolName !== undefined && b.toolName !== ACT) return false;
-  return lookup(b.toolUseId, b.toolName === ACT);
+  if (toolName === EXTRACT) return () => true;
+  if (toolName !== undefined && toolName !== ACT) return;
+  return () => lookup(toolUseId, toolName === ACT);
 }
 
 function* messageBlocks(rows: Iterable<ExtractRow>): Iterable<unknown> {
@@ -58,12 +62,12 @@ function* messageBlocks(rows: Iterable<ExtractRow>): Iterable<unknown> {
 }
 
 export function projectRawMessages<T extends ExtractRow>(messages: T[], storedRows: () => Iterable<ExtractRow>): T[] {
-  // Share one on-demand store scan across the raw page and all embedded pages.
-  const storedCalls = lazyExtractCalls(() => messageBlocks(storedRows()));
-  return projectPage(messages, storedCalls, storedCalls);
+  return projectPage(messages, lazyExtractCalls(() => messageBlocks(storedRows())));
 }
 
-function projectPage<T extends ExtractRow>(messages: T[], lookup: ExtractCallLookup, storedCalls: ExtractCallLookup): T[] {
+function projectPage<T extends ExtractRow>(messages: T[], storedCalls: ExtractCallLookup): T[] {
+  // The current page may contain calls missing from stored history.
+  const lookup = lazyExtractCalls(() => messageBlocks(messages), storedCalls);
   const replacedXml = new Set<string>();
   const projected = messages.map((message) => {
     if (!Array.isArray(message.content)) return message;
@@ -71,9 +75,10 @@ function projectPage<T extends ExtractRow>(messages: T[], lookup: ExtractCallLoo
     const blocks = content.flatMap((b) => {
       if (!record(b)) return [b];
       if (privateBlock(b)) return [];
-      if (!isExtractResult(b, lookup)) return [b];
+      const isExtract = extractResultCheck(b, lookup);
+      if (!isExtract) return [b];
 
-      const body = projectResultBody(b.content, storedCalls);
+      const body = projectResultBody(b.content, isExtract, storedCalls);
       if (body === b.content) return [b];
       if (typeof b.rawXml === 'string') replacedXml.add(b.rawXml);
       const { rawItem: _, ...result } = b;
@@ -101,13 +106,13 @@ function projectPage<T extends ExtractRow>(messages: T[], lookup: ExtractCallLoo
   return projected.some((message, i) => message !== messages[i]) ? projected : messages;
 }
 
-function projectResultBody(body: unknown, storedCalls: ExtractCallLookup): unknown {
-  if (typeof body === 'string') return projectResultText(body, storedCalls);
+function projectResultBody(body: unknown, isExtract: () => boolean, storedCalls: ExtractCallLookup): unknown {
+  if (typeof body === 'string') return projectResultText(body, isExtract, storedCalls);
   if (!Array.isArray(body)) return body;
   let withheld = false;
   const blocks = (body as unknown[]).map((b) => {
     if (!record(b) || b.type !== 'text' || typeof b.text !== 'string') return b;
-    const text = projectResultText(b.text, storedCalls);
+    const text = projectResultText(b.text, isExtract, storedCalls);
     if (text === b.text) return b;
     if (text === WITHHELD) withheld = true;
     const { rawItem: _, ...block } = b;
@@ -117,24 +122,32 @@ function projectResultBody(body: unknown, storedCalls: ExtractCallLookup): unkno
   return blocks.some((b, i) => b !== body[i]) ? blocks : body;
 }
 
-function projectResultText(text: string, storedCalls: ExtractCallLookup): string {
-  if (!text.trimStart().startsWith('{')) return text;
-  let page: unknown;
+// Undefined is not an extract envelope; null is a possible extract cut.
+function parseExtractPage(text: string) {
+  if (!text.startsWith('{')) return;
   try {
     // Framework tool results serialize ToolResult.data, not the outer ToolResult.
-    page = JSON.parse(text);
+    const page: unknown = JSON.parse(text);
+    if (record(page) && Array.isArray(page.messages) && page.returned === page.messages.length) {
+      return page as Record<string, unknown> & { messages: unknown[] };
+    }
   } catch {
-    return hasPrivateBlockMarker(text, storedCalls) ? WITHHELD : text;
+    return null;
   }
-  if (!record(page) || !Array.isArray(page.messages) || page.returned !== page.messages.length) return text;
-  const messages: unknown[] = page.messages;
+}
+
+function projectResultText(text: string, isExtract: () => boolean, storedCalls: ExtractCallLookup): string {
+  const trimmed = text.trimStart();
+  const page = parseExtractPage(trimmed);
+  if (page === undefined) return text;
+  if (page === null) return hasPrivateBlockMarker(trimmed, storedCalls) && isExtract() ? WITHHELD : text;
+  const { messages } = page;
   if (!messages.every((m): m is ExtractRow & Record<string, unknown> => record(m)
     && typeof m.id === 'string' && typeof m.timestamp === 'string' && typeof m.participant === 'string'
     && (Array.isArray(m.content) || typeof m.content === 'string'))) return text;
+  if (!isExtract()) return text;
 
-  // The embedded page can also contain calls no longer in the store.
-  const lookup = lazyExtractCalls(() => messageBlocks(messages), storedCalls);
-  const projected = projectPage(messages, lookup, storedCalls);
+  const projected = projectPage(messages, storedCalls);
   return projected === messages ? text : JSON.stringify({ ...page, messages: projected });
 }
 
@@ -186,7 +199,6 @@ function hasPrivateBlockMarker(text: string, storedCalls: ExtractCallLookup): bo
       const fields: Record<string, unknown> = {};
       if (at === 'block') blocks.push(fields);
       if (at === 'resultText') body!.push(fields);
-      let thinking = false;
       let data = false;
       do {
         if (!token?.startsWith('"')) throw new SyntaxError();
@@ -198,12 +210,10 @@ function hasPrivateBlockMarker(text: string, storedCalls: ExtractCallLookup): bo
         }
         if (at === 'block') {
           // A cut can land in the block's string value itself.
-          if (key === 'thinking' || key === 'data') {
-            const startsString = token?.startsWith('"') ?? /^[ \t\r\n]*"/.test(text.slice(start));
-            if (key === 'thinking') thinking = startsString;
-            else data = startsString;
-          }
-          if ((fields.type === 'thinking' && thinking) || (fields.type === 'redacted_thinking' && data)) return true;
+          const startsString = token?.startsWith('"') || unfinishedString !== undefined;
+          if ((key === 'thinking' || key === 'signature') && startsString) return true;
+          if (key === 'data') data = startsString;
+          if (fields.type === 'redacted_thinking' && data) return true;
         }
         const child = at === 'page' && key === 'messages' ? 'messages'
           : at === 'message' && key === 'content' ? 'content'
@@ -236,7 +246,13 @@ function hasPrivateBlockMarker(text: string, storedCalls: ExtractCallLookup): bo
     // The input ends in a cut or syntax error; check the prefix we did read.
   }
   const lookup = lazyExtractCalls(() => blocks, storedCalls);
-  return blocks.some((b) => Array.isArray(b.content) && isExtractResult(b, lookup)
-    && b.content.some((item) => item.type === 'text' && typeof item.text === 'string'
-      && hasPrivateBlockMarker(item.text, storedCalls)));
+  return blocks.some((b) => {
+    if (!Array.isArray(b.content)) return false;
+    const isExtract = extractResultCheck(b, lookup);
+    return isExtract && b.content.some((item) => {
+      if (item.type !== 'text' || typeof item.text !== 'string') return false;
+      const trimmed = item.text.trimStart();
+      return parseExtractPage(trimmed) !== undefined && hasPrivateBlockMarker(trimmed, storedCalls) && isExtract();
+    });
+  });
 }

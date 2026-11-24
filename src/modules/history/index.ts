@@ -1493,16 +1493,41 @@ export class HistoryModule implements Module {
       ...windowField(view?.mark(msg)),
       content: format === 'raw' ? msg.content : flattenContent(msg.content, this.failedSpeech(msg)),
     }));
-    return format === 'raw' ? projectRawMessages(messages, () => this.extractCallHistory()) : messages;
+    return format === 'raw'
+      ? projectRawMessages(messages, () => this.extractCallHistory(Math.max(...page.map((m) => m.sequence))))
+      : messages;
   }
 
-  private *extractCallHistory(): Iterable<StoredMessage> {
+  private *extractCallHistory(sequence: number): Iterable<StoredMessage> {
     const cm = this.cm as ContextManager;
+    const options = { resolveBlobs: false };
+    // Filtered and timestamp-ordered pages don't have a store offset. Find
+    // the newest returned row by append sequence, so we also cover calls
+    // that fall between (but are filtered out of) the returned rows.
+    let lo = 0;
     const count = cm.getMessageCount();
-    // One pass over stored call provenance, without inflating attachments
-    // or materializing the whole history at once.
-    for (let offset = 0; offset < count; offset += 1000) {
-      yield* cm.getMessageWindow(offset, 1000, { resolveBlobs: false }).messages;
+    let end = count;
+    while (lo < end) {
+      const mid = lo + Math.floor((end - lo) / 2);
+      const row = cm.getMessageWindow(mid, 1, options).messages[0];
+      if (row?.sequence === sequence) {
+        end = mid + 1;
+        break;
+      }
+      if (row && row.sequence < sequence) lo = mid + 1;
+      else end = mid;
+    }
+    // Calls normally precede results. Read backwards in bounded batches
+    // and let the lookup stop as soon as it has found its match.
+    for (let stop = end; stop > 0;) {
+      const start = Math.max(0, stop - 128);
+      const rows = cm.getMessageWindow(start, stop - start, options).messages;
+      for (let i = rows.length - 1; i >= 0; i--) yield rows[i]!;
+      stop = start;
+    }
+    // A later call with the same ID can also identify a legacy result.
+    for (let start = end; start < count; start += 128) {
+      yield* cm.getMessageWindow(start, Math.min(128, count - start), options).messages;
     }
   }
 
