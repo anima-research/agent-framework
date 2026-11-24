@@ -9,7 +9,8 @@ import { NOTICE_TAG } from '../../notice-tags.js';
 import { nameToTypeBack } from '../../supplied-text.js';
 import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats, Stats } from 'node:fs';
-import { open, readdir, readlink, stat, lstat, realpath } from 'node:fs/promises';
+import { open, readdir, readlink, stat, lstat, realpath, mkdir, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
 import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
@@ -1113,7 +1114,20 @@ export class WorkspaceModule implements Module {
         );
       }
     }
+    const outside: unknown = config.outsideMounts;
+    if (outside !== undefined && outside !== 'read-only' && outside !== 'read-write') {
+      throw new Error(`[workspace] outsideMounts must be 'read-only' or 'read-write', not ${shownValue(outside)}`);
+    }
     this.config = config;
+  }
+
+  /**
+   * What read_image says of itself, and what its path field adds, where the
+   * host lets it read outside the mounts (WorkspaceConfig.outsideMounts), for
+   * the framework's own read_image to say the same. Null where it doesn't.
+   */
+  get readsOutside(): { description: string; path: string } | null {
+    return this.config.outsideMounts === undefined ? null : { description: READS_OUTSIDE, path: PATH_OUTSIDE };
   }
 
   /**
@@ -1914,6 +1928,16 @@ export class WorkspaceModule implements Module {
       : '';
     const deleteDirect = writable ? ' On a direct mount, the file is removed from disk at once, and an undo or other head move doesn\'t bring it back.' : '';
     const materializeDirect = writable ? ' A direct mount writes its files to disk as they\'re made, so materialize passes over it, under `skipped` where you name it.' : '';
+    // Where the host lets files outside the mounts be read, or written too
+    // (WorkspaceConfig.outsideMounts), the tools that take one say so. A host
+    // that doesn't keeps their descriptions as they were.
+    const outside = this.config.outsideMounts;
+    const readOutside = outside !== undefined ? ` ${READS_OUTSIDE}` : '';
+    const writeOutside = outside === 'read-write'
+      ? ' With an absolute path, or one that starts with "~/", it writes a file outside the mounts: on disk when the call answers, in directories made as needed, '
+        + "and an undo or other head move leaves it there. One that lies in a mount's directory is written as that mount's file."
+      : '';
+    const pathOutside = (takes: boolean): string => (takes ? PATH_OUTSIDE : '');
     return [
       {
         name: 'read',
@@ -1921,11 +1945,11 @@ export class WorkspaceModule implements Module {
           + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files. '
           + 'For long lines or spill files, use offsetChars/limitChars instead: returns raw text without '
           + 'line numbers, with nextOffsetChars (null at EOF). Keep limitChars when continuing. '
-          + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
+          + 'Character offsets count UTF-16 code units; do not mix character and line parameters.' + readOutside,
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'File path (mount-prefixed, e.g., "project/src/main.ts")' },
+            path: { type: 'string', description: 'File path (mount-prefixed, e.g., "project/src/main.ts")' + pathOutside(outside !== undefined) },
             offset: { type: 'integer', description: 'Starting line number (1-indexed)' },
             limit: { type: 'integer', description: 'Maximum number of lines to return (default 2000)' },
             offsetChars: { type: 'integer', description: 'Character paging: zero-based UTF-16 offset (default 0); use nextOffsetChars to continue' },
@@ -1936,22 +1960,22 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'read_image',
-        description: 'Read an image file from the workspace and return native image content.',
+        description: 'Read an image file from the workspace and return native image content.' + readOutside,
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'Image file path (mount-prefixed, e.g., "project/assets/logo.png")' },
+            path: { type: 'string', description: 'Image file path (mount-prefixed, e.g., "project/assets/logo.png")' + pathOutside(outside !== undefined) },
           },
           required: ['path'],
         },
       },
       {
         name: 'write',
-        description: 'Create or overwrite a file in the workspace.' + writeDirect,
+        description: 'Create or overwrite a file in the workspace.' + writeDirect + writeOutside,
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'File path (mount-prefixed)' },
+            path: { type: 'string', description: 'File path (mount-prefixed)' + pathOutside(outside === 'read-write') },
             content: { type: 'string', description: 'Content to write' },
           },
           required: ['path', 'content'],
@@ -4028,9 +4052,7 @@ export class WorkspaceModule implements Module {
       // No more than the limit is loaded, as for a file over it at its fstat.
       const { bytes, more } = await readPrefix(opened.handle, maxSize, opened.fileStat.size);
       if (more) return { error: over(`at least ${(maxSize + 1).toLocaleString('en-US')}`) };
-      if (looksBinary(bytes)) {
-        return { error: `${JSON.stringify(path)} is binary, so read doesn't show it as text. ${sniffImageMime(bytes) ? 'read_image shows it, if its data holds together as an image.' : 'No tool shows it as text, so calling again won\'t change that.'}` };
-      }
+      if (looksBinary(bytes)) return { error: binaryNotText(path, bytes) };
       return { bytes };
     } catch (err) {
       return { error: unreadable(JSON.stringify(path), errnoOf(err)) };
@@ -4150,6 +4172,96 @@ export class WorkspaceModule implements Module {
   }
 
   // ==========================================================================
+  // Outside the mounts
+  // ==========================================================================
+
+  /**
+   * Where a path lies when it isn't spelled from a mount's name: an absolute
+   * path, or one from the home directory (`~/…`), where `outsideMounts` lets
+   * read, read_image and write take one. In a mount's directory, as the
+   * mounts are configured, it's that mount's file, answered mount-prefixed
+   * for the mount's own rules to judge (the innermost mount's, where they
+   * nest). Anywhere else it's a file outside every mount, answered absolute.
+   * Null for any other path, and for every path while the setting is off, so
+   * those are parsed, and refused, as they always were.
+   */
+  private outsidePath(path: string): { mountPath: string } | { absolute: string } | null {
+    if (this.config.outsideMounts === undefined) return null;
+    const absolute = path.startsWith('~/') ? join(homedir(), path.slice(2)) : isAbsolute(path) ? resolve(path) : null;
+    if (absolute === null) return null;
+    let held: { name: string; root: string } | undefined;
+    for (const { config } of this.mounts.values()) {
+      const root = resolve(config.path);
+      if (isContainedPath(root, absolute) && (held === undefined || root.length > held.root.length)) held = { name: config.name, root };
+    }
+    if (held === undefined) return { absolute };
+    const rest = relative(held.root, absolute).split(sep).join('/');
+    return { mountPath: rest === '' ? held.name : `${held.name}/${rest}` };
+  }
+
+  /**
+   * A file outside every mount, for read and read_image: disk's bytes as
+   * they are now, as the host's own user reaches them, through no mount's
+   * boundary. Up to the size a mount takes by default, since no mount's
+   * setting covers it. Or why there are none to show, of `shown`, the path
+   * as the caller gave it.
+   */
+  private async bytesOutside(absolute: string, shown: string, tool: 'read' | 'read_image'): Promise<{ bytes: Buffer } | { error: string }> {
+    const quoted = JSON.stringify(shown);
+    const over = (size: string) => `${quoted} is ${size} bytes, past the ${OUTSIDE_LIMIT} on a file outside the mounts, so ${tool} doesn't show it.`;
+    const unread = (err: unknown): { error: string } => {
+      const code = errnoOf(err);
+      return { error: code === 'ENOENT' || code === 'ENOTDIR' ? `there's no file at ${quoted}.` : unreadable(quoted, code) };
+    };
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      // O_NONBLOCK, as a mount's reader opens: a FIFO there opens at once, for the check below to refuse.
+      handle = await open(absolute, fsConstants.O_RDONLY | NONBLOCK);
+    } catch (err) {
+      return unread(err);
+    }
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) return { error: `${quoted} is ${info.isDirectory() ? 'a directory' : 'not a regular file'}, so ${tool} has nothing of it to show.` };
+      if (info.size > DEFAULT_MAX_FILE_SIZE) return { error: over(info.size.toLocaleString('en-US')) };
+      const { bytes, more } = await readPrefix(handle, DEFAULT_MAX_FILE_SIZE, info.size);
+      if (more) return { error: over(`at least ${(DEFAULT_MAX_FILE_SIZE + 1).toLocaleString('en-US')}`) };
+      return { bytes };
+    } catch (err) {
+      return unread(err);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * write's file outside every mount, where `outsideMounts` is 'read-write':
+   * the content written in place, as a shell's redirect writes it, so a link
+   * there is written through and the file keeps its mode, in directories made
+   * as needed. Nothing of it is stored, so nothing brings the old text back.
+   */
+  private async writeOutside(absolute: string, input: WriteInput): Promise<ToolResult> {
+    const shown = JSON.stringify(input.path);
+    const buffer = Buffer.from(input.content, 'utf-8');
+    if (buffer.byteLength > DEFAULT_MAX_FILE_SIZE) {
+      return {
+        success: false,
+        isError: true,
+        error: didNothing('write', `${shown} would be ${buffer.byteLength.toLocaleString('en-US')} bytes, past the ${OUTSIDE_LIMIT} on a file outside the mounts. Content within the limit is written.`),
+      };
+    }
+    try {
+      await mkdir(dirname(absolute), { recursive: true });
+      await writeFile(absolute, buffer);
+    } catch (err) {
+      // Not "did nothing": a write that fails partway, as a full disk makes one, leaves what it got to.
+      const code = errnoOf(err);
+      return { success: false, isError: true, error: `The write to ${shown} failed: ${errnoWords(code)}. ${errnoWayOn(code)}` };
+    }
+    return { success: true, data: { path: input.path, size: buffer.byteLength, hash: hashContent(input.content), disk: 'done' } };
+  }
+
+  // ==========================================================================
   // Tool Handlers
   // ==========================================================================
 
@@ -4168,8 +4280,14 @@ export class WorkspaceModule implements Module {
     }
     let file: FileText;
     let notes: string[] = [];
-    if (generatedContent === undefined) {
-      const { mount, relativePath, path } = await this.parseFilePath(input.path);
+    const place = generatedContent === undefined ? this.outsidePath(input.path) : null;
+    if (place !== null && 'absolute' in place) {
+      const found = await this.bytesOutside(place.absolute, input.path, 'read');
+      if ('error' in found) return { success: false, error: didNothing('read', found.error), isError: true };
+      if (looksBinary(found.bytes)) return { success: false, error: didNothing('read', binaryNotText(input.path, found.bytes)), isError: true };
+      file = fileText(found.bytes);
+    } else if (generatedContent === undefined) {
+      const { mount, relativePath, path } = await this.parseFilePath(place?.mountPath ?? input.path);
       if (relativePath === '') return { success: false, error: didNothing('read', namesRoot(input.path, mount.config.name)), isError: true };
       input = { ...input, path };
       const found = await this.bytesOf(mount, relativePath, path);
@@ -4191,7 +4309,18 @@ export class WorkspaceModule implements Module {
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
     const given = input.path;
     const refused = (body: string): ToolResult => ({ success: false, isError: true, error: didNothing('read_image', body) });
-    const { mount, relativePath, path } = await this.parseFilePath(given);
+    const place = this.outsidePath(given);
+    if (place !== null && 'absolute' in place) {
+      const found = await this.bytesOutside(place.absolute, given, 'read_image');
+      if ('error' in found) return refused(found.error);
+      try {
+        return imageResult(given, this.validateImageBytes(found.bytes, given, DEFAULT_MAX_FILE_SIZE));
+      } catch (err) {
+        if (err instanceof WorkspaceImageReadError) return refused(err.message);
+        throw err;
+      }
+    }
+    const { mount, relativePath, path } = await this.parseFilePath(place?.mountPath ?? given);
     if (!relativePath) return refused(namesRoot(given, mount.config.name));
     input = { ...input, path };
 
@@ -4236,7 +4365,17 @@ export class WorkspaceModule implements Module {
     if (LONE_SURROGATE.test(input.content)) {
       return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store. Give it without the surrogate, or with the other half of its pair.' };
     }
-    const { mount, relativePath, path } = await this.parseFilePath(input.path).catch((error: unknown) => { throw notStored(error); });
+    const place = this.outsidePath(input.path);
+    if (place !== null && 'absolute' in place) {
+      if (this.config.outsideMounts === 'read-write') return this.writeOutside(place.absolute, input);
+      return {
+        success: false,
+        isError: true,
+        error: didNothing('write', `${JSON.stringify(input.path)} lies outside the mounts, where this workspace reads files and doesn't write them. `
+          + onlyTheHost("set the workspace's outsideMounts to 'read-write'")),
+      };
+    }
+    const { mount, relativePath, path } = await this.parseFilePath(place?.mountPath ?? input.path).catch((error: unknown) => { throw notStored(error); });
     if (relativePath === '') return { success: false, error: didNothing('write', namesRoot(input.path, mount.config.name)), isError: true };
     input = { ...input, path };
     const refusal = writeRefusal(mount, this.writableNames());
@@ -6985,6 +7124,20 @@ function uncheckedFile(shown: string, note: string | undefined, cause: Cause): s
   const on = note === ROOT_REPLACED || note === ROOT_ON_ANOTHER_DEVICE || cause.ownStep === true ? null
     : (note === undefined ? null : wayOn(note, cause, 'read')) ?? 'calling again checks disk again; if the same reason comes back, whoever runs this host can fix it on disk';
   return `${shown} isn't in the workspace, and disk couldn't be checked: ${sentence(note ?? 'not observed')}${on !== null ? ` ${on[0]!.toUpperCase()}${sentence(on.slice(1))}` : ''}`;
+}
+
+/** What read and read_image say of themselves where the host lets them read outside the mounts; the framework's own read_image says it too (readsOutside). */
+const READS_OUTSIDE = 'With an absolute path, or one that starts with "~/", it reads a file outside the mounts, as it is on disk now. '
+  + "One that lies in a mount's directory is read as that mount's file.";
+
+/** What a path field says where its tool takes a file outside the mounts. */
+const PATH_OUTSIDE = ', or an absolute path for a file outside the mounts';
+
+const OUTSIDE_LIMIT = `${DEFAULT_MAX_FILE_SIZE.toLocaleString('en-US')}-byte limit`;
+
+function binaryNotText(path: string, bytes: Buffer): string {
+  return `${JSON.stringify(path)} is binary, so read doesn't show it as text. `
+    + (sniffImageMime(bytes) ? 'read_image shows it, if its data holds together as an image.' : "No tool shows it as text, so calling again won't change that.");
 }
 
 function namesRoot(path: string, mount: string): string {

@@ -9254,7 +9254,7 @@ export class AgentFramework {
       ...(this.heartbeat?.getTools() ?? []),
       this.buildAgentSettingsTool(),
       ...(this.getWorkspaceModule()
-        ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
+        ? [AgentFramework.SAVE_IMAGE_TOOL, this.readImageTool(),
            AgentFramework.FETCH_REFERENCE_TOOL]
         : []),
       ...(this.eventGate && this.getWorkspaceModule() ? [AgentFramework.DUMP_SUPPRESSED_TOOL] : []),
@@ -14984,6 +14984,21 @@ export class AgentFramework {
       required: ['path'],
     },
   };
+
+  /** read_image as this host's workspace takes it: where the workspace reads files outside its mounts, the tool says so, in the workspace's words. */
+  private readImageTool(): import('./types/index.js').ToolDefinition {
+    const tool = AgentFramework.READ_IMAGE_TOOL;
+    const outside = this.getWorkspaceModule()?.readsOutside;
+    if (!outside) return tool;
+    return {
+      ...tool,
+      description: `${tool.description} ${outside.description}`,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: { path: { type: 'string', description: `Mount-prefixed image path, e.g. "project/photos/name.png"${outside.path}.` } },
+      },
+    };
+  }
 
   private static readonly AGENT_SETTINGS_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'agent_settings',
