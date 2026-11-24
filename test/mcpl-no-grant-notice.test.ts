@@ -18,7 +18,7 @@ const notice = (method: string, cause: string, tail: string) =>
   `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant for such messages, because ${cause}. ` +
   `So for now its pushes and channel messages don't reach you. ${tail ? `${tail} ` : ''}If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
 const UPDATE = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
-const RESTORED = '[no-grant] The MCPL server "radio" holds a grant again. The messages that its grant covers reach you again.';
+const ENDED = '[no-grant] The MCPL server "radio" now holds a grant. The host accepts the messages that its grant covers.';
 const CAUSE = {
   unanswered: "it did not answer the host's policy request",
   errored: "it answered the host's policy request with an error",
@@ -93,9 +93,9 @@ function noticeRows(fw: Fw) {
     .filter((m) => m.metadata?.kind === NOTICE_KIND);
 }
 
-function restored(fw: Fw): string[] {
+function ended(fw: Fw): string[] {
   return fw.framework.getAgent('scout')!.getContextManager().getAllMessages()
-    .filter((m) => m.metadata?.kind === 'mcpl-grant-restored')
+    .filter((m) => m.metadata?.kind === 'mcpl-no-grant-ended')
     .map((m) => m.content.map((c) => (c.type === 'text' ? c.text : '')).join(''));
 }
 
@@ -315,7 +315,7 @@ test('case 15: a server that gets a grant at a later exchange is no longer told 
   assert.equal(error?.code, -32002, 'refused at the gate');
   assert.equal(error?.message, 'inference-request rejected: capability "inferenceRequest" not in the effective grant');
   assert.equal(notices(fw).length, 0);
-  assert.deepEqual(restored(fw), [], 'a server that was never told of a spell gets no row when its grant comes');
+  assert.deepEqual(ended(fw), [], 'a server that was never told of a spell gets no row when its grant comes');
 });
 
 test('case 16: a server that got a grant and lost it again is told again, on the same connection', async (t) => {
@@ -332,14 +332,14 @@ test('case 16: a server that got a grant and lost it again is told again, on the
   await roundTrip(fw);
   const granted = await server.peer.request('push/event', ring('r2', 'GRANTED-RING'));
   assert.equal(granted.error, undefined, 'a push is admitted under the grant');
-  assert.deepEqual(restored(fw), [RESTORED], 'the agent is told that the grant came back');
+  assert.deepEqual(ended(fw), [ENDED], 'the agent is told that the server now holds a grant');
   server.peer.ws.terminate();
   await waitFor(() => handshakes(server) === 2, 'the host reconnects and finishes its handshake');
   const answer = await server.peer.request('push/event', ring('r3', 'after the reconnect'));
   assert.ok(answer.error, 'refused, since the reconnect\'s policy Request got an error');
   await waitFor(() => notices(fw).length === 2, 'a second notice, for the second spell');
   assert.equal(notices(fw)[1], notice('push/event', CAUSE.errored, UPDATE));
-  assert.equal(restored(fw).length, 1);
+  assert.equal(ended(fw).length, 1);
 });
 
 test('a granted server whose manifest drops pushEvents, and whose policy Request after it gets an error: its next push is refused and writes the notice, without the words for an old server', async (t) => {
@@ -372,7 +372,7 @@ test('a granted server whose manifest drops pushEvents, and whose policy Request
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, ''));
 });
 
-test('a server that was told of and then accepts a grant that admits none of the gated messages: no row says that the grant came back', async (t) => {
+test('a server that was told of and then accepts a grant that admits none of the gated messages: no row says that the server now holds a grant', async (t) => {
   let policies = 0;
   let manifest: Json = { version: '0.5', pushEvents: true, ...advert() };
   const server = await startScriptedServer({
@@ -399,7 +399,7 @@ test('a server that was told of and then accepts a grant that admits none of the
   await roundTrip(fw);
   const answer = await server.peer.request('push/event', ring('r2', 'two'));
   assert.ok(answer.error, 'still refused, since the grant lacks pushEvents');
-  assert.deepEqual(restored(fw), []);
+  assert.deepEqual(ended(fw), []);
   assert.equal(connectionOf(fw).noGrantTold, true, 'the agent is still counted as told');
 });
 
