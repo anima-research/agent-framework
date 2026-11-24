@@ -3467,7 +3467,16 @@ export { suppressedRow } from './presentation.js';
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
 
-const NO_GRANT_OLD_SERVER = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const NO_GRANT_OLD_SERVER = {
+  declared: 'The server declares an MCPL version before 0.5. Such a server does not take that request, and it needs an update to MCPL 0.5.',
+  unknown: 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.',
+};
+
+function oldServerWords(version: unknown): string | null {
+  const parts = typeof version === 'string' ? /^(\d+)\.(\d+)/.exec(version) : null;
+  if (!parts) return NO_GRANT_OLD_SERVER.unknown;
+  return Number(parts[1]) === 0 && Number(parts[2]) < 5 ? NO_GRANT_OLD_SERVER.declared : null;
+}
 const NO_GRANT_WORDS = {
   unanswered: { cause: "it did not answer the host's policy request", tail: '' },
   errored: { cause: "it answered the host's policy request with an error", tail: '' },
@@ -37870,11 +37879,12 @@ export class AgentFramework {
     if (connection.noGrantTold || this.agents.size === 0) return;
     const { cause, tail } = NO_GRANT_WORDS[refusal.end];
     const firstPolicy = (refusal.end === 'unanswered' || refusal.end === 'errored') && !connection.policyEstablished;
+    const oldServer = firstPolicy ? oldServerWords(connection.capabilities?.version) : null;
     const text = [
       `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it.`,
       `The server holds no grant for such messages, because ${cause}.`,
       "So for now its pushes and channel messages don't reach you.",
-      ...(firstPolicy ? [NO_GRANT_OLD_SERVER] : []),
+      ...(oldServer ? [oldServer] : []),
       ...(tail ? [tail] : []),
       "If you can't change that yourself, ask whoever runs this host.",
       'The host says this one time.',
