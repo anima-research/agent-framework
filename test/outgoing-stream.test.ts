@@ -466,6 +466,49 @@ test('locus: after a mid-turn addressed re-pin, the next round streams to the ne
   } finally { await h.framework.stop(); }
 });
 
+test("locus: a mid-turn addressed row of another agent's provider items alone, which the agent is sent nothing of, moves no pin", async () => {
+  const h = await harness([[round(text('station four, proceeding'), call('one', 'test--read')), final(text('answering you'))]], {}, { speech: { locus: 'latest-inbound' } });
+  // While the tool runs, another agent's row of a compaction item alone,
+  // addressed from a DM, is stored for the agent, so the round's boundary
+  // hears it: the agent's request leaves it out (rawForeignRowAsSent).
+  h.module.during = async () => {
+    (h.framework as unknown as { addMessage(p: string, c: ContentBlock[], m: object, o: { forAgent: string }): string }).addMessage(
+      'scout',
+      [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_scout', encrypted_content: 'enc' } } as ContentBlock],
+      { channelId: 'discord:dm:antra', tags: ['chat:addressed'], messageId: 'heard-77' },
+      { forAgent: 'assistant' },
+    );
+  };
+  try {
+    await h.run();
+    assert.deepEqual(h.publishes(), [
+      { channelId: 'world:test', text: 'station four, proceeding' },
+      { channelId: 'world:test', text: 'answering you' },
+    ], 'the pin stays where the turn was');
+  } finally { await h.framework.stop(); }
+});
+
+for (const [label, content, told] of [
+  ["another agent's row of provider items alone, which the agent is sent nothing of, isn't told", [{ type: 'text', text: '', rawItem: { type: 'compaction', id: 'cmp_scout', encrypted_content: 'enc' } } as ContentBlock], false],
+  ["another agent's row of words is told", [{ type: 'text', text: 'a question for you' } as ContentBlock], true],
+] as const) {
+  test(`delivery: a mid-turn addressed ${label} as addressed elsewhere`, async () => {
+    const h = await harness([[round(text('station four, proceeding'), call('one', 'test--read')), final(text('answering you'))]]);
+    h.module.during = async () => {
+      (h.framework as unknown as { addMessage(p: string, c: ContentBlock[], m: object, o: { forAgent: string }): string }).addMessage(
+        'scout', [...content], { channelId: 'discord:dm:antra', tags: ['chat:addressed'], messageId: 'heard-77' }, { forAgent: 'assistant' },
+      );
+    };
+    try {
+      await h.run();
+      const notices = h.framework.getAgent('assistant')!.getContextManager().getAllMessages()
+        .filter((m) => JSON.stringify(m.content).includes('addressed you from'));
+      assert.equal(notices.length, told ? 1 : 0, told ? 'the agent is told it was addressed elsewhere' : 'no notice for a row the agent was sent nothing of');
+      assert.deepEqual(h.publishes().map((p) => p.channelId), ['world:test', 'world:test'], 'the pin stays, as delivery mode keeps it');
+    } finally { await h.framework.stop(); }
+  });
+}
+
 test("explicit: a stream's complete waits for the deliveries it queued, so no chunk follows it", async () => {
   // skip_reply ends the turn while round one's post is still out: explicit
   // mode doesn't hold the turn for its queued deliveries.
