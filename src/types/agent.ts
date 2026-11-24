@@ -172,8 +172,8 @@ export interface AgentConfig {
    * parse of the turn: where a `skip_reply` ends the turn, the text of every
    * round of the stream it cancels (after a budget restart, the
    * continuation's); at a natural end, the text of a round whose `skip_reply`
-   * was refused for its wake, refused because another call of its step
-   * failed, or cut off. A derived agent and the
+   * was refused for its wake, refused because a send of its step failed,
+   * or cut off. A derived agent and the
    * subconscious don't take it from this agent. The agent can change it for
    * itself with `agent_settings` (`same_round_skip_reply_text_policy`); its
    * choice persists.

@@ -171,7 +171,7 @@ import { markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, supplie
 import { NOTICE_TAG } from './notice-tags.js';
 import type { IncomingMessageFacts, RoutingDecision } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { SILENCING_SENDS, bareToolName } from './send-tools.js';
+import { SILENCING_SENDS, bareToolName, isSpeechTool } from './send-tools.js';
 import { boundedErrorMessage, errorMessage } from './error-message.js';
 import { ProviderWaits, EVERY_MODEL, isReleaseModel, withoutControls, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -340,9 +340,13 @@ const isSilencingTool = (name: string): boolean => {
  *  send, though inspecting drafts is not). */
 const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
   if (isSilencingTool(call.name)) return true;
-  return call.name === 'drafts'
-    && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+  return isDraftsResend(call);
 };
+
+const isDraftsResend = (call: { name: string; input?: unknown }): boolean => call.name === 'drafts'
+  && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+
+const isSendCall = (call: { name: string; input?: unknown }): boolean => isSpeechTool(call.name) || isDraftsResend(call);
 
 /** Hybrid prose envelopes: every line starting with `>>>` opens a new one.
  *  Leading whitespace before a `>>>` is dropped; blank envelopes are skipped. */
@@ -1754,7 +1758,7 @@ type SkipHeld = { held: Draft[]; target?: ChannelRef; wouldHold: boolean };
 
 type SkipVerdict = { held: SkipHeld[]; failed: string[] };
 
-type StepWait = { agent: Agent; streamId: number; others: string[]; settle: (failed: string[]) => void };
+type StepWait = { agent: Agent; streamId: number; sends: string[]; settle: (failed: string[]) => void };
 
 /**
  * How a round's prose is delivered: under which turn's routing, and how what
@@ -29859,7 +29863,7 @@ export class AgentFramework {
             const asked = askingAt >= 0 ? new Promise<SkipHeld[]>((resolve) => { answerAsk = resolve; }) : undefined;
             const waits = (): boolean => this.agents.get(agent.name) === agent && agent.streamId === myStreamId
               && agent.state.status === 'waiting_for_tools';
-            const waitingAt = !this.channelRegistry || streamRouting.skipReplyFailedCall || calls.every((c) => c.name === 'skip_reply')
+            const waitingAt = !this.channelRegistry || streamRouting.skipReplyFailedCall || !calls.some(isSendCall)
               ? []
               : calls.flatMap((c, i) => (c.name === 'skip_reply' && roundCalls[i]!.permitted && !roundCalls[i]!.refused ? [i] : []));
             const heldAt = [...new Set([...(askingAt >= 0 ? [askingAt] : []), ...waitingAt])];
@@ -29870,7 +29874,7 @@ export class AgentFramework {
             let failedCallRefused = false;
             const failed = waitingAt.length === 0 ? undefined : new Promise<string[]>((settle) => {
               this.stepWaits.set(agent.name, {
-                agent, streamId: myStreamId, others: calls.filter((c) => c.name !== 'skip_reply').map((c) => c.id), settle,
+                agent, streamId: myStreamId, sends: calls.filter(isSendCall).map((c) => c.id), settle,
               });
             }).then((names) => {
               if (names.length > 0 && waits()) {
@@ -34011,10 +34015,10 @@ export class AgentFramework {
       this.stepWaits.delete(agent.name);
       return;
     }
-    if (wait.others.some((id) => state.pending.has(id))) return;
+    if (wait.sends.some((id) => state.pending.has(id))) return;
     this.stepWaits.delete(agent.name);
     const failed = new Map(state.completed.filter((c) => c.result.isError === true).map((c) => [c.id, c.name]));
-    wait.settle(wait.others.flatMap((id) => failed.get(id) ?? []));
+    wait.settle(wait.sends.flatMap((id) => failed.get(id) ?? []));
   }
 
   private refuseSkipReplyOnce(agentName: string, call: ToolCall, held: SkipHeld[], failed: string[]): void {

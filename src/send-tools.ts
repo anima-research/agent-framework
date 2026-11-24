@@ -35,6 +35,8 @@ export const SILENCING_SENDS = new Set([...SPEECH_TOOLS].filter(([, tool]) => to
 /** Strip the `server--` MCPL prefix from a tool name. */
 export const bareToolName = (n: string): string => n.split('--').pop()!;
 
+export const isSpeechTool = (name: string): boolean => SPEECH_TOOLS.has(bareToolName(name));
+
 export function speechOf(name: unknown, input: unknown): { tool: string; words: string } | undefined {
   if (typeof name !== 'string' || typeof input !== 'object' || input === null) return undefined;
   const tool = bareToolName(name);
