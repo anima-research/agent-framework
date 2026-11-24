@@ -286,6 +286,9 @@ test('case 12: a server that refuses the policy after a manifest change: the not
 test('case 12, with no reason: the host\'s log says that the server gave none', (t) =>
   refusedAfterManifestChange(t, {}, 'refused post-manifest policy (no reason)'));
 
+test('case 12, with a line break in the reason: the host\'s log keeps the reason in one field of one line', (t) =>
+  refusedAfterManifestChange(t, { reason: 'line one\n[mcpl] forged' }, 'refused post-manifest policy ("line\\u0020one\\n[mcpl]\\u0020forged")'));
+
 test('case 15: a server that gets a grant at a later exchange is no longer told that it holds none', async (t) => {
   let policies = 0;
   const { server, fw } = await setup(t, (msg, peer) => {
