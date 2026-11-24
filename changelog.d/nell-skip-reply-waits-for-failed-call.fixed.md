@@ -10,8 +10,8 @@
   ends the turn. That costs one more model call. A refused `skip_reply`
   reports no tool-lifecycle events, and the refusal happens once per turn.
   Later in the turn, `skip_reply` runs as before, even beside a failed send.
-  A failed call that isn't a send ends the turn as before. A `skip_reply`
-  with bad arguments is still answered at once. A script's own `skip_reply`
-  also runs at once. With `sameRoundSkipReplyTextPolicy: 'ask'`, a step can
-  meet both rules. It then gets one refusal: the policy's words and one
-  added sentence.
+  Beside a failed call that isn't a send, `skip_reply` runs as before. A
+  `skip_reply` with bad arguments is still answered at once. A script's own
+  `skip_reply` also runs at once. With `sameRoundSkipReplyTextPolicy:
+  'ask'`, a step can meet both rules. It then gets one refusal: the policy's
+  words and one added sentence.
