@@ -571,7 +571,9 @@ error answer, when the server refuses the policy, when it declares no MCPL,
 or when the host's own policy step fails. The host then refuses the server's
 pushes and its other messages that need a capability. At the first such
 refusal, the agent gets a `[no-grant]` notice in its context, of kind
-`mcpl-no-grant`, which names the server and says why it holds no grant.
+`mcpl-no-grant`, which names the server and says why it holds no grant. When
+the server later accepts a grant on the same connection, the agent gets a row
+of kind `mcpl-grant-restored`, which says so.
 
 #### Event coalescing (RFC-006)
 

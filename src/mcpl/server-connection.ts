@@ -1238,6 +1238,10 @@ export class McplServerConnection extends EventEmitter {
     'tools-observe': 'toolLifecycle.observe',
   };
 
+  grantAdmitsNoGatedMessage(): boolean {
+    return Object.values(McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY).every((path) => !this.grant.has(path));
+  }
+
   private static isControlPlaneEvent(event: string): boolean {
     return event === 'stderr'
       || event === 'scope-elevate'

@@ -3467,14 +3467,19 @@ export { suppressedRow } from './presentation.js';
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
 
-const NO_GRANT_UPDATE = "Its tools don't need a grant. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.";
+const NO_GRANT_OLD_SERVER = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
 const NO_GRANT_WORDS = {
-  unanswered: { cause: "it did not answer the host's policy request", tail: NO_GRANT_UPDATE },
-  errored: { cause: "it answered the host's policy request with an error", tail: NO_GRANT_UPDATE },
-  refused: { cause: 'it refused the policy that the host offered', tail: "Its tools don't need a grant. The host's log has the server's reason, if it gave one." },
-  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: "Its tools don't need a grant. A server that sends MCPL messages must declare MCPL." },
+  unanswered: { cause: "it did not answer the host's policy request", tail: '' },
+  errored: { cause: "it answered the host's policy request with an error", tail: '' },
+  refused: { cause: 'it refused the policy that the host offered', tail: "The host's log has the server's reason, if it gave one." },
+  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: 'A server that sends MCPL messages must declare MCPL.' },
   'host-error': { cause: "the host hit an error while it set up the server's policy", tail: "The host's log has the error. A restart of the server may clear it." },
 } satisfies Record<McplNoGrantEnd, { cause: string; tail: string }>;
+
+function noGrantEndOf(err: unknown): McplNoGrantEnd | null {
+  if (!(err instanceof McplRequestError)) return null;
+  return err.outcome === 'error-response' ? 'errored' : err.outcome === 'no-response' ? 'unanswered' : 'host-error';
+}
 
 /** The largest file dump_suppressed writes (bytes), under the workspace's default 5 MB file limit. */
 const DUMP_MAX_BYTES = 4 * 1024 * 1024;
@@ -37863,16 +37868,34 @@ export class AgentFramework {
 
   private tellNoGrant(connection: McplServerConnection, refusal: McplNoGrantRefusal): void {
     if (connection.noGrantTold || this.agents.size === 0) return;
-    const words = NO_GRANT_WORDS[refusal.end];
-    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it. ` +
-      `The server holds no grant, because ${words.cause}. So its pushes and channel messages don't reach you. ${words.tail} ` +
-      "If you can't change that yourself, ask whoever runs this host. The host says this one time. " +
-      'It says it again only after it connects the server anew, or after the server got a grant and lost it.';
+    const { cause, tail } = NO_GRANT_WORDS[refusal.end];
+    const firstPolicy = (refusal.end === 'unanswered' || refusal.end === 'errored') && !connection.policyEstablished;
+    const text = [
+      `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it.`,
+      `The server holds no grant for such messages, because ${cause}.`,
+      "So for now its pushes and channel messages don't reach you.",
+      ...(firstPolicy ? [NO_GRANT_OLD_SERVER] : []),
+      ...(tail ? [tail] : []),
+      "If you can't change that yourself, ask whoever runs this host.",
+      'The host says this one time.',
+      'It says it again only after it connects the server anew, or after the server got a grant and lost it.',
+    ].join(' ');
     try {
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant', serverId: connection.id });
       connection.noGrantTold = true;
     } catch (error) {
       console.error(`[mcpl] ${connection.id}: the notice that it holds no grant could not be written:`, error);
+    }
+  }
+
+  private tellGrantRestored(connection: McplServerConnection): void {
+    if (!connection.noGrantTold) return;
+    connection.noGrantTold = false;
+    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" holds a grant again. The earlier notice about it no longer applies.`;
+    try {
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-grant-restored', serverId: connection.id });
+    } catch (error) {
+      console.error(`[mcpl] ${connection.id}: the notice that it holds a grant again could not be written:`, error);
     }
   }
 
@@ -38389,17 +38412,19 @@ export class AgentFramework {
           }
         } else {
           connection.establishGrant(newGrant);
-          connection.noGrantTold = false;
+          this.tellGrantRestored(connection);
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
         }
-      } catch {
+      } catch (err) {
         if (connection.transportEpoch !== epoch) {
           console.error(`[mcpl] ${connection.id}: post-manifest policy Request ended by its transport's close; not applied`);
           return;
         }
         console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
+        const end = noGrantEndOf(err);
+        if (end && (connection.noGrantEnd !== null || connection.grantAdmitsNoGatedMessage())) connection.noGrantEnd = end;
       }
       if (closeForGood) {
         await this.closeMcplServerForGood(connection);
@@ -38569,7 +38594,7 @@ export class AgentFramework {
       } else {
         // Expansion activates on receipt (§6.7).
         connection.establishGrant(grant);
-        connection.noGrantTold = false;
+        this.tellGrantRestored(connection);
         if (receipt?.accepted === true && receipt.mode === 'degraded') {
           for (const uf of receipt.unavailableFeatures ?? []) {
             console.error(recorded(
@@ -38583,9 +38608,7 @@ export class AgentFramework {
         console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
         return;
       }
-      if (err instanceof McplRequestError) {
-        connection.noGrantEnd = err.outcome === 'error-response' ? 'errored' : err.outcome === 'no-response' ? 'unanswered' : 'host-error';
-      }
+      connection.noGrantEnd = noGrantEndOf(err);
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
