@@ -1626,6 +1626,8 @@ export type TraceEvent =
       type: 'prose:drafts-dismissed';
       agentName: string;
       draftIds: string[];
+      /** Set aside at a turn's end, having been left alone all through it, rather than by the resident's own dismissal. */
+      auto?: true;
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */

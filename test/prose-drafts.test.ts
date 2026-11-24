@@ -542,6 +542,10 @@ async function harness(opts: {
       await framework.runUntilIdle();
     },
     drafts: (agent = 'scout') => (framework as unknown as { proseDrafts: ProseDraftStore }).proseDrafts.open(agent),
+    /** Every draft the store keeps, whatever became of it, newest first: a
+     *  held draft left alone for a whole turn is set aside, and is open no more. */
+    kept: (agent = 'scout') => [...((framework as unknown as { proseDrafts: { drafts: Map<string, Map<string, ReturnType<ProseDraftStore['open']>[number]>> } })
+      .proseDrafts.drafts.get(agent)?.values() ?? [])].reverse(),
     store: () => (framework as unknown as { proseDrafts: ProseDraftStore }).proseDrafts,
     texts: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text),
@@ -614,7 +618,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged; left alone, they are set aside when your next turn ends)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -688,7 +692,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged; left alone, they are set aside when your next turn ends)`,
       );
     } finally {
       await h.close();
@@ -773,7 +777,7 @@ describe('held prose drafts, end to end', () => {
       const held = h.drafts();
       assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged; left alone, they are set aside when your next turn ends) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
@@ -1641,9 +1645,10 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       assert.deepEqual(h.publishes(), []);
-      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Checking my drafts.', 'no-destination'], ['lost words', 'bounced']],
+      // (Kept, not open: the bounce's own wake is a whole turn that leaves the line alone, and so sets it aside.)
+      assert.deepEqual(h.kept().map((d) => [d.text, d.reason]), [['Checking my drafts.', 'no-destination'], ['lost words', 'bounced']],
         'the refused target still bounces; the line after it is held as no-destination');
-      assert.ok(!h.texts().some((t) => !t.startsWith('[delivered]') && t.includes(h.drafts()[0]!.id)), 'no notice names the line before the turn ends');
+      assert.ok(!h.texts().some((t) => !t.startsWith('[delivered]') && t.includes(h.kept()[0]!.id)), 'no notice names the line before the turn ends');
     } finally {
       await h.close();
     }
@@ -1678,7 +1683,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       await h.until(() => h.membrane.calls.length >= before + 2, "its ' !' starts a continuation turn: the model is asked again");
-      assert.deepEqual(h.drafts().map((d) => d.text), ['Kept words.'], 'its words are held');
+      assert.deepEqual(h.kept().map((d) => d.text), ['Kept words.'], 'its words are held');
     } finally {
       await h.close();
     }
@@ -1884,12 +1889,13 @@ describe('held prose drafts, end to end', () => {
   it('a dismissal in the same round as its draft\'s resend is refused until that result is in: it can\'t call back words on their way', async () => {
     const h = await harness();
     try {
-      await h.turn([
-        createMockResponse([text('words that land'), explicitSend('s1'), text('words in doubt'), call('l1', 'channel_list', {})], 'tool_use'),
-        createMockResponse([]),
-      ]);
-      const sure = h.drafts().find((d) => d.text === 'words that land')!;
-      const unsure = h.drafts().find((d) => d.text === 'words in doubt')!;
+      // Each draft is held in the turn before the one that races it: a held
+      // draft left alone for a whole turn is set aside at that turn's end.
+      const hold = async (words: string, id: string) => {
+        await h.turn([createMockResponse([text(words), explicitSend(id)], 'tool_use'), createMockResponse([])]);
+        return h.drafts().find((d) => d.text === words)!;
+      };
+      const sure = await hold('words that land', 's1');
       // The resend is dispatched first, so its attempt is out when the dismissal runs.
       const raced = (id: string) => [
         drafts(`r-${id}`, { action: 'resend', draftIds: [id], destination: ROOM }),
@@ -1904,6 +1910,7 @@ describe('held prose drafts, end to end', () => {
       assert.match(dismissal!, waits(sure.id), 'no "dismissed" reply over words that went out');
       assert.equal(draftState(h.store().get('scout', sure.id)!), 'delivered');
 
+      const unsure = await hold('words in doubt', 's2');
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse(raced(unsure.id), 'tool_use'), createMockResponse([])]);
       [resent, dismissal] = h.toolResults();
@@ -1929,6 +1936,8 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       const [draft] = h.drafts();
+      // One turn, the one after the draft was held: a held draft left alone
+      // for a whole turn is set aside at its end.
       await h.turn([
         createMockResponse([
           // A caller whose provider presents every property as required, filling
@@ -1939,19 +1948,7 @@ describe('held prose drafts, end to end', () => {
           drafts('c', { action: 'list', offset: ' 0 ' }),
           drafts('d', { action: 'list', offset: ' ' }),
         ], 'tool_use'),
-        createMockResponse([]),
-      ]);
-      const [listed, oneEmpty, read, padded, blank] = h.toolResults();
-      // The call a review named: one empty field, the rest null.
-      assert.match(oneEmpty!, /^1 open draft, newest first:/);
-      assert.ok(oneEmpty!.includes(draft!.id), oneEmpty);
-      assert.equal(listed, oneEmpty, 'every unused field empty lists the same');
-      assert.match(read!, /words/);
-      assert.equal(padded, listed, 'a padded offset reads as its digits');
-      assert.match(blank!, /offset must be a whole number of drafts to skip/, 'whitespace alone is a value, and not a number');
-
-      // A value in use is still checked, by the guards the rule now feeds.
-      await h.turn([
+        // A value in use is still checked, by the guards the rule now feeds.
         createMockResponse([
           drafts('f', { action: 'read', draftIds: '' }),
           drafts('g', { action: 'list', destination: '#elsewhere' }),
@@ -1964,9 +1961,27 @@ describe('held prose drafts, end to end', () => {
           // false is "don't confirm", what list already does: it lists.
           drafts('l', { action: 'list', confirmDuplicate: false }),
         ], 'tool_use'),
+        // resend: an empty destination is unused (and this resident has no home to
+        // fall back to), and an empty confirmDuplicate is unused, so the send goes.
+        createMockResponse([
+          drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '', confirmDuplicate: '' }),
+          drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM, confirmDuplicate: '' }),
+        ], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse] = h.toolResults();
+      const [
+        listed, oneEmpty, read, padded, blank,
+        noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse,
+        noDest, resent,
+      ] = h.toolResults();
+      // The call a review named: one empty field, the rest null.
+      assert.match(oneEmpty!, /^1 open draft, newest first:/);
+      assert.ok(oneEmpty!.includes(draft!.id), oneEmpty);
+      assert.equal(listed, oneEmpty, 'every unused field empty lists the same');
+      assert.match(read!, /words/);
+      assert.equal(padded, listed, 'a padded offset reads as its digits');
+      assert.match(blank!, /offset must be a whole number of drafts to skip/, 'whitespace alone is a value, and not a number');
+
       assert.match(noIds!, /action "read" needs draftIds/);
       assert.match(destUsed!, /destination is not used by action "list"/);
       assert.match(confirmUsed!, /confirmDuplicate is not used by action "list"/);
@@ -1976,16 +1991,6 @@ describe('held prose drafts, end to end', () => {
       assert.match(unsafe!, /offset must be a whole number of drafts to skip/);
       assert.equal(confirmFalse, listed, 'confirmDuplicate: false lists, as an omitted one does');
 
-      // resend: an empty destination is unused (and this resident has no home to
-      // fall back to), and an empty confirmDuplicate is unused, so the send goes.
-      await h.turn([
-        createMockResponse([
-          drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '', confirmDuplicate: '' }),
-          drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM, confirmDuplicate: '' }),
-        ], 'tool_use'),
-        createMockResponse([]),
-      ]);
-      const [noDest, resent] = h.toolResults();
       assert.match(noDest!, /resend needs a destination/);
       assert.match(resent!, new RegExp(`${draft!.id}: delivered to`));
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'words']);
@@ -2209,6 +2214,129 @@ describe('draft notices and turn-end settlement', () => {
   });
 });
 
+describe('a held draft left alone for a whole turn is set aside', () => {
+  const heldBack = [createMockResponse([text('words a send held back'), explicitSend('s1')], 'tool_use'), createMockResponse([])];
+  const stateOf = (h: Awaited<ReturnType<typeof harness>>, id: string) => draftState(h.store().get('scout', id)!);
+  const setAsides = (h: Awaited<ReturnType<typeof harness>>): Array<{ draftIds: string[]; auto?: true }> => {
+    const seen: Array<{ draftIds: string[]; auto?: true }> = [];
+    h.framework.onTrace((ev) => { if (ev.type === 'prose:drafts-dismissed') seen.push({ draftIds: ev.draftIds, ...(ev.auto ? { auto: true as const } : {}) }); });
+    return seen;
+  };
+
+  it("the turn that holds it leaves it open and says so; the next turn's end sets it aside, with no row of its own", async () => {
+    const h = await harness();
+    try {
+      const traced = setAsides(h);
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      assert.equal(draft?.text, 'words a send held back', 'open at the end of its own turn');
+      const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
+      assert.ok(notice.endsWith(
+        `drafts(action: "resend", draftIds: ["${draft!.id}"], destination: "#room") delivers it unchanged; ` +
+        'left alone, it is set aside when your next turn ends.'), notice);
+      assert.ok(!notice.includes('dismiss'), 'the notice asks for no call');
+
+      const rows = h.messages().length;
+      await h.turn([createMockResponse([text('about something else')])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed');
+      assert.deepEqual(h.drafts(), [], 'nothing is left open');
+      assert.deepEqual(traced, [{ draftIds: [draft!.id], auto: true }]);
+      assert.ok(!h.messages().slice(rows).some((m) => JSON.stringify(m.content).includes(draft!.id)), 'nothing tells the resident again');
+
+      // As after its own dismissal: the words stay readable, and are not resent.
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'read', draftIds: [draft!.id] }), drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [read, resend] = h.toolResults();
+      assert.ok(read!.startsWith(`${draft!.id} — dismissed;`) && read!.endsWith('words a send held back'), read);
+      assert.equal(resend, `${draft!.id} was dismissed, so it can't be resent. Nothing was sent.`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("closing words, named only by their turn's receipt, are open through the next turn and resend in it", async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([explicitSend('s1')], 'tool_use'), createMockResponse([text('closing words')])]);
+      const [draft] = h.drafts();
+      assert.ok(h.texts().some((t) => t.startsWith('[delivered]') && t.includes(draft!.id)), 'premise: the receipt names it');
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'delivered');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'closing words']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a turn a tool ends sets it aside too', async () => {
+    const h = await harness();
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      await h.turn([createMockResponse([call('k1', 'skip_reply', {})], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a turn that fails, and a silent one, set nothing aside: the resident may not have read the notice', async () => {
+    const h = await harness({ retries: 0 });
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      failWhileToolsRun(h.membrane);
+      await h.turn([createMockResponse([call('l1', 'channel_list', {})], 'tool_use')]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'a failed turn leaves it open');
+      await h.turn([createMockResponse([])], 'scout', 'silent');
+      assert.equal(stateOf(h, draft!.id), 'held', 'a silent turn leaves it open');
+      await h.turn([createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed', 'the next turn that ends as its own does not');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a resend that fails counts as something done with it: the draft is open through the turn after', async () => {
+    const h = await harness();
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      h.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'a failed resend leaves it held, and its turn does not set it aside');
+      h.command({ op: 'publish-mode', mode: 'delivered' });
+      await h.turn([createMockResponse([drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'delivered', 'so the next turn can still send it');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a bounce, and a draft that may already have been posted, stay open however long they are left', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('>>>#nowhere lost words')])]);
+      const [bounce] = h.drafts();
+      assert.equal(bounce?.reason, 'bounced');
+      // Held by a send, then resent with no receipt: it may have been posted.
+      await h.turn(heldBack);
+      const doubted = h.drafts().find((d) => d.reason === 'explicit-send')!;
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [doubted.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, doubted.id), 'unconfirmed');
+      await h.turn([createMockResponse([])]);
+      await h.turn([createMockResponse([])]);
+      assert.equal(stateOf(h, bounce!.id), 'held', 'the bounce is still open');
+      assert.equal(stateOf(h, doubted.id), 'unconfirmed', 'and so is the one in doubt');
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 describe('a draft whose notice an undo takes out of the window', () => {
   type Harness = Awaited<ReturnType<typeof harness>>;
   const undo = async (h: Harness): Promise<void> => {
@@ -2236,9 +2364,9 @@ describe('a draft whose notice an undo takes out of the window', () => {
       assert.ok(!windowNames(h, draft!.id), 'the undo took the receipt out of the window');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'the next start names it');
+      assert.ok(h.drafts().some((d) => d.id === draft!.id), 'it is still open: the turn that names it again is not one that left it alone');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'a later start does not name it again');
-      assert.ok(h.drafts().some((d) => d.id === draft!.id), 'it is still open');
     } finally {
       await h.close();
     }
@@ -2925,12 +3053,12 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply, a drafts call or a private think\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.
-      const before = h.drafts().length;
+      const before = h.kept().length;
       await h.turn(rounds(
         [text('>>>skip_reply thinking aloud'), call('l4', 'channel_list', {})],
         [text('still thinking'), explicitSend('s2')],
       ));
-      assert.equal(h.drafts().length, before, 'nothing private was drafted');
+      assert.equal(h.kept().length, before, 'nothing private was drafted');
       // "still thinking" is the one kept private (live routing does not count
       // the `>>>skip_reply` envelope itself).
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)');
@@ -2950,9 +3078,9 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const copy = h.drafts().find((d) => d.text.endsWith('a postscript'))!;
       assert.deepEqual([copy.text, copy.note, copy.reason, copy.inheritedRisk], ['lost words and a postscript', `written for >>>${ROOM}`, 'explicit-send', undefined]);
 
-      const count = h.drafts().length;
+      const count = h.kept().length;
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}}`), explicitSend('s2')]));
-      assert.equal(h.drafts().length, count, 'a bare {{unsent}} mints no copy');
+      assert.equal(h.kept().length, count, 'a bare {{unsent}} mints no copy');
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
         `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (not sent — drafts can resend them unchanged, or dismiss them)`);
 
@@ -3003,7 +3131,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'resend me']);
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
         `[delivered] plain speech → #room (Guild One) (${ROOM}) (draft ${ids[0]}, by your resend) · ` +
-        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged, or dismiss them) · ` +
+        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged; left alone, they are set aside when your next turn ends) · ` +
         `draft ${ids[1]} dismissed by you`);
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -4766,10 +4894,10 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
       // answer is queued as its stream opens.
       onSecondStream(h.membrane, createMockResponse([text('continued heartbeat words')]));
       await h.turn([createMockResponse([text('first heartbeat words')])], 'scout', 'heartbeat');
-      await h.until(() => h.drafts().length >= 2, 'the continuation');
+      await h.until(() => h.kept().length >= 2, 'the continuation');
       await h.framework.runUntilIdle();
       assert.deepEqual(h.publishes(), [], 'neither the turn nor its continuation posted');
-      assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
+      assert.deepEqual(h.kept().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
       assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
         'the continuation is not told again');
       assert.ok(h.texts().some((t) => t.startsWith('[continue]') && t.includes('are held as drafts, as on the heartbeat')),
@@ -4986,7 +5114,7 @@ describe('sameRoundSkipReplyTextPolicy', () => {
   const asksWhere = (result: string, id: string): void => {
     assert.ok(result.startsWith(opening(id)), result);
     assert.ok(result.includes(`drafts(action: "resend", draftIds: ["${id}"], destination: "#room") delivers it unchanged`), result);
-    assert.ok(result.includes(`drafts(action: "dismiss", draftIds: ["${id}"]) sets it aside.`), result);
+    assert.ok(result.includes("left alone, it is set aside when your next turn ends."), result);
     assert.match(result, /call skip_reply again/);
     assert.match(result, /wake_in_seconds/);
     assert.match(result, /\breason\b/);

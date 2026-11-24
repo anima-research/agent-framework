@@ -10,7 +10,10 @@
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
  * the exact words until the resident resends or dismisses them, or the
- * retention below lets it go.
+ * retention below lets it go. A held draft the resident leaves alone for a
+ * whole turn, unless it is a bounce, is set aside at that turn's end, as its
+ * own dismissal would (AgentFramework.setAsideIdleDrafts), so speech the
+ * routing rules held back asks nothing of a resident who doesn't want it sent.
  *
  * The boundary is publication and agency: a draft is never
  * published except by its resident's explicit resend (or `{{unsent}}`), and
@@ -139,7 +142,8 @@ export interface Draft {
  *   needs explicit confirmation. A later attempt that fails does not resolve
  *   an earlier one that may have landed — the uncertainty stays;
  * - `delivered`: an attempt was confirmed — its receipt is historical;
- * - `dismissed`: the resident set it aside.
+ * - `dismissed`: the resident set it aside, or left it alone for a whole
+ *   turn (ProseDraftStore.idleSince).
  */
 export type DraftState = 'held' | 'unconfirmed' | 'delivered' | 'dismissed';
 
@@ -431,6 +435,15 @@ export class ProseDraftStore {
   markNoticed(agent: string, ids: string[], messageId: string): void {
     if (ids.length === 0) return;
     this.write({ op: 'noticed', agent, ids, at: Date.now(), messageId }, true, true);
+  }
+
+  /**
+   * Held drafts a notice has named that nothing has happened to since
+   * `since`: when `since` is a turn's opening, the ones the resident was told
+   * of before that turn and left alone all through it.
+   */
+  idleSince(agent: string, since: number): Draft[] {
+    return this.open(agent).filter((d) => draftState(d) === 'held' && d.noticedAt !== undefined && lastActivity(d) < since);
   }
 
   dismiss(agent: string, id: string): void {
