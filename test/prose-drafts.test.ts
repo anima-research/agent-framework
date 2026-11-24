@@ -5708,7 +5708,6 @@ describe('a skip_reply beside a call of its step that failed', () => {
   }).eventGate;
   const waitsOf = (h: Awaited<ReturnType<typeof harness>>) => h.framework as unknown as {
     stepWaits: Map<string, unknown>;
-    skipReplyHolds: Map<string, unknown>;
     releaseAgentRuntime(agent: unknown): void;
   };
   const answeredBeforeTheTurnEnds = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean => {
@@ -5812,15 +5811,15 @@ describe('a skip_reply beside a call of its step that failed', () => {
     try {
       const before = h.membrane.calls.length;
       const turn = h.turn([createMockResponse([skip('k1'), sendFile('l1', { hold: 'h1' })], 'tool_use')]);
-      await h.until(() => module.holding('h1'), 'the lookup waits');
-      assert.ok(!phases().includes('k1:started'), `skip_reply waits while the lookup runs: ${phases().join(' ')}`);
+      await h.until(() => module.holding('h1'), 'the send waits');
+      assert.ok(!phases().includes('k1:started'), `skip_reply waits while the send runs: ${phases().join(' ')}`);
       module.release('h1');
       await turn;
       assert.equal(h.membrane.calls.length - before, 1, 'one model call');
       assert.equal(ended(), 1);
       const order = phases();
       assert.ok(order.includes('l1:completed') && order.indexOf('k1:started') > order.indexOf('l1:completed'),
-        `skip_reply ran after the lookup it was called before: ${order.join(' ')}`);
+        `skip_reply ran after the send it was called before: ${order.join(' ')}`);
     } finally {
       module.releaseAll();
       await h.close();
@@ -5980,11 +5979,11 @@ describe('a skip_reply beside a call of its step that failed', () => {
     const h = await harness({ modules: [module], gate: true });
     try {
       const turn = h.turn([createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use')]);
-      await h.until(() => module.holding('h1'), 'the lookup waits');
-      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no wake while the lookup runs');
+      await h.until(() => module.holding('h1'), 'the send waits');
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no wake while the send runs');
       module.release('h1');
       await turn;
-      assert.ok(gateOf(h).selfWakeTimers.has('scout'), 'the wake is armed once the lookup has answered');
+      assert.ok(gateOf(h).selfWakeTimers.has('scout'), 'the wake is armed once the send has answered');
     } finally {
       module.releaseAll();
       await h.close();
@@ -6019,10 +6018,10 @@ describe('a skip_reply beside a call of its step that failed', () => {
       h.membrane.pushResponse(createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use'));
       const before = h.membrane.calls.length;
       h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-stop', mode: 'addressed', text: 'message' });
-      await h.until(() => h.membrane.calls.length > before && module.holding('h1'), 'the lookup waits');
+      await h.until(() => h.membrane.calls.length > before && module.holding('h1'), 'the send waits');
       assert.ok(h.framework.abortInference('scout', 'test stop'), 'premise: the turn was stopped');
       module.release('h1');
-      await h.until(() => dropped, "the lookup's late answer is dropped");
+      await h.until(() => dropped, "the send's late answer is dropped");
       await h.framework.runUntilIdle();
       assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'the skip_reply never ran: no self-wake is armed');
       assert.ok(!waitsOf(h).stepWaits.has('scout'), "the stream's end dropped its step wait");
@@ -6032,7 +6031,7 @@ describe('a skip_reply beside a call of its step that failed', () => {
     }
   });
 
-  it("deregistering an agent while its skip_reply waits drops the agent's step wait and holds", async () => {
+  it("deregistering an agent while its skip_reply waits drops the agent's step wait", async () => {
     const module = lab();
     const h = await harness({ modules: [module] });
     try {
@@ -6041,7 +6040,6 @@ describe('a skip_reply beside a call of its step that failed', () => {
       await h.until(() => module.holding('h1') && waitsOf(h).stepWaits.has('scout'), 'the skip_reply waits');
       waitsOf(h).releaseAgentRuntime(h.framework.getAgent('scout'));
       assert.ok(!waitsOf(h).stepWaits.has('scout'), 'no step wait is left');
-      assert.ok(![...waitsOf(h).skipReplyHolds.keys()].some((key) => key.startsWith('scout\u0000')), 'no hold is left');
       module.release('h1');
     } finally {
       module.releaseAll();
@@ -6078,7 +6076,7 @@ describe('a skip_reply beside a call of its step that failed', () => {
         createMockResponse([sendFile('l1', { fail: true, hold: 'h1' }), call('ce1', 'code_execution', { code: 'await tools.skip_reply({});' })], 'tool_use'),
         createMockResponse([text('Never asked for.')]),
       ]);
-      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'ce1'), "the script ends while the lookup still runs: its skip_reply didn't wait");
+      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'ce1'), "the script ends while the send still runs: its skip_reply didn't wait");
       module.release('h1');
       await turn;
       assert.equal(ended(), 1);
@@ -6099,7 +6097,7 @@ describe('a skip_reply beside a call of its step that failed', () => {
         createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
         createMockResponse([skip('k3')], 'tool_use'),
       ]);
-      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'k1'), 'k1 is answered while the lookup still runs');
+      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'k1'), 'k1 is answered while the send still runs');
       module.release('h1');
       await turn;
       const results = h.toolResults();
