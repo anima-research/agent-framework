@@ -179,7 +179,9 @@ test('case 5: a server that refuses the initial policy: the notice has the words
 test('case 6: a policy established without pushEvents: a refused push writes no notice', async (t) => {
   const { server, fw } = await setup(t, accepts, {}, { pushEvents: false });
   const answer = await server.peer.request('push/event', ring('r1', 'one'));
-  assert.ok(answer.error, 'refused, since the grant lacks pushEvents');
+  const error = answer.error as Json | undefined;
+  assert.equal(error?.code, -32002, 'refused at the gate');
+  assert.equal(error?.message, 'push-event rejected: capability "pushEvents" not in the effective grant');
   await roundTrip(fw);
   assert.equal(notices(fw).length, 0);
 });
@@ -368,6 +370,37 @@ test('a granted server whose manifest drops pushEvents, and whose policy Request
   assert.ok(answer.error, 'refused, since the grant left in force lacks pushEvents');
   await waitFor(() => notices(fw).length === 1, 'the notice');
   assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, ''));
+});
+
+test('a server that was told of and then accepts a grant that admits none of the gated messages: no row says that the grant came back', async (t) => {
+  let policies = 0;
+  let manifest: Json = { version: '0.5', pushEvents: true, ...advert() };
+  const server = await startScriptedServer({
+    advert: advert(),
+    tools: TOOLS,
+    onPolicy: (msg, peer) => {
+      policies++;
+      if (policies === 1) peer.error(msg.id, -32601, 'Method not found');
+      else peer.reply(msg.id, { accepted: true });
+    },
+    on: (msg, peer) => {
+      if (msg.method === 'tools/call') peer.reply(msg.id, { content: [{ type: 'text', text: 'on air' }] });
+      else if (msg.method === 'mcpl/manifest') peer.reply(msg.id, manifest);
+      else if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  t.after(() => server.close());
+  const fw = await host(t, server.url);
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  manifest = { version: '0.5', ...advert() };
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => policies === 2, 'the policy Request after the manifest change');
+  await roundTrip(fw);
+  const answer = await server.peer.request('push/event', ring('r2', 'two'));
+  assert.ok(answer.error, 'still refused, since the grant lacks pushEvents');
+  assert.deepEqual(restored(fw), []);
+  assert.equal(connectionOf(fw).noGrantTold, true, 'the agent is still counted as told');
 });
 
 test('a server in a spell without a grant, whose policy Request after a manifest change gets an error: the end is the new one, and no second notice comes', async (t) => {
