@@ -593,8 +593,10 @@ for (const name of ['skip_reply', 'think'] as const) {
       h.framework.pushEvent({ type: 'external-message', source: 'probe', content: 'Run', metadata: {} }); await h.framework.runUntilIdle();
       const results = h.membrane.lastStream!.receivedToolResults[0] as Array<{ toolUseId: string; isError?: boolean }>;
       assert.equal(results.length, 2); assert.equal(results.find(r => r.toolUseId === 'denied')!.isError, true);
-      assert.ok(!results.find(r => r.toolUseId === 'allowed')!.isError); assert.deepEqual(h.effects, []);
-      assert.deepEqual(routed, name === 'skip_reply' ? [] : ['Trailing prose']);
+      assert.equal(!!results.find(r => r.toolUseId === 'allowed')!.isError, name === 'skip_reply',
+        'a call the list refuses counts as failed, so the skip_reply beside it is refused, and think is not');
+      assert.deepEqual(h.effects, []);
+      assert.deepEqual(routed, ['Trailing prose'], 'the turn goes on past the round, whose own prose stays private');
     } finally { await h.close(); }
   });
 }
