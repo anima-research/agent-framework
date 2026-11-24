@@ -2255,7 +2255,16 @@ export class WorkspaceModule implements Module {
       if (problem !== null) {
         return { success: false, isError: true, error: `The ${call.name} call did nothing: ${problem}.` };
       }
-      const input = call.input as Record<string, unknown>;
+      let input = call.input as Record<string, unknown>;
+      // An absolute path that lies in a mount is that mount's file from here
+      // on (outsidePath), so what's below judges one spelling of it: a
+      // generated file's own check, which an absolute spelling would pass by.
+      // Nothing is awaited for it while the setting is off, so a call then
+      // reaches its handler in the turn it always did.
+      if (this.config.outsideMounts !== undefined && TAKES_OUTSIDE.has(call.name) && typeof input?.path === 'string') {
+        const place = await this.outsidePath(input.path);
+        if (place !== null && 'mountPath' in place) input = { ...input, path: place.mountPath };
+      }
       // The most of this call's result that can reach its caller whole: past
       // it, a model's result spills into a file, and a script gets
       // ResultTooLarge in its place. A call made in process carries none and
@@ -4178,24 +4187,30 @@ export class WorkspaceModule implements Module {
   /**
    * Where a path lies when it isn't spelled from a mount's name: an absolute
    * path, or one from the home directory (`~/…`), where `outsideMounts` lets
-   * read, read_image and write take one. In a mount's directory, as the
-   * mounts are configured, it's that mount's file, answered mount-prefixed
-   * for the mount's own rules to judge (the innermost mount's, where they
-   * nest). Anywhere else it's a file outside every mount, answered absolute.
-   * Null for any other path, and for every path while the setting is off, so
-   * those are parsed, and refused, as they always were.
+   * read, read_image and write take one. In a mount's directory it's that
+   * mount's file, answered mount-prefixed for the mount's own rules to judge
+   * (the innermost mount's, where they nest). Anywhere else it's a file
+   * outside every mount, answered absolute, as given, for the system to
+   * resolve as it resolves any path. Null for any other path, which is
+   * parsed, and refused, as it always was. Only asked while the setting is
+   * on: off, its callers await nothing for it.
+   *
+   * Which mount holds it is judged by where disk has the path and each
+   * configured mount's root (realOf), so a link that leads into a mount, a
+   * root reached through a link, and another spelling of a name the
+   * filesystem folds all reach the mount, and none goes around its rules.
    */
-  private outsidePath(path: string): { mountPath: string } | { absolute: string } | null {
-    if (this.config.outsideMounts === undefined) return null;
-    const absolute = path.startsWith('~/') ? join(homedir(), path.slice(2)) : isAbsolute(path) ? resolve(path) : null;
+  private async outsidePath(path: string): Promise<{ mountPath: string } | { absolute: string } | null> {
+    const absolute = path.startsWith('~/') ? homedir() + path.slice(1) : isAbsolute(path) ? path : null;
     if (absolute === null) return null;
+    const real = await realOf(absolute);
     let held: { name: string; root: string } | undefined;
-    for (const { config } of this.mounts.values()) {
-      const root = resolve(config.path);
-      if (isContainedPath(root, absolute) && (held === undefined || root.length > held.root.length)) held = { name: config.name, root };
+    for (const mount of this.config.mounts) {
+      const root = await realOf(resolve(mount.path));
+      if (isContainedPath(root, real) && (held === undefined || root.length > held.root.length)) held = { name: mount.name, root };
     }
     if (held === undefined) return { absolute };
-    const rest = relative(held.root, absolute).split(sep).join('/');
+    const rest = relative(held.root, real).split(sep).join('/');
     return { mountPath: rest === '' ? held.name : `${held.name}/${rest}` };
   }
 
@@ -4208,7 +4223,8 @@ export class WorkspaceModule implements Module {
    */
   private async bytesOutside(absolute: string, shown: string, tool: 'read' | 'read_image'): Promise<{ bytes: Buffer } | { error: string }> {
     const quoted = JSON.stringify(shown);
-    const over = (size: string) => `${quoted} is ${size} bytes, past the ${OUTSIDE_LIMIT} on a file outside the mounts, so ${tool} doesn't show it.`;
+    // The limit is on the whole file, which read's paging, as its description offers it, doesn't get around.
+    const over = (size: string) => `${quoted} is ${size} bytes, past the ${OUTSIDE_LIMIT} on a file outside the mounts, so ${tool} doesn't show it${tool === 'read' ? ', or any page of it' : ''}.`;
     const unread = (err: unknown): { error: string } => {
       const code = errnoOf(err);
       return { error: code === 'ENOENT' || code === 'ENOTDIR' ? `there's no file at ${quoted}.` : unreadable(quoted, code) };
@@ -4250,13 +4266,22 @@ export class WorkspaceModule implements Module {
         error: didNothing('write', `${shown} would be ${buffer.byteLength.toLocaleString('en-US')} bytes, past the ${OUTSIDE_LIMIT} on a file outside the mounts. Content within the limit is written.`),
       };
     }
+    // Only a regular file, or nothing yet, is written: a pipe there would hold the call until something read it, and stop with it.
+    const there = await stat(absolute).catch(() => null);
+    if (there !== null && !there.isFile()) {
+      return { success: false, isError: true, error: didNothing('write', `${shown} is ${there.isDirectory() ? 'a directory' : 'not a regular file'}, so there's no file there to write.`) };
+    }
     try {
       await mkdir(dirname(absolute), { recursive: true });
       await writeFile(absolute, buffer);
     } catch (err) {
-      // Not "did nothing": a write that fails partway, as a full disk makes one, leaves what it got to.
+      // Not "did nothing": a write in place that fails partway, as a full disk makes one, leaves what it got to.
       const code = errnoOf(err);
-      return { success: false, isError: true, error: `The write to ${shown} failed: ${errnoWords(code)}. ${errnoWayOn(code)}` };
+      return {
+        success: false,
+        isError: true,
+        error: `The write to ${shown} failed: ${errnoWords(code)}. A write in place can stop partway, so what the file holds now isn't known: read it to see. ${errnoWayOn(code)}`,
+      };
     }
     return { success: true, data: { path: input.path, size: buffer.byteLength, hash: hashContent(input.content), disk: 'done' } };
   }
@@ -4280,7 +4305,7 @@ export class WorkspaceModule implements Module {
     }
     let file: FileText;
     let notes: string[] = [];
-    const place = generatedContent === undefined ? this.outsidePath(input.path) : null;
+    const place = generatedContent === undefined && this.config.outsideMounts !== undefined ? await this.outsidePath(input.path) : null;
     if (place !== null && 'absolute' in place) {
       const found = await this.bytesOutside(place.absolute, input.path, 'read');
       if ('error' in found) return { success: false, error: didNothing('read', found.error), isError: true };
@@ -4309,7 +4334,7 @@ export class WorkspaceModule implements Module {
   private async handleReadImage(input: ReadImageInput): Promise<ToolResult> {
     const given = input.path;
     const refused = (body: string): ToolResult => ({ success: false, isError: true, error: didNothing('read_image', body) });
-    const place = this.outsidePath(given);
+    const place = this.config.outsideMounts !== undefined ? await this.outsidePath(given) : null;
     if (place !== null && 'absolute' in place) {
       const found = await this.bytesOutside(place.absolute, given, 'read_image');
       if ('error' in found) return refused(found.error);
@@ -4365,7 +4390,7 @@ export class WorkspaceModule implements Module {
     if (LONE_SURROGATE.test(input.content)) {
       return { success: false, isError: true, error: 'The write did nothing: "content" holds a lone UTF-16 surrogate, which UTF-8 can\'t store. Give it without the surrogate, or with the other half of its pair.' };
     }
-    const place = this.outsidePath(input.path);
+    const place = this.config.outsideMounts !== undefined ? await this.outsidePath(input.path) : null;
     if (place !== null && 'absolute' in place) {
       if (this.config.outsideMounts === 'read-write') return this.writeOutside(place.absolute, input);
       return {
@@ -7134,6 +7159,24 @@ const READS_OUTSIDE = 'With an absolute path, or one that starts with "~/", it r
 const PATH_OUTSIDE = ', or an absolute path for a file outside the mounts';
 
 const OUTSIDE_LIMIT = `${DEFAULT_MAX_FILE_SIZE.toLocaleString('en-US')}-byte limit`;
+
+/** The tools that take a file outside the mounts where the host lets them (WorkspaceConfig.outsideMounts). */
+const TAKES_OUTSIDE = new Set(['read', 'read_image', 'write']);
+
+/**
+ * An absolute path as disk has it: its links followed and its names as disk
+ * spells them, as far along it as anything exists. What lies past that stays
+ * as given, so a file not yet written is placed by its nearest directory.
+ */
+async function realOf(absolute: string): Promise<string> {
+  const rest: string[] = [];
+  for (let at = absolute; ; at = dirname(at)) {
+    const real = await realpath(at).catch(() => null);
+    if (real !== null) return join(real, ...rest);
+    if (dirname(at) === at) return absolute;
+    rest.unshift(basename(at));
+  }
+}
 
 function binaryNotText(path: string, bytes: Buffer): string {
   return `${JSON.stringify(path)} is binary, so read doesn't show it as text. `

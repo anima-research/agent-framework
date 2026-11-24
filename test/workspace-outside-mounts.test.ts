@@ -1,6 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, truncateSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -142,7 +143,7 @@ test('a path that starts with "~/" is read from the home directory', async (t) =
   const { root, call } = setup(t, 'read-only');
   const home = process.env.HOME;
   process.env.HOME = root;
-  t.after(() => { process.env.HOME = home; });
+  t.after(() => { if (home === undefined) delete process.env.HOME; else process.env.HOME = home; });
   writeFileSync(join(root, 'elsewhere', 'home.txt'), 'from home\n');
 
   const read = await call('read', { path: '~/elsewhere/home.txt' });
@@ -165,7 +166,7 @@ test('what is outside and cannot be shown is refused in words that name it', asy
   writeFileSync(big, '');
   truncateSync(big, 5 * 1024 * 1024 + 1);
   assert.equal((await call('read', { path: big })).error,
-    `The read did nothing: ${JSON.stringify(big)} is 5,242,881 bytes, past the 5,242,880-byte limit on a file outside the mounts, so read doesn't show it.`);
+    `The read did nothing: ${JSON.stringify(big)} is 5,242,881 bytes, past the 5,242,880-byte limit on a file outside the mounts, so read doesn't show it, or any page of it.`);
   assert.equal((await call('read_image', { path: big })).error,
     `The read_image did nothing: ${JSON.stringify(big)} is 5,242,881 bytes, past the 5,242,880-byte limit on a file outside the mounts, so read_image doesn't show it.`);
   const tooMuch = await call('write', { path: join(elsewhere, 'too-much.txt'), content: 'x'.repeat(5 * 1024 * 1024 + 1) });
@@ -180,10 +181,81 @@ test('what is outside and cannot be shown is refused in words that name it', asy
   writeFileSync(text, 'words\n');
   assert.match(String((await call('read_image', { path: text })).error), /isn't a PNG, JPEG, GIF or WebP image/);
 
-  // A directory where the file would go: the write fails, and says how.
+  // A paged read of a file over the limit is refused as the whole file is.
+  assert.match(String((await call('read', { path: big, offset: 1, limit: 10 })).error), /so read doesn't show it, or any page of it\.$/);
+
   mkdirSync(join(elsewhere, 'taken'));
   assert.equal((await call('write', { path: join(elsewhere, 'taken'), content: 'x' })).error,
-    `The write to ${JSON.stringify(join(elsewhere, 'taken'))} failed: it's a directory. Calling again won't change that while disk holds what it does there.`);
+    `The write did nothing: ${JSON.stringify(join(elsewhere, 'taken'))} is a directory, so there's no file there to write.`);
+  // A write the system refuses says the file's state isn't known, since it's written in place.
+  const sealed = join(elsewhere, 'sealed.txt');
+  writeFileSync(sealed, 'old\n');
+  chmodSync(sealed, 0o444);
+  if (process.getuid?.() !== 0) {
+    assert.equal((await call('write', { path: sealed, content: 'new\n' })).error,
+      `The write to ${JSON.stringify(sealed)} failed: permission denied. A write in place can stop partway, so what the file holds now isn't known: read it to see. `
+      + "Calling again won't change that; whoever runs this host can change the permissions.");
+  }
+});
+
+test('a pipe outside the mounts is refused at once, read or written, and holds no call', { skip: process.platform === 'win32' }, async (t) => {
+  const { elsewhere, call } = setup(t, 'read-write');
+  const pipe = join(elsewhere, 'pipe');
+  execFileSync('mkfifo', [pipe]);
+  const quoted = JSON.stringify(pipe);
+  assert.equal((await call('read', { path: pipe })).error, `The read did nothing: ${quoted} is not a regular file, so read has nothing of it to show.`);
+  assert.equal((await call('read_image', { path: pipe })).error, `The read_image did nothing: ${quoted} is not a regular file, so read_image has nothing of it to show.`);
+  assert.equal((await call('write', { path: pipe, content: 'x' })).error, `The write did nothing: ${quoted} is not a regular file, so there's no file there to write.`);
+});
+
+test('a link is followed: one that leads into a mount reaches the mount and its rules, and one to a file outside is read and written through', async (t) => {
+  const { mountDir, elsewhere, call } = setup(t, 'read-write', 'read-only');
+  writeFileSync(join(mountDir, 'kept.txt'), 'the mount holds this\n');
+  symlinkSync(mountDir, join(elsewhere, 'alias'));
+  const aliased = join(elsewhere, 'alias', 'kept.txt');
+  assert.match(textOf(await call('read', { path: aliased })), /^path: work\/kept\.txt\n/);
+  const refused = await call('write', { path: aliased, content: 'replaced\n' });
+  assert.equal(refused.isError, true);
+  assert.match(String(refused.error), /read-only/);
+  // A file that doesn't exist yet is placed by its nearest directory, so a new one can't be made in the mount this way either.
+  assert.match(String((await call('write', { path: join(elsewhere, 'alias', 'new.txt'), content: 'x' })).error), /read-only/);
+  assert.equal(existsSync(join(mountDir, 'new.txt')), false);
+  assert.equal(readFileSync(join(mountDir, 'kept.txt'), 'utf8'), 'the mount holds this\n');
+
+  const target = join(elsewhere, 'target.txt');
+  const link = join(elsewhere, 'link.txt');
+  writeFileSync(target, 'before\n');
+  symlinkSync(target, link);
+  assert.match(textOf(await call('read', { path: link })), /before/);
+  assert.equal((await call('write', { path: link, content: 'after\n' })).success, true);
+  assert.equal(readFileSync(target, 'utf8'), 'after\n');
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+});
+
+test("a generated file's absolute path is the generated file, read and refused as its mount path is", async (t) => {
+  const { mountDir, workspace } = setup(t, 'read-write');
+  workspace.registerGeneratedTextFile('work/generated.txt', () => 'made at each read\n', 'scout');
+  const as = (agent: string, name: string, path: string, more: Record<string, unknown> = {}) =>
+    workspace.handleToolCall({ id: name, name, input: { path, ...more }, callerAgentName: agent });
+  const absolute = join(mountDir, 'generated.txt');
+
+  assert.match(textOf(await as('scout', 'read', absolute)), /made at each read/);
+  for (const [agent, name, more] of [['other', 'read', {}], ['scout', 'write', { content: 'mine now\n' }], ['scout', 'read_image', {}]] as const) {
+    const byMount = await as(agent, name, 'work/generated.txt', more);
+    assert.equal(byMount.isError, true, `${agent} ${name}`);
+    assert.equal((await as(agent, name, absolute, more)).error, byMount.error, `${agent} ${name}`);
+  }
+  assert.equal(existsSync(absolute), false);
+});
+
+test("before the store is in, an absolute path in a mount is still the mount's, and isn't written around it", async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'af-outside-early-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'mount'));
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: join(root, 'mount'), mode: 'read-only', watch: 'never' }], outsideMounts: 'read-write' });
+  const written = await workspace.handleToolCall({ id: 'write', name: 'write', input: { path: join(root, 'mount', 'early.txt'), content: 'x' } });
+  assert.equal(written.isError, true);
+  assert.equal(existsSync(join(root, 'mount', 'early.txt')), false);
 });
 
 test('a setting that is neither value is refused when the module is made', () => {

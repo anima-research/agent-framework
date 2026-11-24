@@ -409,9 +409,10 @@ export interface WorkspaceConfig {
    * the host's own user, through no mount's boundary, include or symlink
    * rule. Nothing of it is stored or watched, and an undo or other head move
    * leaves a write to it on disk. One is read or written up to the size a
-   * mount takes by default. An absolute path that lies in a mount's
-   * directory is that mount's file, by that mount's own rules, so a
-   * read-only mount stays read-only.
+   * mount takes by default, and only a regular file is. An absolute path
+   * that lies in a mount's directory is that mount's file, by that mount's
+   * own rules, so a read-only mount stays read-only; which mount holds it is
+   * judged by where disk has the path, its links followed.
    *
    * The tools' descriptions say what the setting allows, so setting it
    * changes them.
