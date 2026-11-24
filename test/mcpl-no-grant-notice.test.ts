@@ -17,7 +17,7 @@ const advert = (): Json => ({ featureSets: { 'radio.events': { description: 'Rin
 const notice = (method: string, cause: string, tail: string) =>
   `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant, because ${cause}. ` +
   `So its pushes and channel messages don't reach you. ${tail} If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
-const UPDATE = 'You can still call its tools. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const UPDATE = "Its tools don't need a grant. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.";
 const CAUSE = {
   unanswered: "it did not answer the host's policy request",
   errored: "it answered the host's policy request with an error",
@@ -25,7 +25,7 @@ const CAUSE = {
   noMcpl: 'it declared no MCPL in its handshake, so the host offered it no policy',
   hostError: "the host hit an error while it set up the server's policy",
 };
-const REFUSED_TAIL = "You can still call its tools. The host's log has the server's reason, if it gave one.";
+const REFUSED_TAIL = "Its tools don't need a grant. The host's log has the server's reason, if it gave one.";
 
 type Policy = (msg: Json, peer: ScriptedPeer) => void;
 type Fw = Awaited<ReturnType<typeof makeFramework>>;
@@ -346,7 +346,7 @@ test('case 13: a server that declares no MCPL and sends push/event: the notice h
   const answer = await server.peer.request('push/event', ring('r1', 'one'));
   assert.ok(answer.error, 'refused, since nothing is granted');
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.noMcpl, 'You can still call its tools. A server that sends MCPL messages must declare MCPL.'));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.noMcpl, "Its tools don't need a grant. A server that sends MCPL messages must declare MCPL."));
 });
 
 test('case 14: a reconnect whose policy step throws on the host leaves the connection live: the notice has the words for the host\'s error', async (t) => {

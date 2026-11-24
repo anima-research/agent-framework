@@ -3467,12 +3467,12 @@ export { suppressedRow } from './presentation.js';
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
 
-const NO_GRANT_UPDATE = 'You can still call its tools. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const NO_GRANT_UPDATE = "Its tools don't need a grant. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.";
 const NO_GRANT_WORDS = {
   unanswered: { cause: "it did not answer the host's policy request", tail: NO_GRANT_UPDATE },
   errored: { cause: "it answered the host's policy request with an error", tail: NO_GRANT_UPDATE },
-  refused: { cause: 'it refused the policy that the host offered', tail: "You can still call its tools. The host's log has the server's reason, if it gave one." },
-  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: 'You can still call its tools. A server that sends MCPL messages must declare MCPL.' },
+  refused: { cause: 'it refused the policy that the host offered', tail: "Its tools don't need a grant. The host's log has the server's reason, if it gave one." },
+  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: "Its tools don't need a grant. A server that sends MCPL messages must declare MCPL." },
   'host-error': { cause: "the host hit an error while it set up the server's policy", tail: "The host's log has the error. A restart of the server may clear it." },
 } satisfies Record<McplNoGrantEnd, { cause: string; tail: string }>;
 
