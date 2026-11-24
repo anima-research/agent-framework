@@ -5704,6 +5704,11 @@ describe('a skip_reply beside a call of its step that failed', () => {
   const gateOf = (h: Awaited<ReturnType<typeof harness>>) => (h.framework as unknown as {
     eventGate: { selfWakeTimers: Map<string, unknown>; getSleepState(): { until: number } | null };
   }).eventGate;
+  const waitsOf = (h: Awaited<ReturnType<typeof harness>>) => h.framework as unknown as {
+    stepWaits: Map<string, unknown>;
+    skipReplyHolds: Map<string, unknown>;
+    releaseAgentRuntime(agent: unknown): void;
+  };
   const answeredBeforeTheTurnEnds = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean => {
     const state = h.framework.getAgent('scout')!.state;
     return state.status === 'waiting_for_tools' && state.completed.some((c) => c.id === id);
@@ -5988,6 +5993,43 @@ describe('a skip_reply beside a call of its step that failed', () => {
       await h.until(() => dropped, "the lookup's late answer is dropped");
       await h.framework.runUntilIdle();
       assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'the skip_reply never ran: no self-wake is armed');
+      assert.ok(!waitsOf(h).stepWaits.has('scout'), "the stream's end dropped its step wait");
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("deregistering an agent while its skip_reply waits drops the agent's step wait and holds", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    try {
+      h.membrane.pushResponse(createMockResponse([lookup('l1', { hold: 'h1' }), skip('k1')], 'tool_use'));
+      h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-release', mode: 'addressed', text: 'message' });
+      await h.until(() => module.holding('h1') && waitsOf(h).stepWaits.has('scout'), 'the skip_reply waits');
+      waitsOf(h).releaseAgentRuntime(h.framework.getAgent('scout'));
+      assert.ok(!waitsOf(h).stepWaits.has('scout'), 'no step wait is left');
+      assert.ok(![...waitsOf(h).skipReplyHolds.keys()].some((key) => key.startsWith('scout\u0000')), 'no hold is left');
+      module.release('h1');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a retried silent turn keeps the refusal it already used', async () => {
+    const h = await harness({ modules: [lab()], retries: 1 });
+    try {
+      breakAfterToolRound(h.membrane, 'error', {
+        beforeFailure: () => {
+          h.membrane.pushResponse(createMockResponse([failed('l2'), skip('k2')], 'tool_use'));
+          h.membrane.pushResponse(createMockResponse([skip('k3')], 'tool_use'));
+        },
+      });
+      await h.turn([createMockResponse([failed('l1'), skip('k1')], 'tool_use')], 'scout', 'silent');
+      assert.equal(answerOf(h, 'k1'), refusal('lab--lookup'), 'premise: the first step used the refusal');
+      assert.ok(roundTaken(h, 'k2'), 'premise: the retry ran');
+      const second = answerOf(h, 'k2');
+      assert.ok(second !== undefined && !second.startsWith("This skip_reply didn't run"), second);
+      assert.ok(!roundTaken(h, 'k3'), "the retry's skip_reply ended the turn");
     } finally {
       await h.close();
     }
@@ -6112,7 +6154,7 @@ describe('a skip_reply beside a call of its step that failed', () => {
     try {
       await h.turn([
         createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
-        { ...createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1'), result('l1', 'nothing found'), result('k1', refusal('lab--lookup')), text('After it, posted.')]), toolCalls: [] },
+        { ...createMockResponse([text('Beside the refused skip.'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--lookup')), text('After it, posted.')]), toolCalls: [] },
       ]);
       assert.equal(h.toolResults()[1], refusal('lab--lookup'));
       assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
@@ -6146,7 +6188,7 @@ describe('a skip_reply beside a call of its step that failed', () => {
       await h.turn([
         createMockResponse([sendToRoom('s1')], 'tool_use'),
         createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
-        { ...createMockResponse([sendToRoom('s1'), result('s1', 'sent'), failed('l1'), skip('k1'), result('l1', 'nothing found'), result('k1', refusal('lab--lookup')), text('Held by the send.')]), toolCalls: [] },
+        { ...createMockResponse([sendToRoom('s1-reparsed'), result('s1-reparsed', 'sent'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--lookup')), text('Held by the send.')]), toolCalls: [] },
       ]);
       assert.equal(answerOf(h, 'k1'), refusal('lab--lookup'));
       assert.deepEqual(h.publishes(), []);
@@ -6161,7 +6203,7 @@ describe('a skip_reply beside a call of its step that failed', () => {
     try {
       await h.turn([
         createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
-        { ...createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1'), result('l1', 'nothing found'), result('k1', refusal('lab--lookup')), text('After it, posted.')]), toolCalls: [] },
+        { ...createMockResponse([text('Beside the refused skip.'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--lookup')), text('After it, posted.')]), toolCalls: [] },
       ]);
       assert.equal(h.toolResults()[1], refusal('lab--lookup'));
       assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Beside the refused skip.', 'skip-reply']]);
