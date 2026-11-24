@@ -15,9 +15,10 @@ const NOTICE_KIND = 'mcpl-no-grant';
 const advert = (): Json => ({ featureSets: { 'radio.events': { description: 'Rings of the bell.', uses: ['pushEvents'] } } });
 
 const notice = (method: string, cause: string, tail: string) =>
-  `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant, because ${cause}. ` +
-  `So its pushes and channel messages don't reach you. ${tail} If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
-const UPDATE = "Its tools don't need a grant. One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.";
+  `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant for such messages, because ${cause}. ` +
+  `So for now its pushes and channel messages don't reach you. ${tail ? `${tail} ` : ''}If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
+const UPDATE = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const RESTORED = '[no-grant] The MCPL server "radio" holds a grant again. The earlier notice about it no longer applies.';
 const CAUSE = {
   unanswered: "it did not answer the host's policy request",
   errored: "it answered the host's policy request with an error",
@@ -25,7 +26,7 @@ const CAUSE = {
   noMcpl: 'it declared no MCPL in its handshake, so the host offered it no policy',
   hostError: "the host hit an error while it set up the server's policy",
 };
-const REFUSED_TAIL = "Its tools don't need a grant. The host's log has the server's reason, if it gave one.";
+const REFUSED_TAIL = "The host's log has the server's reason, if it gave one.";
 
 type Policy = (msg: Json, peer: ScriptedPeer) => void;
 type Fw = Awaited<ReturnType<typeof makeFramework>>;
@@ -90,6 +91,12 @@ async function setup(t: TestContext, policy: Policy, config: Partial<McplServerC
 function noticeRows(fw: Fw) {
   return fw.framework.getAgent('scout')!.getContextManager().getAllMessages()
     .filter((m) => m.metadata?.kind === NOTICE_KIND);
+}
+
+function restored(fw: Fw): string[] {
+  return fw.framework.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => m.metadata?.kind === 'mcpl-grant-restored')
+    .map((m) => m.content.map((c) => (c.type === 'text' ? c.text : '')).join(''));
 }
 
 function notices(fw: Fw): string[] {
@@ -306,6 +313,7 @@ test('case 15: a server that gets a grant at a later exchange is no longer told 
   assert.equal(error?.code, -32002, 'refused at the gate');
   assert.equal(error?.message, 'inference-request rejected: capability "inferenceRequest" not in the effective grant');
   assert.equal(notices(fw).length, 0);
+  assert.deepEqual(restored(fw), [], 'a server that was never told of a spell gets no row when its grant comes');
 });
 
 test('case 16: a server that got a grant and lost it again is told again, on the same connection', async (t) => {
@@ -322,12 +330,61 @@ test('case 16: a server that got a grant and lost it again is told again, on the
   await roundTrip(fw);
   const granted = await server.peer.request('push/event', ring('r2', 'GRANTED-RING'));
   assert.equal(granted.error, undefined, 'a push is admitted under the grant');
+  assert.deepEqual(restored(fw), [RESTORED], 'the agent is told that the grant came back');
   server.peer.ws.terminate();
   await waitFor(() => handshakes(server) === 2, 'the host reconnects and finishes its handshake');
   const answer = await server.peer.request('push/event', ring('r3', 'after the reconnect'));
   assert.ok(answer.error, 'refused, since the reconnect\'s policy Request got an error');
   await waitFor(() => notices(fw).length === 2, 'a second notice, for the second spell');
   assert.equal(notices(fw)[1], notice('push/event', CAUSE.errored, UPDATE));
+  assert.equal(restored(fw).length, 1);
+});
+
+test('a granted server whose manifest drops pushEvents, and whose policy Request after it gets an error: its next push is refused and writes the notice, without the words for an old server', async (t) => {
+  let policies = 0;
+  let manifest: Json = { version: '0.5', pushEvents: true, ...advert() };
+  const server = await startScriptedServer({
+    advert: advert(),
+    tools: TOOLS,
+    onPolicy: (msg, peer) => {
+      policies++;
+      if (policies === 1) peer.reply(msg.id, { accepted: true });
+      else peer.error(msg.id, -32603, 'Internal error');
+    },
+    on: (msg, peer) => {
+      if (msg.method === 'mcpl/manifest') peer.reply(msg.id, manifest);
+      else if (msg.id !== undefined) peer.error(msg.id, -32601, 'Method not found');
+    },
+  });
+  t.after(() => server.close());
+  const fw = await host(t, server.url);
+  const admitted = await server.peer.request('push/event', ring('r1', 'GRANTED-RING'));
+  assert.equal(admitted.error, undefined, 'a push is admitted under the first grant');
+  manifest = { version: '0.5', ...advert() };
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => policies === 2, 'the policy Request after the manifest change');
+  await waitFor(() => connectionOf(fw).noGrantEnd === 'errored', 'the end of the failed exchange');
+  const answer = await server.peer.request('push/event', ring('r2', 'two'));
+  assert.ok(answer.error, 'refused, since the grant left in force lacks pushEvents');
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, ''));
+});
+
+test('a server in a spell without a grant, whose policy Request after a manifest change gets an error: the end is the new one, and no second notice comes', async (t) => {
+  let policies = 0;
+  const { server, fw } = await setup(t, (msg, peer) => {
+    policies++;
+    if (policies === 1) refuses(msg, peer);
+    else peer.error(msg.id, -32603, 'Internal error');
+  });
+  server.peer.notify('push/event', ring('r1', 'one'));
+  await waitFor(() => notices(fw).length === 1, 'the notice');
+  server.peer.notify('mcpl/manifestChanged', {});
+  await waitFor(() => policies === 2, 'the policy Request after the manifest change');
+  await waitFor(() => connectionOf(fw).noGrantEnd === 'errored', 'the end of the newer exchange');
+  const answer = await server.peer.request('push/event', ring('r2', 'two'));
+  assert.ok(answer.error, 'still refused');
+  assert.equal(notices(fw).length, 1);
 });
 
 test('a policy Request that the host could not send: the notice has the words for the host\'s error, not the server\'s silence', async (t) => {
@@ -349,7 +406,7 @@ test('case 13: a server that declares no MCPL and sends push/event: the notice h
   const answer = await server.peer.request('push/event', ring('r1', 'one'));
   assert.ok(answer.error, 'refused, since nothing is granted');
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.noMcpl, "Its tools don't need a grant. A server that sends MCPL messages must declare MCPL."));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.noMcpl, 'A server that sends MCPL messages must declare MCPL.'));
 });
 
 test('case 14: a reconnect whose policy step throws on the host leaves the connection live: the notice has the words for the host\'s error', async (t) => {
