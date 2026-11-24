@@ -359,7 +359,7 @@ test("a refused initial policy's reason is recorded without the server's configu
   const refused = traces.filter((t) => t.type === 'mcpl:policy-refused');
   assert.equal(refused.length, 1);
   assert.equal((refused[0] as { reason?: string }).reason, 'policy for redacted too narrow');
-  assert.ok(capture.lines.some((l) => l.includes('srv refused initial policy (policy for redacted too narrow)')), capture.lines.join('\n'));
+  assert.ok(capture.lines.some((l) => l.includes('srv refused initial policy ("policy\\u0020for\\u0020redacted\\u0020too\\u0020narrow")')), capture.lines.join('\n'));
   assert.ok(!capture.lines.join('\n').includes(secret));
 });
 
@@ -442,7 +442,7 @@ test('registerMcplServerFeatures: a refused initial policy is traced, and fallba
       traces.filter((t) => t.type === 'mcpl:policy-refused').map(withoutTimestamp),
       [{ type: 'mcpl:policy-refused', serverId: 'srv', phase: 'initial', reason: 'policy too narrow', fallback }],
     );
-    assert.ok(capture.lines.some((l) => l.includes(`srv refused initial policy (policy too narrow) — fallback: ${fallback}`)));
+    assert.ok(capture.lines.some((l) => l.includes(`srv refused initial policy ("policy\\u0020too\\u0020narrow") — fallback: ${fallback}`)));
   }
 });
 

@@ -110,7 +110,7 @@ import { assertBooleanSetting, assertOneOfSetting, holdsSettings, kindOf } from 
 import { ModuleRegistry, checkedToolResult, droppedToolResultLine, ensureStateRegistered, retiredPushLine, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { prefixesMeet, prefixesMeetError } from './mcpl/prefix-rule.js';
-import { logDetail, logValue } from './mcpl/log-value.js';
+import { logDetail, logValue, logValueRedacted } from './mcpl/log-value.js';
 import { expandCoreTags, isAmbient, isMarkerTagged, isSystemNotice } from './mcpl/tags.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -1019,7 +1019,7 @@ import {
 import { SuppressionReview, type ReviewRuleInfo, type SuppressionReviewSummary } from './gate/suppression-review.js';
 import { EPHEMERAL_USAGE_NAME, UsageTracker, persistedUsageProblem, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
-import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplServerConnection } from './mcpl/server-connection.js';
+import { McplRequestError, McplUnreapedLaunchError, stderrTailOf, toolsetDeclarationsOf, withStderr, type McplConnectionCloseInfo, type McplNoGrantEnd, type McplNoGrantRefusal, type McplServerConnection } from './mcpl/server-connection.js';
 import { ToolsetHub, TOOLSETS_MODULE, META_TOOL_NAMES, type ToolsetController } from './mcpl/toolset-host.js';
 import { HostPresentation, BUILTIN_TOOLSET, type HostActTarget } from './host-presentation.js';
 import { isEmptyChange, type Presence } from './mcpl/tool-presence.js';
@@ -3482,6 +3482,29 @@ export { suppressedRow } from './presentation.js';
  * since a notice never wakes the agent.
  */
 export const TOOL_CHANGES_EVENT_TYPE = 'mcpl:tool-changes';
+
+const NO_GRANT_OLD_SERVER = {
+  declared: 'The server declares an MCPL version before 0.5. Such a server does not take that request, and it needs an update to MCPL 0.5.',
+  unknown: 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.',
+};
+
+function oldServerWords(version: unknown): string | null {
+  const parts = typeof version === 'string' ? /^(\d+)\.(\d+)/.exec(version) : null;
+  if (!parts) return NO_GRANT_OLD_SERVER.unknown;
+  return Number(parts[1]) === 0 && Number(parts[2]) < 5 ? NO_GRANT_OLD_SERVER.declared : null;
+}
+const NO_GRANT_WORDS = {
+  unanswered: { cause: "it did not answer the host's policy request", tail: '' },
+  errored: { cause: "it answered the host's policy request with an error", tail: '' },
+  refused: { cause: 'it refused the policy that the host offered', tail: "The host's log has the server's reason, if it gave one." },
+  'no-mcpl': { cause: 'it declared no MCPL in its handshake, so the host offered it no policy', tail: 'A server that sends MCPL messages must declare MCPL.' },
+  'host-error': { cause: "the host hit an error while it set up the server's policy", tail: "The host's log has the error. A restart of the server may clear it." },
+} satisfies Record<McplNoGrantEnd, { cause: string; tail: string }>;
+
+function noGrantEndOf(err: unknown): McplNoGrantEnd | null {
+  if (!(err instanceof McplRequestError)) return null;
+  return err.outcome === 'error-response' ? 'errored' : err.outcome === 'no-response' ? 'unanswered' : 'host-error';
+}
 
 /** The largest file dump_suppressed writes (bytes), under the workspace's default 5 MB file limit. */
 const DUMP_MAX_BYTES = 4 * 1024 * 1024;
@@ -37723,6 +37746,7 @@ export class AgentFramework {
     try {
       await this.registerMcplServerFeatures(config, connection);
     } catch (error) {
+      if (connection.transportEpoch === epoch && !connection.policyEstablished) connection.noGrantEnd = 'host-error';
       if (opts.closeOnFailure) await this.closeFailedRuntimeConnect(connection, 'policy registration');
       throw error;
     } finally {
@@ -38015,6 +38039,40 @@ export class AgentFramework {
     void controller.connected(connection).catch((error: unknown) => {
       console.error(`[mcpl] ${connection.id}: reading its open toolsets failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+  }
+
+  private tellNoGrant(connection: McplServerConnection, refusal: McplNoGrantRefusal): void {
+    if (connection.noGrantTold || this.agents.size === 0) return;
+    const { cause, tail } = NO_GRANT_WORDS[refusal.end];
+    const firstPolicy = (refusal.end === 'unanswered' || refusal.end === 'errored') && !connection.policyEstablished;
+    const oldServer = firstPolicy ? oldServerWords(connection.capabilities?.version) : null;
+    const text = [
+      `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" sent ${refusal.method}, and the host refused it.`,
+      `The server holds no grant for such messages, because ${cause}.`,
+      "So for now its pushes and channel messages don't reach you.",
+      ...(oldServer ? [oldServer] : []),
+      ...(tail ? [tail] : []),
+      "If you can't change that yourself, ask whoever runs this host.",
+      'The host says this one time.',
+      'It says it again only after it connects the server anew, or after the server got a grant and lost it.',
+    ].join(' ');
+    try {
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant', serverId: connection.id });
+      connection.noGrantTold = true;
+    } catch (error) {
+      console.error(`[mcpl] ${connection.id}: the notice that it holds no grant could not be written:`, error);
+    }
+  }
+
+  private tellNoGrantEnded(connection: McplServerConnection): void {
+    if (!connection.noGrantTold || connection.grantAdmitsNoGatedMessage()) return;
+    connection.noGrantTold = false;
+    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" now holds a grant. The host accepts the messages that its grant covers.`;
+    try {
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant-ended', serverId: connection.id });
+    } catch (error) {
+      console.error(`[mcpl] ${connection.id}: the notice that it now holds a grant could not be written:`, error);
+    }
   }
 
   /**
@@ -38423,11 +38481,11 @@ export class AgentFramework {
     }
 
     st.inFlight = true;
+    // A manifest, and the policy negotiated for it, belong to the transport
+    // they came on: one that closes meanwhile installs nothing, since the
+    // next transport's initialize and policy exchange start afresh.
+    const epoch = connection.transportEpoch;
     try {
-      // A manifest, and the policy negotiated for it, belong to the transport
-      // they came on: one that closes meanwhile installs nothing, since the
-      // next transport's initialize and policy exchange start afresh.
-      const epoch = connection.transportEpoch;
       // §17.4 fetch. A server that cannot answer keeps its previous
       // manifest in force — an unparseable/failed fetch teaches nothing and
       // narrows nothing (§17.5 step 1).
@@ -38514,7 +38572,7 @@ export class AgentFramework {
         if (receipt && receipt.accepted === false) {
           const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
           const fallback = refusal.fallback;
-          console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
+          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${typeof receipt.reason === 'string' ? logValueRedacted(receipt.reason, recorded) : 'no reason'}) — fallback: ${fallback}`);
           this.emitTrace({
             type: 'mcpl:policy-refused',
             serverId: connection.id,
@@ -38525,20 +38583,24 @@ export class AgentFramework {
             closeForGood = true;
           } else {
             connection.establishGrant(CapabilityGrant.empty());
+            connection.noGrantEnd = 'refused';
             this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, CapabilityGrant.empty());
           }
         } else {
           connection.establishGrant(newGrant);
+          this.tellNoGrantEnded(connection);
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
         }
-      } catch {
+      } catch (err) {
         if (connection.transportEpoch !== epoch) {
           console.error(`[mcpl] ${connection.id}: post-manifest policy Request ended by its transport's close; not applied`);
           return;
         }
         console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
+        const end = noGrantEndOf(err);
+        if (end && (connection.noGrantEnd !== null || connection.grantAdmitsNoGatedMessage())) connection.noGrantEnd = end;
       }
       if (closeForGood) {
         await this.closeMcplServerForGood(connection);
@@ -38586,6 +38648,9 @@ export class AgentFramework {
         impacts,
       });
       this.handleToolsListChanged(connection.id);
+    } catch (err) {
+      if (connection.transportEpoch === epoch && connection.noGrantEnd === null && connection.grantAdmitsNoGatedMessage()) connection.noGrantEnd = 'host-error';
+      throw err;
     } finally {
       st.inFlight = false;
       st.lastCompletedAt = Date.now();
@@ -38635,7 +38700,10 @@ export class AgentFramework {
     config: import('./mcpl/types.js').McplServerConfig,
     connection: McplServerConnection,
   ): Promise<void> {
-    if (!connection.capabilities) return;
+    if (!connection.capabilities) {
+      connection.noGrantEnd = 'no-mcpl';
+      return;
+    }
     // Taken before any await, so every record of what the server says below
     // uses one derivation, whatever becomes of the server meanwhile (removed,
     // or replaced by a restart).
@@ -38686,7 +38754,7 @@ export class AgentFramework {
         const refusal = AgentFramework.policyRefusalFields(receipt, recorded);
         const fallback = refusal.fallback;
         console.error(
-          `[mcpl] ${config.id} refused initial policy (${refusal.reason ?? 'no reason'}) — fallback: ${fallback}`,
+          `[mcpl] ${config.id} refused initial policy (${typeof receipt.reason === 'string' ? logValueRedacted(receipt.reason, recorded) : 'no reason'}) — fallback: ${fallback}`,
         );
         this.emitTrace({
           type: 'mcpl:policy-refused',
@@ -38697,11 +38765,15 @@ export class AgentFramework {
         // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
         // dark, plain MCP tools keep working. MUST NOT widen in response to
         // the refusal — a human can change config; the policy engine cannot.
-        if (fallback !== 'close') return;
+        if (fallback !== 'close') {
+          connection.noGrantEnd = 'refused';
+          return;
+        }
         closeForGood = true;
       } else {
         // Expansion activates on receipt (§6.7).
         connection.establishGrant(grant);
+        this.tellNoGrantEnded(connection);
         if (receipt?.accepted === true && receipt.mode === 'degraded') {
           for (const uf of receipt.unavailableFeatures ?? []) {
             console.error(recorded(
@@ -38715,6 +38787,7 @@ export class AgentFramework {
         console.error(`[mcpl] ${config.id}: its transport closed during the initial policy Request; the next one, if one comes, negotiates its own`);
         return;
       }
+      connection.noGrantEnd = noGrantEndOf(err);
       // A pre-0.5 server treats the Request as a notification and never
       // answers. §6.7: an unanswered expansion simply does not activate —
       // grant stays empty, connection is effectively MCP-only. This WILL
@@ -39653,6 +39726,8 @@ export class AgentFramework {
     connection.on('stderr', (params: { line: string }) => {
       this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: recorded(params.line) });
     });
+
+    connection.on('no-grant-refusal', (refusal: McplNoGrantRefusal) => this.tellNoGrant(connection, refusal));
 
     // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
     // -32601 (superseded by SPEC §17's host-diffed manifest fetch); no

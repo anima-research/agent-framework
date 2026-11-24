@@ -1,0 +1,3 @@
+- The framework now writes `[no-grant]` notices. It marks `[no-grant` in text from a participant or a server, as it marks its other notice openings.
+- After a manifest change, the host sends a new policy, and the server can refuse it. The stderr line for that refusal now gives the server's reason. When the server gave none, the line says "no reason".
+- The stderr lines for a refused policy, the first one and one after a manifest change, print the server's reason as the host's log lines print other text that a server chose: redacted, escaped, and cut to at most 256 UTF-16 code units. A reason with a space or a line break prints as a quoted JSON string.

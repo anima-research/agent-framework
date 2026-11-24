@@ -273,6 +273,13 @@ export type HintRead =
   /** A standalone tools/hints (carrier 3). */
   | { kind: 'hints'; params: unknown };
 
+export type McplNoGrantEnd = 'unanswered' | 'errored' | 'refused' | 'no-mcpl' | 'host-error';
+
+export interface McplNoGrantRefusal {
+  method: string;
+  end: McplNoGrantEnd;
+}
+
 /** Requests whose results can carry hint state, remembered for a late answer (RFC-014 §6.1). */
 const HINTED_METHODS: ReadonlySet<string> = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list']);
 
@@ -438,6 +445,11 @@ function unmatchedResponse(
  *                            connection runs the §5.3 policy exchange again,
  *                            then opens the planes (the framework's listener
  *                            does).
+ * - `'no-grant-refusal'`   — The admission gate refused a message for lack of
+ *                            a capability while `noGrantEnd` is set:
+ *                            `{ method, end }`, the refused message's MCPL
+ *                            method and `noGrantEnd`. Raised for each such
+ *                            message, after the refusal, past the gate.
  */
 export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
@@ -485,6 +497,24 @@ export class McplServerConnection extends EventEmitter {
 
   /** True once the §5.3 initial policy Request has been answered. */
   policyEstablished = false;
+
+  /** How this transport's §5.3 policy exchange ended, when it ended with no
+   *  grant in force: `unanswered` or `errored` for a policy Request that got
+   *  no answer or an error answer, `refused` for a refused policy, `no-mcpl`
+   *  for a server that declared no MCPL, so none was offered, and
+   *  `host-error` for a host error in the policy step. After a manifest
+   *  change, a failed policy Request sets it too, when the grant left in
+   *  force admits none of the gated messages. Null until then. Whoever runs
+   *  the exchange sets it (the framework does); `establishGrant` and a
+   *  transport boundary clear it. */
+  noGrantEnd: McplNoGrantEnd | null = null;
+
+  /** Whether the agent has been told that this connection holds no grant, in
+   *  its current spell without one. Whoever tells the agent sets it (the
+   *  framework does, once its notice is written), and clears it when the
+   *  server accepts a grant that admits a gated message. A transport
+   *  boundary and the empty grant that a refusal sets keep it. */
+  noGrantTold = false;
 
   /**
    * RFC-007 §6: the server's `tools/observe` filter — interest, never
@@ -566,6 +596,7 @@ export class McplServerConnection extends EventEmitter {
   establishGrant(grant: CapabilityGrant): void {
     this.grant = grant;
     this.policyEstablished = true;
+    this.noGrantEnd = null;
     // RFC-007 §6.5: revoking observe discards the filter; the server sends
     // it again if the capability is granted later.
     if (!grant.has('toolLifecycle.observe')) this.toolObserveFilter = null;
@@ -577,6 +608,7 @@ export class McplServerConnection extends EventEmitter {
   private resetPolicyForTransportBoundary(): void {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
+    this.noGrantEnd = null;
     this.transportEpoch++;
     this.transportEnded.abort();
     this.transportEnded = new AbortController();
@@ -1074,6 +1106,10 @@ export class McplServerConnection extends EventEmitter {
         } else {
           console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
         }
+        if (this.noGrantEnd !== null) {
+          const refusal: McplNoGrantRefusal = { method: McplServerConnection.methodOf(name), end: this.noGrantEnd };
+          super.emit('no-grant-refusal', refusal);
+        }
         return true;
       }
       // §6.6: a request that will never be answered MUST get an error. A
@@ -1203,6 +1239,10 @@ export class McplServerConnection extends EventEmitter {
     // (-32002 otherwise, including before the §5.3 policy exchange).
     'tools-observe': 'toolLifecycle.observe',
   };
+
+  grantAdmitsNoGatedMessage(): boolean {
+    return Object.values(McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY).every((path) => !this.grant.has(path));
+  }
 
   private static isControlPlaneEvent(event: string): boolean {
     return event === 'stderr'
@@ -2381,6 +2421,11 @@ export class McplServerConnection extends EventEmitter {
   // ==========================================================================
   // Private: inbound message routing
   // ==========================================================================
+
+  private static methodOf(event: string): string {
+    return Object.keys(McplServerConnection.METHOD_TO_EVENT)
+      .find((method) => McplServerConnection.METHOD_TO_EVENT[method] === event) ?? event;
+  }
 
   /**
    * Map from JSON-RPC method name to the EventEmitter event name.
