@@ -2493,7 +2493,7 @@ describe('present while acting', () => {
     assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
       `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
-        '(not sent — drafts can resend them unchanged, or dismiss them)',
+        '(not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends)',
     ]);
 
     await framework.stop();
@@ -2538,7 +2538,7 @@ describe('present while acting', () => {
       assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
         `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
-          '(not sent — drafts can resend them unchanged, or dismiss them)',
+          '(not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends)',
       ], `${verb}: suppression is visible in the receipt`);
 
       await framework.stop();

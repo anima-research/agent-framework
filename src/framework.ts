@@ -379,6 +379,8 @@ const draftsToolDescription = (sendSilencing: boolean): string =>
   'because a routing prefix bounced, or because it had no destination. ' +
   `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
   `drafts are always kept; an older one may be let go once ${Math.round(KEEP_IDLE_MS / 86_400_000)} days pass in which nothing happens to it. ` +
+  'A held draft that you leave alone for a whole turn is set aside when that turn ends, as dismiss does; one that ' +
+  'bounced, or that may already have been posted, is left open. ' +
   'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
   'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
   'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
@@ -1497,6 +1499,10 @@ interface TurnRouting {
    * from another's.
    */
   turnId: number;
+  /** When the turn's routing was made: a held draft that nothing has happened to since is one the turn left alone (setAsideIdleDrafts). */
+  openedAt: number;
+  /** The drafts the turn's own `drafts` calls named (read, resend, dismiss). Something was done with them, so the turn's end sets none of them aside, though a resend refused before its attempt is journaled leaves no record on the draft. */
+  draftsNamed?: Set<string>;
   /**
    * The channel whose message triggered the turn (item-3 redux), which the
    * locus is resolved from when the turn opens, and which the channel
@@ -1685,6 +1691,7 @@ function noteTurnChannel(routing: TurnRouting, channel: ChannelRef | undefined):
 function freshTurnRouting(): TurnRouting {
   return {
     turnId: ++lastTurnId,
+    openedAt: Date.now(),
     engaged: new Set(),
     wasIn: [],
     continuation: false, deliveries: [], suppressed: 0, drafts: [], keptPrivate: 0, arrivals: [], heard: new Map(),
@@ -23915,6 +23922,18 @@ export class AgentFramework {
       ...risky.map((d) => `${this.riskText(d)}, so resending ${d.id} could post it twice ` +
         `(to send it anyway: drafts(action: "resend", draftIds: ["${d.id}"], destination: ${destination}, confirmDuplicate: true))`),
     ];
+    // A draft left alone needs no call: a turn's end sets it aside
+    // (setAsideIdleDrafts). One that may already have been posted stays open,
+    // so only it is given its dismissal, and the others are then named.
+    const aside = [
+      ...(free.length > 0
+        ? [`left alone for a whole turn, ${risky.length > 0 ? free.map((d) => d.id).join(', ') : free.length > 1 ? 'they' : 'it'} ` +
+          `${free.length > 1 ? 'are' : 'is'} set aside when that turn ends`]
+        : []),
+      ...(risky.length > 0
+        ? [`drafts(action: "dismiss", draftIds: [${quoted(risky)}]) sets ${risky.length > 1 ? 'them' : 'it'} aside`]
+        : []),
+    ];
     // Named: residents share one message slot (#197), and an agent that
     // observes the writer's slot is shown the notice too.
     // "Not sent" only when no copied words may already have been posted.
@@ -23922,7 +23941,7 @@ export class AgentFramework {
       `[${NOTICE_TAG.drafts}] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
       `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${because ? `because ${because}` : AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
-      `${resend.join('; ')}; drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
+      `${[...resend, ...aside].join('; ')}.`
     );
   }
 
@@ -24126,6 +24145,37 @@ export class AgentFramework {
     this.recordDraftNotices(agent, this.draftsNamedInHistory(agent, held.map((d) => d.id)));
   }
 
+  /**
+   * A turn's own end (its last response, or a tool that ends it): set aside,
+   * as the resident's dismissal would, each held draft a notice named before
+   * the turn opened, that nothing has happened to since, and that none of
+   * the turn's `drafts` calls named (TurnRouting.draftsNamed). The resident
+   * had the whole turn to resend it and left it alone, so it asks nothing
+   * more of them: no call to make, and no growing list of open drafts. A turn
+   * that fails, is stopped, is cut off or ends in a refusal sets nothing
+   * aside, since its resident may never have read the notice, or reached what
+   * it meant to do. A bounce stays open: it is a message its resident
+   * addressed and that didn't arrive, which may wait for a destination to
+   * come back, and `{{unsent}}` means it. So do a draft that may already have
+   * been posted (its risk is the resident's to answer) and one queued in a
+   * resend still running.
+   */
+  private setAsideIdleDrafts(agent: Agent, routing: TurnRouting): void {
+    const setAside: string[] = [];
+    try {
+      for (const d of this.proseDrafts.idleSince(agent.name, routing.openedAt)) {
+        if (d.reason === 'bounced' || routing.draftsNamed?.has(d.id) || this.draftsInFlight.has(`${agent.name}\u0000${d.id}`)) continue;
+        this.proseDrafts.dismiss(agent.name, d.id);
+        setAside.push(d.id);
+      }
+    } catch (err) {
+      console.error(`[drafts] ${agent.name}: setting idle drafts aside failed; the next turn's end tries again:`, err);
+    }
+    if (setAside.length === 0) return;
+    console.error(`[drafts] ${agent.name}: set aside ${setAside.join(', ')} (left alone for a turn)`);
+    this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: setAside, auto: true });
+  }
+
   /** Record each named draft as noticed, with the message that names it
    *  (draftsNamedInHistory). */
   private recordDraftNotices(agent: Agent, named: Map<string, string>): void {
@@ -24246,6 +24296,11 @@ export class AgentFramework {
         return refuse('draftIds must be a list of draft ids such as "d-k7x3qm2", or null.');
       }
       ids = (input.draftIds as string[]).map((id) => id.trim());
+      // Naming a draft is something done with it: its turn's end doesn't set
+      // it aside (setAsideIdleDrafts), whatever becomes of the call, a
+      // refusal of the whole call included.
+      const naming = turn ?? this.openLogical.get(agentName);
+      if (naming) for (const id of ids) (naming.draftsNamed ??= new Set()).add(id);
       if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');
       if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
     }
@@ -24689,12 +24744,17 @@ export class AgentFramework {
     // names one the text left out.
     const idList = (ds: Draft[]): string => ds.map((d) => d.id).join(', ');
     const held = inState('held');
-    if (held.length > 0) {
+    // A bounce stays open until its resident resends or dismisses it; a
+    // later turn's end sets the rest aside (setAsideIdleDrafts).
+    const heldNote = (ds: Draft[], otherwise: string): void => {
+      if (ds.length === 0) return;
       notes.push(
-        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
-        '(not sent — drafts can resend them unchanged, or dismiss them)',
+        `${ds.length} plain-speech segment(s) held as draft${ds.length === 1 ? '' : 's'} ${idList(ds)} ` +
+        `(not sent — drafts can resend them unchanged${otherwise})`,
       );
-    }
+    };
+    heldNote(held.filter((d) => d.reason !== 'bounced'), '; left alone for a whole turn, they are set aside when that turn ends');
+    heldNote(held.filter((d) => d.reason === 'bounced'), ', or dismiss them');
     if (letGo.length > 0) {
       notes.push(
         `draft${letGo.length === 1 ? '' : 's'} ${idList(letGo)} held this turn and since let go by retention ` +
@@ -29585,6 +29645,7 @@ export class AgentFramework {
         // closed-channel note comes once they've run.
         void turnSpeechChain.then(() => this.appendClosedChannelNoteAlone(agent, streamRouting));
       }
+      if (cancelKind === 'turn_ended' && !trigger?.suppressProse) this.setAsideIdleDrafts(agent, streamRouting);
       // A `!` an earlier round asked for still starts its
       // continuation when a tool ends the turn, once the turn's
       // deliveries have run. Explicit mode doesn't hold the turn
@@ -30908,6 +30969,10 @@ export class AgentFramework {
             } else if (!trigger?.suppressProse) {
               this.appendClosedChannelNoteAlone(agent, streamRouting);
             }
+            // Only a turn the model ended itself: a refusal read nothing it
+            // could act on, and a turn cut off (the output limit, the stall
+            // guard) may not have reached what it meant to do with a draft.
+            if (!trigger?.suppressProse && AUTO_CONTINUE_STOP_REASONS.has(response.stopReason)) this.setAsideIdleDrafts(agent, streamRouting);
 
             // A `!` continuation this turn asked for. This gives prose the
             // same continuation ability tool rounds have (wanted for
