@@ -575,7 +575,7 @@ and its other messages that need a capability. At the first such refusal,
 the agent gets a `[no-grant]` notice in its context, of kind `mcpl-no-grant`,
 which names the server and says why it holds no grant. If that server later
 accepts a grant on the same connection, and the grant admits one of those
-messages, the agent gets a row of kind `mcpl-grant-restored`, which says so.
+messages, the agent gets a row of kind `mcpl-no-grant-ended`, which says so.
 
 #### Event coalescing (RFC-006)
 

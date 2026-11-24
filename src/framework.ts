@@ -37888,14 +37888,14 @@ export class AgentFramework {
     }
   }
 
-  private tellGrantRestored(connection: McplServerConnection): void {
+  private tellNoGrantEnded(connection: McplServerConnection): void {
     if (!connection.noGrantTold || connection.grantAdmitsNoGatedMessage()) return;
     connection.noGrantTold = false;
-    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" holds a grant again. The messages that its grant covers reach you again.`;
+    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" now holds a grant. The host accepts the messages that its grant covers.`;
     try {
-      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-grant-restored', serverId: connection.id });
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-no-grant-ended', serverId: connection.id });
     } catch (error) {
-      console.error(`[mcpl] ${connection.id}: the notice that it holds a grant again could not be written:`, error);
+      console.error(`[mcpl] ${connection.id}: the notice that it now holds a grant could not be written:`, error);
     }
   }
 
@@ -38412,7 +38412,7 @@ export class AgentFramework {
           }
         } else {
           connection.establishGrant(newGrant);
-          this.tellGrantRestored(connection);
+          this.tellNoGrantEnded(connection);
           this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
@@ -38594,7 +38594,7 @@ export class AgentFramework {
       } else {
         // Expansion activates on receipt (§6.7).
         connection.establishGrant(grant);
-        this.tellGrantRestored(connection);
+        this.tellNoGrantEnded(connection);
         if (receipt?.accepted === true && receipt.mode === 'degraded') {
           for (const uf of receipt.unavailableFeatures ?? []) {
             console.error(recorded(
