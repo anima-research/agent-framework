@@ -17,7 +17,7 @@ const advert = (): Json => ({ featureSets: { 'radio.events': { description: 'Rin
 const notice = (method: string, cause: string, tail: string) =>
   `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant for such messages, because ${cause}. ` +
   `So for now its pushes and channel messages don't reach you. ${tail ? `${tail} ` : ''}If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
-const UPDATE = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
+const POSSIBLE_OLD_SERVER = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
 const OLD_SERVER = 'The server declares an MCPL version before 0.5. Such a server does not take that request, and it needs an update to MCPL 0.5.';
 const ENDED = '[no-grant] The MCPL server "radio" now holds a grant. The host accepts the messages that its grant covers.';
 const CAUSE = {
@@ -122,7 +122,7 @@ test('case 1: a server that never answers the policy Request: its first refused 
   const { server, fw } = await setup(t, unanswered);
   server.peer.notify('push/event', ring('r1', 'RING-ONE'));
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, UPDATE));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, ''));
   assert.equal(Reflect.get(noticeRows(fw)[0]!.metadata ?? {}, 'serverId'), 'radio');
   await roundTrip(fw);
   assert.ok(!windowText(fw.framework).some((x) => x.includes('RING-ONE')), 'nothing the push carried is in the context');
@@ -194,7 +194,7 @@ test('a push held while a policy exchange runs, which then ends with no grant, i
   });
   const fw = await host(t, server.url);
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, ''));
   assert.ok(!windowText(fw.framework).some((x) => x.includes('HELD-RING')), 'nothing the push carried is in the context');
 });
 
@@ -240,7 +240,7 @@ test('case 9: a refused channels/register writes the notice, naming that method,
   });
   assert.ok(answer.error, 'refused for lack of a grant');
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('channels/register', CAUSE.unanswered, UPDATE));
+  assert.equal(notices(fw)[0], notice('channels/register', CAUSE.unanswered, ''));
   server.peer.notify('push/event', ring('r1', 'one'));
   await roundTrip(fw);
   assert.equal(notices(fw).length, 1);
@@ -267,7 +267,7 @@ test('case 11: a server that answers the policy Request with an error: the notic
   const { server, fw } = await setup(t, answersWithError);
   server.peer.notify('push/event', ring('r1', 'one'));
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, UPDATE));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.errored, ''));
 });
 
 test('a server that declares an MCPL version from before 0.5, and never answers the policy Request: the notice says so as a fact', async (t) => {
@@ -281,7 +281,7 @@ test('a server that declares a version that is no string, and never answers the 
   const { server, fw } = await setup(t, unanswered, {}, { version: 4, ...advert() });
   server.peer.notify('push/event', ring('r1', 'one'));
   await waitFor(() => notices(fw).length === 1, 'the notice');
-  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, UPDATE));
+  assert.equal(notices(fw)[0], notice('push/event', CAUSE.unanswered, POSSIBLE_OLD_SERVER));
 });
 
 test('a server that declares MCPL 0.5 or later, and answers the policy Request with an error: the notice says nothing of an old server', async (t) => {
@@ -360,7 +360,7 @@ test('case 16: a server that got a grant and lost it again is told again, on the
   const answer = await server.peer.request('push/event', ring('r3', 'after the reconnect'));
   assert.ok(answer.error, 'refused, since the reconnect\'s policy Request got an error');
   await waitFor(() => notices(fw).length === 2, 'a second notice, for the second spell');
-  assert.equal(notices(fw)[1], notice('push/event', CAUSE.errored, UPDATE));
+  assert.equal(notices(fw)[1], notice('push/event', CAUSE.errored, ''));
   assert.equal(ended(fw).length, 1);
 });
 
