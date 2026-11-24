@@ -1,11 +1,11 @@
 - An agent now gets a notice about an MCPL server that holds no grant. The server holds none because its policy exchange ended without one. The host refuses its pushes and its other privileged messages. At the first such refusal, the framework writes a `[no-grant]` notice into the agent's context, which wakes nobody. The row's kind is `mcpl-no-grant`, and it carries `serverId`. The notice names the server and the refused method, and says why the server holds no grant.
 - A policy exchange ends without a grant in these ways:
-  - the server doesn't answer the policy Request;
-  - the server answers the policy Request with an error;
+  - the server doesn't answer its first policy Request;
+  - the server answers its first policy Request with an error;
   - the server refuses the policy, at its first exchange or after a manifest change;
   - the server declares no MCPL;
-  - the host can't send the policy Request on a live connection;
+  - the host can't send the first policy Request on a live connection;
   - the host's own policy step throws, and the connection stays live;
   - after a manifest change, the policy Request fails in one of the ways above, and the grant left in force admits none of the messages that need a capability.
-- The notice comes once for each spell without a grant. When only the transport drops and comes back, the spell goes on. A connect of the server, or a restart of the server or of the host, starts a new spell. A grant that the server accepted ends a spell, and a later loss starts another. When a spell that the agent was told of ends on the same connection, the framework writes one more row, of kind `mcpl-grant-restored`, which says that the server holds a grant again. The refusal itself is unchanged, and so are its error answer and its stderr line.
+- The notice comes once for each spell without a grant. When only the transport drops and comes back, the spell goes on. A new connection starts a new spell: a connect of the server, a restart of the server through the host, or a start of the host. A server process that restarts on its own, and that the host reconnects on the same connection, stays in its spell. A grant that the server accepted ends a spell, and a later loss starts another. When a spell that the agent was told of ends on the same connection, with a grant that admits one of the messages that need a capability, the framework writes one more row, of kind `mcpl-grant-restored`, which says that the server holds a grant again. The refusal itself is unchanged, and so are its error answer and its stderr line.
 - The connection has two new fields and one new event. `McplServerConnection.noGrantEnd` names the end of a policy exchange that left no grant. Its values are `'unanswered'`, `'errored'`, `'refused'`, `'no-mcpl'` and `'host-error'`, and it is null at other times. `McplServerConnection.noGrantTold` says whether the agent has been told of the current spell. While `noGrantEnd` is set, a refusal for lack of a capability raises a `'no-grant-refusal'` event. The event carries `{ method, end }`. The package exports their types, `McplNoGrantEnd` and `McplNoGrantRefusal`.

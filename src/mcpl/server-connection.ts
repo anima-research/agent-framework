@@ -502,16 +502,18 @@ export class McplServerConnection extends EventEmitter {
    *  grant in force: `unanswered` or `errored` for a policy Request that got
    *  no answer or an error answer, `refused` for a refused policy, `no-mcpl`
    *  for a server that declared no MCPL, so none was offered, and
-   *  `host-error` for a host error in the policy step. Null until then, and
-   *  while a grant is in force. Whoever runs the exchange sets it (the
-   *  framework does); a grant and a transport boundary clear it. */
+   *  `host-error` for a host error in the policy step. After a manifest
+   *  change, a failed policy Request sets it too, when the grant left in
+   *  force admits none of the gated messages. Null until then. Whoever runs
+   *  the exchange sets it (the framework does); `establishGrant` and a
+   *  transport boundary clear it. */
   noGrantEnd: McplNoGrantEnd | null = null;
 
   /** Whether the agent has been told that this connection holds no grant, in
    *  its current spell without one. Whoever tells the agent sets it (the
    *  framework does, once its notice is written), and clears it when the
-   *  server accepts a grant. A transport boundary and the empty grant that a
-   *  refusal sets keep it. */
+   *  server accepts a grant that admits a gated message. A transport
+   *  boundary and the empty grant that a refusal sets keep it. */
   noGrantTold = false;
 
   /**

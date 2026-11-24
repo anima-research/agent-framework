@@ -37889,9 +37889,9 @@ export class AgentFramework {
   }
 
   private tellGrantRestored(connection: McplServerConnection): void {
-    if (!connection.noGrantTold) return;
+    if (!connection.noGrantTold || connection.grantAdmitsNoGatedMessage()) return;
     connection.noGrantTold = false;
-    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" holds a grant again. The earlier notice about it no longer applies.`;
+    const text = `[${NOTICE_TAG.noGrant}] The MCPL server "${connection.id}" holds a grant again. The messages that its grant covers reach you again.`;
     try {
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'mcpl-grant-restored', serverId: connection.id });
     } catch (error) {

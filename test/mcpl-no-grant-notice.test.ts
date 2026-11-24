@@ -18,7 +18,7 @@ const notice = (method: string, cause: string, tail: string) =>
   `[no-grant] The MCPL server "radio" sent ${method}, and the host refused it. The server holds no grant for such messages, because ${cause}. ` +
   `So for now its pushes and channel messages don't reach you. ${tail ? `${tail} ` : ''}If you can't change that yourself, ask whoever runs this host. The host says this one time. It says it again only after it connects the server anew, or after the server got a grant and lost it.`;
 const UPDATE = 'One possible cause: a server from before MCPL 0.5 does not take that request. Such a server needs an update to MCPL 0.5.';
-const RESTORED = '[no-grant] The MCPL server "radio" holds a grant again. The earlier notice about it no longer applies.';
+const RESTORED = '[no-grant] The MCPL server "radio" holds a grant again. The messages that its grant covers reach you again.';
 const CAUSE = {
   unanswered: "it did not answer the host's policy request",
   errored: "it answered the host's policy request with an error",
