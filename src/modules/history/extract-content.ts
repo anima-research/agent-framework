@@ -212,6 +212,8 @@ function hasPrivateBlockMarker(text: string, storedCalls: ExtractCallLookup): bo
           // A cut can land in the block's string value itself.
           const startsString = token?.startsWith('"') || unfinishedString !== undefined;
           if ((key === 'thinking' || key === 'signature') && startsString) return true;
+          // Once typed private, any later block-level payload key is a marker.
+          if ((fields.type === 'thinking' || fields.type === 'redacted_thinking') && key !== 'type') return true;
           if (key === 'data') data = startsString;
           if (fields.type === 'redacted_thinking' && data) return true;
         }

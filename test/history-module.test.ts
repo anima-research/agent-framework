@@ -162,6 +162,7 @@ const FIXTURE: StoredMessage[] = [
 
 const THINKING = { type: 'thinking', thinking: 'placeholder', signature: 'placeholder signature' } as const;
 const REDACTED = { type: 'redacted_thinking', data: 'placeholder data' } as const;
+const LEGACY_REDACTED = { type: 'redacted_thinking', data: { opaque: 'private data' } } as const;
 const EXTRACT_CALL = { type: 'tool_use', id: 'extract1', name: 'history--extract', input: { format: 'raw' } } as const;
 const ORDINARY_CALL = {
   type: 'tool_use', id: 'ordinary1', name: 'example--save', input: { example: THINKING, data: REDACTED },
@@ -283,7 +284,8 @@ describe('HistoryModule raw projection (#717)', () => {
         resultBlock('another', page, EXTRACT_CALL.name),
       ]),
     ]);
-    const scan = t.mock.method(cm, 'getMessageCount');
+    const countReads = t.mock.method(cm, 'getMessageCount');
+    const windowReads = t.mock.method(cm, 'getMessageWindow');
     const h = new HistoryModule();
     h.bind(cm);
     const extract = async (offset: number) => {
@@ -291,11 +293,15 @@ describe('HistoryModule raw projection (#717)', () => {
       assert.equal(result.success, true, result.error);
     };
     await extract(1);
-    assert.equal(scan.mock.callCount(), 0, 'explicitly named result with no ambiguous descendants');
+    assert.equal(countReads.mock.callCount(), 0, 'explicitly named result with no ambiguous descendants');
+    assert.equal(windowReads.mock.callCount(), 0, 'no window reads for the explicitly named result');
     await extract(2);
-    assert.equal(scan.mock.callCount(), 1, 'one scan for all nested lookups');
+    assert.equal(countReads.mock.callCount(), 1, 'one scan for all nested lookups');
+    // Two anchor probes and one backward batch in this three-row fixture.
+    assert.equal(windowReads.mock.callCount(), 3, 'window reads are shared across nested lookups');
     await extract(2);
-    assert.equal(scan.mock.callCount(), 2, 'the index is not cached across calls');
+    assert.equal(countReads.mock.callCount(), 2, 'the index is not cached across calls');
+    assert.equal(windowReads.mock.callCount(), 6, 'the window reads repeat on the next call');
   });
 
   it('withholds a truncated extract with private thinking inside a nested extract result', async () => {
@@ -406,12 +412,14 @@ describe('HistoryModule raw projection (#717)', () => {
       msg('m1', 1000, 'Claude', [act]),
       msg('m2', 2000, 'user', [plain, unrelatedJson, truncated, nestedCut, paired]),
     ]);
-    const scan = t.mock.method(cm, 'getMessageWindow');
+    const countReads = t.mock.method(cm, 'getMessageCount');
+    const windowReads = t.mock.method(cm, 'getMessageWindow');
     const h = new HistoryModule();
     h.bind(cm);
     const result = await h.handleToolCall(call('extract', { format: 'raw' }));
     assert.equal(result.success, true, result.error);
-    assert.equal(scan.mock.callCount(), 0, 'no store scan needed');
+    assert.equal(countReads.mock.callCount(), 0, 'no store count needed');
+    assert.equal(windowReads.mock.callCount(), 0, 'no store window needed');
     const { messages } = result.data as { messages: Array<{ content: ContentBlock[] }> };
     assert.deepEqual(messages[1]?.content, [plain, unrelatedJson, truncated, nestedCut, {
       ...paired, content: JSON.stringify(extractSnapshot([])),
@@ -491,7 +499,7 @@ describe('HistoryModule raw projection (#717)', () => {
   it('drops blocks by type and handles BOM-prefixed and reordered legacy payloads', async () => {
     const privateBlocks = [
       { type: 'thinking', signature: 'private signature' },
-      { type: 'redacted_thinking', data: { opaque: 'private data' } },
+      LEGACY_REDACTED,
     ] as unknown as ContentBlock[];
     const clean = textBlock('keep');
     const bom = '\uFEFF';
@@ -514,6 +522,21 @@ describe('HistoryModule raw projection (#717)', () => {
       ...cuts.map((cut) => ({ ...cut, content: '[History extract withheld: malformed JSON contains a private thinking block.]' })),
     ]);
   });
+
+  for (const [shape, block, payload] of [
+    ['redacted_thinking with object data', LEGACY_REDACTED, 'private data'],
+    ['thinking with an object payload', { type: 'thinking', thinking: { opaque: 'private reasoning' } }, 'private reasoning'],
+    ['thinking with a different payload key', { type: 'thinking', text: 'private text' }, 'private text'],
+  ] as const) {
+    it(`withholds a cut legacy extract containing ${shape}`, async () => {
+      const body = JSON.stringify(extractSnapshot([block as unknown as ContentBlock]));
+      const cut = resultBlock('cut', body.slice(0, body.indexOf(payload) + 3), EXTRACT_CALL.name);
+      const { messages } = await rawExtract([msg('m1', 1000, 'user', [cut])]);
+      assert.deepEqual(messages[0]?.content, [
+        { ...cut, content: '[History extract withheld: malformed JSON contains a private thinking block.]' },
+      ]);
+    });
+  }
 
   it('leaves the results paired when removing their duplicate XML replay copy', async () => {
     const body = JSON.stringify(extractSnapshot([THINKING, ORDINARY_CALL]));
