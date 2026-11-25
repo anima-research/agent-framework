@@ -322,7 +322,11 @@ async function resident(options: {
   if (options.channels) {
     await started;
     const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
-    assert.ok(await pollUntil(() => registry.listChannelsRaw().length >= 2), 'the stand-in server registered its channels');
+    if (!await pollUntil(() => registry.listChannelsRaw().length >= 2)) {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+      assert.fail('the stand-in server registered its channels');
+    }
   }
   const cm = () => framework.getAgent('prime')!.getContextManager();
   const rows = () => cm().getAllMessages() as unknown as Array<{ id: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> }>;
@@ -781,17 +785,22 @@ describe('a turn refused for budget while compression is pending waits idle, and
 
   async function reheldWithSecond(replies: Reply[]) {
     const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', ...replies] });
-    t.internal.budgetHoldRecheckMs = 60_000;
-    t.send('hello');
-    assert.ok(await pollUntil(() => t.stored().includes('Hi')));
-    t.sendForPrime('go');
-    assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
-    t.send('second');
-    assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
-    t.internal.releaseBudgetHold('prime');
-    assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
-      'released while compression still refuses, its start merged with that wake is refused and waits again');
-    return t;
+    try {
+      t.internal.budgetHoldRecheckMs = 60_000;
+      t.send('hello');
+      assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+      t.sendForPrime('go');
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+      t.send('second');
+      assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+      t.internal.releaseBudgetHold('prime');
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+        'released while compression still refuses, its start merged with that wake is refused and waits again');
+      return t;
+    } catch (error) {
+      await t.close();
+      throw error;
+    }
   }
 
   it('a released turn refused again keeps the wakes merged into it at its release: a surgery that drops it puts them back in the queue, and they run', async () => {
@@ -805,6 +814,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed']);
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
         assert.ok(requestText(t.turnCalls()[1]).includes('second'), 'which read it');
         assert.equal(t.of('inference:held')[1]?.heldRequests, 2, 'the wait held again counted that wake among the requests it held as it started');
@@ -825,6 +835,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'stopped']);
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
       } finally {
         await t.close();
@@ -1034,6 +1045,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.readyAt = c.ticks;
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
       } finally {
         await t.close();
@@ -1097,6 +1109,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => stopped !== undefined), "the released start's compile ran");
         assert.equal(stopped, true, 'the stop reached it');
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
         assert.ok(!t.internal.budgetHolds.has('prime'), 'and nothing waits');
       } finally {
@@ -1126,7 +1139,42 @@ describe('a turn refused for budget while compression is pending waits idle, and
         cooldown()!.until = Date.now();
         t.internal.releaseProviderAccelerationCooldown('prime');
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a wake that joins a released start's retry while a provider hold keeps it is kept too: refused for budget, then dropped, the retry gives back both wakes", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered both'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const cooldown = () => t.internal.providerAccelerationCooldowns.get('prime');
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = providerLimit();
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "the released start met a provider hold, and its retry waits there");
+        t.send('third');
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 1), "third's wake waits in the provider hold too");
+        cooldown()!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'the retry, merged with third, was refused for budget and waits');
+        assert.equal(t.hold()?.heldRequests, 3, "second's and third's wakes wait beside the turn");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.ok(await pollUntil(() => t.stored().includes('Answered both')), 'the wakes ran');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        assert.match(requestText(t.turnCalls().at(-1)), /second[\s\S]*third/, 'reading both');
       } finally {
         await t.close();
       }
@@ -1184,6 +1232,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.readyAt = c.ticks;
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
       } finally {
         await t.close();
