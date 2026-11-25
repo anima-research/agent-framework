@@ -28,7 +28,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, AgentRegistry, residentSpec, taskForkSpec, withAudience } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentPresentation, heldFromResidents, type PresentationHost, type PresentationTrace, type PresentedAgent } from '../src/presentation.js';
-import { isAnotherAgentsInjection } from '../src/stored-injections.js';
+import { isAnotherAgentsContext } from '../src/stored-injections.js';
 import { removeStoredMessage } from '../src/stored-removal.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -74,7 +74,7 @@ async function rig() {
   const open = async (name: string) => {
     const cm = await ContextManager.open({
       store, namespace: `agents/${name}`, strategy: new PassthroughStrategy(),
-      viewFilter: (m: StoredMessage) => !heldFromResidents(m.metadata as Record<string, unknown> | undefined) && !isAnotherAgentsInjection(m.metadata, name),
+      viewFilter: (m: StoredMessage) => !heldFromResidents(m.metadata as Record<string, unknown> | undefined) && !isAnotherAgentsContext(m.metadata, name),
     });
     closers.push(() => cm.close());
     return cm;

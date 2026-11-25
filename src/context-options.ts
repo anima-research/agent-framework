@@ -17,16 +17,16 @@
  * - A resident reads the residents' shared slot (no `isolate`), its context
  *   state under `agents/<name>`. Its view leaves out what a tune-out holds
  *   (heldFromResidents), what a suppress rule hid (suppressedRow), and the
- *   other residents' stored context injections (isAnotherAgentsInjection):
- *   their context, which they share the slot with it but never its
- *   conversation. Both views also omit legacy reasoning-loss notices.
+ *   other residents' context rows, their stored context injections and
+ *   system change rows (isAnotherAgentsContext): their context, which they
+ *   share the slot with it but never its conversation. Both views also omit legacy reasoning-loss notices.
  * - The subconscious keeps its rows in a slot of its own,
  *   `subconscious/<serves>`, and reads the residents' slot beside it
  *   (`auxiliaryMessageViews: [{}]`), held traffic included, which is what it
  *   reads for. With the presentation index the residents' rows enter its
  *   window by its observe edge's rule, and the merged slot is still the
  *   record its window is presented from. Its view leaves out only the
- *   residents' stored context injections and what a suppress rule hid,
+ *   residents' context rows and what a suppress rule hid,
  *   in this shared view, along with legacy notices. Its strategy is a windowed
  *   passthrough, anchored at the oldest active tune-out's start, or at an
  *   earlier start kept in force: a cancelled tune-out's, kept while another
@@ -40,12 +40,12 @@ import { WindowedPassthroughStrategy, type ContextManagerConfig, type StoredMess
 import { isReasoningLoss } from './reasoning-loss.js';
 import { heldFromResidents, suppressedRow } from './dendrite/audience.js';
 import { persistentReaderName } from './tune-out/tools.js';
-import { isAnotherAgentsInjection } from './stored-injections.js';
+import { isAnotherAgentsContext } from './stored-injections.js';
 
 /** ContextManager.open's options over a store the caller gives: everything but the store. */
 export type ContextManagerOpenOptions = Omit<Extract<ContextManagerConfig, { store: unknown }>, 'store'>;
 
-/** A resident's view: no held traffic, suppressed rows, foreign injections or legacy notices.
+/** A resident's view: no held traffic, suppressed rows, another agent's context rows or legacy notices.
  * Supports both a reusable named predicate and a direct metadata-only probe. */
 export function residentViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
 export function residentViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;
@@ -53,17 +53,17 @@ export function residentViewFilter(messageOrName: Pick<StoredMessage, 'metadata'
   if (typeof messageOrName !== 'string') return residentViewFilter(name!)(messageOrName);
   return (message) => !heldFromResidents(message.metadata as Record<string, unknown> | undefined)
     && !suppressedRow(message.metadata as Record<string, unknown> | undefined)
-    && !isAnotherAgentsInjection(message.metadata, messageOrName)
+    && !isAnotherAgentsContext(message.metadata, messageOrName)
     && !isReasoningLoss(message.metadata);
 }
 
-/** The subconscious includes held traffic, but not suppressed rows, foreign injections or legacy notices. */
+/** The subconscious includes held traffic, but not suppressed rows, another agent's context rows or legacy notices. */
 export function subconsciousViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
 export function subconsciousViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;
 export function subconsciousViewFilter(messageOrName: Pick<StoredMessage, 'metadata'> | string, name?: string): boolean | ((message: Pick<StoredMessage, 'metadata'>) => boolean) {
   if (typeof messageOrName !== 'string') return subconsciousViewFilter(name!)(messageOrName);
   return (message) => !suppressedRow(message.metadata as Record<string, unknown> | undefined)
-    && !isAnotherAgentsInjection(message.metadata, messageOrName)
+    && !isAnotherAgentsContext(message.metadata, messageOrName)
     && !isReasoningLoss(message.metadata);
 }
 

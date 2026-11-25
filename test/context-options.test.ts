@@ -25,8 +25,9 @@ import { persistentReaderName } from '../src/tune-out/tools.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const text = (t: string) => ({ type: 'text', text: t }) as ContentBlock;
-const textsOf = (messages: ReadonlyArray<{ content: ReadonlyArray<{ type: string; text?: string }> }>) =>
-  messages.map((m) => m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')).filter((t) => t !== '');
+const textsOf = (messages: ReadonlyArray<{ content: ReadonlyArray<{ type: string; text?: string; defineTools?: ReadonlyArray<{ name: string }> }> }>) =>
+  messages.map((m) => m.content.map((b) => (b.type === 'text' ? b.text ?? ''
+    : b.type === 'system_change' ? `change:${(b.defineTools ?? []).map((t) => t.name).join(',')}` : '')).join('')).filter((t) => t !== '');
 
 const dirs: string[] = [];
 const frameworks: AgentFramework[] = [];
@@ -38,7 +39,7 @@ afterEach(async () => {
 });
 
 /** mira and oren on the residents' slot, the subconscious serving mira, with a held row and oren's stored injection in the slot. */
-async function boot() {
+async function boot(opts: { changes?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'context-options-'));
   dirs.push(dir);
   const framework = await AgentFramework.create({
@@ -61,6 +62,11 @@ async function boot() {
     [STORED_INJECTION_KEY]: { agent: 'oren', namespace: 'notes', contentHash: 'h1', part: 0, parts: 1 },
   } as never);
   write('antra', [text('another word')]);
+  if (opts.changes) {
+    const change = (tool: string): ContentBlock[] => [{ type: 'system_change', defineTools: [{ name: tool, description: tool, inputSchema: { type: 'object', properties: {} } }] }];
+    write('Host', change('host_tool'));
+    for (const name of ['mira', 'oren', 'Subconscious']) write('system', change(`${name}_tool`), { system: true, kind: 'system-change', agent: name });
+  }
   // The held row and oren's injection are 'elsewhere' for mira (and the
   // injection for the subconscious), so no presentation point takes them
   // in; a window written down from the record (an earlier release's) holds
@@ -140,6 +146,20 @@ describe('the open shapes of a resident and the subconscious (#291, AF-5)', () =
     assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('mira'), strategy: new PassthroughStrategy() })), mira, "mira's");
     const sub = await h.live('Subconscious');
     assert.ok(sub.includes('a held word') && !sub.includes("oren's injected context"), `premise: ${JSON.stringify(sub)}`);
+    assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
+  });
+
+  it("a host's open with the exported shapes compiles what the live agents compile with change rows in the store: each keeps a host's change and its own, not another agent's", async () => {
+    const h = await boot({ changes: true });
+    const changes = (texts: string[]) => texts.filter((t) => t.startsWith('change:'));
+    const mira = await h.live('mira');
+    assert.deepEqual(changes(mira), ['change:host_tool', 'change:mira_tool'], `premise: mira's compile: ${JSON.stringify(mira)}`);
+    assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('mira'), strategy: new PassthroughStrategy() })), mira, "mira's");
+    const oren = await h.live('oren');
+    assert.deepEqual(changes(oren), ['change:host_tool', 'change:oren_tool'], `premise: oren's compile: ${JSON.stringify(oren)}`);
+    assert.deepEqual(await h.compiled(await h.open({ ...residentContextOptions('oren'), strategy: new PassthroughStrategy() })), oren, "oren's");
+    const sub = await h.live('Subconscious');
+    assert.deepEqual(changes(sub), ['change:host_tool', 'change:Subconscious_tool'], `premise: the subconscious's compile: ${JSON.stringify(sub)}`);
     assert.deepEqual(await h.compiled(await h.open(subconsciousContextOptions({ serves: 'mira' }))), sub, "the subconscious's");
   });
 

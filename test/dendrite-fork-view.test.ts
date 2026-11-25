@@ -6,7 +6,8 @@
  * the source's own, so the framework replaces it (deriveSharedContext) and
  * records the same predicate for main's checks of whether an agent sees a row
  * (storeSees, agentSees). Reopened after it ends, a fork's context keeps the
- * view it had live, a fork of a fork's included (reopenAgentContext).
+ * view it had live, a fork of a fork's included (reopenAgentContext). A change
+ * row (src/system-changes.ts) is seen as a stored injection is.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +18,8 @@ import { ContextManager, type ContextInjection } from '@animalabs/context-manage
 import type { ContentBlock } from '@animalabs/membrane';
 import { AgentFramework, type Agent } from '../src/index.js';
 import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
+import { storeOwnRow } from '../src/dendrite/audience.js';
+import { systemChangeMetadata } from '../src/system-changes.js';
 
 type Internals = {
   storeInjections(agent: Agent, injections: ContextInjection[] | undefined): ContextInjection[] | undefined;
@@ -28,6 +31,17 @@ const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentB
 const injection = (t: string): ContextInjection => ({ namespace: 'lessons', position: 'afterUser', content: [text(t)] });
 const textOf = (m: { content: unknown }): string =>
   (m.content as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
+const change = (name: string): ContentBlock[] =>
+  [{ type: 'system_change', defineTools: [{ name, description: name, inputSchema: { type: 'object', properties: {} } }] }];
+const defined = (messages: ReadonlyArray<{ content: readonly ContentBlock[] }>): string[] =>
+  messages.flatMap((m) => m.content.flatMap((b) => (b.type === 'system_change' ? (b.defineTools ?? []).map((t) => t.name) : [])));
+const store = (framework: AgentFramework, agent: Agent, participant: string, content: ContentBlock[], metadata?: Parameters<ContextManager['addMessage']>[2]) => {
+  const id = agent.getContextManager().addMessage(participant, content, metadata);
+  (framework as unknown as { presentation: { afterStore(agent: Agent, ids: unknown[]): void } }).presentation.afterStore(agent, [id]);
+  return id;
+};
+const adopt = (framework: AgentFramework, agent: Agent) => (framework as unknown as { adoptPresentation(agent: Agent): void }).adoptPresentation(agent);
+const storedChanges = (cm: ContextManager, owner: string) => cm.queryMessages({ metadata: { kind: 'system-change', agent: owner } }).messages.length;
 
 const FRAMING = '[FORK-FRAMING] Count the open issues.';
 const GRANDCHILD = '[GRANDCHILD-FRAMING] Count the closed ones.';
@@ -144,5 +158,73 @@ describe("a shared fork's view", () => {
     const leftBelow = await framework.inspectAgentContext('fork-2');
     assert.deepEqual(await shown(leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN'], "the reopened fork of a fork, as live: its source's source's view too");
     assert.deepEqual(seenBy(readerOf(leftBelow), leftBelow), ['MIRA-OWN', 'FORK-OWN', 'FORK2-OWN']);
+  });
+  it("keeps its source's change rows and its own and leaves out another resident's, and its first request takes its source's and its own from its own branch alone", async () => {
+    membrane.takesChanges = true;
+    const changeTools = async (cm: ContextManager): Promise<string[]> => defined((await cm.compile(undefined, undefined, { dryRun: true })).messages);
+    const mira = framework.getAgent('mira')!;
+    const oren = framework.getAgent('oren')!;
+    store(framework, mira, 'user', [text('Please look into the open issues.')]);
+    store(framework, mira, 'system', change('mira-tool'), systemChangeMetadata('mira'));
+    store(framework, oren, 'system', change('oren-tool'), systemChangeMetadata('oren'));
+    assert.deepEqual(await changeTools(mira.getContextManager()), ['mira-tool'], "the premise: the source's view keeps its own change and leaves out another resident's");
+    const fork = await framework.deriveAgent({
+      name: 'fork-1',
+      from: 'mira',
+      framing: [{ participant: 'user', content: [text(FRAMING)] }],
+    });
+    adopt(framework, fork.agent);
+    storeOwnRow(fork.agent, 'system', change('fork-tool'), systemChangeMetadata('fork-1'));
+    assert.deepEqual(await changeTools(fork.contextManager), ['mira-tool', 'fork-tool'], "the fork's compile: its source's change and its own, not another resident's");
+    framework.start();
+    membrane.script('fork-1', say('fork-1 done'));
+    assert.equal((await framework.runEphemeralToCompletion(fork.agent, fork.contextManager)).speech, 'fork-1 done');
+    const [request] = membrane.callsFor('fork-1');
+    assert.deepEqual(defined(request!.messages), [], 'its first request records its head and carries no change row');
+    const reopened = await framework.inspectAgentContext('fork-1');
+    assert.deepEqual(await changeTools(reopened), [], "the reopened fork: another resident's change out of its view, and its source's and its own gone from its branch");
+    assert.deepEqual([storedChanges(reopened, 'mira'), storedChanges(reopened, 'fork-1'), storedChanges(reopened, 'oren')], [0, 0, 1],
+      "its source's and its own taken out of its branch, and another resident's left there, out of its view");
+    assert.deepEqual([storedChanges(mira.getContextManager(), 'mira'), storedChanges(oren.getContextManager(), 'oren')], [1, 1],
+      "and the residents' own rows as they were");
+  });
+});
+
+describe("a resident whose model takes no change, refused over budget", () => {
+  let tempDir: string;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'dendrite-fork-view-budget-'));
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store.chronicle'),
+      membrane: new RoutedMembrane().asMembrane(),
+      agents: [{ name: 'nell', model: 'test-model', systemPrompt: 'You are nell.' }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("leaves its own change rows that its window doesn't hold, and the refusal goes on", async () => {
+    const nell = framework.getAgent('nell')!;
+    const cm = nell.getContextManager();
+    cm.addMessage('user', [text('Please look into the open issues.')]);
+    const row = cm.addMessage('system', change('n'), systemChangeMetadata('nell'));
+    assert.equal(storedChanges(cm, 'nell'), 1, 'the premise: its own row is stored');
+    assert.notEqual(cm.windowStatusOf(row), 'in', "the premise: its window doesn't hold it");
+    let refused = 0;
+    (cm as unknown as { compile: (...args: unknown[]) => Promise<unknown> }).compile = async () => {
+      refused++;
+      throw Object.assign(new Error('over budget'), { name: 'OverBudgetError' });
+    };
+    await assert.rejects(nell.buildActivationRequest([]), /over budget/, 'refused over budget');
+    assert.equal(refused, 1, 'compiled once');
+    assert.equal(storedChanges(cm, 'nell'), 1, 'its row left where it was');
   });
 });

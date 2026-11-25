@@ -18,7 +18,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import {
   AgentRegistry, audienceOf, residentSpec, storeOwnRow, subconsciousSpec, taskForkSpec, withAudience, workerSpec,
 } from '../src/index.js';
-import { isAnotherAgentsInjection } from '../src/stored-injections.js';
+import { isAnotherAgentsContext } from '../src/stored-injections.js';
 import {
   AgentPresentation, heldFromResidents, type PresentationHost, type PresentationTrace, type PresentedAgent, type Position,
 } from '../src/presentation.js';
@@ -50,7 +50,7 @@ afterEach(() => {
 });
 
 const residentFilter = (name: string) => (m: StoredMessage) =>
-  !heldFromResidents(m.metadata as Record<string, unknown> | undefined) && !isAnotherAgentsInjection(m.metadata, name);
+  !heldFromResidents(m.metadata as Record<string, unknown> | undefined) && !isAnotherAgentsContext(m.metadata, name);
 
 async function openResident(store: JsStore, name: string, strategy = new PassthroughStrategy()): Promise<ContextManager> {
   const cm = await ContextManager.open({ store, namespace: `agents/${name}`, strategy, viewFilter: residentFilter(name) });
@@ -74,7 +74,7 @@ async function rig(options: { beforeOpen?: (store: JsStore) => void } = {}) {
   const oren = new TestAgent('oren', await openResident(store, 'oren', orenStrategy));
   const subCm = await ContextManager.open({
     store, namespace: 'subconscious/mira', isolate: true, auxiliaryMessageViews: [{}],
-    viewFilter: (m) => !isAnotherAgentsInjection(m.metadata, 'Subconscious'), strategy: new PassthroughStrategy(),
+    viewFilter: (m) => !isAnotherAgentsContext(m.metadata, 'Subconscious'), strategy: new PassthroughStrategy(),
   });
   closers.push(() => subCm.close());
   const sub = new TestAgent('Subconscious', subCm);
@@ -323,6 +323,15 @@ describe('the presentation module', () => {
     const second = r.presentation.presentAtBoundary(r.mira, [], { injects: true });
     assert.deepEqual(second.heard.map((h) => h.id), [plain]);
     assert.equal(second.cutAt, voiced, "a row named as the agent would render as its own turn");
+
+    r.alive.delete('mira');
+    r.presentation.presentAtEnd(r.mira);
+    r.alive.add('mira');
+    const effort = r.write(r.oren, 'system', [{ type: 'system_change', effort: 'low' } as unknown as ContentBlock], ['mira']);
+    const declared = r.write(r.oren, 'system', [{ type: 'system_change', defineTools: [{ name: 't', description: 'a tool', inputSchema: { type: 'object' } }] } as unknown as ContentBlock], ['mira']);
+    const third = r.presentation.presentAtBoundary(r.mira, [], { injects: true });
+    assert.deepEqual(third.heard.map((h) => h.id), [effort], 'an effort alone joins the live stream');
+    assert.equal(third.cutAt, declared, 'a change of tools waits for the next start');
   });
 
   it("a tool boundary whose stream can't carry injected rows presents the round alone", async () => {

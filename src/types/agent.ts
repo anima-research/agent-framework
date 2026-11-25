@@ -258,45 +258,74 @@ export interface AgentConfig {
     dropBlock?: boolean;
     /**
      * Whether this agent's model binds its signed thinking to the
-     * conversation before it, as the host knows from its own model records.
-     * A context manager that keeps a record of what each branch sent can
-     * then leave out thinking whose earlier conversation changed before the
-     * provider sees it. Set:
-     * - each compile the agent sends tells the context manager so
-     *   (`thinkingBinding`: `binds`, `dropBlock` as set here, and the agent's
-     *   name as the `participant` whose replies are its own), with digests
-     *   of what the request carries ahead of its messages (`identity`: the
-     *   system text with its system-position injections, the tools in the
-     *   order sent, the model, and the thinking config, `maxTokens`,
-     *   `providerParams` and `prefillUserMessage`);
-     * - each framework stream tells the context manager which stored rows
-     *   its later rounds and its last reply carried as stored
-     *   (`noteRequestSent`), naming the compile it was built from, so their
-     *   thinking is kept at the next compile. The direct API
-     *   (`runInference`) notes nothing, so each of its replies' thinking is
-     *   left out at the compile after it's stored;
-     * - with `dropBlock` set too, each framework stream tells the context
-     *   manager which stored replies' thinking the provider reports dropping
-     *   (`noteThinkingDropped`), naming the compile it was built from, so
-     *   once a note lands, the next compile sends those replies without their
-     *   thinking;
-     * - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
-     *   starts a new stream mid-turn, since the new stream's compile can take
-     *   the turn's earlier reasoning out of the request;
-     * - with `dropBlock` set too, where a compile reports where the branch's
-     *   record began (`thinkingRecordedAfter`), a block the provider drops
-     *   that the record doesn't account for raises the
-     *   `thinking-binding-loss` ops alert, once per incident and again if a
-     *   call drops more. The provider reports drops only on a request that
-     *   carries the drop control; without it, such a block is refused;
-     * - the agent is told nothing of reasoning left out or dropped: no line
-     *   about the mechanics of its own memory or reasoning is put in its
-     *   context. Hosts can observe compiles' strips through
-     *   `Agent.onThinkingStrip`;
-     * The record and the notes
-     * vouch for requests as agent-framework hands them to membrane, so a
-     * membrane `beforeRequest` hook that changes a request must change every
-     * request alike. Default false: compiles and streams are as they were.
+     * conversation before it, so that a change to anything before a thinking
+     * block sets it aside, as the host knows from its own model records. One
+     * fact with three states, each feature taking its own safe side where
+     * it's left out:
+     * - `true`: the host declares that the model binds. What relies on the
+     *   declaration is on:
+     *   - each compile the agent sends tells the context manager so
+     *     (`thinkingBinding`: `binds`, `dropBlock` as set here, and the
+     *     agent's name as the `participant` whose replies are its own), with
+     *     digests of what the request carries ahead of its messages
+     *     (`identity`: the system text with its system-position injections,
+     *     the tools in the order sent, the model, and the thinking config,
+     *     `maxTokens`, `providerParams` and `prefillUserMessage`). On a
+     *     model that takes a change in its context (see
+     *     `Membrane.takesToolOrSystemChanges`) these are the recorded head's,
+     *     which the request carries, so a declared change leaves them as they were,
+     *     and a move of the head changes them wherever it changes what the
+     *     request carries ahead of its messages, and then the compile for
+     *     the new head leaves out every thinking block;
+     *   - each framework stream tells the context manager which stored rows
+     *     its later rounds and its last reply carried as stored
+     *     (`noteRequestSent`), naming the compile it was built from, so their
+     *     thinking is kept at the next compile. The direct API
+     *     (`runInference`) notes nothing, so each of its replies' thinking is
+     *     left out at the compile after it's stored;
+     *   - with `dropBlock` set too, each framework stream tells the context
+     *     manager which stored replies' thinking the provider reports
+     *     dropping (`noteThinkingDropped`), naming the compile it was built
+     *     from, so once a note lands, the next compile sends those replies
+     *     without their thinking;
+     *   - with `physicalWindowTokens` set too, `maxStreamTokens` no longer
+     *     starts a new stream mid-turn, since the new stream's compile can
+     *     take the turn's earlier reasoning out of the request;
+     *   - with `dropBlock` set too, where a compile reports where the
+     *     branch's record began (`thinkingRecordedAfter`), a block the
+     *     provider drops that the record doesn't account for raises the
+     *     `thinking-binding-loss` ops alert, once per incident and again if a
+     *     call drops more. The provider reports drops only on a request that
+     *     carries the drop control; without it, such a block is refused;
+     *   - the agent is told nothing of reasoning left out or dropped: no
+     *     line about the mechanics of its own memory or reasoning is put in
+     *     its context. Hosts can observe compiles' strips through
+     *     `Agent.onThinkingStrip`.
+     *
+     *   The record and the notes vouch for requests as agent-framework hands
+     *   them to membrane, so a membrane `beforeRequest` hook that changes a
+     *   request must change every request alike.
+     * - `false`: the host says the model doesn't bind. Compiles and streams
+     *   are as they were, and nothing is held back to keep thinking.
+     * - Left out: not declared. What relies on the declaration stays off, as
+     *   with `false`, and a choice that could set kept thinking aside is made
+     *   as for a model that binds (`Agent.mayBindThinking`), as with
+     *   `true`.
+     *
+     * The choice that reads `mayBindThinking` is a move of the head for
+     * cost, on a model that takes a change in its context: a model that may
+     * bind moves its head for cost only at a compile where no kept thinking
+     * sits before its `firstChanged` (the first message that compile renders
+     * differently from the last one; the compile's own change already moved
+     * the prefix of everything from there on, so a move adds no loss of its
+     * own there). So a move for cost never sets kept thinking aside. When a
+     * compile is refused over budget, or for dropping messages no summary
+     * covers, with changes kept, the head moves anyway. With `true`, the
+     * compile for the new head leaves that thinking out. Left out, the
+     * request still carries it, under a prefix it wasn't signed under. With
+     * `dropBlock`, the provider drops it from each request that carries it.
+     * Without it, an account that enforces the binding refuses each such
+     * request, and one that doesn't decides for itself.
      */
     binds?: boolean;
   };

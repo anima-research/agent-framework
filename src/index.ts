@@ -8,6 +8,7 @@ export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from 
 export { Agent } from './agent.js';
 export { FLAT_MINIMUM_MS, type InferenceBoundsOptions } from './inference-bounds.js';
 export { storedInjectionMarkOf, type StoredInjectionMark } from './stored-injections.js';
+export { isSystemChangeMessage } from './system-changes.js';
 export type { StartStreamResult } from './agent.js';
 export type { PresentationOccasion } from './presentation.js';
 export { covers, coverTest, describeReadMark, markAtOrAfter, type Cover, type MarkCm, type MarkedRow, type ReadMark } from './read-marks.js';

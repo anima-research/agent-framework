@@ -9,6 +9,7 @@ import type {
   NormalizedRequest,
   NormalizedResponse,
   ContentBlock,
+  ModelPricing,
   YieldingStream,
   StreamEvent,
 } from '@animalabs/membrane';
@@ -226,6 +227,18 @@ export class MockMembrane {
     const stream = new MockYieldingStream(remaining, this.supportsInjectedMessages);
     this.lastStream = stream;
     return stream;
+  }
+
+  takesChanges = false;
+
+  takesToolOrSystemChanges(_model: string): boolean {
+    return this.takesChanges;
+  }
+
+  prices: (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined = undefined;
+
+  pricingFor(_model: string): (ModelPricing & { cacheWrite1hPerMillion?: number }) | undefined {
+    return this.prices && { ...this.prices };
   }
 
   asMembrane(): import('@animalabs/membrane').Membrane {
