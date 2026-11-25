@@ -1043,6 +1043,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
           "the released start failed, and the error policy's retry was refused and waits again");
         assert.equal(c.failNext, undefined, 'the released start met the failure');
+        assert.deepEqual((t.internal.budgetHolds.get('prime')!.wait as { rows?: string[] }).rows, [String(t.rowWith('go').id)],
+          "the turn that waits again still stands on go's row");
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
