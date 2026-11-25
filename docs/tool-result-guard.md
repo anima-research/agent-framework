@@ -210,8 +210,9 @@ the stub:
 > Kept from its result: {"materialized":[{"mount":"work","path":"LOG.md"}]}
 
 They're serialized as a stored result is, in the order marked. Past the inline
-cap they're cut, with a note saying so and that the whole result is where the
-stub says, so a later field can be cut away entirely. A failed result keeps
+cap they keep their head and tail, as a stored result does, with a note between
+them naming the characters it elides and saying that the whole result is where
+the stub says, so a field in the middle can be cut away entirely. A failed result keeps
 nothing, and no other tool marks any field.
 
 The file is an ordinary workspace file. The agent can read it back
