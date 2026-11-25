@@ -1403,7 +1403,7 @@ function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined 
 /** The wakes of a merged start's batch (MERGED_BATCH): its requests that
  *  don't carry the turn on. */
 function mergedWakes(request: InferenceRequest): InferenceRequest[] {
-  return (mergedBatch(request) ?? []).filter((r) => !continuesTurn(r) && budgetWaitOf(r) === undefined);
+  return (mergedBatch(request) ?? []).filter((r) => !continuesTurn(r));
 }
 
 function releasedTurnBatch(request: InferenceRequest | undefined): ReleasedStart | undefined {
@@ -7750,9 +7750,10 @@ export class AgentFramework {
       }
     }
     if (released) this.undoReleasedStartRouting(agent, routing, released);
-    const turn = released
+    const turn: MarkedRequest = released
       ? { ...released.turn }
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
+    if (released && budgetWaitOf(turn)?.rows?.length) delete turn[TURN_RETRY];
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
     const { standsOn, ownRows } = !continuesTurn(turn) && carried
@@ -23708,6 +23709,7 @@ export class AgentFramework {
       // turn's retry (TURN_RETRY), whichever request leads the merge: held
       // again before it takes a token, it keeps the turn alive as before.
       const start: MarkedRequest = requests.some(isTurnRetry) ? asTurnRetry(merged) : merged;
+      delete start[RELEASED_ROUTING];
       const carry = requests.map(turnCarryOf).find((c) => c !== undefined);
       if (carry) start[TURN_CARRY] = carry;
       else delete start[TURN_CARRY];
@@ -28492,7 +28494,6 @@ export class AgentFramework {
     checkWindow: CheckWindow,
   ): Promise<boolean> {
     if (attempt === 0 && this.budgetWaitEnded(agent, trigger)) return false;
-    const asCame = trigger;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
