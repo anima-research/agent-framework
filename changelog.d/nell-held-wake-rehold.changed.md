@@ -1,4 +1,4 @@
 - `inference:held`'s `heldRequests` now counts the wakes that a hold takes
-  back. It used to be 1 always. `healthSnapshot()`'s
+  back, so it can be more than 1. `healthSnapshot()`'s
   `budgetHold.heldRequests` and `getHostModeStatus().gatedRequests` count
-  the same requests.
+  those wakes too.

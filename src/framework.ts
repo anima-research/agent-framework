@@ -1420,17 +1420,6 @@ function releasedStartOf(request: InferenceRequest | undefined, assembly: Assemb
   return released && { turn: released.turn, wakes: released.wakes.map((wake) => restoredWake(wake, assembly)) };
 }
 
-function routingSnapshot(routing: TurnRouting): Record<string, unknown> {
-  const copy: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(routing)) {
-    copy[key] = value instanceof Set ? new Set(value)
-      : value instanceof Map ? new Map(value)
-        : Array.isArray(value) ? [...value]
-          : value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype ? { ...value }
-            : value;
-  }
-  return copy;
-}
 
 function isTurnRetry(request: InferenceRequest): boolean {
   return (request as MarkedRequest)[TURN_RETRY] === true;
@@ -2667,9 +2656,9 @@ export interface HostModeStatus {
    * `parkedAdmissions` instead, however many wakes are merged into it. A turn
    * a budget hold holds counts once, continuation or not. The wakes merged
    * into its start are part of it, except those that joined its wait before
-   * a release, which the hold takes back when it holds the released start
-   * again. Those, and wakes that joined it while it waited, count as other
-   * gated requests do. Other continuations (budget restart, tool
+   * a release: when the start it holds merged one released turn with them,
+   * the hold takes them back. Those, and wakes that joined it while it
+   * waited, count as other gated requests do. Other continuations (budget restart, tool
    * results, the tool-result guard's retry) and a held turn's retry, which a
    * quiesce lets through, are never counted. */
   gatedRequests: number;
@@ -5019,7 +5008,7 @@ export class AgentFramework {
    * per-stream local this survives framework retries and budget restarts. */
   private logicalTurnToolCalls: WeakMap<Agent, { turnToken: number; count: number }> = new WeakMap();
   private answeredTurns = new WeakMap<Agent, TurnRouting>();
-  private releasedStartRoutings = new WeakMap<TurnRouting, { opened: true } | { opened: false; before: Record<string, unknown> }>();
+  private releasedStartRoutings = new WeakMap<TurnRouting, { opened: true } | { opened: false; wakeChannels?: ChannelRef[] }>();
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -7763,9 +7752,8 @@ export class AgentFramework {
         return false;
       }
     }
-    const restored = released && withTurnCarry({ ...released.turn }, turnCarryOf(retry) ?? turnCarryOf(released.turn));
-    const turn = restored
-      ? retry && isTurnRetry(retry) ? asTurnRetry(restored) : restored
+    const turn = released
+      ? { ...released.turn }
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     if (released) this.undoReleasedStartRouting(agent, routing);
     const carried = budgetWaitOf(turn);
@@ -7852,10 +7840,10 @@ export class AgentFramework {
       if (this.openLogical.get(agent.name) === routing) this.openLogical.delete(agent.name);
       if (this.turnRouting.get(agent.name) === routing) this.turnRouting.delete(agent.name);
       if (this.answeredTurns.get(agent) === routing) this.answeredTurns.delete(agent);
+    } else if (wrote.wakeChannels) {
+      routing.wakeChannels = wrote.wakeChannels;
     } else {
-      const fields = routing as unknown as Record<string, unknown>;
-      for (const key of Object.keys(fields)) if (!(key in wrote.before)) delete fields[key];
-      Object.assign(fields, wrote.before);
+      delete routing.wakeChannels;
     }
   }
 
@@ -28560,6 +28548,8 @@ export class AgentFramework {
       }
     }
 
+    const released = releasedStartOf(asCame, assembly);
+
     // A turn whose only causes were deferred batches, none of which gave it
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
     // render-start that could not be made durable, whose batch then waits for
@@ -28710,8 +28700,10 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
-    if (releasedStartOf(asCame, undefined) && !this.releasedStartRoutings.has(routing)) {
-      this.releasedStartRoutings.set(routing, opensTurn ? { opened: true } : { opened: false, before: routingSnapshot(routing) });
+    if (released && !this.releasedStartRoutings.has(routing)) {
+      this.releasedStartRoutings.set(routing, opensTurn
+        ? { opened: true }
+        : { opened: false, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) });
     }
     if (opensTurn) {
       const head = agent.branchHead();
@@ -28998,7 +28990,9 @@ export class AgentFramework {
       // A stop made while the hooks ran had no stream to cancel.
       const stopAfterHooks = this.takeStartStop(agent, checkWindow);
       if (stopAfterHooks) {
+        this.releasedStartRoutings.delete(routing);
         this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
+        if (released) appendAll(this.pendingRequests, released.wakes);
         return false;
       }
       this.nameUnpostedSpeech(agent, routing);
@@ -29094,7 +29088,9 @@ export class AgentFramework {
         // that started this one.
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
+        this.releasedStartRoutings.delete(routing);
         this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn);
+        if (released) appendAll(this.pendingRequests, released.wakes);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
@@ -29216,6 +29212,7 @@ export class AgentFramework {
           return false;
         }
         this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn);
+        if (released) appendAll(this.pendingRequests, released.wakes);
         return false;
       }
 
@@ -29231,7 +29228,7 @@ export class AgentFramework {
           checkWindow.gateReleased = true;
           this.releasePrimaryProviderGate(agent.name);
         }
-      }, releasedStartOf(asCame, assembly))) return false;
+      }, released)) return false;
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         this.releasedStartRoutings.delete(routing);
         // Capacity scheduling is not poisoned history. The cooldown timer owns
@@ -29259,7 +29256,6 @@ export class AgentFramework {
       else this.deadlineCuts.delete(agent.name);
       if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
-        const released = releasedStartOf(asCame, assembly);
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs, checkWindow, agent, { nextTry: policyAttempt + 2, action });
         if (this.providerAdmissionClosed) {
@@ -29285,7 +29281,7 @@ export class AgentFramework {
         if (stopAfterWait) {
           this.releasedStartRoutings.delete(routing);
           this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn);
-          if (released) this.pendingRequests.push(...released.wakes);
+          if (released) appendAll(this.pendingRequests, released.wakes);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's

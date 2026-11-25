@@ -212,8 +212,8 @@ export type TraceEvent =
        *  count from the wait's first hold. */
       since: number;
       /** Requests the hold holds as it starts: the refused start's own, and,
-       *  when it holds a released turn's start again, the wakes that joined
-       *  the wait before the release, which it takes back. */
+       *  when that start merged one released turn with the wakes that joined
+       *  its wait, those wakes, which the hold takes back. */
       heldRequests: number;
     })
   | (TraceEventBase & {
