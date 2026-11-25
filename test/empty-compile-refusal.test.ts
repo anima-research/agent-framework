@@ -126,7 +126,9 @@ async function harness(contextBudgetTokens: number, opts: { names?: readonly str
   const idle = () => {
     if (!quiet()) { quietSince = undefined; return false; }
     quietSince ??= Date.now();
-    return Date.now() - quietSince >= 25;
+    if (Date.now() - quietSince < 25) return false;
+    quietSince = undefined;
+    return true;
   };
   const exhausted = () => traces.filter((t) => t.type === 'inference:exhausted');
   const close = async () => {
@@ -532,7 +534,7 @@ test('an ephemeral run that is refused writes its notice and gets no wake onto i
     await h.framework.runEphemeralToCompletion(worker.agent, worker.contextManager).catch(() => undefined);
     await until(h.idle, 'the framework idle');
     assert.deepEqual(h.exhausted().filter((t) => t.agentName === 'worker-1').map((t) => t.errorType), ['empty_compile'], 'the run was refused once');
-    assert.deepEqual(h.traces.filter((t) => t.type === 'inference:request_dropped' && t.agentName === 'worker-1'), [], 'no wake was queued for it to drop');
+    assert.deepEqual(h.noticeWakes().filter((r) => r.agentName === 'worker-1'), [], 'no wake was queued for it');
     const rows = worker.contextManager.getAllMessages().map((m) => m.content.map((b) => (b as { text?: string }).text ?? '').join(''));
     assert.ok(rows.some((r) => r.startsWith('[inference-failed]')), 'it wrote its notice');
   } finally { await h.close(); }
@@ -650,7 +652,7 @@ test('the wake onto the notice of a refused silent tick is silent too', async ()
   } finally { await h.close(); }
 });
 
-test('a budget the boot applied at once whose compile selects none of the conversation falls back to the recipe\'s budget, as a refused one does', async () => {
+test('a compile that selects none of the conversation neither proves the live budget nor counts against it: a budget the boot applied at once stays', async () => {
   const h = await harness(12_000);
   try {
     const store = (h.framework as unknown as { store: JsStore }).store;
@@ -662,12 +664,15 @@ test('a budget the boot applied at once whose compile selects none of the conver
       const errors: string[] = [];
       const error = console.error;
       console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
-      let sent: NormalizedRequest;
       try {
-        sent = await host.buildActivationRequest([]);
+        await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
+          assert.ok(err instanceof EmptyCompileError, String(err));
+          assert.equal(err.budgetTokens, 12_000);
+          return true;
+        });
       } finally { console.error = error; }
-      assert.ok(texts(sent).some((t) => t.startsWith('zz-long')), 'the compile at the recipe\'s budget holds the message');
-      assert.ok(errors.some((l) => l.includes('contextBudgetTokens=12000, which the boot applied at once')), errors.join('\n'));
+      assert.equal(host.getProvenContextBudgetTokens(), 12_000, 'the boot\'s proof stands');
+      assert.ok(!errors.some((l) => l.includes('which the boot applied at once')), errors.join('\n'));
     } finally { await cm.close(); }
   } finally { await h.close(); }
 });
@@ -723,37 +728,17 @@ test('the wake onto a notice answers the refused turn\'s own channel and message
     assert.equal(h.noticeWakes()[0]!.channelId, 'zz-chan');
     assert.equal(h.noticeWakes()[0]!.channelServerId, 'zz-srv');
     assert.equal(h.noticeWakes()[0]!.answersMessageId, 'zz-m1');
-
-    h.say(`${LONG} zz-again`, true);
-    await until(() => h.rows().some((r) => r.includes('zz-again')), 'a second long message stored');
-    h.wake({ reason: 'heartbeat', source: 'heartbeat' });
-    await until(() => h.noticeWakes().length === 2, 'the heartbeat\'s notice wake queued');
-    await until(h.idle, 'the framework idle');
-    const heartbeat = h.noticeWakes()[1]!;
-    assert.equal(heartbeat.heartbeatTurn, true);
-    assert.equal(heartbeat.channelId, undefined, 'no channel from an earlier turn');
   } finally { await h.close(); }
-});
-
-test('a routing notice after an oversized message isn\'t conversation: the compile that selects only it is refused', async () => {
-  const h = await harness(12_000);
+  const b = await harness(12_000);
   try {
-    const store = (h.framework as unknown as { store: JsStore }).store;
-    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
-    try {
-      cm.presentRows([
-        cm.addMessage('User', [{ type: 'text', text: LONG }]),
-        cm.addMessage('user', [{ type: 'text', text: '[routing] Your plain speech now lands in zz-chan.' }], { system: true, kind: 'routing-notice' } as never),
-      ]);
-      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
-      const preview = await host.buildActivationRequest([], undefined, undefined, undefined, { dryRun: true } as never);
-      assert.ok(!texts(preview).some((t) => t.startsWith('zz-long')), 'premise: the compile leaves the long message out');
-      await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
-        assert.ok(err instanceof EmptyCompileError, String(err));
-        return true;
-      });
-    } finally { await cm.close(); }
-  } finally { await h.close(); }
+    b.say(LONG, true);
+    await until(() => b.rows().some((r) => r.startsWith('zz-long')), 'the long message stored');
+    b.wake({ reason: 'heartbeat', source: 'heartbeat' });
+    await until(() => b.noticeWakes().length === 1, 'the heartbeat\'s notice wake queued');
+    await until(b.idle, 'the framework idle');
+    assert.equal(b.noticeWakes()[0]!.heartbeatTurn, true);
+    assert.equal(b.noticeWakes()[0]!.channelId, undefined);
+  } finally { await b.close(); }
 });
 
 test('a compile made while a tool-result batch holds back its reserve isn\'t refused: its request is sent as before', async () => {
@@ -772,15 +757,46 @@ test('a compile made while a tool-result batch holds back its reserve isn\'t ref
   } finally { await h.close(); }
 });
 
-test('a host that never presents rows has every stored row in its window, as before', async () => {
+test('a host that never presents rows has every stored row in its window, as before, and an oversized one is refused', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    for (const [namespace, text, refused] of [['zz-host-a', 'zz-stored', false], ['zz-host-b', LONG, true]] as const) {
+      const cm = await ContextManager.open({ store, namespace, isolate: true, strategy: new PassthroughStrategy() } as never);
+      try {
+        cm.addMessage('User', [{ type: 'text', text }]);
+        const host = new Agent({ name: namespace, model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+        if (refused) {
+          await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
+            assert.ok(err instanceof EmptyCompileError, String(err));
+            return true;
+          });
+        } else {
+          assert.ok(texts(await host.buildActivationRequest([])).includes('zz-stored'));
+        }
+      } finally { await cm.close(); }
+    }
+  } finally { await h.close(); }
+});
+
+test('a framework notice after an oversized message isn\'t conversation: a compile that holds only notices is refused', async () => {
   const h = await harness(12_000);
   try {
     const store = (h.framework as unknown as { store: JsStore }).store;
     const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
     try {
-      cm.addMessage('User', [{ type: 'text', text: 'zz-stored' }]);
+      cm.presentRows([
+        cm.addMessage('User', [{ type: 'text', text: LONG }]),
+        cm.addMessage('user', [{ type: 'text', text: '[routing] zz-routing' }], { system: true, kind: 'routing-notice' } as never),
+        cm.addMessage('user', [{ type: 'text', text: '[clock] zz-clock' }], { system: true, kind: 'zz-clock' } as never),
+      ]);
       const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
-      assert.ok(texts(await host.buildActivationRequest([])).includes('zz-stored'));
+      const preview = texts(await host.buildActivationRequest([], undefined, undefined, undefined, { dryRun: true } as never));
+      assert.ok(preview.includes('[routing] zz-routing') && preview.includes('[clock] zz-clock') && !preview.some((t) => t.startsWith('zz-long')), JSON.stringify(preview));
+      await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
+        assert.ok(err instanceof EmptyCompileError, String(err));
+        return true;
+      });
     } finally { await cm.close(); }
   } finally { await h.close(); }
 });

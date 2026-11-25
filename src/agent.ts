@@ -6,7 +6,7 @@ import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { managerSees } from './context-options.js';
-import { EmptyCompileError, isEmptyCompileError } from './empty-compile.js';
+import { EmptyCompileError } from './empty-compile.js';
 import { rowNamed } from './author-presentation.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
@@ -165,6 +165,12 @@ import type {
  * message, apart from `injectionTail` stored context injections after it
  * (counted over the messages the sanitizer keeps).
  */
+function notConversation(metadata: unknown): boolean {
+  if (storedInjectionMarkOf(metadata) !== undefined) return true;
+  if (typeof metadata !== 'object' || metadata === null || !('system' in metadata) || metadata.system !== true) return false;
+  return !('kind' in metadata) || metadata.kind !== 'inference-failed';
+}
+
 function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, injectionTail: number): boolean {
   const own = messages[messages.length - 1 - injectionTail];
   return own !== undefined && own.participant === agentName
@@ -173,11 +179,6 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, inje
 
 /** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
  *  it out), key order aside: the head digests the thinking binding compares, so a change on the wire changes one. */
-function isBookkeepingRow(metadata: unknown): boolean {
-  return storedInjectionMarkOf(metadata) !== undefined
-    || (typeof metadata === 'object' && metadata !== null && 'kind' in metadata && metadata.kind === 'routing-notice');
-}
-
 function wireDigest(value: unknown): string {
   return stableHash(JSON.parse(JSON.stringify(value) ?? 'null'));
 }
@@ -740,7 +741,7 @@ export class Agent {
     const conversation = (i: number) => {
       const source = compiled.provenance?.messages[i];
       if (source?.kind === 'injection') return false;
-      return source?.kind !== 'raw' || source.bodies.length === 0 || !source.bodies.every((b) => isBookkeepingRow(metadataOf(b.messageId)));
+      return source?.kind !== 'raw' || source.bodies.length === 0 || !source.bodies.every((b) => notConversation(metadataOf(b.messageId)));
     };
     if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
     const newest = this.newestConversationRow(rows);
@@ -753,7 +754,7 @@ export class Agent {
   private newestConversationRow(rows: readonly StoredMessage[]): StoredMessage | undefined {
     for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i]!;
-      if (hasRenderedContent(row.content) && !isBookkeepingRow(row.metadata) && managerSees(this.contextManager, row.metadata)) return row;
+      if (hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata)) return row;
     }
     return undefined;
   }
@@ -915,9 +916,8 @@ export class Agent {
     try {
       result = await compile();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' && !isEmptyCompileError(error)) throw error;
-      // A refusal, or a compile that selected none of the conversation,
-      // shows the budget it planned at doesn't fit, whatever
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
+      // A refusal shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
       // nothing is credited, unless a compile that started later has already
       // ended at that budget.
