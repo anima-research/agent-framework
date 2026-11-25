@@ -57,6 +57,21 @@ export function residentViewFilter(messageOrName: Pick<StoredMessage, 'metadata'
     && !isReasoningLoss(message.metadata);
 }
 
+const managerViews = new WeakMap<object, (metadata: unknown) => boolean>();
+
+export function recordManagerView(manager: object, sees: (metadata: unknown) => boolean): void {
+  managerViews.set(manager, sees);
+}
+
+export function recordedManagerView(manager: object): ((metadata: unknown) => boolean) | undefined {
+  return managerViews.get(manager);
+}
+
+export function managerSees(manager: object, metadata: unknown): boolean {
+  const sees = managerViews.get(manager);
+  return !isReasoningLoss(metadata) && (!sees || sees(metadata));
+}
+
 /** The subconscious includes held traffic, but not suppressed rows, foreign injections or legacy notices. */
 export function subconsciousViewFilter(message: Pick<StoredMessage, 'metadata'>, name: string): boolean;
 export function subconsciousViewFilter(name: string): (message: Pick<StoredMessage, 'metadata'>) => boolean;

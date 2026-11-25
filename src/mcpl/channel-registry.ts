@@ -16,6 +16,7 @@
 import { NOTICE_TAG } from '../notice-tags.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { convertBlocks } from './convert-block.js';
+import { qualifiedChannelName } from './channel-name.js';
 import { cutToFit, markedText, markNoticeOpenings, nameToTypeBack, quotedValue, showsAsItself, suppliedValue } from '../supplied-text.js';
 import type { JsStore } from '@animalabs/chronicle';
 import { isDeepStrictEqual } from 'node:util';
@@ -695,19 +696,10 @@ export function sameChannel(a: ChannelRef | null | undefined, b: ChannelRef | nu
   return a.serverId === b.serverId && a.channelId === b.channelId;
 }
 
+export { qualifiedChannelName } from './channel-name.js';
+
 export const NO_CHANNEL_EXAMPLE = '#<channel>';
 export const NO_PERSON_EXAMPLE = '@<person>';
-
-/**
- * A channel's server-qualified name, `serverId:channelId`. A name given as a
- * string (a tool's channelId, a `>>` target, a host's call) may take this
- * form to pick one server's channel where several servers register the id.
- * It is looked up among the registered pairs, never split at a colon, since
- * ids hold colons (ChannelRegistry.entriesNamed).
- */
-export function qualifiedChannelName(ref: ChannelRef): string {
-  return `${ref.serverId}:${ref.channelId}`;
-}
 
 function markedHistory(history: readonly unknown[]): unknown[] {
   return history.map((item) => {

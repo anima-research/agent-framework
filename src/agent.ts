@@ -5,6 +5,9 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { managerSees } from './context-options.js';
+import { EmptyCompileError } from './empty-compile.js';
+import { rowNamed } from './author-presentation.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
@@ -132,6 +135,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  StoredMessage,
   ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
@@ -174,6 +178,7 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+const DEFAULT_COMPILE_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -710,8 +715,35 @@ export class Agent {
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
     // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? DEFAULT_COMPILE_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+  }
+
+  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined): void {
+    const cm = this.contextManager as Partial<ContextManager>;
+    const rows = typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages() : [];
+    let byId: Map<MessageId, StoredMessage> | undefined;
+    const storedInjection = (i: number) => {
+      const source = compiled.provenance?.messages[i];
+      if (source?.kind !== 'raw' || source.bodies.length === 0 || !compiled.messages[i]?.participant.startsWith('system_context:')) return false;
+      byId ??= new Map(rows.map((row) => [row.id, row]));
+      return source.bodies.every((b) => storedInjectionMarkOf(byId!.get(b.messageId)?.metadata) !== undefined);
+    };
+    const conversation = (i: number) => compiled.provenance?.messages[i]?.kind !== 'injection' && !storedInjection(i);
+    if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
+    const newest = this.newestConversationRow(rows);
+    if (!newest) return;
+    const at = compiledAt ?? DEFAULT_COMPILE_BUDGET;
+    const strategy = cm.getStrategy?.().name;
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, rowNamed(newest, this.name), strategy);
+  }
+
+  private newestConversationRow(rows: readonly StoredMessage[]): StoredMessage | undefined {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i]!;
+      if (hasRenderedContent(row.content) && storedInjectionMarkOf(row.metadata) === undefined && managerSees(this.contextManager, row.metadata)) return row;
+    }
+    return undefined;
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
@@ -1926,11 +1958,16 @@ export class Agent {
     // agent before the consumed watermark moves, once it returns.
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const select = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    let compiledAt: TokenBudget | undefined;
+    const select = () => {
+      compiledAt = this.compileBudget(budget);
+      return this.contextManager.compile(compiledAt, injections, opts as never);
+    };
     const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
+      if (!opts?.dryRun) this.refuseEmptyCompile(result, compiledAt);
     } catch (error) {
       this.unshowFailedCompile(watermark, shownBefore);
       throw error;

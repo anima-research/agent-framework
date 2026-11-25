@@ -1,6 +1,7 @@
 import { MembraneError } from '@animalabs/membrane';
 import { OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import { isDeadlineCut } from './inference-bounds.js';
+import { isEmptyCompileError } from './empty-compile.js';
 
 /**
  * Longest failure text the inference-failure pipeline writes to one sink: the
@@ -72,7 +73,7 @@ export function compileRefusalType(err: Error): 'over_budget' | 'context_refusal
 }
 
 export function houseReason(err: Error): string | undefined {
-  return isDeadlineCut(err) || compileRefusalType(err) !== undefined ? String(err.message) : undefined;
+  return isDeadlineCut(err) || compileRefusalType(err) !== undefined || isEmptyCompileError(err) ? String(err.message) : undefined;
 }
 
 export function failureWords(err: Error, otherwise = 'the turn failed'): string {

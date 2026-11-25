@@ -180,6 +180,10 @@ export type TraceEvent =
       httpStatus?: number;
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
+      /** For the operator: an `empty_compile`'s strategy, budget figures and what to change. */
+      operatorNote?: string;
+      /** For an `empty_compile`: the tokens the budget leaves for the conversation once the room held back for the reply and any pending tool results is set aside. */
+      emptyCompileUsable?: number;
     })
   | (TraceEventBase & {
       /**

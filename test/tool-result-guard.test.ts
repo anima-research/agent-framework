@@ -19,6 +19,12 @@ import { TOOL_RESULT_NOTICE_ROOM } from '../src/tool-image-ledger.js';
 import { JsStore } from '@animalabs/chronicle';
 import { NOTICE_TAG } from '../src/notice-tags.js';
 
+function addPresented(cm: { addMessage(participant: string, content: ContentBlock[]): string; presentRows(ids: readonly string[]): number[] }, participant: string, content: ContentBlock[]): string {
+  const id = cm.addMessage(participant, content);
+  cm.presentRows([id]);
+  return id;
+}
+
 /**
  * A stream message's channel as the test records it. Each delivery hands its
  * stream the destination its publish went to, here the stub's server: one
@@ -467,7 +473,7 @@ test('quiesced scheduler admits a queued guard recovery as a continuation', asyn
   const h = await harness([[answer()]], { toolResultGuard: true });
   try {
     await h.framework.quiesce();
-    h.framework.getAgent('assistant')!.getContextManager().addMessage('user', [{
+    addPresented(h.framework.getAgent('assistant')!.getContextManager(), 'user', [{
       type: 'text', text: TOOL_RESULT_GUARD_NOTICE,
     }]);
     // A recovery can be requeued while waiting for provider admission. It
@@ -1282,7 +1288,7 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
   };
   try {
     const agent = h.framework.getAgent('assistant')!;
-    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    addPresented(agent.getContextManager(), 'user', [{ type: 'text', text: 'read' }]);
     const first = await agent.runInference(h.framework.getAllTools());
     assert.equal(first.toolCalls.length, 1);
     agent.provideToolResult('one', { success: true, data: 'direct-original' });
@@ -1425,7 +1431,7 @@ test('direct API: a transient compile failure does not wedge the guard', async (
     async () => responses.shift()!;
   try {
     const agent = h.framework.getAgent('assistant')!;
-    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    addPresented(agent.getContextManager(), 'user', [{ type: 'text', text: 'read' }]);
     await agent.runInference(h.framework.getAllTools());
     agent.provideToolResult('one', { success: true, data: 'direct-original' });
     const compile = agent.compileWithInjections.bind(agent);
@@ -2262,7 +2268,7 @@ test('#277: direct API: a request after an aborted batch is compiled once its st
     const agent = h.framework.getAgent('assistant')!;
     slowSpill(h.framework, () => { spills++; return write.opened; });
     const compiles = watchCompiles(h.framework);
-    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    addPresented(agent.getContextManager(), 'user', [{ type: 'text', text: 'read' }]);
     await agent.runInference(h.framework.getAllTools());
     agent.provideToolResult('one', { success: true, data: 'direct-original' });
     const aborted = await agent.runInference(h.framework.getAllTools());
@@ -2826,8 +2832,8 @@ test('#277: direct API: the refusal retry fits the budget, though its stubs are 
   try {
     const agent = h.framework.getAgent('assistant')!;
     const cm = agent.getContextManager();
-    for (let i = 0; i < 200; i++) cm.addMessage('user', [{ type: 'text', text: `filler-${i} ` + 'y'.repeat(200) }]);
-    cm.addMessage('user', [{ type: 'text', text: 'read' }]);
+    for (let i = 0; i < 200; i++) addPresented(cm, 'user', [{ type: 'text', text: `filler-${i} ` + 'y'.repeat(200) }]);
+    addPresented(cm, 'user', [{ type: 'text', text: 'read' }]);
     await agent.runInference(h.framework.getAllTools());
     for (const id of ids) agent.provideToolResult(id, { success: true, data: 'x' });
     await agent.runInference(h.framework.getAllTools());
@@ -3680,7 +3686,7 @@ test('#277: direct API: a withheld result keeps its file lists, cut at the house
   };
   try {
     const agent = h.framework.getAgent('assistant')!;
-    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    addPresented(agent.getContextManager(), 'user', [{ type: 'text', text: 'read' }]);
     await agent.runInference(h.framework.getAllTools());
     const written = Array.from({ length: 3000 }, (_, i) => `file-${i}.txt`);
     agent.provideToolResult('marked', { success: true, data: { written }, keepWhenWithheld: ['written'] });
