@@ -6,7 +6,7 @@ import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { managerSees } from './context-options.js';
-import { EmptyCompileError } from './empty-compile.js';
+import { EmptyCompileError, isEmptyCompileError } from './empty-compile.js';
 import { rowNamed } from './author-presentation.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
@@ -903,8 +903,9 @@ export class Agent {
     try {
       result = await compile();
     } catch (error) {
-      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError') throw error;
-      // A refusal shows the budget it planned at doesn't fit, whatever
+      if ((error as { name?: unknown } | null)?.name !== 'OverBudgetError' && !isEmptyCompileError(error)) throw error;
+      // A refusal, or a compile that selected none of the conversation,
+      // shows the budget it planned at doesn't fit, whatever
       // changed while it ran: the record's marker for it is withdrawn, and
       // nothing is credited, unless a compile that started later has already
       // ended at that budget.
@@ -1958,16 +1959,16 @@ export class Agent {
     // agent before the consumed watermark moves, once it returns.
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    let compiledAt: TokenBudget | undefined;
-    const select = () => {
-      compiledAt = this.compileBudget(budget);
-      return this.contextManager.compile(compiledAt, injections, opts as never);
+    const select = async () => {
+      const at = this.compileBudget(budget);
+      const compiled = await this.contextManager.compile(at, injections, opts as never);
+      if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at);
+      return compiled;
     };
     const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget || opts?.dryRun ? await compile() : await this.compileAtLiveBudget(compile);
-      if (!opts?.dryRun) this.refuseEmptyCompile(result, compiledAt);
     } catch (error) {
       this.unshowFailedCompile(watermark, shownBefore);
       throw error;
