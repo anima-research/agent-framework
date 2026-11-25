@@ -1336,6 +1336,7 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
+const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
 /**
@@ -1362,7 +1363,8 @@ interface TurnCarry {
   read: number;
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
+type ReleasedRouting = { opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
@@ -5004,8 +5006,6 @@ export class AgentFramework {
    * per-stream local this survives framework retries and budget restarts. */
   private logicalTurnToolCalls: WeakMap<Agent, { turnToken: number; count: number }> = new WeakMap();
   private answeredTurns = new WeakMap<Agent, TurnRouting>();
-  private releasedStartRoutings = new WeakMap<InferenceRequest,
-    { opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] }>();
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -7749,10 +7749,10 @@ export class AgentFramework {
         return false;
       }
     }
+    if (released) this.undoReleasedStartRouting(agent, routing, released);
     const turn = released
       ? { ...released.turn }
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
-    if (released) this.undoReleasedStartRouting(agent, routing, released);
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
     const { standsOn, ownRows } = !continuesTurn(turn) && carried
@@ -7829,8 +7829,8 @@ export class AgentFramework {
   }
 
   private undoReleasedStartRouting(agent: Agent, routing: TurnRouting, released: ReleasedStart): void {
-    const wrote = this.releasedStartRoutings.get(released.turn);
-    this.releasedStartRoutings.delete(released.turn);
+    const wrote = (released.turn as MarkedRequest)[RELEASED_ROUTING];
+    delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
     if (!wrote) return;
     if (wrote.opened) {
       this.releaseTurnInputs(routing);
@@ -24878,6 +24878,8 @@ export class AgentFramework {
 
   private turnRetryOf(trigger: InferenceRequest, routing: TurnRouting | undefined): InferenceRequest {
     const retry: MarkedRequest = asTurnRetry(trigger);
+    const released = releasedTurnBatch(retry);
+    if (released) retry[MERGED_BATCH] = mergedBatch(retry)!.map((m) => (m === released.turn ? asTurnRetry(m) : m));
     delete retry.wakeChannels;
     return Object.assign(retry, this.wakeChannelsMark(routing));
   }
@@ -28707,10 +28709,10 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
-    if (released && !this.releasedStartRoutings.has(released.turn)) {
-      this.releasedStartRoutings.set(released.turn, opensTurn
+    if (released && !(released.turn as MarkedRequest)[RELEASED_ROUTING]) {
+      (released.turn as MarkedRequest)[RELEASED_ROUTING] = opensTurn
         ? { opened: true, turn: this.turnRouting.get(agent.name), answered: this.answeredTurns.get(agent) }
-        : { opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) });
+        : { opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) };
     }
     if (opensTurn) {
       const head = agent.branchHead();
@@ -28997,9 +28999,9 @@ export class AgentFramework {
       // A stop made while the hooks ran had no stream to cancel.
       const stopAfterHooks = this.takeStartStop(agent, checkWindow);
       if (stopAfterHooks) {
-        if (released) this.releasedStartRoutings.delete(released.turn);
+        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
-        if (released) appendAll(this.pendingRequests, released.wakes);
+        if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
         return false;
       }
       this.nameUnpostedSpeech(agent, routing);
@@ -29094,9 +29096,9 @@ export class AgentFramework {
         // that started this one.
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
-        if (released) this.releasedStartRoutings.delete(released.turn);
+        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn);
-        if (released) appendAll(this.pendingRequests, released.wakes);
+        if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
@@ -29140,7 +29142,7 @@ export class AgentFramework {
         }
       }
       if (released) {
-        this.releasedStartRoutings.delete(released.turn);
+        delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         delete (trigger as MarkedRequest)[MERGED_BATCH];
       }
       // The [Continue] prompt this stream's first round follows, if any, as
@@ -29210,7 +29212,7 @@ export class AgentFramework {
       // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
-        if (released) this.releasedStartRoutings.delete(released.turn);
+        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
           const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
             : 'the framework was stopping';
@@ -29222,7 +29224,7 @@ export class AgentFramework {
           return false;
         }
         this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn);
-        if (released) appendAll(this.pendingRequests, released.wakes);
+        if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
         return false;
       }
 
@@ -29287,9 +29289,9 @@ export class AgentFramework {
         // does at theirs.
         const stopAfterWait = this.takeStartStop(agent, checkWindow);
         if (stopAfterWait) {
-          if (released) this.releasedStartRoutings.delete(released.turn);
+          if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
           this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn);
-          if (released) appendAll(this.pendingRequests, released.wakes);
+          if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's
@@ -29304,7 +29306,7 @@ export class AgentFramework {
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
         await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
       } else {
-        if (released) this.releasedStartRoutings.delete(released.turn);
+        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         this.noteFailedTurnEnd(agent, routing);
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame

@@ -6,9 +6,10 @@
   released start before it sends anything, when that start fails and its
   retry is refused, and when a provider hold keeps its retry. The turn that
   waits again is the released one. A wake that a surgery removes takes its
-  channel with it. A withdrawal still reaches a joined wake. If the released
-  start rendered all of a joined wake's deferred batch for this agent, that
-  wake reads the stored render once the turn is dropped. A start that merged
-  two released turns, or a released turn and a continuation, still ends its
-  joined wakes with the turn. If the released start moved where the turn's
-  speech lands, the move and its notice stay.
+  channel with it. A withdrawal still reaches a joined wake that the
+  released start didn't render. If the released start rendered all of a
+  joined wake's deferred batch for this agent, that wake reads the stored
+  render once the turn is dropped. A start that merged two released turns,
+  or a released turn and a continuation, still ends its joined wakes with
+  the turn. If the released start moved where the turn's speech lands, the
+  move and its notice stay.
