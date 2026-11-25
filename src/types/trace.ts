@@ -213,7 +213,8 @@ export type TraceEvent =
       since: number;
       /** Requests the hold holds as it starts: the refused start's own, and,
        *  when that start merged one released turn with the wakes that joined
-       *  its wait, those wakes, which the hold takes back. */
+       *  its wait, those wakes, which the hold takes back. A wake that a
+       *  quiesce lets through isn't counted, as in `gatedRequests`. */
       heldRequests: number;
     })
   | (TraceEventBase & {

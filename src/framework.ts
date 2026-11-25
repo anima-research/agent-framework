@@ -1336,7 +1336,6 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
-const RELEASED_START: unique symbol = Symbol('released-start');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
 /**
@@ -1363,7 +1362,7 @@ interface TurnCarry {
   read: number;
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_START]?: ReleasedStart; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
@@ -1402,10 +1401,10 @@ function mergedBatch(request: InferenceRequest): InferenceRequest[] | undefined 
 /** The wakes of a merged start's batch (MERGED_BATCH): its requests that
  *  don't carry the turn on. */
 function mergedWakes(request: InferenceRequest): InferenceRequest[] {
-  return [...(mergedBatch(request) ?? []).filter((r) => !continuesTurn(r)), ...((request as MarkedRequest)[RELEASED_START]?.wakes ?? [])];
+  return (mergedBatch(request) ?? []).filter((r) => !continuesTurn(r) && budgetWaitOf(r) === undefined);
 }
 
-function releasedTurnBatch(request: InferenceRequest | undefined): { turn: InferenceRequest; wakes: InferenceRequest[] } | undefined {
+function releasedTurnBatch(request: InferenceRequest | undefined): ReleasedStart | undefined {
   const batch = request ? mergedBatch(request) : undefined;
   if (!batch) return undefined;
   const turns = batch.filter((r) => budgetWaitOf(r) !== undefined);
@@ -1413,16 +1412,6 @@ function releasedTurnBatch(request: InferenceRequest | undefined): { turn: Infer
   return turns.length === 1 && wakes.length > 0 && turns.length + wakes.length === batch.length ? { turn: turns[0]!, wakes } : undefined;
 }
 
-function withReleasedStart(request: InferenceRequest, released: ReleasedStart | undefined): InferenceRequest {
-  return released ? { ...request, [RELEASED_START]: released } as MarkedRequest : request;
-}
-
-function releasedStartOf(request: InferenceRequest | undefined, assembly: AssemblyResult | undefined): ReleasedStart | undefined {
-  const carried = request ? (request as MarkedRequest)[RELEASED_START] : undefined;
-  if (carried) return carried;
-  const released = releasedTurnBatch(request);
-  return released && { turn: released.turn, wakes: released.wakes.map((wake) => restoredWake(wake, assembly)) };
-}
 
 
 function isTurnRetry(request: InferenceRequest): boolean {
@@ -3290,8 +3279,11 @@ function restoredWake(wake: InferenceRequest, assembly: AssemblyResult | undefin
   const renders = subjects.flatMap((subject) => assembly?.materializedRows.get(subject) ?? []);
   if (!wake.coalescingBatch || subjects.length === 0 || renders.length !== subjects.length) return wake;
   const { coalescingBatch: _batch, coalescingBatchSubjects: _subjects, coalescingSubject: _subject, readsRow: _row, readsRows: _rows, ...own } = wake;
-  const rows = [...wakeRows(wake), ...renders];
-  return rows.length === 1 ? { ...own, readsRow: rows[0]! } : { ...own, readsRows: rows.map((row) => ({ row })) };
+  const reads: NonNullable<InferenceRequest['readsRows']> = [
+    ...(wake.readsRows ?? (wake.readsRow !== undefined ? [{ row: wake.readsRow }] : [])),
+    ...renders.map((row) => ({ row })),
+  ];
+  return reads.length === 1 && reads[0]!.replyTo === undefined ? { ...own, readsRow: reads[0]!.row } : { ...own, readsRows: reads };
 }
 
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
@@ -5012,8 +5004,8 @@ export class AgentFramework {
    * per-stream local this survives framework retries and budget restarts. */
   private logicalTurnToolCalls: WeakMap<Agent, { turnToken: number; count: number }> = new WeakMap();
   private answeredTurns = new WeakMap<Agent, TurnRouting>();
-  private releasedStartRoutings = new WeakMap<TurnRouting,
-    { opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; wakeChannels?: ChannelRef[] }>();
+  private releasedStartRoutings = new WeakMap<InferenceRequest,
+    { opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] }>();
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -7760,7 +7752,7 @@ export class AgentFramework {
     const turn = released
       ? { ...released.turn }
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
-    if (released) this.undoReleasedStartRouting(agent, routing);
+    if (released) this.undoReleasedStartRouting(agent, routing, released);
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
     const { standsOn, ownRows } = !continuesTurn(turn) && carried
@@ -7836,9 +7828,9 @@ export class AgentFramework {
     return true;
   }
 
-  private undoReleasedStartRouting(agent: Agent, routing: TurnRouting): void {
-    const wrote = this.releasedStartRoutings.get(routing);
-    this.releasedStartRoutings.delete(routing);
+  private undoReleasedStartRouting(agent: Agent, routing: TurnRouting, released: ReleasedStart): void {
+    const wrote = this.releasedStartRoutings.get(released.turn);
+    this.releasedStartRoutings.delete(released.turn);
     if (!wrote) return;
     if (wrote.opened) {
       this.releaseTurnInputs(routing);
@@ -7852,9 +7844,9 @@ export class AgentFramework {
         else this.answeredTurns.delete(agent);
       }
     } else if (wrote.wakeChannels) {
-      routing.wakeChannels = wrote.wakeChannels;
+      wrote.routing.wakeChannels = wrote.wakeChannels;
     } else {
-      delete routing.wakeChannels;
+      delete wrote.routing.wakeChannels;
     }
   }
 
@@ -28559,7 +28551,11 @@ export class AgentFramework {
       }
     }
 
-    const released = releasedStartOf(asCame, assembly);
+    const asReleased = releasedTurnBatch(trigger);
+    if (asReleased) {
+      trigger = { ...trigger, [MERGED_BATCH]: [asReleased.turn, ...asReleased.wakes.map((wake) => restoredWake(wake, assembly))] } as MarkedRequest;
+    }
+    const released = releasedTurnBatch(trigger);
 
     // A turn whose only causes were deferred batches, none of which gave it
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
@@ -28648,8 +28644,8 @@ export class AgentFramework {
       const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, ...retry } = trigger;
       trigger = retry;
     }
-    if (trigger && (mergedBatch(trigger) || (trigger as MarkedRequest)[RELEASED_START])) {
-      const { [MERGED_BATCH]: _batch, [RELEASED_START]: _released, ...own } = trigger as MarkedRequest;
+    if (trigger && mergedBatch(trigger) && !releasedTurnBatch(trigger)) {
+      const { [MERGED_BATCH]: _batch, ...own } = trigger as MarkedRequest;
       trigger = own;
     }
 
@@ -28711,10 +28707,10 @@ export class AgentFramework {
         opensTurn = true;
       }
     }
-    if (released && !this.releasedStartRoutings.has(routing)) {
-      this.releasedStartRoutings.set(routing, opensTurn
+    if (released && !this.releasedStartRoutings.has(released.turn)) {
+      this.releasedStartRoutings.set(released.turn, opensTurn
         ? { opened: true, turn: this.turnRouting.get(agent.name), answered: this.answeredTurns.get(agent) }
-        : { opened: false, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) });
+        : { opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) });
     }
     if (opensTurn) {
       const head = agent.branchHead();
@@ -29001,7 +28997,7 @@ export class AgentFramework {
       // A stop made while the hooks ran had no stream to cancel.
       const stopAfterHooks = this.takeStartStop(agent, checkWindow);
       if (stopAfterHooks) {
-        this.releasedStartRoutings.delete(routing);
+        if (released) this.releasedStartRoutings.delete(released.turn);
         this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
         if (released) appendAll(this.pendingRequests, released.wakes);
         return false;
@@ -29056,7 +29052,6 @@ export class AgentFramework {
         inferenceBounds: this.inferenceBounds,
       });
       if (trigger) delete (trigger as MarkedRequest)[BUDGET_WAIT];
-      this.releasedStartRoutings.delete(routing);
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
@@ -29099,7 +29094,7 @@ export class AgentFramework {
         // that started this one.
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
-        this.releasedStartRoutings.delete(routing);
+        if (released) this.releasedStartRoutings.delete(released.turn);
         this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn);
         if (released) appendAll(this.pendingRequests, released.wakes);
         return false;
@@ -29143,6 +29138,10 @@ export class AgentFramework {
           this.eventGate?.onInferenceEnded(agent.name);
           return false;
         }
+      }
+      if (released) {
+        this.releasedStartRoutings.delete(released.turn);
+        delete (trigger as MarkedRequest)[MERGED_BATCH];
       }
       // The [Continue] prompt this stream's first round follows, if any, as
       // the Agent read it from the request: the round's rows carry it
@@ -29211,7 +29210,7 @@ export class AgentFramework {
       // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
-        this.releasedStartRoutings.delete(routing);
+        if (released) this.releasedStartRoutings.delete(released.turn);
         if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
           const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
             : 'the framework was stopping';
@@ -29227,7 +29226,7 @@ export class AgentFramework {
         return false;
       }
 
-      const retry = trigger && withReleasedStart(withTurnCarry(trigger, carry), released);
+      const retry = trigger && withTurnCarry(trigger, carry);
       const asTransient = this.takeAsTransient(agent.name, err, trigger);
       if (this.holdForBudgetRefusal(agent, err, retry, checkpoint, routing, compileBaseline, () => {
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
@@ -29288,7 +29287,7 @@ export class AgentFramework {
         // does at theirs.
         const stopAfterWait = this.takeStartStop(agent, checkWindow);
         if (stopAfterWait) {
-          this.releasedStartRoutings.delete(routing);
+          if (released) this.releasedStartRoutings.delete(released.turn);
           this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn);
           if (released) appendAll(this.pendingRequests, released.wakes);
           return false;
@@ -29305,7 +29304,7 @@ export class AgentFramework {
         if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
         await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
       } else {
-        this.releasedStartRoutings.delete(routing);
+        if (released) this.releasedStartRoutings.delete(released.turn);
         this.noteFailedTurnEnd(agent, routing);
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame
