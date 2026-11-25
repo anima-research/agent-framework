@@ -173,6 +173,11 @@ function endsOnOwnMessage(messages: NormalizedMessage[], agentName: string, inje
 
 /** A digest of a value as a request's JSON carries it (a field whose value is undefined left out, as the wire leaves
  *  it out), key order aside: the head digests the thinking binding compares, so a change on the wire changes one. */
+function isBookkeepingRow(metadata: unknown): boolean {
+  return storedInjectionMarkOf(metadata) !== undefined
+    || (typeof metadata === 'object' && metadata !== null && 'kind' in metadata && metadata.kind === 'routing-notice');
+}
+
 function wireDigest(value: unknown): string {
   return stableHash(JSON.parse(JSON.stringify(value) ?? 'null'));
 }
@@ -719,17 +724,24 @@ export class Agent {
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
-  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined): void {
+  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean): void {
+    if (guarded) return;
     const cm = this.contextManager as Partial<ContextManager>;
     const rows = typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages() : [];
     let byId: Map<MessageId, StoredMessage> | undefined;
-    const storedInjection = (i: number) => {
-      const source = compiled.provenance?.messages[i];
-      if (source?.kind !== 'raw' || source.bodies.length === 0 || !compiled.messages[i]?.participant.startsWith('system_context:')) return false;
+    const metadataOf = (id: MessageId): unknown => {
+      try {
+        const own = this.contextManager.getMessage(id);
+        if (own) return own.metadata;
+      } catch { /* the presented rows answer */ }
       byId ??= new Map(rows.map((row) => [row.id, row]));
-      return source.bodies.every((b) => storedInjectionMarkOf(byId!.get(b.messageId)?.metadata) !== undefined);
+      return byId.get(id)?.metadata;
     };
-    const conversation = (i: number) => compiled.provenance?.messages[i]?.kind !== 'injection' && !storedInjection(i);
+    const conversation = (i: number) => {
+      const source = compiled.provenance?.messages[i];
+      if (source?.kind === 'injection') return false;
+      return source?.kind !== 'raw' || source.bodies.length === 0 || !source.bodies.every((b) => isBookkeepingRow(metadataOf(b.messageId)));
+    };
     if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
     const newest = this.newestConversationRow(rows);
     if (!newest) return;
@@ -741,7 +753,7 @@ export class Agent {
   private newestConversationRow(rows: readonly StoredMessage[]): StoredMessage | undefined {
     for (let i = rows.length - 1; i >= 0; i--) {
       const row = rows[i]!;
-      if (hasRenderedContent(row.content) && storedInjectionMarkOf(row.metadata) === undefined && managerSees(this.contextManager, row.metadata)) return row;
+      if (hasRenderedContent(row.content) && !isBookkeepingRow(row.metadata) && managerSees(this.contextManager, row.metadata)) return row;
     }
     return undefined;
   }
@@ -1635,8 +1647,9 @@ export class Agent {
     if (watermark) this.shownWatermark = watermark;
     const select = async () => {
       const at = this.compileBudget(budget);
+      const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
       const compiled = await this.contextManager.compile(at);
-      this.refuseEmptyCompile(compiled, at);
+      this.refuseEmptyCompile(compiled, at, guarded);
       return compiled;
     };
     const compile = () => this.compileUnpinningOnRefusal(select);
@@ -1967,8 +1980,9 @@ export class Agent {
     if (watermark) this.shownWatermark = watermark;
     const select = async () => {
       const at = this.compileBudget(budget);
+      const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
       const compiled = await this.contextManager.compile(at, injections, opts as never);
-      if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at);
+      if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at, guarded);
       return compiled;
     };
     const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);

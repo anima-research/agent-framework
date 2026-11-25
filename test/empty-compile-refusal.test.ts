@@ -95,6 +95,15 @@ async function harness(contextBudgetTokens: number, opts: { names?: readonly str
   } as never);
   const traces: Trace[] = [];
   framework.onTrace((e) => { traces.push(e as unknown as Trace); });
+  const queued: Array<Record<string, unknown>> = [];
+  const capture = (list: Array<Record<string, unknown>>) => {
+    const push = list.push.bind(list);
+    list.push = (...items) => { queued.push(...items); return push(...items); };
+    return list;
+  };
+  const host = framework as unknown as { pendingRequests: Array<Record<string, unknown>> };
+  let current = capture(host.pendingRequests);
+  Object.defineProperty(host, 'pendingRequests', { configurable: true, get: () => current, set: (list: Array<Record<string, unknown>>) => { current = capture(list); } });
   const stderr: string[] = [];
   const error = console.error;
   console.error = (...a: unknown[]) => { stderr.push(a.map(String).join(' ')); };
@@ -125,7 +134,8 @@ async function harness(contextBudgetTokens: number, opts: { names?: readonly str
     console.error = error;
     rmSync(dir, { recursive: true, force: true });
   };
-  return { framework, membrane, traces, stderr, count, settled, rows, notices, say, wake, alerts, exhausted, pending, idle, close };
+  const noticeWakes = () => queued.filter((r) => r.reason === 'empty-compile-notice');
+  return { framework, membrane, traces, stderr, count, settled, rows, notices, say, wake, alerts, exhausted, pending, idle, noticeWakes, close };
 }
 
 const texts = (request: NormalizedRequest) => request.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '');
@@ -491,8 +501,11 @@ test('no operator\'s sink names the newest row\'s sender or channel, from the fi
     for (const t of h.exhausted()) assert.ok(!named(t.message) && !named((t as { error?: string }).error) && !named(t.shownReason) && !named(t.operatorNote), JSON.stringify(t));
     for (const t of h.traces.filter((e) => e.type === 'ops:alert')) assert.ok(!named(t.message), t.message);
     for (const line of h.stderr.filter((l) => l.startsWith('[inference-'))) assert.ok(!named(line), line);
-    const logged = readFileSync('logs/failures.log', 'utf8').split('\n').filter((l) => l !== '')
-      .map((l) => JSON.parse(l) as { at: string; errorType?: string })
+    const parsed = (l: string): { at: string; errorType?: string } | undefined => {
+      try { return JSON.parse(l) as { at: string; errorType?: string }; } catch { return undefined; }
+    };
+    const logged = readFileSync('logs/failures.log', 'utf8').split('\n').map(parsed)
+      .filter((r): r is { at: string; errorType?: string } => r !== undefined)
       .filter((r) => r.errorType === 'empty_compile' && Date.parse(r.at) >= started);
     assert.ok(logged.length >= 3, 'premise: failures.log holds a record of each refusal');
     for (const r of logged) assert.ok(!named(JSON.stringify(r)), JSON.stringify(r));
@@ -500,11 +513,13 @@ test('no operator\'s sink names the newest row\'s sender or channel, from the fi
 });
 
 test('a host\'s provider hold doesn\'t park a refused compile', async () => {
-  const h = await harness(4_000, { framework: { providerHold: () => ({ holdMs: 60_000, reason: 'zz-hold' }) } });
+  let asked = 0;
+  const h = await harness(4_000, { framework: { providerHold: () => { asked++; return { holdMs: 60_000, reason: 'zz-hold' }; } } });
   try {
     h.say('zz-q1');
     await until(() => h.exhausted().length === 1, 'the refused turn ends');
     assert.equal(h.exhausted()[0]!.errorType, 'empty_compile');
+    assert.equal(asked, 0, 'the host\'s hook isn\'t asked');
   } finally { await h.close(); }
 });
 
@@ -694,5 +709,78 @@ test('once a host presents rows, a row it stores and doesn\'t present is in no r
         }
       } finally { await cm.close(); }
     }
+  } finally { await h.close(); }
+});
+
+test('the wake onto a notice answers the refused turn\'s own channel and message, and a refused heartbeat\'s wake is a heartbeat\'s', async () => {
+  const h = await harness(12_000);
+  try {
+    h.say(LONG, true);
+    await until(() => h.rows().some((r) => r.startsWith('zz-long')), 'the long message stored');
+    h.wake({ channelId: 'zz-chan', channelServerId: 'zz-srv', answersMessageId: 'zz-m1' });
+    await until(() => h.noticeWakes().length === 1, 'the notice wake queued');
+    await until(h.idle, 'the framework idle');
+    assert.equal(h.noticeWakes()[0]!.channelId, 'zz-chan');
+    assert.equal(h.noticeWakes()[0]!.channelServerId, 'zz-srv');
+    assert.equal(h.noticeWakes()[0]!.answersMessageId, 'zz-m1');
+
+    h.say(`${LONG} zz-again`, true);
+    await until(() => h.rows().some((r) => r.includes('zz-again')), 'a second long message stored');
+    h.wake({ reason: 'heartbeat', source: 'heartbeat' });
+    await until(() => h.noticeWakes().length === 2, 'the heartbeat\'s notice wake queued');
+    await until(h.idle, 'the framework idle');
+    const heartbeat = h.noticeWakes()[1]!;
+    assert.equal(heartbeat.heartbeatTurn, true);
+    assert.equal(heartbeat.channelId, undefined, 'no channel from an earlier turn');
+  } finally { await h.close(); }
+});
+
+test('a routing notice after an oversized message isn\'t conversation: the compile that selects only it is refused', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
+    try {
+      cm.presentRows([
+        cm.addMessage('User', [{ type: 'text', text: LONG }]),
+        cm.addMessage('user', [{ type: 'text', text: '[routing] Your plain speech now lands in zz-chan.' }], { system: true, kind: 'routing-notice' } as never),
+      ]);
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      const preview = await host.buildActivationRequest([], undefined, undefined, undefined, { dryRun: true } as never);
+      assert.ok(!texts(preview).some((t) => t.startsWith('zz-long')), 'premise: the compile leaves the long message out');
+      await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
+        assert.ok(err instanceof EmptyCompileError, String(err));
+        return true;
+      });
+    } finally { await cm.close(); }
+  } finally { await h.close(); }
+});
+
+test('a compile made while a tool-result batch holds back its reserve isn\'t refused: its request is sent as before', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
+    try {
+      cm.presentRows([cm.addMessage('User', [{ type: 'text', text: 'zz-short' }])]);
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      const guard = (host as unknown as { toolResultGuard: object }).toolResultGuard;
+      Object.defineProperty(guard, 'pendingWireReserveTokens', { configurable: true, get: () => 20_000 });
+      const sent = await host.buildActivationRequest([]);
+      assert.ok(!texts(sent).includes('zz-short'), 'premise: the reserve left no room for the message');
+    } finally { await cm.close(); }
+  } finally { await h.close(); }
+});
+
+test('a host that never presents rows has every stored row in its window, as before', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
+    try {
+      cm.addMessage('User', [{ type: 'text', text: 'zz-stored' }]);
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      assert.ok(texts(await host.buildActivationRequest([])).includes('zz-stored'));
+    } finally { await cm.close(); }
   } finally { await h.close(); }
 });

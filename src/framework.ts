@@ -36735,7 +36735,7 @@ export class AgentFramework {
     const shownText = typeof forResident === 'string'
       ? failureShown(boundFailureText(forResident, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
     const notSent = sameAgent && !ended && errorType === 'empty_compile' && shownText !== undefined && !this.emptyCompileNoticed.has(agentName);
-    if (agent && (ended || notSent) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+    if (agent && sameAgent && (ended || notSent) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
@@ -36915,10 +36915,9 @@ export class AgentFramework {
   private noticedEmptyCompile(agent: Agent, usable: number | undefined): void {
     this.emptyCompileNoticed.add(agent.name);
     if ((usable ?? 0) <= 0 || this.ephemeralRuns.has(agent.name)) return;
-    const answered = this.answeredTurns.get(agent);
     const refused = this.turnRouting.get(agent.name);
     this.pendingRequests.push({
-      ...this.rewindRetry(agent.name, 'empty-compile-notice', answered, answered ?? refused),
+      ...this.rewindRetry(agent.name, 'empty-compile-notice', refused, refused),
       ...(refused?.silent ? { suppressProse: true } : {}),
       ...(refused ? { ...this.heartbeatTurnMark(refused), ...this.unpromptedTurnMark(refused) } : {}),
     });

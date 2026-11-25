@@ -11,9 +11,10 @@
   says that the turn wasn't sent and that none of the conversation reached
   the context. When the budget leaves room for conversation, the notice
   names the newest message's author and channel where its metadata gives
-  them, never from its text. The framework then wakes the agent once, so
-  that it can tell the sender. If the refused turn was silent, a heartbeat
-  or unprompted, its wake is of that kind too. An ephemeral run gets the
+  them, never from its text, or says that it is a tool result or one the
+  agent wrote. The framework then wakes the agent once, so that it can
+  tell the sender. If the refused turn was silent, a heartbeat or
+  unprompted, its wake is of that kind too. An ephemeral run gets the
   notice without a wake. For the passthrough strategy, the notice also
   says that a message too large for the context keeps the older
   conversation out, and what the agent can do. When a round of the turn
