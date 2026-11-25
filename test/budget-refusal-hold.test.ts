@@ -858,6 +858,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
         assert.equal(t.of('inference:hold_ended').at(-1)?.outcome, 'removed');
         assert.ok(await pollUntil(() => t.stored().includes('Answered both')), 'the wakes ran');
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
         const read = requestText(t.turnCalls()[1]);
         assert.ok(read.includes('second') && read.includes('third'), 'which read both');
@@ -1018,6 +1019,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
         assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the turn ran once there was room');
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
       } finally {
         await t.close();
@@ -1080,6 +1082,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('Quiet thoughts')), "second's wake ran");
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed'],
           'the surgery dropped the waiting turn rather than releasing it');
+        await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
       } finally {
         await t.close();
@@ -1133,6 +1136,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
         c.failNext = providerLimit();
         t.internal.releaseBudgetHold('prime');
         assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "the released start met a provider hold, and its retry waits there");
+        assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, "second's wake counts as gated; the turn's retry, which a quiesce lets through, doesn't");
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
