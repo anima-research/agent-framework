@@ -894,28 +894,33 @@ describe('a turn refused for budget while compression is pending waits idle, and
 
   async function deferredBatchReheld() {
     const f = await coalescingFixture({ framework: { maintenanceIntervalMs: 0 } });
-    f.framework.start();
-    const internal = f.framework as unknown as Internal;
-    internal.budgetHoldRecheckMs = 60_000;
-    const traces: TraceEvent[] = [];
-    f.framework.onTrace((e) => traces.push(e));
-    const held = () => traces.filter((e) => e.type === 'inference:held').length;
-    const goRow = String(internal.addMessage('User', [text('go')]));
-    internal.pendingRequests.push({ agentName: 'agent', reason: 'external-message', source: 'test', timestamp: Date.now(), readsRow: goRow });
-    assert.ok(await pollUntil(() => held() === 1), 'go waits');
-    const pushed = await f.send('push/event', f.params('d1', 'zz batch', { deferred: true, key: 'docA' }));
-    assert.equal(pushed.result.coalesce.outcome, 'first');
-    const hold = () => (f.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { heldRequests?: number } | null }> })
-      .agents.find((a) => a.name === 'agent')?.budgetHold ?? null;
-    assert.ok(await pollUntil(() => hold()?.heldRequests === 2), "the deferred batch's wake joined the wait");
-    internal.releaseBudgetHold('agent');
-    assert.ok(await pollUntil(() => held() === 2 && internal.budgetHolds.has('agent')), 'released, merged with that wake, refused and waiting again');
-    assert.equal(f.renders.length, 1, "the released start's assembly rendered the batch");
-    assert.equal(hold()?.heldRequests, 2, "and the batch's wake waits again beside the turn");
-    const renderRow = (f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: unknown }>)
-      .find((r) => JSON.stringify(r.content).includes('document_diff'));
-    assert.ok(renderRow, 'and stored its render');
-    return { f, goRow, renderRow: String(renderRow.id), traces };
+    try {
+      f.framework.start();
+      const internal = f.framework as unknown as Internal;
+      internal.budgetHoldRecheckMs = 60_000;
+      const traces: TraceEvent[] = [];
+      f.framework.onTrace((e) => traces.push(e));
+      const held = () => traces.filter((e) => e.type === 'inference:held').length;
+      const goRow = String(internal.addMessage('User', [text('go')]));
+      internal.pendingRequests.push({ agentName: 'agent', reason: 'external-message', source: 'test', timestamp: Date.now(), readsRow: goRow });
+      assert.ok(await pollUntil(() => held() === 1), 'go waits');
+      const pushed = await f.send('push/event', f.params('d1', 'zz batch', { deferred: true, key: 'docA' }));
+      assert.equal(pushed.result.coalesce.outcome, 'first');
+      const hold = () => (f.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { heldRequests?: number } | null }> })
+        .agents.find((a) => a.name === 'agent')?.budgetHold ?? null;
+      assert.ok(await pollUntil(() => hold()?.heldRequests === 2), "the deferred batch's wake joined the wait");
+      internal.releaseBudgetHold('agent');
+      assert.ok(await pollUntil(() => held() === 2 && internal.budgetHolds.has('agent')), 'released, merged with that wake, refused and waiting again');
+      assert.equal(f.renders.length, 1, "the released start's assembly rendered the batch");
+      assert.equal(hold()?.heldRequests, 2, "and the batch's wake waits again beside the turn");
+      const renderRow = (f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: unknown }>)
+        .find((r) => JSON.stringify(r.content).includes('document_diff'));
+      assert.ok(renderRow, 'and stored its render');
+      return { f, goRow, renderRow: String(renderRow.id), traces };
+    } catch (error) {
+      await f.close();
+      throw error;
+    }
   }
 
   it("a deferred batch rendered by a released start that is refused again still runs when a surgery drops the turn, and reads its render", async () => {
@@ -1094,6 +1099,66 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
         assert.ok(!t.internal.budgetHolds.has('prime'), 'and nothing waits');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("abortInference() of a released start's retry that a provider hold keeps puts the wakes merged into it back in the queue, and they run", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const cooldown = () => t.internal.providerAccelerationCooldowns.get('prime');
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = providerLimit();
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "the released start met a provider hold, and its retry waits there");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        cooldown()!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a silent continuation released with a wake that opens a turn, and refused again, still stands on its own rows: a surgery that removes them drops it and gives the wake back", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const cooldown = () => t.internal.providerAccelerationCooldowns.get('prime');
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        c.failNext = providerLimit();
+        const goRow = String(t.internal.addMessage('User', [text('go')]));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-silent', source: 'test', timestamp: Date.now(), readsRow: goRow, suppressProse: true });
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "go's silent start met a provider hold, and its retry waits there");
+        cooldown()!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), "go's retry was refused for budget, and waits");
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'released, merged with that wake, refused and waiting again');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [goRow] });
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed'],
+          'the surgery dropped the waiting turn rather than releasing it');
       } finally {
         await t.close();
       }
