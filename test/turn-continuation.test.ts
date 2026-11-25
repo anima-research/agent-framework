@@ -1158,7 +1158,7 @@ function standInCoalescer(framework: AgentFramework) {
       assembled.push(`${agent}:${(subjects ?? []).join(',')}`);
       const had = pending;
       pending = false;
-      return { materialized: new Set(had ? ['s1'] : []), settled: new Set(subjects ?? []) };
+      return { materialized: new Set(had ? ['s1'] : []), settled: new Set(subjects ?? []), materializedRows: new Map<string, string>() };
     },
     suspend: () => {},
   };

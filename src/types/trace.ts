@@ -211,7 +211,9 @@ export type TraceEvent =
        *  release starts a new hold; its `context-refusal` alert and the note
        *  count from the wait's first hold. */
       since: number;
-      /** Requests the hold holds as it starts: the refused start's own. */
+      /** Requests the hold holds as it starts: the refused start's own, and,
+       *  when it holds a released turn's start again, the wakes that joined
+       *  the wait before the release, which it takes back. */
       heldRequests: number;
     })
   | (TraceEventBase & {
