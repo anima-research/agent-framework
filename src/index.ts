@@ -3,6 +3,7 @@ export * from './types/index.js';
 
 // Core classes
 export { AgentFramework, AgentStoppedError, BudgetPreflightError, DefaultErrorPolicy, ProviderWaitNotSleptError, QuiesceBlockedError, ResumeBlockedError } from './framework.js';
+export { EmptyCompileError, isEmptyCompileError } from './empty-compile.js';
 export { isReasoningLoss } from './reasoning-loss.js';
 export type { RuntimeSettingsPreview, HostModeStatus, DeriveAgentOptions } from './framework.js';
 export { Agent } from './agent.js';
