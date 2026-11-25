@@ -1363,7 +1363,7 @@ interface TurnCarry {
   read: number;
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
-type ReleasedRouting = { opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] };
+type ReleasedRouting = { wasRetry: boolean } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
 type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
@@ -7749,11 +7749,12 @@ export class AgentFramework {
         return false;
       }
     }
-    if (released) this.undoReleasedStartRouting(agent, routing, released);
+    const wrote = released ? this.undoReleasedStartRouting(agent, routing, released) : undefined;
     const turn: MarkedRequest = released
       ? { ...released.turn }
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
-    if (released && budgetWaitOf(turn)?.rows?.length) delete turn[TURN_RETRY];
+    if (wrote && !wrote.wasRetry) delete turn[TURN_RETRY];
+    delete turn[RELEASED_ROUTING];
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
     const { standsOn, ownRows } = !continuesTurn(turn) && carried
@@ -7829,10 +7830,10 @@ export class AgentFramework {
     return true;
   }
 
-  private undoReleasedStartRouting(agent: Agent, routing: TurnRouting, released: ReleasedStart): void {
+  private undoReleasedStartRouting(agent: Agent, routing: TurnRouting, released: ReleasedStart): ReleasedRouting | undefined {
     const wrote = (released.turn as MarkedRequest)[RELEASED_ROUTING];
     delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
-    if (!wrote) return;
+    if (!wrote) return undefined;
     if (wrote.opened) {
       this.releaseTurnInputs(routing);
       if (this.openLogical.get(agent.name) === routing) this.openLogical.delete(agent.name);
@@ -7849,6 +7850,7 @@ export class AgentFramework {
     } else {
       delete wrote.routing.wakeChannels;
     }
+    return wrote;
   }
 
   private rowsTurnStandsOn(agent: Agent, turn: InferenceRequest, routing: TurnRouting): { standsOn: string[]; ownRows: string[] } {
@@ -28711,9 +28713,10 @@ export class AgentFramework {
       }
     }
     if (released && !(released.turn as MarkedRequest)[RELEASED_ROUTING]) {
+      const wasRetry = isTurnRetry(released.turn);
       (released.turn as MarkedRequest)[RELEASED_ROUTING] = opensTurn
-        ? { opened: true, turn: this.turnRouting.get(agent.name), answered: this.answeredTurns.get(agent) }
-        : { opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) };
+        ? { wasRetry, opened: true, turn: this.turnRouting.get(agent.name), answered: this.answeredTurns.get(agent) }
+        : { wasRetry, opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) };
     }
     if (opensTurn) {
       const head = agent.branchHead();
