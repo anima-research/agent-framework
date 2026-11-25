@@ -320,13 +320,18 @@ async function resident(options: {
   } as unknown as ProcessEvent);
   const started = framework.start();
   if (options.channels) {
-    await started;
-    const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
-    if (!await pollUntil(() => registry.listChannelsRaw().length >= 2)) {
-      await framework.stop();
-      rmSync(dir, { recursive: true, force: true });
-      assert.fail('the stand-in server registered its channels');
+    let registered = false;
+    try {
+      await started;
+      const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
+      registered = await pollUntil(() => registry.listChannelsRaw().length >= 2);
+    } finally {
+      if (!registered) {
+        await framework.stop().catch(() => {});
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
+    assert.ok(registered, 'the stand-in server registered its channels');
   }
   const cm = () => framework.getAgent('prime')!.getContextManager();
   const rows = () => cm().getAllMessages() as unknown as Array<{ id: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> }>;
@@ -832,7 +837,9 @@ describe('a turn refused for budget while compression is pending waits idle, and
       try {
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
+        const wakes = [...t.internal.budgetHolds.get('prime')!.wakes];
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.ok(wakes.length === 1 && t.internal.pendingRequests.length === 1 && t.internal.pendingRequests[0] === wakes[0], "the queue holds second's wake, not the turn");
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'stopped']);
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
         await t.framework.runUntilIdle();
@@ -1047,10 +1054,37 @@ describe('a turn refused for budget while compression is pending waits idle, and
           "the turn that waits again still stands on go's row");
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
+        const wakes = [...t.internal.budgetHolds.get('prime')!.wakes];
         assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.ok(wakes.length === 1 && t.internal.pendingRequests.length === 1 && t.internal.pendingRequests[0] === wakes[0], "the queue holds second's wake, not the turn");
         assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
         await t.framework.runUntilIdle();
         assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a released turn with no rows to stand on, whose start fails once and whose retry is refused again, waits again as the fresh turn it was", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-rowless', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the turn with no rows waits');
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = new Error('zz store unavailable');
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+          "the released start failed, and the error policy's retry was refused and waits again");
+        assert.equal(c.failNext, undefined, 'the released start met the failure');
+        const marks = Object.getOwnPropertySymbols(t.internal.budgetHolds.get('prime')!.turn as object).map((x) => x.description);
+        assert.ok(!marks.includes('turn-retry'), `the turn waits again as the fresh turn it was, not as the retry of one: ${marks}`);
       } finally {
         await t.close();
       }
