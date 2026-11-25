@@ -23,5 +23,8 @@
   budget that a boot applied at once falls back to a paced restore from
   the recipe's budget, and compiles again. The `context-refusal` ops alert
   gives the operator the strategy, the budget's figures and what to
-  change. No operator's log, alert or trace names the newest message's
-  sender or channel. A turn on an empty store is sent as before.
+  change. No ops alert, `inference:exhausted` trace, stderr line or
+  `failures.log` record names the newest message's sender or channel. The
+  notice itself names them, so a later request that holds the notice
+  carries them, as it carries the conversation. A turn on an empty store
+  is sent as before.

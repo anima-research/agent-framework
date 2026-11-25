@@ -111,7 +111,14 @@ async function harness(contextBudgetTokens: number, opts: { names?: readonly str
   const alerts = () => traces.filter((t) => t.type === 'ops:alert' && t.kind === 'context-refusal');
   const pending = () => (framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests;
   const busy = new Set(['inferring', 'streaming', 'waiting_for_tools']);
-  const idle = () => pending().length === 0 && (opts.names ?? ['resident']).every((n) => !busy.has(framework.getAgent(n)?.state.status ?? 'idle'));
+  const quiet = () => pending().length === 0 && framework.getHostModeStatus().drained
+    && (opts.names ?? ['resident']).every((n) => !busy.has(framework.getAgent(n)?.state.status ?? 'idle'));
+  let quietSince: number | undefined;
+  const idle = () => {
+    if (!quiet()) { quietSince = undefined; return false; }
+    quietSince ??= Date.now();
+    return Date.now() - quietSince >= 25;
+  };
   const exhausted = () => traces.filter((t) => t.type === 'inference:exhausted');
   const close = async () => {
     await framework.stop().catch(() => {});
@@ -372,8 +379,8 @@ for (const [form, strategy, budget, participant, content, reason] of [
     [{ type: 'text', text: 'zz-mine '.repeat(50) }],
     'none of your conversation reached your context. The newest message in your conversation is one you wrote. If that message is too large for your context, it and everything before it stay out of what you see until it is removed or your budget is raised.'],
   ['a tool result stamped as its own row, under passthrough', undefined, 4_100, 'user',
-    [{ type: 'tool_result', toolUseId: 'zz-t', content: [{ type: 'text', text: 'zz-out '.repeat(50) }] }],
-    'none of your conversation reached your context. The newest message in your conversation is a tool result. If that message is too large for your context, it and everything before it stay out of what you see until it is removed or your budget is raised, and a call that returns less may fit.'],
+    [{ type: 'tool_result', toolUseId: 'zz-t', toolName: 'zz_look', content: [{ type: 'text', text: 'zz-out '.repeat(50) }] }],
+    'none of your conversation reached your context. The newest message in your conversation is a tool result from zz_look. If that message is too large for your context, it and everything before it stay out of what you see until it is removed or your budget is raised, and a call that returns less may fit.'],
 ] as const) {
   test(`the notice names the newest row as ${form}`, async () => {
     const h = await harness(budget, strategy ? { strategy: strategy() } : {});
@@ -384,6 +391,7 @@ for (const [form, strategy, budget, participant, content, reason] of [
       await until(() => h.settled() >= 1, 'the wake');
       await until(h.idle, 'the framework idle');
       assert.ok(h.membrane.sent.every((r) => texts(r).some((t) => t.startsWith('[inference-failed]'))), 'only a wake onto the notice is sent');
+      assert.equal(h.membrane.sent.length, budget > 4_100 ? 1 : 0, budget > 4_100 ? 'the wake onto the notice is sent' : 'the wake onto the notice is refused too, since the notice doesn\'t fit');
       assert.equal(h.notices()[0], `[inference-failed] Your previous turn wasn't sent: ${reason}`);
       if (strategy) {
         const note = h.exhausted()[0]!.operatorNote!;
@@ -646,5 +654,45 @@ test('a budget the boot applied at once whose compile selects none of the conver
       assert.ok(texts(sent).some((t) => t.startsWith('zz-long')), 'the compile at the recipe\'s budget holds the message');
       assert.ok(errors.some((l) => l.includes('contextBudgetTokens=12000, which the boot applied at once')), errors.join('\n'));
     } finally { await cm.close(); }
+  } finally { await h.close(); }
+});
+
+test('a committing compileContext refuses as compileWithInjections does', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
+    try {
+      cm.presentRows([cm.addMessage('User', [{ type: 'text', text: LONG }])]);
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      await assert.rejects(host.compileContext(), (err: unknown) => {
+        assert.ok(err instanceof EmptyCompileError, String(err));
+        return true;
+      });
+    } finally { await cm.close(); }
+  } finally { await h.close(); }
+});
+
+test('once a host presents rows, a row it stores and doesn\'t present is in no request, and a window that holds only an oversized row is refused', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    for (const [namespace, presented, refused] of [['zz-host-a', 'zz-seen', false], ['zz-host-b', LONG, true]] as const) {
+      const cm = await ContextManager.open({ store, namespace, isolate: true, strategy: new PassthroughStrategy() } as never);
+      try {
+        cm.presentRows([cm.addMessage('User', [{ type: 'text', text: presented }])]);
+        cm.addMessage('User', [{ type: 'text', text: 'zz-stored-only' }]);
+        const host = new Agent({ name: namespace, model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+        if (refused) {
+          await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
+            assert.ok(err instanceof EmptyCompileError, String(err));
+            return true;
+          });
+        } else {
+          const sent = texts(await host.buildActivationRequest([]));
+          assert.ok(sent.includes('zz-seen') && !sent.some((t) => t.includes('zz-stored-only')), JSON.stringify(sent));
+        }
+      } finally { await cm.close(); }
+    }
   } finally { await h.close(); }
 });

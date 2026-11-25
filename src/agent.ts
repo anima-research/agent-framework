@@ -1633,7 +1633,13 @@ export class Agent {
     const marksBefore = this.watermarkMarks;
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.compileUnpinningOnRefusal(() => this.contextManager.compile(this.compileBudget(budget)));
+    const select = async () => {
+      const at = this.compileBudget(budget);
+      const compiled = await this.contextManager.compile(at);
+      this.refuseEmptyCompile(compiled, at);
+      return compiled;
+    };
+    const compile = () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget ? await compile() : await this.compileAtLiveBudget(compile);

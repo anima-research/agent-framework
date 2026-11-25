@@ -34,7 +34,8 @@ export function authorNamed(metadata: Record<string, unknown> | MessageMetadata 
 }
 
 export function rowNamed(row: { participant?: string; content: readonly ContentBlock[]; metadata?: unknown }, agent: string): NewestRow {
-  if (row.content.some((b) => b.type === 'tool_result')) return { toolResult: isOwnRowOf(row.metadata, agent) ? 'own' : 'other' };
+  const result = row.content.find((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result');
+  if (result) return { toolResult: isOwnRowOf(row.metadata, agent) ? 'own' : 'other', ...(result.toolName ? { tool: result.toolName } : {}) };
   if (row.participant === agent && isOwnRowOf(row.metadata, agent)) {
     return { own: row.content.some((b) => b.type === 'tool_use') ? 'tool-call' : 'message' };
   }

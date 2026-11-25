@@ -2,6 +2,7 @@ export interface NewestRow {
   sender?: string;
   channel?: string;
   toolResult?: 'own' | 'other';
+  tool?: string;
   own?: 'tool-call' | 'message';
 }
 
@@ -74,7 +75,7 @@ function residentReason(usable: number, newest: NewestRow, passthrough: boolean)
 
 function newestNamed(newest: NewestRow): string | undefined {
   const lead = 'The newest message in your conversation';
-  if (newest.toolResult) return `${lead} is a tool result`;
+  if (newest.toolResult) return `${lead} is a tool result${newest.tool ? ` from ${newest.tool}` : ''}`;
   if (newest.own === 'tool-call') return `${lead} is your own tool call`;
   if (newest.own === 'message') return `${lead} is one you wrote`;
   if (newest.sender !== undefined && newest.channel !== undefined) return `${lead} is from ${newest.sender} in ${newest.channel}`;

@@ -4011,9 +4011,11 @@ function heldThoughThrown(error: unknown, holds: (id: MessageId) => boolean): bo
   }
 }
 
-function residentNoteOf(err: Error): { residentNote?: string } {
-  return isEmptyCompileError(err) ? { residentNote: err.residentNote } : {};
+function residentNoteOf(err: Error, agent: Agent): ResidentNote {
+  return isEmptyCompileError(err) ? { residentNote: err.residentNote, residentOf: agent } : {};
 }
+
+interface ResidentNote { residentNote?: string; residentOf?: Agent }
 
 function boundedCause(err: Error): Error {
   const cause = new Error(boundFailureText(String(err.message)));
@@ -29276,7 +29278,7 @@ export class AgentFramework {
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
           ...this.classifyInferenceError(err),
-        }, residentNoteOf(err));
+        }, residentNoteOf(err, agent));
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
           this.pushEvent(action.emit);
@@ -31390,7 +31392,7 @@ export class AgentFramework {
                 // request's content or size, which a shed of the newest
                 // exchange may fix.
                 ...this.classifyInferenceError(err),
-              }, residentNoteOf(err));
+              }, residentNoteOf(err, agent));
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
                 this.pushEvent(action.emit);
@@ -31782,7 +31784,7 @@ export class AgentFramework {
         error: err.message,
         ...shownReasonOf(err),
         ...this.classifyInferenceError(err),
-      }, residentNoteOf(err));
+      }, residentNoteOf(err, agent));
       this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
@@ -36113,7 +36115,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: TraceEventInput, own: { residentNote?: string } = {}): void {
+  private emitTrace(event: TraceEventInput, own: ResidentNote = {}): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -36134,6 +36136,7 @@ export class AgentFramework {
           operatorNote: event.operatorNote as string | undefined,
           emptyCompileUsable: event.emptyCompileUsable as number | undefined,
           residentNote: own.residentNote,
+          residentOf: own.residentOf,
         },
       );
     } else if (event.type === 'inference:completed') {
@@ -36649,7 +36652,7 @@ export class AgentFramework {
     rawReason: string,
     retryable?: boolean,
     rawErrorType?: string,
-    detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string; operatorNote?: string; emptyCompileUsable?: number; residentNote?: string },
+    detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string; operatorNote?: string; emptyCompileUsable?: number } & ResidentNote,
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -36727,10 +36730,11 @@ export class AgentFramework {
 
     // (2) Agent-facing chronicle marker. It triggers no inference, except the
     // one wake after an empty_compile's notice, so it makes no loop.
-    const forResident = typeof detail?.residentNote === 'string' ? detail.residentNote : detail?.shownReason;
+    const sameAgent = detail?.residentOf === undefined || detail.residentOf === agent;
+    const forResident = sameAgent && typeof detail?.residentNote === 'string' ? detail.residentNote : detail?.shownReason;
     const shownText = typeof forResident === 'string'
       ? failureShown(boundFailureText(forResident, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
-    const notSent = !ended && errorType === 'empty_compile' && shownText !== undefined && !this.emptyCompileNoticed.has(agentName);
+    const notSent = sameAgent && !ended && errorType === 'empty_compile' && shownText !== undefined && !this.emptyCompileNoticed.has(agentName);
     if (agent && (ended || notSent) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
