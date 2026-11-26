@@ -3230,6 +3230,11 @@ type BudgetHoldOutcome = 'released' | 'stopped' | 'removed';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
 }
+function deadlineRetryLine(agentName: string, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
+  const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
+  const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
+  return `[inference-timeout] agent=${agentName} retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/\s+/g, ' ').trim())}`;
+}
 interface BudgetHoldBaseline {
   progress: string | undefined;
   settings: number;
@@ -9104,8 +9109,9 @@ export class AgentFramework {
    * for implementations that report cancel() that way — see
    * host-quiesce.test.ts), so the two cannot drift: settle the turn, ONE
    * inference:aborted carrying the caller's reason, the neutral
-   * [turn-interrupted] marker, an attributable inference-log terminal, gate
-   * release. Deliberately none of the failure accounting: inference:failed /
+   * [turn-interrupted] marker, an attributable inference-log terminal, one
+   * stderr line when a live stream was cancelled, gate release. Deliberately
+   * none of the failure accounting: inference:failed /
    * inference:exhausted feed the consecutive-failure streak, hard-down ops
    * alerts, the poison-history breaker and the "[inference-failed]" marker,
    * and errorPolicy would relaunch the very inference someone just stopped.
@@ -9168,6 +9174,7 @@ export class AgentFramework {
       reason,
       durationMs,
     });
+    if (before === undefined) console.error(`[turn] ${agent.name}: a stop cancelled the turn mid-stream after ${describeWait(durationMs)}; it ends there (reason=${logValue(reason)})`);
     // Agent-facing marker in the same system envelope as the failure marker
     // so surfaces render it the same way. The text names the act and not an
     // actor (the wire reason names the call, not who made it). Of delivery
@@ -31303,6 +31310,7 @@ export class AgentFramework {
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
             if (action.retry) {
+              if (cuts !== undefined) console.error(deadlineRetryLine(agent.name, err.message, action, policyAttempt + 2));
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
               // does. Until then, that check is ahead, in a window of its own
