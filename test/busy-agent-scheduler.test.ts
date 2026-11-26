@@ -13,6 +13,7 @@ interface FrameworkHarness {
   agents: Map<string, { state: { status: string } }>;
   activeStreams: Map<string, Promise<void>>;
   activeTurnTokens: Map<string, number>;
+  startRetryErrors: Array<{ error: unknown }>;
   staleWarnAt: Map<string, number>;
   inferencePolicy: { shouldInfer(): boolean };
   sweepExpiredConversations(): void;
@@ -36,6 +37,7 @@ function busyAgentHarness(): FrameworkHarness {
   framework.agents = new Map([['Sol', { state: { status: 'waiting_for_tools' } }]]);
   framework.activeStreams = new Map();
   framework.activeTurnTokens = new Map();
+  framework.startRetryErrors = [];
   framework.staleWarnAt = new Map();
   framework.sweepExpiredConversations = () => {};
   framework.createFrameworkState = () => ({});
