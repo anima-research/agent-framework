@@ -23208,6 +23208,9 @@ export class AgentFramework {
     try {
       await this.runInferencePass(requestsByAgent);
     } finally {
+      const unvisited: InferenceRequest[] = [];
+      for (const requests of requestsByAgent.values()) appendAll(unvisited, requests);
+      if (unvisited.length > 0) this.pendingRequests = [...unvisited, ...this.pendingRequests];
       this.passRequests?.delete(requestsByAgent);
     }
   }
