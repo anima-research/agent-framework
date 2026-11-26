@@ -3115,6 +3115,11 @@ interface TurnRetryWait {
 /** How many upcoming wakes healthSnapshot lists per agent: an agent can hold any number of reminders. */
 const HEALTH_UPCOMING_WAKES = 8;
 
+/** The latest end that the `sleep` tool sets: the last instant that a JavaScript
+ *  Date holds (8.64e15 ms), less one day, so that the gate's own read of the
+ *  clock and the local time of the end in any time zone stay within it. */
+const LAST_SLEEP_END_MS = 8.64e15 - 86_400_000;
+
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
 /** Total time one withheld batch may spend awaiting workspace writes.
@@ -30547,7 +30552,37 @@ export class AgentFramework {
               // the guard's refusal does, so a call the host refuses produces
               // no events.
               this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
-              this.dispatchToolCall(agent.name, call, streamRouting.turnId);
+              try {
+                this.dispatchToolCall(agent.name, call, streamRouting.turnId);
+              } catch (error) {
+                this.toolLifecycleEmitter?.open(agent.name, call.id);
+                this.toolLifecycleEmitter?.markDispatchFailure(agent.name, call.id);
+                const message = thrownText(error);
+                let stack: string | undefined;
+                try {
+                  const read: unknown = error instanceof Error ? error.stack : undefined;
+                  stack = typeof read === 'string' ? read : undefined;
+                } catch {
+                  stack = undefined;
+                }
+                this.emitTrace({ type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error: message, stack });
+                console.error(
+                  `[tool-dispatch] agent=${agent.name} tool=${call.name} call=${call.id}: its dispatch threw, so the host ` +
+                  `queues a failed result for the call and the round goes on: ${describeFailureWithFrames(error)}`,
+                );
+                const result: ToolResult = { success: false, error: `${call.name} failed in the host: ${message}; it may have taken effect`, isError: true };
+                const waiting = this.scriptRounds.get(agent.name);
+                if (waiting?.pending.has(call.id)) this.scriptRoundOfResult.set(result, waiting);
+                this.pushEvent({
+                  type: 'tool-result',
+                  callId: call.id,
+                  toolName: call.name,
+                  agentName: agent.name,
+                  moduleName: 'framework',
+                  result,
+                });
+                continue;
+              }
               if (!heldIds.has(call.id)) this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
@@ -33871,9 +33906,9 @@ export class AgentFramework {
         this.dispatchToolCall(agentName, call, turnId);
       } catch (error) {
         // Dispatch threw. Not a refusal (refusal sites call refuse() and
-        // answer): the tool may have done work first (sleep sets the gate,
-        // then formats its reply), so the call started and the host got no
-        // result — `failed`, as for a dispatch that rejects.
+        // answer): the tool may have done work first, so the call started
+        // and the host got no result — `failed`, as for a dispatch that
+        // rejects.
         if (origin) {
           this.toolLifecycleEmitter?.open(agentName, callId);
           this.toolLifecycleEmitter?.markDispatchFailure(agentName, callId);
@@ -43077,6 +43112,14 @@ export class AgentFramework {
     const seconds = Number(input.seconds);
     if (!Number.isFinite(seconds) || seconds <= 0) {
       finish({ success: false, error: 'sleep: `seconds` must be a positive number', isError: true });
+      return;
+    }
+    if (Date.now() + seconds * 1000 > LAST_SLEEP_END_MS) {
+      finish({
+        success: false,
+        error: "sleep: that sleep would end beyond the host's date range. Your sleep settings haven't changed. Use a smaller number of seconds.",
+        isError: true,
+      });
       return;
     }
 

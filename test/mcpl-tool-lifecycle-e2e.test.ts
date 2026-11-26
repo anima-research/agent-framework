@@ -211,6 +211,62 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     // The provider, which holds no toolLifecycle grant, received nothing.
     assert.equal(readLog(provLog).filter((e) => e.event === 'lifecycle').length, 0);
   });
+  it('a model-path call whose dispatch throws is reported started then failed, and the other call of its response completes (#259)', async () => {
+    const internals = framework as unknown as {
+      dispatchToolCall(agentName: string, call: { name: string; input: unknown }, turnId?: number): void;
+    };
+    const original = internals.dispatchToolCall;
+    internals.dispatchToolCall = function (this: unknown, agentName, call, turnId) {
+      if (call.name === 'prov--click' && (call.input as { boom?: boolean }).boom) throw new RangeError('Invalid time value');
+      return original.call(this, agentName, call, turnId);
+    };
+    try {
+      const lifecycle = () => readLog(obsLog).filter((e) => e.event === 'lifecycle').map((e) => e.params!);
+      const before = lifecycle().length;
+      const streamsBefore = membrane.calls.length;
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'toolu_01THROWSAAAAAAAAAAAAAAAA', name: 'prov--click', input: { x: 1, y: 2, boom: true } },
+        { type: 'tool_use', id: 'toolu_01SIBLINGBBBBBBBBBBBBBBB', name: 'prov--run', input: { cmd: 'ls' } },
+      ] as never, 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+      const ended = new Promise<string>((resolve) => {
+        const off = framework.onTrace((e) => {
+          const t = (e as { type: string }).type;
+          if (t === 'inference:completed' || t === 'inference:exhausted') { off(); resolve(t); }
+        });
+      });
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'test',
+        content: [{ type: 'text', text: 'go' }],
+        metadata: {},
+        triggerInference: true,
+      } as unknown as ProcessEvent);
+      assert.equal(await ended, 'inference:completed', 'the turn goes on');
+      await waitFor(() => lifecycle().length >= before + 4, 'both calls, both phases');
+      await new Promise((r) => setTimeout(r, 300));
+
+      const events = lifecycle().slice(before);
+      const phasesOf = (tool: string) => events.filter((p) => p.tool === tool).map((p) => p.phase);
+      assert.deepEqual(phasesOf('prov--click'), ['started', 'failed']);
+      assert.deepEqual(phasesOf('prov--run'), ['started', 'completed']);
+      assert.equal(events.length, 4);
+      const [clickStart] = events.filter((p) => p.tool === 'prov--click' && p.phase === 'started');
+      const [clickEnd] = events.filter((p) => p.tool === 'prov--click' && p.phase === 'failed');
+      assert.equal(clickEnd.toolCallId, clickStart.toolCallId);
+      assert.ok(!JSON.stringify(events).includes('Invalid time value'), 'the throw stays out of what observers get');
+
+      assert.ok(membrane.calls.length > streamsBefore);
+      const answers = membrane.lastStream!.receivedToolResults.flat() as Array<{ toolUseId: string; content: unknown; isError?: boolean }>;
+      const click = answers.find((a) => a.toolUseId === 'toolu_01THROWSAAAAAAAAAAAAAAAA');
+      assert.equal(click?.isError, true);
+      assert.equal(click?.content, 'prov--click failed in the host: Invalid time value; it may have taken effect');
+      assert.ok(answers.some((a) => a.toolUseId === 'toolu_01SIBLINGBBBBBBBBBBBBBBB'), 'the other call was answered');
+    } finally {
+      delete (internals as { dispatchToolCall?: unknown }).dispatchToolCall;
+    }
+  });
+
   it('a provider that dies takes its classes with it, and calls to it are never reported (review #3, #4)', async () => {
     const internals = framework as unknown as {
       mcplServerRegistry: { getServer(id: string): unknown } | null;

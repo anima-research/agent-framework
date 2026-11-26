@@ -2357,6 +2357,34 @@ describe('a round whose run or wait call watches a script that can change its ro
     }
   });
 
+  it("a code_execution call that holds its round and whose dispatch throws settles the round: its prose goes out (#259)", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'about to speak' },
+        scriptCall({ code: 'await tools["test--slow"]({}); // then skip_reply' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    const internals = h.framework as unknown as {
+      dispatchToolCall(agentName: string, call: { name: string; input: unknown }, turnId?: number): void;
+    };
+    const original = internals.dispatchToolCall;
+    internals.dispatchToolCall = function (this: unknown, agentName, call, turnId) {
+      if (call.name === 'code_execution') throw new RangeError('Invalid time value');
+      return original.call(this, agentName, call, turnId);
+    };
+    const error = console.error;
+    console.error = () => {};
+    try {
+      await h.run();
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:about to speak@world:test', 'publish:done@world:test']);
+      assert.ok(!h.log.includes('tool:slow'), 'the script never ran');
+    } finally {
+      console.error = error;
+      await h.done();
+    }
+  });
+
   it("a name a Unicode letter or a joiner continues isn't the tool's name", async () => {
     await publishedWhileScriptRuns('locus', 'await tools["test--slow"]({}); // πsay sayπ say\u200D \u200Csay say\u00E9');
   });
