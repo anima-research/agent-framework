@@ -23743,7 +23743,7 @@ export class AgentFramework {
       // it takes its token it stands for them all.
       if (requests.length > 1 && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
-      await this.startAgentStream(agent, start, 0, false, true);
+      await this.startAgentStream(agent, start);
     }
   }
 
@@ -27975,7 +27975,7 @@ export class AgentFramework {
     trigger?: InferenceRequest,
     attempt = 0,
     providerGateAlreadyHeld = false,
-    awaitedByScheduler = false,
+    awaitedByFrame = false,
   ): Promise<void> {
     if (attempt === 0) this.deadlineCuts.delete(agent.name);
     const ownsProviderGate = this.registry.ownsProviderScheduling(agent.name);
@@ -28129,7 +28129,7 @@ export class AgentFramework {
     this.checkAhead.set(agent, checkWindow);
     let tokenHandedOff = false;
     try {
-      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow, awaitedByScheduler);
+      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow, awaitedByFrame);
     } catch (error) {
       this.endThrownStart(agent, trigger, turnToken, error);
       throw error;
@@ -28533,7 +28533,7 @@ export class AgentFramework {
     /** This start's window (checkAhead), which its checks read for an
      *  operator's abandon. */
     checkWindow: CheckWindow,
-    awaitedByScheduler: boolean,
+    awaitedByFrame: boolean,
   ): Promise<boolean> {
     if (attempt === 0 && this.budgetWaitEnded(agent, trigger)) return false;
     const myIncarnation = this.registry.ref(agent.name).incarnation;
@@ -29361,9 +29361,9 @@ export class AgentFramework {
           // once the retry is held finds the held retry (abortInference's
           // drop), not a window nothing will collect.
           if (this.checkAhead.get(agent) === window) this.checkAhead.delete(agent);
-          await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
+          await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1, false, true);
         };
-        if (!awaitedByScheduler) {
+        if (awaitedByFrame) {
           await retryAfterWait(checkWindow);
           return false;
         }
@@ -30620,7 +30620,7 @@ export class AgentFramework {
                   source: trigger?.source ?? 'framework', timestamp: Date.now(),
                 };
                 delete retried.wakeChannels;
-                await this.startAgentStream(agent, withTurnCarry({ ...retried, ...this.wakeChannelsMark(streamRouting) }, { silence, sends: turnSends, read: carry.read }), attempt);
+                await this.startAgentStream(agent, withTurnCarry({ ...retried, ...this.wakeChannelsMark(streamRouting) }, { silence, sends: turnSends, read: carry.read }), attempt, false, true);
                 return;
               }
               const lastResult = response.content.reduce((last, block, index) =>
@@ -31506,7 +31506,7 @@ export class AgentFramework {
                   return;
                 }
                 // Marked as its turn's retry, as at the start's failure.
-                await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1);
+                await this.startAgentStream(agent, retry && this.turnRetryOf(retry, streamRouting), attempt + 1, false, true);
               } else {
                 // The turn ends here, and its inference:failed doesn't say so,
                 // since a retry usually follows one: an inference:aborted
