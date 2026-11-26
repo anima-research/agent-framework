@@ -318,20 +318,19 @@ async function resident(options: {
   const send = (body: string) => framework.pushEvent({
     type: 'external-message', source: 'test', content: [text(body)], metadata: {}, triggerInference: true,
   } as unknown as ProcessEvent);
-  const started = framework.start();
-  if (options.channels) {
-    let registered = false;
-    try {
-      await started;
+  let ready = false;
+  try {
+    framework.start();
+    if (options.channels) {
       const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
-      registered = await pollUntil(() => registry.listChannelsRaw().length >= 2);
-    } finally {
-      if (!registered) {
-        await framework.stop().catch(() => {});
-        rmSync(dir, { recursive: true, force: true });
-      }
+      assert.ok(await pollUntil(() => registry.listChannelsRaw().length >= 2), 'the stand-in server registered its channels');
     }
-    assert.ok(registered, 'the stand-in server registered its channels');
+    ready = true;
+  } finally {
+    if (!ready) {
+      await framework.stop().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
   const cm = () => framework.getAgent('prime')!.getContextManager();
   const rows = () => cm().getAllMessages() as unknown as Array<{ id: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> }>;
@@ -766,6 +765,8 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
         assert.ok(t.internal.budgetHolds.get('prime')!.wait.since > hold.wait.since + 120_000, 'in a wait of its own');
         assert.equal(t.alerts('context-refusal').length, 2, 'with its own open alert');
+        const standsOn = (t.internal.budgetHolds.get('prime') as unknown as { standsOn: string[] }).standsOn;
+        assert.ok(standsOn.includes(String(t.rowWith('go').id)), `and the turn still stands on go's row: ${standsOn}`);
       } finally {
         await t.close();
       }
