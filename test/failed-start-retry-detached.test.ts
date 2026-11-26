@@ -21,6 +21,7 @@ type Internals = {
   turnRouting: Map<string, object>;
   activeTurnTokens: Map<string, number>;
   providerGates: Map<string, { primaryDepth: number }>;
+  providerGate(name: string): { auxiliaryInFlight: number; idleWaiters: Array<() => void> };
   pendingRequests: Array<{ agentName: string }>;
   providerWaits: { set(agentName: string, model: string, ms: number, why: string): void };
   eventGate: { onInferenceStarted(agentName: string): void; getStatus?(): unknown } | null;
@@ -204,6 +205,21 @@ describe("a failed start's wait to retry", () => {
     await until("a's retry to answer", () => h.log.includes('completed:a'));
     assert.ok(before(h.log, 'a compile 1', 'started:b'), `control: a's start came first: ${h.log.join(', ')}`);
     assert.ok(before(h.log, 'completed:b', 'a compile 2'), `b's turn ended before a's retry: ${h.log.join(', ')}`);
+  });
+
+  it("a start that waited behind an auxiliary call and then fails waits beside the scheduler, and runUntilIdle() waits for its retry", async (t) => {
+    const h = await boot(t, { delayMs: 300, start: false });
+    Object.defineProperty(h.agent, 'primaryWaitsForAuxiliary', { value: true });
+    const gate = h.i.providerGate('a');
+    gate.auxiliaryInFlight = 1;
+    wake(h.fw, 'a');
+    await within('the pass that starts a', h.fw.runUntilIdle());
+    assert.equal(gate.idleWaiters.length, 1, "control: a's start waits behind the auxiliary call");
+    gate.auxiliaryInFlight = 0;
+    for (const resolve of gate.idleWaiters.splice(0)) resolve();
+    await until("a's wait to retry", () => h.log.includes('waiting:a'));
+    await within('runUntilIdle()', h.fw.runUntilIdle());
+    assert.ok(h.log.includes('completed:a'), `runUntilIdle() returned once a's retry had answered: ${h.log.join(', ')}`);
   });
 
   it('lets another agent and an event go first under runUntilIdle(), which returns once the retry has ended', async (t) => {
