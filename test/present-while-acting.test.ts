@@ -2046,7 +2046,7 @@ describe('present while acting', () => {
       assemble: async () => {
         entered();
         await released;
-        return { settled: new Set<string>(), materialized: new Set<string>() };
+        return { settled: new Set<string>(), materialized: new Set<string>(), materializedRows: new Map<string, string>() };
       },
       suspend: () => {},
       isRendering: () => false,
