@@ -81,6 +81,8 @@ interface Run {
   requests: string[];
   boundaryLines: string[];
   failedTraces: Array<{ callId?: string; tool?: string; error?: string }>;
+  /** How many `inference:completed` traces the run emitted. */
+  completed: number;
   audit: Array<Record<string, any>>;
   drafts: Array<{ text: string; reason: string }>;
   /** The drafts the run held and didn't deliver, with their ids and notes. */
@@ -156,8 +158,10 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
     get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
   });
   const failedTraces: Run['failedTraces'] = [];
+  let completed = 0;
   framework.onTrace((event) => {
     if (event.type === 'tool:failed') failedTraces.push(event as Run['failedTraces'][number]);
+    if (event.type === 'inference:completed') completed++;
   });
   const lines: string[] = [];
   const error = console.error;
@@ -190,6 +194,7 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       requests,
       boundaryLines: lines.filter((line) => line.startsWith('[tool-boundary]')),
       failedTraces,
+      completed,
       audit: settings.toolResultGuard ? framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, any>> : [],
       drafts: undelivered.map((d) => ({ text: d.text, reason: d.reason })),
       held: undelivered.map((d) => ({ id: d.id, text: d.text, reason: d.reason, ...(d.note ? { note: d.note } : {}) })),
@@ -594,6 +599,8 @@ describe('a response that the output limit ends in plain prose', () => {
     const notes = outputLimitNotes(run);
     assert.equal(notes.length, 1, 'exactly one note');
     assert.deepEqual(notes[0]!.content, [{ type: 'text', text: OUTPUT_LIMIT }]);
+    assert.equal(notes[0]!.participant, 'user', 'the note is a user row, not the agent\'s reply');
+    assert.equal(notes[0]!.metadata?.system, true);
     assert.equal(notes[0]!.metadata?.kind, 'cut-off-reply');
     const replyAt = run.rows.findIndex((row) => row.participant === 'resident' && row.content.some((block) => block.text === text));
     assert.ok(replyAt >= 0, 'the cut reply is stored with its exact text');
@@ -610,7 +617,7 @@ describe('a response that the output limit ends in plain prose', () => {
     assert.deepEqual(cut.routed, [CUT_PROSE, NEXT], 'the cut words go out as written');
     assert.equal(cut.requests.length, 2, 'the cut starts no turn of its own');
     assert.equal(outputLimitNotes(ended).length, 0, 'a reply the model ended gets no note');
-    assert.deepEqual(rowTexts(cut), rowTexts(ended), 'beside the note, the rows are those of a reply the model ended');
+    assert.deepEqual(rowTexts(cut), rowTexts(ended), 'beside the note, the rows hold the participants and texts of a reply the model ended');
     assert.deepEqual(cut.routed, ended.routed);
     assert.equal(ended.requests.length, 2);
   });
@@ -633,15 +640,18 @@ describe('a response that the output limit ends in plain prose', () => {
   it('writes no note when the limit falls inside thinking, before any reply text, so none points at an older reply', async () => {
     const run = await turn('native', [{ blocks: [{ text: 'An earlier answer.' }], stop: 'end_turn' }, { blocks: [{ thinking: 'Where was I going with' }], stop: 'max_tokens' }]);
     assert.equal(run.requests.length, 2, 'the second message was answered with the thinking alone');
-    assert.deepEqual(replyTexts(run), ['An earlier answer.'], 'no reply is stored for the thinking');
+    assert.equal(run.completed, 2, 'and that inference completed');
+    assert.equal(run.rows.filter((row) => row.participant === 'resident').length, 1, 'no reply is stored for the thinking');
+    assert.deepEqual(replyTexts(run), ['An earlier answer.']);
     assert.deepEqual(run.routed, ['An earlier answer.']);
     assert.equal(outputLimitNotes(run).length, 0);
   });
 
-  for (const [label, cut] of [['no content blocks', []], ['one empty text block', [{ text: '' }]]] as const) {
+  for (const [label, cut] of [['no content blocks', []], ['one empty text block', [{ text: '' }]], ['one text block of whitespace', [{ text: ' \n ' }]]] as const) {
     it(`writes no note when the cut response holds ${label}, so the next request points at no older reply`, async () => {
       const run = await turn('native', [{ blocks: [{ text: 'An earlier answer.' }], stop: 'end_turn' }, { blocks: [...cut], stop: 'max_tokens' }], {}, { next: ['And next?', 'And then?'] });
       assert.equal(run.requests.length, 3, 'the cut answered the second message, and a third request followed it');
+      assert.equal(run.completed, 3, 'and each of the three inferences completed');
       assert.equal(outputLimitNotes(run).length, 0);
       assert.ok(!run.requests[2]!.includes(OUTPUT_LIMIT), 'the request after the cut carries no note');
       assert.deepEqual(run.routed, ['An earlier answer.', NEXT]);
