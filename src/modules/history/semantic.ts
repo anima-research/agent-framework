@@ -417,8 +417,8 @@ export function messageToItem(msg: StoredMessage, cfg: { includePrivateTools?: b
   const parts = messageIndexParts(msg, cfg.includePrivateTools ?? true);
   const joined = joinIndexParts(parts);
   const leftTrimmed = joined.trimStart();
+  if (!leftTrimmed) return null;
   const text = safeSlice(leftTrimmed.trimEnd(), 0, cfg.maxChars ?? 32_000);
-  if (!text) return null;
   // Map the actual UTF-16-safe slice end back into the untrimmed parts.
   const indexedEnd = joined.length - leftTrimmed.length + text.length;
   const tsMs = msg.timestamp.getTime();

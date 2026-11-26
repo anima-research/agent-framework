@@ -204,6 +204,17 @@ describe('semantic index send channels', () => {
     ]);
     assert.equal(messageToItem(stored, {})!.channel, 'zulip:private room');
   });
+
+  it('keeps an item when the character cap leaves no complete character of nonblank text', () => {
+    const stored = msg('m9', T0, [{ type: 'text', text: '😀 hello' }], 'chan-A');
+    for (const maxChars of [0, 1]) {
+      const item = messageToItem(stored, { maxChars });
+      assert.ok(item, `nonblank message with maxChars=${maxChars}`);
+      assert.equal(item.text, '');
+      assert.equal(item.channel, 'chan-A');
+    }
+    assert.equal(messageToItem(msg('m10', T0, [{ type: 'text', text: ' ' }]), { maxChars: 0 }), null);
+  });
 });
 
 describe('HistoryModule semantic_search', () => {
@@ -329,6 +340,35 @@ describe('HistoryModule semantic_search', () => {
     await mod.handleToolCall({ id: 'c2', name: 'semantic_search', input: { query: 'evening', level: 1 } });
     assert.deepEqual(svc.searches.at(-1)!.kinds, ['summary']);
     await mod.stop();
+  });
+
+  it('checks and reports the current channel of an edited message before re-sync', async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const channelId = 'zulip:room';
+      const store = [msg('m9', T0, [
+        { type: 'tool_use', id: 'u', name: 'zulip--send_message', input: { type: 'stream', to: 'room', content: 'old words' } },
+      ])];
+      const mod = new HistoryModule({
+        semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 },
+      });
+      mod.bind(stubCm(store));
+      await mod.syncSemanticIndex()!;
+      const search = async (channelId?: string) => {
+        const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query: 'old words', channelId } });
+        assert.equal(res.success, true, JSON.stringify(res));
+        return res.data as { hits: Array<{ id: string; snippet: string; channelId: string | null }>; index: { droppedStale: number } };
+      };
+
+      assert.equal((await search(channelId)).hits[0]?.channelId, channelId);
+      store[0] = msg('m9', T0, [{ type: 'text', text: 'private draft' }]);
+      const filtered = await search(channelId);
+      assert.deepEqual(filtered.hits, []);
+      assert.equal(filtered.index.droppedStale, 1);
+      assert.equal(svc2.items.get('msg:m9')?.channel, channelId, 'the remote item still has the old tag');
+      assert.deepEqual((await search()).hits.map((h) => [h.id, h.snippet, h.channelId]), [['msg:m9', 'private draft', null]]);
+      await mod.stop();
+    } finally { await svc2.stop(); }
   });
 
   it('drops hits for messages and summaries that are no longer on the current branch (/undo, /checkout)', async () => {
