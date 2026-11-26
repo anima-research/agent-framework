@@ -722,6 +722,56 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  it("a released start that fits, then meets a provider wait recorded during its compile, leaves its wait behind: refused for budget, its retry waits in a hold of its own", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const waits = t.internal.providerWaits as unknown as {
+        set(agentName: string, model: string, ms: number, reason: string): unknown;
+        release(agentName: string, model: string | undefined, by: string): unknown;
+      };
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const hold = t.internal.budgetHolds.get('prime')!;
+        hold.wait.since -= 180_000;
+        const agent = t.framework.getAgent('prime')! as unknown as { startStreamWithInjections: (...a: unknown[]) => Promise<unknown> };
+        const compile = agent.startStreamWithInjections.bind(agent);
+        let recorded = false;
+        agent.startStreamWithInjections = async (...args: unknown[]) => {
+          const made = await compile(...args);
+          if (!recorded) {
+            recorded = true;
+            c.fitAt = Infinity;
+            c.readyAt = Infinity;
+            waits.set('prime', 'test-model', 60_000, 'zz wait during the compile');
+          }
+          return made;
+        };
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-newer', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => (t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0),
+          'the start fit, and the wait recorded during its compile holds its retry');
+        const marks = (o: object) => Object.getOwnPropertySymbols(o).map((x) => x.description);
+        const kept = t.internal.providerAccelerationCooldowns.get('prime')!.heldRequests[0] as Record<symbol, unknown>;
+        const batch = Object.getOwnPropertySymbols(kept).filter((x) => x.description === 'merged-batch').map((x) => kept[x] as object[])[0] ?? [];
+        assert.deepEqual(batch.flatMap(marks).filter((m) => m === 'budget-wait'), [], 'nothing in the retry carries the wait');
+        waits.release('prime', undefined, 'zz');
+        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
+        assert.ok(t.internal.budgetHolds.get('prime')!.wait.since > hold.wait.since + 120_000, 'in a wait of its own');
+        assert.equal(t.alerts('context-refusal').length, 2, 'with its own open alert');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('when compression has nothing left and the context still does not fit, releases the wait, and the refusal takes the error policy\'s path with the note in place', async () => {
     await withWebhook(async (posts) => {
       await withCompression({ fitAt: Infinity, readyAt: 2 }, async () => {
