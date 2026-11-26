@@ -103,8 +103,8 @@ function stderrOf(t: TestContext): string[] {
 const physicalLines = (calls: string[]) => calls.flatMap((text) => text.split(/\r\n|[\n\r\v\f\u2028\u2029\u0085]/));
 const timeoutCalls = (calls: string[]) => calls.filter((text) => physicalLines([text]).some((line) => line.startsWith('[inference-timeout]')));
 const stopCalls = (calls: string[]) => calls.filter((text) => text.includes(STOP_WORDS));
-const timeoutLine = (reason: string, scheduled = 'in 1000ms (2 of 2)') => `[inference-timeout] agent=resident retry scheduled ${scheduled}: ${reason}`;
-const stopLine = (reason: string) => new RegExp(`^\\[turn\\] resident: ${STOP_WORDS} after \\d+ (s|min); the turn ends there \\(reason=${reason}\\)$`);
+const timeoutLine = (reason: string, scheduled = 'in 1000ms (2 of 2)', agent = 'resident') => `[inference-timeout] agent=${agent} retry scheduled ${scheduled}: ${reason}`;
+const stopLine = (reason: string, agent = 'resident') => new RegExp(`^\\[turn\\] ${agent}: ${STOP_WORDS} after \\d+ (s|min); the turn ends there \\(reason=${reason}\\)$`);
 const markedDeadline = (message: string) => () => {
   const error = new MembraneError({ type: 'timeout', retryable: true, message, rawError: undefined } as ConstructorParameters<typeof MembraneError>[0]);
   Object.defineProperty(error, Symbol.for('membrane.deadlineExpiry'), { value: true });
@@ -115,18 +115,25 @@ const retryOnce = (action: ErrorAction): ErrorPolicy => ({
   onInferenceError: (_error: Error, _agentName: string, attempt: number): ErrorAction => (attempt === 0 ? action : { retry: false }),
 });
 
-async function boot(t: TestContext, script: Array<() => YieldingStream>, errorPolicy?: ErrorPolicy) {
+async function boot(t: TestContext, script: Array<() => YieldingStream>, errorPolicy?: ErrorPolicy, name = 'resident') {
   const dir = mkdtempSync(join(tmpdir(), 'af-cut-stop-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let made: AgentFramework | undefined;
+  t.after(async () => {
+    try {
+      await made?.stop();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   const membrane = new ScriptedMembrane(script);
   const module = new InputModule();
   const fw = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+    agents: [{ name, model: 'zz-model', systemPrompt: 'system' }],
     modules: [module], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     ...(errorPolicy ? { errorPolicy } : {}),
   });
-  t.after(() => fw.stop().catch(() => {}));
+  made = fw;
   const traces: TraceEvent[] = [];
   fw.onTrace((event) => { traces.push(event); });
   fw.start();
@@ -308,5 +315,33 @@ describe("a caller's stop that cancels a live stream writes one stderr line", ()
     assert.ok(traces.some((e) => e.type === 'inference:aborted'));
     assert.deepEqual(stopCalls(stderr), []);
     assert.ok(stderr.includes("[turn] resident: a stop reached the turn's start before it sent anything; it ends there"));
+  });
+});
+
+describe('an agent name with a line break stays one field on each new line', () => {
+  const name = 'night\nowl';
+  const field = '"night\\nowl"';
+
+  it('on the [inference-timeout] line', async (t) => {
+    const stderr = stderrOf(t);
+    const { fw } = await boot(t, [cut('No provider event within 150s')], undefined, name);
+    hello(fw);
+    await within('the turn', fw.runUntilIdle());
+    const calls = timeoutCalls(stderr);
+    assert.equal(physicalLines(calls).length, 1, 'one physical line');
+    assert.deepEqual(calls, [timeoutLine(`No provider event within 150s ${HOST_SETTING}`, 'in 1000ms (2 of 2)', field)]);
+  });
+
+  it('on the [turn] stop line', async (t) => {
+    const stderr = stderrOf(t);
+    const { fw, membrane } = await boot(t, [() => new LiveStream('aborted')], undefined, name);
+    hello(fw);
+    await until('the stream', () => membrane.calls.length === 1 && fw.getAgent(name)!.state.status === 'streaming');
+    fw.abortInference(name, 'operator-probe');
+    await within('the turn', fw.runUntilIdle());
+    const calls = stopCalls(stderr);
+    assert.equal(physicalLines(calls).length, 1, 'one physical line');
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]!, stopLine('operator-probe', field.replace(/\\/g, '\\\\')));
   });
 });
