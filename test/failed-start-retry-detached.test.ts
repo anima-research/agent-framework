@@ -59,7 +59,7 @@ class InputModule implements Module {
   async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: false, isError: true, error: 'none' }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type !== 'external-message') return {};
-    const metadata = (event as { metadata?: { to?: string; ping?: boolean; hold?: boolean } }).metadata;
+    const metadata = (event as { metadata?: { to?: string | string[]; ping?: boolean; hold?: boolean } }).metadata;
     if (metadata?.hold) {
       held.entered = true;
       await held.gate?.promise;
@@ -69,7 +69,7 @@ class InputModule implements Module {
       this.log.push('ping handled');
       return {};
     }
-    return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: metadata?.to ? [metadata.to] : true };
+    return { addMessages: [{ participant: 'User', content: [{ type: 'text', text: String(event.content) }] }], requestInference: metadata?.to ? [metadata.to].flat() : true };
   }
 }
 
@@ -196,6 +196,14 @@ describe("a failed start's wait to retry", () => {
     await until("a's retry to answer", () => h.log.includes('completed:a'));
     assert.ok(before(h.log, 'started:b', 'a compile 2'), `b started before a's retry: ${h.log.join(', ')}`);
     assert.ok(before(h.log, 'ping handled', 'a compile 2'), `the event was handled before a's retry: ${h.log.join(', ')}`);
+  });
+
+  it("one event that wakes a and b: b's turn starts in the same pass, before a's retry", async (t) => {
+    const h = await boot(t, { delayMs: 3_000, start: true });
+    h.fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hello both', metadata: { to: ['a', 'b'] } } as unknown as ProcessEvent);
+    await until("a's retry to answer", () => h.log.includes('completed:a'));
+    assert.ok(before(h.log, 'a compile 1', 'started:b'), `control: a's start came first: ${h.log.join(', ')}`);
+    assert.ok(before(h.log, 'completed:b', 'a compile 2'), `b's turn ended before a's retry: ${h.log.join(', ')}`);
   });
 
   it('lets another agent and an event go first under runUntilIdle(), which returns once the retry has ended', async (t) => {

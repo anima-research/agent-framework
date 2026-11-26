@@ -637,12 +637,12 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     const retries: Array<{ attempt: number; stopping: boolean }> = [];
     const frames = framework as unknown as {
       providerAdmissionClosed: boolean;
-      startAgentStream(agent: unknown, trigger?: unknown, attempt?: number, held?: boolean): Promise<void>;
+      startAgentStream(agent: unknown, trigger?: unknown, attempt?: number, held?: boolean, awaitedByScheduler?: boolean): Promise<void>;
     };
     const startAgentStream = frames.startAgentStream.bind(framework);
-    frames.startAgentStream = (a, trigger, attempt = 0, held = false) => {
+    frames.startAgentStream = (a, trigger, attempt = 0, held = false, awaitedByScheduler = false) => {
       if (attempt > 0) retries.push({ attempt, stopping: frames.providerAdmissionClosed });
-      return startAgentStream(a, trigger, attempt, held);
+      return startAgentStream(a, trigger, attempt, held, awaitedByScheduler);
     };
     framework.start();
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
