@@ -307,7 +307,9 @@ export interface AgentConfig {
    * carries none of the offending content, so it cannot itself re-trip), and
    * re-runs — up to `maxRewinds` times before giving up. This keeps the agent
    * on its own model (no fallback-model substitution) while self-healing around
-   * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
+   * a poison turn. Default: off (a refusal surfaces a marker and a built-in
+   * reaction unless a host has taken ownership through `getMainRefusalBridge()`;
+   * the marker is unaffected by ownership).
    */
   refusalHandling?: {
     /**
@@ -329,8 +331,9 @@ export interface AgentConfig {
      *
      * Retries are spent before the framework sees the refusal at all, so the
      * escalation order is: membrane retries -> autoRewind (if on) -> the
-     * refusal reaction, which therefore means "the border is close" rather
-     * than firing on every near-threshold flip.
+     * built-in refusal reaction (unless a host has taken ownership through
+     * `getMainRefusalBridge()`). The reaction therefore means "the border is
+     * close" rather than firing on every near-threshold flip.
      *
      * Native tool mode only — see the XML-mode warning in Membrane.
      */
@@ -728,11 +731,13 @@ export interface InferenceRequest {
    *  channel or a push, the onboarding wake included, and carries it onto a
    *  rewind's retry and `/unstick`'s run. If the turn it opens is refused,
    *  no rewind takes the refusal and the turn isn't an ephemeral run's, the
-   *  refusal reaction goes on that message (on a Discord channel). Left out for a wake that is for no
-   *  single message: a batch, the gate's included even when it holds one
-   *  message, and a module's wake; and left off a re-armed turn that speaks
-   *  in another channel than the message's. A start merged from wakes that
-   *  don't all answer the same message, in the same channel, answers none:
+   *  built-in refusal reaction goes on that message (on a Discord channel)
+   *  unless a host has taken ownership through `getMainRefusalBridge()`.
+   *  Left out for a wake that is for no single message: a batch, the gate's
+   *  included even when it holds one message, and a module's wake. Also left
+   *  off a re-armed turn that speaks in another channel than the message's.
+   *  A start merged from wakes that don't all answer the same message, in
+   *  the same channel, answers none:
    *  wakes for two messages, or a message's wake merged with one that
    *  answers no message, such as a timer's or a reaction's. */
   answersMessageId?: string;

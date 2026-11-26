@@ -4549,7 +4549,7 @@ export class AgentFramework {
   private async dispatchMainRefusal(handler: MainRefusalHandler, refusal: MainRefusal): Promise<void> {
     try { await handler(refusal); }
     catch (err) {
-      console.error(`[inference-refusal] host handler failed (agent=${refusal.agentName} turn=${refusal.turnId}): ${err instanceof Error ? err.message : String(err)}; no retry or legacy fallback`);
+      console.error(`[inference-refusal] host handler failed (agent=${refusal.agentName} turn=${refusal.turnId}): ${thrownText(err)}; no retry or legacy fallback`);
     }
   }
   // The framework ends a stream at a tool boundary from handleProcessEvent:
@@ -30606,8 +30606,9 @@ export class AgentFramework {
 
             // Surface refusals instead of going silently mute: stderr line
             // (headless inference failures are otherwise under-logged) + an
-            // emoji reaction on the triggering Discord message, keyed by the
-            // refusal category from stop_details.
+            // emoji reaction on the answered Discord message, keyed by the
+            // refusal category from stop_details, unless a host has taken
+            // ownership through getMainRefusalBridge().
             if (response.stopReason === 'refusal') {
               // stop_details lives on the raw PROVIDER response
               // (response.raw is RawAccess = { request, response, headers }).

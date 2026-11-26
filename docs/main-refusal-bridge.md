@@ -9,7 +9,7 @@ message. Provider retry policy and the ops refusal-streak threshold are unchange
 
 - `takeOwnership(handler)` replaces **all** framework-owned refusal reactions for
   that framework. Only one owner is allowed. The returned disposer restores
-  legacy ownership. Installing a Zulip driver does not imply this handover.
+  legacy ownership. Ownership is never inferred from server configuration.
 - The handler receives a frozen `MainRefusal`: agent name, process-local agent
   instance identity, logical turn id, category, frozen answer provenance if known,
   and `rewind: 'handled' | 'unhandled'`. Only the latter may produce a reaction.
@@ -27,10 +27,7 @@ The signal is made only on the main stream's final refusal path, after membrane
 has exhausted any retries enabled for that attempt (none during guarded tool-result recovery) and after the existing rewind decision. A
 handled rewind is reported without an effect; its retry keeps the original
 origin. Auxiliary `complete()` calls and ephemeral agents in `run` mode do not enter
-this handoff. Ephemeral conversations do enter it, matching legacy behavior. Provider retry execution itself is membrane's responsibility; mock
-stream tests do not qualify a real provider.
-Auxiliary exclusion is source-reviewed (the signal is only in the main final
-stream branch), not behavior-proven by a direct call to a mock's `complete()`.
+this handoff. Ephemeral conversations do enter it, matching legacy behavior.
 
 ## Origin, not cause
 
@@ -48,7 +45,9 @@ does not turn the batch into a direct-message wake.
 A merged wake has no trusted origin unless every cause names the same
 admitted message within the same scope. Nonmessage markers, context-only
 traffic, and heartbeats supply no target. An edit counts only on an admitted
-first view.
+first view. A merged start released from a provider hold can recover its
+original answer and origin even if an additional wake folded into it during
+the hold would have made them ambiguous.
 
 An open turn keeps its answer despite new inbound messages, locus moves, and
 provider/framework continuations. Rewind retries carry provenance from the
@@ -66,16 +65,11 @@ text or the latest channel. This reports the message answered, not the culprit
 or cause of a refusal. The main completion captures the answer before
 reset/settlement/terminal traces; later host work never looks up a newer target.
 
-## Relationship to #947
-
-Main already includes #947. This bridge uses its per-turn answer, scheduling,
-rewind and built-in reaction behavior without replacing it. The bridge adds
-only trusted origin and the v1 host handover.
-
 ## Failure semantics
 
 A host owner's failure is logged and contained. It neither falls back to legacy
-reactions nor requests inference. The existing ops home notice starts at streak
-two, independently of this handoff. Hosts own their effect and deduplication policies; this API promises
-neither exactly-once effects nor durable cross-process/cross-host deduplication.
+reactions nor requests inference. The existing `ops:alert` of kind `refusal`
+starts at streak two, independently of this handoff. Hosts own their effect and
+deduplication policies; this API promises neither exactly-once effects nor
+durable cross-process/cross-host deduplication.
 Disposing restores legacy ownership but cannot retract an already issued effect.

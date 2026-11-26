@@ -12,7 +12,8 @@ export const AUTO_CONTINUE_REASON = 'auto-continue';
 
 /**
  * Stop reasons of a turn the model ended itself. The others don't continue:
- * a refusal has its own handling (retries, rewind, the reaction), a
+ * a refusal has its own handling (retries, rewind, and the built-in reaction
+ * unless a host has taken ownership through `getMainRefusalBridge()`), a
  * `max_tokens` end was cut off rather than chosen, and `no_progress` and
  * `round_limit` are the stall guard's verdict that the turn wasn't moving.
  */

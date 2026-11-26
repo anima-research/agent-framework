@@ -1,4 +1,6 @@
-/** Trusted processing origin, not evidence that a message caused a refusal. */
+/** Trusted processing origin, not evidence that a message caused a refusal.
+ * @experimental
+ */
 export interface MainRefusalOrigin {
   readonly serverId: string;
   readonly binding: string;
@@ -8,7 +10,9 @@ export interface MainRefusalOrigin {
   readonly messageRef: string;
 }
 
-/** Only a final MAIN response, after provider retries and the rewind decision. */
+/** Only a final MAIN response, after provider retries and the rewind decision.
+ * @experimental
+ */
 export interface MainRefusal {
   readonly agentName: string;
   readonly agentInstanceId: string;
@@ -18,6 +22,7 @@ export interface MainRefusal {
   readonly rewind: 'handled' | 'unhandled';
 }
 
+/** @experimental */
 export type MainRefusalHandler = (refusal: MainRefusal) => void | Promise<void>;
 
 /** Optional host facet. Taking ownership replaces ALL built-in refusal reactions,

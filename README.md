@@ -58,6 +58,9 @@ Agents can opt into the [tool result guard](docs/tool-result-guard.md) through
 setting persists across restarts; withheld results remain recoverable in
 Chronicle's audit history.
 
+Hosts can opt into the experimental [main-refusal bridge](docs/main-refusal-bridge.md)
+to take over reactions to final main refusals.
+
 ```typescript
 {
   name: 'researcher',

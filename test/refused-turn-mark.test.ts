@@ -5,6 +5,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager as StoreWindow } from '@animalabs/context-manager';
 import { createMockResponse, HeldStream, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, ok, TS } from './helpers/coalescing-fixture.js';
+import type { MainRefusal } from '../src/main-refusal.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 
 const ROOM = 'discord:g1:room';
@@ -57,6 +58,7 @@ class RunsUntilStopped implements YieldingStream {
 }
 
 async function baseRig(t: TestContext, opts: { framework?: Partial<FrameworkConfig>; agents?: unknown[]; fixture?: Record<string, unknown> } = {}, owner = false) {
+  const signals: MainRefusal[] = [];
   const marks: Array<{ name?: unknown; arguments?: Record<string, unknown> }> = [];
   const f = await fixture({
     ...opts.fixture,
@@ -67,6 +69,7 @@ async function baseRig(t: TestContext, opts: { framework?: Partial<FrameworkConf
   t.after(f.close);
   if (owner) {
     f.framework.getMainRefusalBridge().takeOwnership(signal => {
+      signals.push(signal);
       if (signal.rewind !== 'unhandled' || !signal.origin) return;
       // Record the target a host would use; built-in effects still go through
       // toolsCall above, so a double dispatch fails the same assertions.
@@ -116,12 +119,19 @@ async function baseRig(t: TestContext, opts: { framework?: Partial<FrameworkConf
     await answered(ROOM, 'm-after');
     await eventually(() => f.published.some((p) => JSON.stringify(p).includes('answer to m-after')), 'a later post');
   };
-  return { f, fw, streams, records, marks, marked, stored, incoming, adminMention, answered, markSent };
+  return { f, fw, streams, records, signals, marks, marked, stored, incoming, adminMention, answered, markSent };
 }
 
 // Run identical target assertions with and without bridge ownership.
 for (const owner of [false, true]) {
 const rig = (t: TestContext, opts: Parameters<typeof baseRig>[1] = {}) => baseRig(t, opts, owner);
+const assertUnknownRefusals = (signals: MainRefusal[], count = 1, rewind: MainRefusal['rewind'] = 'unhandled') => {
+  assert.equal(signals.length, owner ? count : 0);
+  for (const signal of signals) {
+    assert.equal(signal.rewind, rewind);
+    assert.equal(signal.origin, undefined);
+  }
+};
 describe(owner ? 'host owner' : 'built-in owner', () => {
 describe('a refused turn is marked on the message it answers, and its failure names that message\'s channel', () => {
   it('a mention pushed from a closed channel after a message answered in an open one: the mark goes on the mention, and the record names its channel', async (t) => {
@@ -171,6 +181,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 1, 'the refusal recorded');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, ADMIN);
   });
 
@@ -187,6 +198,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.f.renders.length === 1 && r.records.length === 1, 'the batch rendered, and its turn refused');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, ADMIN);
   });
 
@@ -197,6 +209,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 1, 'the refusal recorded');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, ADMIN);
   });
 
@@ -224,6 +237,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await r.f.framework.runUntilIdle();
     assert.equal(checkedAnswered, true, 'the placement moved from after to named');
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
   });
 
   it('a mention whose server\'s wakes are undecided wakes its turn through wake onboarding: the turn answers the mention, and its refusal marks it', async (t) => {
@@ -262,6 +276,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     assert.equal(r.f.membrane.calls.length, 4, 'premise: three failed sends, then the re-armed one');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, GENERAL);
   });
 
@@ -350,6 +365,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 1, 'the refusal recorded');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, ROOM);
   });
 
@@ -371,6 +387,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 1, 'the merged turn, refused');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, GENERAL);
   });
 
@@ -392,6 +409,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 1, 'the merged turn, refused');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, GENERAL);
   });
 
@@ -427,6 +445,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await eventually(() => r.records.length === 1, 'the resumed turn, refused');
     await r.markSent();
     assert.deepEqual(r.marked(), []);
+    assertUnknownRefusals(r.signals);
     assert.equal(r.records[0]!.locus, ROOM);
   });
 
@@ -461,6 +480,8 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await r.markSent();
     assert.deepEqual(r.records.slice(2).map((record) => record.agent).sort(), ['agent', 'second']);
     assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']], 'neither resumed turn for m-2 and m-3 marks a message');
+    assert.equal(r.signals.length, owner ? 4 : 0);
+    assertUnknownRefusals(r.signals.slice(2), 2);
   });
 
   it('a second resident\'s wakes for two messages that its provider\'s stated wait holds as one answer neither: its refusal marks nothing; for one message, it marks it', async (t) => {
@@ -491,6 +512,8 @@ describe('a refused turn is marked on the message it answers, and its failure na
     await r.markSent();
     assert.deepEqual(r.records.slice(2).map((record) => record.agent).sort(), ['agent', 'second']);
     assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']], 'neither turn for m-2 and m-3 marks a message');
+    assert.equal(r.signals.length, owner ? 4 : 0);
+    assertUnknownRefusals(r.signals.slice(2), 2);
   });
 
   it('a provider hold that takes two wakes for different messages as one keeps neither message; for one message, it keeps it', async (t) => {
@@ -571,6 +594,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     await Promise.all(reacting);
     assert.deepEqual(r.records.map((x) => x.locus), [null, null]);
     assert.deepEqual(r.marked(), []);
+    assert.equal(r.signals.length, 0, 'run-mode refusals never reach the host owner');
   });
 
   it('a refusal rewind\'s retry merged at its start with a later ambient wake from another channel still speaks in the refused message\'s channel', async (t) => {
@@ -903,6 +927,7 @@ describe('the retry a rewind queues answers the message the shed turn answered',
     assert.equal(runs.length, 1, "premise: the unstick's run was made once");
     assert.deepEqual([runs[0]!.channelId, runs[0]!.wakeChannels], [undefined, [{ serverId: 'editor', channelId: GENERAL }]], "the unstick's run has no channel, and the timer turn's wake channels");
     assert.equal(r.records.at(-1)?.locus, null, "the unstick's run, refused, names no channel");
+    assertUnknownRefusals(r.signals, 1, 'handled');
   });
 
   it('the poison-history breaker\'s retry speaks in the failed message\'s channel', async (t) => {

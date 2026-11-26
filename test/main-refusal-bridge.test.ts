@@ -147,18 +147,18 @@ test('ownership is exclusive and a stale disposer cannot revoke a reacquired han
 });
 
 
-test('heartbeat is unknown, never invents a platform message origin', async () => {
+test('a silent heartbeat has no refusal origin even with a message ID', async () => {
   const r = await rig();
   try {
     r.membrane.pushResponse(refused());
     r.framework.pushEvent({ type: 'mcpl:push-event', serverId: 'heartbeat', featureSet: 'heartbeat', eventId: 'event-UUID',
-      content: [], triggerInference: true, origin: { source: 'heartbeat', reason: 'schedule', silent: true } });
+      content: [], triggerInference: true, origin: { source: 'heartbeat', reason: 'schedule', silent: true, mcplChannelId: 'discord:g:A', messageId: 'heartbeat-message' } });
     await r.framework.runUntilIdle();
     assert.equal(r.signals.length, 1); assert.equal(r.signals[0].origin, undefined);
   } finally { await r.close(); }
 });
 
-test('ephemeral/subagent main refusals do not enter the reaction handoff', async () => {
+test('ephemeral run-mode main refusals do not enter the reaction handoff', async () => {
   const r = await rig();
   try {
     const ephemeral = await r.framework.createEphemeralAgent({ name: 'child', model: 'mock', systemPrompt: 'fixture' });
@@ -221,8 +221,12 @@ test('disposing an owner restores legacy dispatch at the final-stream call site'
   } finally { await r.close(); }
 });
 
-for (const asyncFailure of [false, true]) {
-  test(`owner failure is contained and correlated without legacy fallback (async=${asyncFailure})`, async (t) => {
+for (const [failure, detail, fail] of [
+  ['sync throw', 'boom', () => { throw new Error('boom'); }],
+  ['async rejection', 'rejected owner', () => Promise.reject('rejected owner')],
+  ['null-prototype rejection', '(a value that could not be read)', () => Promise.reject(Object.create(null))],
+] as const) {
+  test(`owner failure is contained and correlated without legacy fallback (${failure})`, async (t) => {
     const r = await rig();
     const legacy = t.mock.method(r.framework as unknown as {
       reactToRefusal(agent: string, category: string): Promise<void>;
@@ -233,8 +237,7 @@ for (const asyncFailure of [false, true]) {
       r.restore();
       r.bridge.takeOwnership(s => {
         signal = s;
-        if (asyncFailure) return Promise.reject('rejected owner');
-        throw new Error('boom');
+        return fail();
       });
       r.membrane.pushResponse(refused()); r.framework.pushEvent(incoming('A'));
       await r.framework.runUntilIdle();
@@ -243,7 +246,7 @@ for (const asyncFailure of [false, true]) {
       assert.equal(legacy.mock.callCount(), 0);
       assert.equal(r.membrane.calls.length, 1);
       assert.ok(errors.mock.calls.some(c => c.arguments[0] ===
-        `[inference-refusal] host handler failed (agent=agent turn=${signal!.turnId}): ${asyncFailure ? 'rejected owner' : 'boom'}; no retry or legacy fallback`));
+        `[inference-refusal] host handler failed (agent=agent turn=${signal!.turnId}): ${detail}; no retry or legacy fallback`));
       // node:test also fails this test for an unhandled rejection.
     } finally { await r.close(); }
   });
