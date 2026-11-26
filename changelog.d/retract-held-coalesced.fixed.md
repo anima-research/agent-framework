@@ -14,4 +14,5 @@
   has read it, as for any stored occurrence. The event gate's batched
   wakes use the same placements. After the release, a reply judge can count
   such a write as answered. And `upcomingWakes` no longer says that a
-  debounced batch of such writes will certainly wake.
+  debounced batch will certainly wake its agent where each of its events is
+  such a write placed for that agent.

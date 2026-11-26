@@ -332,20 +332,25 @@ test('a write kept in memory that an earlier try may have stored isn\'t withdraw
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as {
     addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+    storeInFork(target: unknown, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
     isUnreadPlacement(placement: CoalescingPlacement): boolean;
     removePlacement(placement: CoalescingPlacement): boolean;
   };
   const unsure: CoalescingPlacement = { agent: '' };
+  const unsureInFork: CoalescingPlacement = { agent: '' };
   const sure: CoalescingPlacement = { agent: '' };
   await whileHeld(f, async () => {
     assert.equal(internals.addMessage('user', [{ type: 'text', text: 'maybe_stored' }], {}, { placement: unsure, mayBeStored: true }), '');
+    assert.equal(internals.storeInFork(f.framework.getAgent('agent'), [{ type: 'text', text: 'maybe_stored_in_fork' }], {}, { placement: unsureInFork, mayBeStored: true }), '');
     assert.equal(internals.addMessage('user', [{ type: 'text', text: 'surely_held' }], {}, { placement: sure }), '');
-    assert.equal(internals.isUnreadPlacement(unsure), false);
-    assert.equal(internals.removePlacement(unsure), false);
+    for (const placement of [unsure, unsureInFork]) {
+      assert.equal(internals.isUnreadPlacement(placement), false);
+      assert.equal(internals.removePlacement(placement), false);
+    }
     assert.equal(internals.isUnreadPlacement(sure), true);
     assert.equal(internals.removePlacement(sure), true);
   });
-  assert(f.context().includes('maybe_stored'), 'the write that may be stored lands at the release');
+  assert(f.context().includes('maybe_stored') && f.context().includes('maybe_stored_in_fork'), 'the writes that may be stored land at the release');
   assert(!f.context().includes('surely_held'), 'the withdrawn write never lands');
   assert.equal(typeof unsure.messageId, 'string', 'its placement names the row it landed as');
 });
