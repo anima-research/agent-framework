@@ -24,6 +24,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import { qualifiedChannelName, type ChannelRef, type ChannelRegistry, type TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { isMarkerTagged } from '../mcpl/tags.js';
 import { armAfter, armAt } from '../deadline-timer.js';
 import type { TraceEventInput } from '../types/trace.js';
 
@@ -4814,7 +4815,11 @@ export class TuneOutCoordinator {
    * Bookkeeping for one held message, after admission decided the hold:
    * the cadence tally, the deterministic acknowledgement of a suppressed
    * mention, and the reader wake when the resident's gate would have woken
-   * them (`gatePass` is that verdict, probed without side effects).
+   * them (`gatePass` is that verdict, probed without side effects). A
+   * marker gets no acknowledgement, since it is no mention. A marker is a
+   * reaction, an edit, a deletion or a `chat:system` notice (isMarkerTagged).
+   * An edit still counts as its message when the host delivered it as the
+   * first version that the agent sees (`firstView`).
    */
   recordHeld(
     serverId: string,
@@ -4823,6 +4828,7 @@ export class TuneOutCoordinator {
     tags: string[] | undefined,
     authorId?: string,
     gatePass = true,
+    firstView = false,
   ): void {
     const key = this.key(serverId, channelId);
     this.divertedSinceInvocation.set(key, (this.divertedSinceInvocation.get(key) ?? 0) + 1);
@@ -4836,7 +4842,7 @@ export class TuneOutCoordinator {
     // mentions and gate-privileged authors wake, per the issue.
     const addressed = Array.isArray(tags) && tags.includes('chat:addressed');
     const privileged = this.hooks.isPrivilegedAuthor(authorId);
-    if (gatePass && addressed) {
+    if (gatePass && addressed && !isMarkerTagged(tags, firstView)) {
       // The mention-er always gets a deterministic signal, independent of
       // what the subconscious later decides (grant-gated; decline
       // precedent). Gate-suppressed mentions get NO reaction: main would

@@ -20905,7 +20905,7 @@ export class AgentFramework {
       // (cadence tally, suppressed-mention ack, reader wake) follows.
       metadata.tuneOut = { epochId: decision.held.epochId };
       this.tuneOutCoordinator?.recordHeld(
-        event.serverId, event.channelId, event.messageId, event.tags, event.author?.id, decision.gatePass,
+        event.serverId, event.channelId, event.messageId, event.tags, event.author?.id, decision.gatePass, event.firstView === true,
       );
     }
 
@@ -22990,7 +22990,7 @@ export class AgentFramework {
       metadata.tuneOut = { epochId: decision.held.epochId };
       this.tuneOutCoordinator?.recordHeld(
         event.serverId, triggerChannel.channelId, event.eventId, event.tags,
-        typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass,
+        typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass, event.firstView === true,
       );
     }
 
