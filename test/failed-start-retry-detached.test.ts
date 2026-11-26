@@ -29,6 +29,7 @@ type Internals = {
   lastInferenceAt: Map<string, { endedAt?: number }>;
   startRetryErrors: unknown[];
   noticeHeadMoves(agent: { name: string }): void;
+  printDiagnostics(): void;
   registry: { inspect(name: string): { incarnation: number } | undefined };
 };
 
@@ -220,6 +221,36 @@ describe("a failed start's wait to retry", () => {
     await until("a's wait to retry", () => h.log.includes('waiting:a'));
     await within('runUntilIdle()', h.fw.runUntilIdle());
     assert.ok(h.log.includes('completed:a'), `runUntilIdle() returned once a's retry had answered: ${h.log.join(', ')}`);
+  });
+
+  it("an agent that a listener stops as its turn starts leaves no event-gate window open once the start is dropped", async (t) => {
+    const h = await boot(t, { delayMs: 50, start: true, gate: true });
+    assert.ok(h.i.eventGate, 'control: the framework has an event gate');
+    let stopped = false;
+    h.fw.onTrace((event) => {
+      if (event.type === 'inference:started' && (event as { agentName?: string }).agentName === 'a' && !stopped) {
+        stopped = true;
+        h.fw.stopAgent('a', { reason: 'zz-released' });
+      }
+    });
+    wake(h.fw, 'a');
+    await until("the start's drop", () => aborts(h.traces, 'a').length > 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopped, true, 'control: the listener stopped a');
+    assert.equal(inferring(h, 'a'), false, "a's window is closed");
+  });
+
+  it("the SIGUSR2 diagnostics name an agent whose failed start waits to retry", async (t) => {
+    const h = await boot(t, { delayMs: 3_000, start: true });
+    wake(h.fw, 'a');
+    await until("a's wait to retry", () => h.log.includes('waiting:a'));
+    const lines: unknown[][] = [];
+    const error = t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args); });
+    h.i.printDiagnostics();
+    error.mock.restore();
+    const dumped = lines.map((args) => String(args[0])).find((line) => line.startsWith('[diagnostics] '));
+    assert.ok(dumped, `a diagnostics line: ${JSON.stringify(lines)}`);
+    assert.deepEqual((JSON.parse(dumped.slice('[diagnostics] '.length)) as { startRetries: string[] }).startRetries, ['a']);
   });
 
   it('lets another agent and an event go first under runUntilIdle(), which returns once the retry has ended', async (t) => {
@@ -549,7 +580,7 @@ describe("a failed start's wait to retry", () => {
     wake(h.fw, 'a');
     await within("the retry's compile", h.state.secondEntered.promise);
     const stopping = h.fw.stop();
-    await sleep(100);
+    await until('stop() to close admission', () => (h.fw as unknown as { providerAdmissionClosed: boolean }).providerAdmissionClosed);
     h.state.secondCompile.open();
     await stopping;
     assert.ok(errors.some((args) => args[0] === 'Error in event loop:' && /zz the policy threw/.test(String(args[1]))), 'stop() wrote the kept throw as the loop writes one');
@@ -557,14 +588,21 @@ describe("a failed start's wait to retry", () => {
   });
 
   it("a throw out of a replaced agent's retry start settles nothing of the agent that holds the name now", async (t) => {
-    const h = await boot(t, { delayMs: 50, start: true, failedCompiles: 2, throwOnRetryFailure: true });
-    h.state.secondCompile = new Gate();
+    const h = await boot(t, { delayMs: 50, start: true });
+    const notice = h.i.noticeHeadMoves.bind(h.fw);
+    let starts = 0;
+    let successorTurn: object | undefined;
+    h.i.noticeHeadMoves = (agent: { name: string }) => {
+      if (agent === h.agent && ++starts === 2) {
+        successorTurn = { ...h.i.turnRouting.get('a') };
+        h.i.agents.set('a', Object.create(h.agent));
+        h.i.openLogical.set('a', successorTurn);
+        throw new Error('zz a step before the compile failed');
+      }
+      notice(agent);
+    };
     wake(h.fw, 'a');
-    await within("the retry's compile", h.state.secondEntered.promise);
-    const successorTurn = { ...h.i.turnRouting.get('a') };
-    h.i.agents.set('a', Object.create(h.agent));
-    h.i.openLogical.set('a', successorTurn);
-    h.state.secondCompile.open();
+    await until("the retry's start", () => starts === 2);
     await retriesEnded(h);
     assert.equal(h.i.openLogical.get('a'), successorTurn, "the successor's open turn is left open");
     h.i.agents.set('a', h.agent);
@@ -599,11 +637,11 @@ describe("a failed start's wait to retry", () => {
   });
 
   it("a frame's retry whose start fails and waits again keeps the turn's gate window and its stream's record until the turn ends", async (t) => {
-    const h = await boot(t, { delayMs: 300, start: true, gate: true, retries: 2, firstStreamFails: true, failedCompiles: [2] });
+    const h = await boot(t, { delayMs: 2_000, start: true, gate: true, retries: 2, firstStreamFails: true, failedCompiles: [2] });
     assert.ok(h.i.eventGate, 'control: the framework has an event gate');
     wake(h.fw, 'a');
     await until("the second wait to retry", () => h.log.filter((line) => line === 'waiting:a').length === 2);
-    await sleep(100);
+    await new Promise((resolve) => setImmediate(resolve));
     assert.equal(h.state.compiles, 2, "control: the stream's retry has failed its compile and waits");
     assert.equal(inferring(h, 'a'), true, "the gate still counts a's turn");
     assert.equal(h.i.activeStreams.has('a'), true, "the failed stream's frame still holds the turn's stream entry");
