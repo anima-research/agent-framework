@@ -548,6 +548,8 @@ describe('tool wrapper prose guard integration', () => {
       await within('the late answer to reach the framework', membrane.answerOut);
       assert.deepEqual(events.filter((event) => event.startsWith('chunk:') || event.startsWith('complete:')), [],
         "the partial text and the disposed frame's late answer were never delivered, so neither streams");
+      await framework.stop();
+      assert.equal(events.filter((event) => event === 'stop:world:test').length, 1, `the late frame's end stops nothing a second time: ${events.join(', ')}`);
     } finally {
       // A failure before the release would leave the stream held, and stop()
       // waiting on it.

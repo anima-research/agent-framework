@@ -26,6 +26,7 @@ type Internals = {
   turnRouting: Map<string, { typing?: ChannelRef }>;
   openLogical: Map<string, unknown>;
   recordTurnCheckpoint(agentName: string): unknown;
+  noticeHeadMoves(agent: unknown): void;
 };
 
 const aGeneral: ChannelRef = { serverId: 'a', channelId: 'general' };
@@ -245,7 +246,9 @@ test("a child run's end, seen after its teardown, leaves a resident's indicator 
   assert.equal(w.typesAt(aGeneral), true);
   resident.open();
   await until("the resident's own stop", () => w.stopsAt(aGeneral) === 1);
+  await until("the resident's turn to end", () => w.turnEnded('scout'));
   await afterTeardown();
+  assert.equal(w.stopsAt(aGeneral), 1, `one stop: ${w.typing.join(', ')}`);
   assert.equal(w.typesAt(aGeneral), false);
   assert.equal(w.stopsAt(bLounge), 0, `control: the resident's end stopped only its own: ${w.typing.join(', ')}`);
   assert.equal(w.typesAt(bLounge), true);
@@ -265,6 +268,10 @@ test("another agent's end leaves a resident's indicator in another channel runni
   assert.equal(w.typesAt(aGeneral), true);
   resident.open();
   await until("the resident's own stop", () => w.stopsAt(aGeneral) === 1);
+  await until("the resident's turn to end", () => w.turnEnded('scout'));
+  await afterTeardown();
+  assert.equal(w.stopsAt(aGeneral), 1, `one stop: ${w.typing.join(', ')}`);
+  assert.equal(w.stopsAt(bLounge), 1, `the other agent's channel was stopped once: ${w.typing.join(', ')}`);
 });
 
 test("a failed stream whose retry is live leaves the retry's indicator running, and the retry's end stops it", async (t) => {
@@ -281,7 +288,9 @@ test("a failed stream whose retry is live leaves the retry's indicator running, 
   assert.equal(w.typesAt(aGeneral), true);
   retry.open();
   await until("the retry's stop", () => w.stopsAt(aGeneral) === 1);
+  await until("the turn to end", () => w.turnEnded('scout'));
   await afterTeardown();
+  assert.equal(w.stopsAt(aGeneral), 1, `one stop: ${w.typing.join(', ')}`);
   assert.equal(w.typesAt(aGeneral), false);
   assert.equal(w.stopsAt(bLounge), 0, `control: neither end stopped another address: ${w.typing.join(', ')}`);
   assert.equal(w.typesAt(bLounge), true);
@@ -466,6 +475,36 @@ test("a turn compiled while its agent was replaced stops its own channel, and no
   w.i.agents.set('scout', agent);
 });
 
+test("a start that throws after its agent was replaced leaves the replacement's indicator at the same address", async (t) => {
+  const w = await world(t);
+  w.framework.channels!.startTyping(bLounge);
+  const agent = w.framework.getAgent('scout')!;
+  const notice = w.i.noticeHeadMoves.bind(w.i);
+  let threw = false;
+  w.i.noticeHeadMoves = (of: unknown) => {
+    if (of === agent && !threw) {
+      threw = true;
+      const replacement = { ...w.i.turnRouting.get('scout'), typing: aGeneral };
+      w.i.agents.set('scout', Object.create(agent));
+      w.i.openLogical.set('scout', replacement);
+      w.i.turnRouting.set('scout', replacement);
+      w.framework.channels!.startTyping(aGeneral);
+      throw new Error('zz a step before the compile failed');
+    }
+    notice(of);
+  };
+  w.wake('scout', aGeneral);
+  await until('the throw', () => threw);
+  await afterTeardown();
+  await afterTeardown();
+  assert.equal(w.stopsAt(aGeneral), 0, `the replacement's indicator is left: ${w.typing.join(', ')}`);
+  assert.equal(w.typesAt(aGeneral), true);
+  assert.equal(w.stopsAt(bLounge), 0, `control: ${w.typing.join(', ')}`);
+  w.i.agents.set('scout', agent);
+  w.i.openLogical.delete('scout');
+  w.i.turnRouting.delete('scout');
+});
+
 test("a turn assembled or compiled while its agent was replaced leaves the replacement's indicator at the same address", async (t) => {
   for (const at of ['assembled', 'compiled'] as const) {
     const w = await world(t);
@@ -536,7 +575,7 @@ test("staged at the teardown's own condition: a newer stream of the agent typing
     const gate = new Gate();
     w.membrane.next('scout', held(gate));
     w.wake('scout', aGeneral);
-    await until('the turn to type', () => w.typesAt(aGeneral));
+    await until('the held stream', () => w.membrane.made.includes('scout') && w.typesAt(aGeneral));
     if (newerAt === bGeneral) w.framework.channels!.startTyping(bGeneral);
     const agent = w.framework.getAgent('scout')!;
     const current = w.i.turnRouting.get('scout')!;
@@ -565,7 +604,7 @@ test("stopAgent on an agent whose stream doesn't answer its cancel stops its cha
   w.framework.channels!.startTyping(aGeneral);
   w.membrane.next('other', deaf(gate));
   w.wake('other', bLounge);
-  await until('the turn to type', () => w.typesAt(bLounge));
+  await until('the held stream', () => w.membrane.made.includes('other') && w.typesAt(bLounge));
   w.framework.stopAgent('other', { reason: 'zz-released' });
   await until('the stop', () => w.stopsAt(bLounge) === 1);
   assert.equal(w.ended.includes('other'), false, "control: the old frame hasn't ended");
@@ -590,6 +629,12 @@ test("stopAgent while the turn's hooks run stops its channel at once, and not th
   await within('the hooks', w.module.hooksEntered.promise);
   w.framework.stopAgent('other', { reason: 'zz-released' });
   await until('the stop', () => w.stopsAt(bLounge) === 1);
+  assert.equal(w.stopsAt(aGeneral), 0, w.typing.join(', '));
+  assert.equal(w.typesAt(aGeneral), true);
+  hooks.open();
+  await until("the start's drop after its hooks", () => w.traces.some((e) => e.type === 'inference:aborted' && (e as { agentName?: string }).agentName === 'other'));
+  await afterTeardown();
+  assert.equal(w.stopsAt(bLounge), 1, `the drop stops nothing a second time: ${w.typing.join(', ')}`);
   assert.equal(w.stopsAt(aGeneral), 0, w.typing.join(', '));
   assert.equal(w.typesAt(aGeneral), true);
 });
@@ -624,7 +669,7 @@ test("the framework's stop sends a stop to every indicator still running, the ho
   w.framework.channels!.startTyping(bGeneral);
   w.membrane.next('scout', held(gate));
   w.wake('scout', aGeneral);
-  await until('the turn to type', () => w.typesAt(aGeneral));
+  await until('the held stream', () => w.membrane.made.includes('scout') && w.typesAt(aGeneral));
   await within('the stop', w.framework.stop());
   assert.equal(w.stopsAt(aGeneral), 1, w.typing.join(', '));
   assert.equal(w.stopsAt(bGeneral), 1, w.typing.join(', '));
@@ -637,7 +682,7 @@ test("staged at the teardown's own condition: an agent replaced under its name, 
     const gate = new Gate();
     w.membrane.next('scout', held(gate));
     w.wake('scout', aGeneral);
-    await until('the turn to type', () => w.typesAt(aGeneral));
+    await until('the held stream', () => w.membrane.made.includes('scout') && w.typesAt(aGeneral));
     if (replacementAt === bGeneral) w.framework.channels!.startTyping(bGeneral);
     const agent = w.framework.getAgent('scout')!;
     const current = w.i.turnRouting.get('scout')!;
