@@ -1073,7 +1073,7 @@ class ModuleContextImpl implements ModuleContext {
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
     if (!row) return null;
-    if (!this.retired) {
+    if (!this.retired && !this.registry.storeHeldFn?.()) {
       this.externalIdMap.set(key, row.id);
       this.persistExternalIdMap();
     }

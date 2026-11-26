@@ -1,9 +1,3 @@
-/**
- * A module's edits and removals while a branch move holds the store, or
- * while the delivery agent's context manager refuses its work: they wait in
- * memory with the writes, in arrival order, and reach the branch that the
- * move lands on.
- */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
@@ -51,7 +45,6 @@ describe("a module's edits and removals while the store is held", () => {
   const ctx = () => mutator.ctx!;
   const lostAlerts = () => traces.filter((t) => t.type === 'ops:alert' && t.kind === 'store-held-lost');
 
-  /** A rollback to m3 whose hold waits, before its cut, until `open()`. */
   const gatedRollback = () => {
     const internals = framework as unknown as { prepareMarkerBatch: (...args: unknown[]) => Promise<unknown> };
     const prepare = internals.prepareMarkerBatch;
@@ -69,6 +62,40 @@ describe("a module's edits and removals while the store is held", () => {
     const rollback = framework.rollbackToMessage('scout', { messageId: ids[2]! });
     rollback.catch(() => {});
     return { inHold: within(inHold, "the rollback's hold"), open, rollback };
+  };
+
+  const gatedSwitch = ({ fail = false } = {}) => {
+    const strategy = cm().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
+    const own = Object.hasOwn(strategy, 'initialize');
+    const initialize = strategy.initialize;
+    let reached!: () => void;
+    const inHold = new Promise<void>((resolve) => { reached = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    strategy.initialize = async (...args: unknown[]) => {
+      if (own) strategy.initialize = initialize;
+      else delete strategy.initialize;
+      reached();
+      await gate;
+      if (fail) throw new Error('injected initialization failure');
+      await initialize?.apply(strategy, args);
+    };
+    openHold = open;
+    const move = framework.switchBranch(framework.getStore().currentBranch().name);
+    move.catch(() => {});
+    return { inHold: within(inHold, "the switch's hold"), open, move };
+  };
+  const refuseWork = async (): Promise<void> => {
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const { inHold, open, move } = gatedSwitch({ fail: true });
+      await inHold;
+      open();
+      await move;
+    } finally {
+      console.error = quiet;
+    }
   };
 
   beforeEach(async () => {
@@ -100,12 +127,21 @@ describe("a module's edits and removals while the store is held", () => {
     const { inHold, open, rollback } = gatedRollback();
     await inHold;
     ctx().editMessage(ids[0]!, text('m1 edited'));
-    ctx().removeMessage(ids[1]!);
     ctx().addMessage('user', text('added during the hold'));
+    ctx().removeMessage(ids[1]!);
     assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5'], 'nothing changes while the store is held');
     assert.equal(framework.getHostModeStatus().deferredWrites, 3);
+    const order: string[] = [];
+    const store = cm() as unknown as { editMessage: (...args: unknown[]) => unknown; removeMessage: (...args: unknown[]) => unknown };
+    const { editMessage, removeMessage } = store;
+    store.editMessage = (...args: unknown[]) => { order.push('edit'); return editMessage.apply(cm(), args); };
+    store.removeMessage = (...args: unknown[]) => { order.push('remove'); return removeMessage.apply(cm(), args); };
+    framework.onTrace((event) => { if (event.type === 'message:added' && event.source === 'surgery-release') order.push('write'); });
     open();
     const result = await rollback;
+    store.editMessage = editMessage;
+    store.removeMessage = removeMessage;
+    assert.deepEqual(order, ['edit', 'write', 'remove'], 'the release keeps the order they came in');
     assert.deepEqual(texts(), ['m1 edited', 'm3', 'added during the hold']);
     await cm().switchBranch(result.sourceBranch);
     assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5'], 'the branch the rollback left is as it was');
@@ -185,11 +221,11 @@ describe("a module's edits and removals while the store is held", () => {
     assert.deepEqual(texts(), ['m1', 'm2', 'm4', 'm5']);
   });
 
-  it("edits made at the release, by a listener of a write that it stores, read each other, and come after an edit that the hold kept", async () => {
+  it("edits made at the release, by a listener of a write that it stores, read each other, and wait behind an edit that the hold kept after that write", async () => {
     const { inHold, open, rollback } = gatedRollback();
     await inHold;
-    ctx().editMessage(ids[0]!, text('m1 first'));
     ctx().addMessage('user', text('new'));
+    ctx().editMessage(ids[0]!, text('m1 first'));
     const seen: string[] = [];
     framework.onTrace((event) => {
       if (event.type !== 'message:added' || event.source !== 'surgery-release') return;
@@ -205,23 +241,30 @@ describe("a module's edits and removals while the store is held", () => {
     assert.deepEqual(texts(), ['m1 second', 'm2', 'm3', 'new, once, twice']);
   });
 
-  it("while the agent's context manager refuses its work, its edits and removals wait in memory, and its recovery applies them", async () => {
-    const strategy = cm().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
-    const own = Object.hasOwn(strategy, 'initialize');
-    const initialize = strategy.initialize;
-    strategy.initialize = async () => { throw new Error('injected initialization failure'); };
-    const quiet = console.error;
-    console.error = () => {};
-    try {
-      await framework.switchBranch('main');
-    } finally {
-      console.error = quiet;
-      if (own) strategy.initialize = initialize;
-      else delete strategy.initialize;
-    }
+  it("a kept removal of one row of a body hides the whole body from a module's reads, and the release removes the whole body", async () => {
+    type ShardStore = { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: string } } };
+    const shards = ['s0', 's1', 's2'].map((shard, shardIndex) =>
+      (cm() as unknown as ShardStore).messageStore.append('user', [{ type: 'text', text: shard }], {}, undefined, { bodyGroupId: 'g', shardIndex }).id as MessageId);
     const counted = ctx().queryMessages({}).totalCount;
-    ctx().editMessage(ids[0]!, text('m1 edited'));
+    const { inHold, open, move } = gatedSwitch();
+    await inHold;
+    ctx().removeMessage(shards[1]!);
+    for (const shard of shards) assert.equal(ctx().getMessage(shard), null);
+    const queried = ctx().queryMessages({});
+    assert(!queried.messages.some((row) => shards.includes(row.id)), "a module's query leaves out the whole body");
+    assert.equal(queried.totalCount, counted - 3);
+    open();
+    await move;
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it("while the agent's context manager refuses its work, its edits and removals wait in memory, and its recovery applies them", async () => {
+    await refuseWork();
+    const counted = ctx().queryMessages({}).totalCount;
     ctx().removeMessage(ids[1]!);
+    const content = text('m1 edited');
+    ctx().editMessage(ids[0]!, content);
+    (content[0] as { text: string }).text = 'm1 changed by its caller after the call';
     ctx().editMessage(ids[1]!, text('m2 edited after its removal'));
     assert.equal(framework.getHostModeStatus().deferredWrites, 3, 'all three wait in memory');
     assert.equal(ctx().getMessage(ids[1]!), null, "a module's read leaves out the row it removed, though an edit of it came after");
@@ -234,19 +277,7 @@ describe("a module's edits and removals while the store is held", () => {
   });
 
   it("a module's edits for an agent that waits for its recovery apply in the order they came, though its manager takes work again before the move", async () => {
-    const strategy = cm().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
-    const own = Object.hasOwn(strategy, 'initialize');
-    const initialize = strategy.initialize;
-    strategy.initialize = async () => { throw new Error('injected initialization failure'); };
-    const quiet = console.error;
-    console.error = () => {};
-    try {
-      await framework.switchBranch('main');
-    } finally {
-      console.error = quiet;
-      if (own) strategy.initialize = initialize;
-      else delete strategy.initialize;
-    }
+    await refuseWork();
     ctx().editMessage(ids[0]!, text('m1 first'));
     await cm().setStrategy(cm().getStrategy());
     ctx().editMessage(ids[0]!, text('m1 second'));
@@ -255,27 +286,101 @@ describe("a module's edits and removals while the store is held", () => {
     assert.deepEqual(texts(), ['m1 second', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  it("an edit or a removal of a row that the store doesn't hold throws at once during a hold, as a write's empty id names none", async () => {
+    const { inHold, open, rollback } = gatedRollback();
+    await inHold;
+    const id = ctx().addMessage('user', text('added during the hold'));
+    assert.equal(id, '');
+    assert.throws(() => ctx().editMessage(id, text('an edit of the write')));
+    assert.throws(() => ctx().removeMessage('no-such-row' as MessageId));
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1, 'only the write waits');
+    open();
+    await rollback;
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'added during the hold']);
+  });
+
+  it('a change whose store throws at the release is told in an alert, and the release goes on with the writes after it', async () => {
+    const { inHold, open, rollback } = gatedRollback();
+    await inHold;
+    ctx().editMessage(ids[0]!, text('m1 edited'));
+    ctx().addMessage('user', text('added after the edit'));
+    const store = cm() as unknown as { editMessage: (...args: unknown[]) => unknown };
+    const editMessage = store.editMessage;
+    store.editMessage = () => { store.editMessage = editMessage; throw new Error('injected store failure'); };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      open();
+      await rollback;
+    } finally {
+      console.error = quiet;
+    }
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'added after the edit']);
+    const alerts = lostAlerts() as unknown as Array<{ message: string; data?: { kinds?: Record<string, number> } }>;
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0]!.message, /injected store failure/);
+    assert.match(alerts[0]!.message, /took effect isn't known/);
+    assert.deepEqual(alerts[0]!.data?.kinds, { edit: 1 });
+  });
+
+  it("a change that the release finds its manager refusing waits for the agent's recovery, which applies it", async () => {
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const { inHold, open, move } = gatedSwitch({ fail: true });
+      await inHold;
+      ctx().removeMessage(ids[1]!);
+      open();
+      await move;
+    } finally {
+      console.error = quiet;
+    }
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5'], 'the release kept it');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1);
+    await framework.switchBranch('main');
+    assert.deepEqual(texts(), ['m1', 'm3', 'm4', 'm5']);
+    assert.deepEqual(lostAlerts(), []);
+  });
+
+  it("a hold begun during the release keeps the changes still to replay for its own release", async () => {
+    const first = gatedRollback();
+    await first.inHold;
+    ctx().addMessage('user', text('added during the hold'));
+    ctx().editMessage(ids[0]!, text('m1 edited'));
+    let second: ReturnType<typeof gatedSwitch> | undefined;
+    framework.onTrace((event) => {
+      if (event.type === 'message:added' && event.source === 'surgery-release' && !second) second = gatedSwitch();
+    });
+    first.open();
+    await first.rollback;
+    assert(second, 'setup: the release began a second hold');
+    await second.inHold;
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'added during the hold'], 'the edit still waits');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1);
+    second.open();
+    await second.move;
+    assert.deepEqual(texts(), ['m1 edited', 'm2', 'm3', 'added during the hold']);
+  });
+
+  it("a lookup during a hold of an external id whose new write waits keeps no entry for the row that the move cuts", async () => {
+    const old = ctx().addMessage('user', text('m6'), { external: { source: 'chat', id: 'e' } });
+    const { inHold, open, rollback } = gatedRollback();
+    await inHold;
+    assert.equal(ctx().addMessage('user', text('m6 again'), { external: { source: 'chat', id: 'e' } }), '');
+    assert.equal(ctx().findMessageByExternalId('chat', 'e'), old, 'the lookup finds the row that the store holds');
+    open();
+    await rollback;
+    const landed = cm().getAllMessages().find((row) => (row.content[0] as { text: string }).text === 'm6 again');
+    assert(landed, 'the release stores the new write');
+    assert.equal(ctx().findMessageByExternalId('chat', 'e'), landed.id);
+  });
+
   it("a module's removal of a row with an external id during the hold keeps the id's entry, and the first lookup after the release drops it", async () => {
     const id = ctx().addMessage('user', text('m6'), { external: { source: 'chat', id: 'e6' } });
     const entries = () => Object.keys((ctx().getState<{ externalIdMap?: Record<string, string> }>() ?? {}).externalIdMap ?? {});
     assert.deepEqual(entries(), ['chat:e6']);
-    const strategy = cm().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
-    const own = Object.hasOwn(strategy, 'initialize');
-    const initialize = strategy.initialize;
-    let reached!: () => void;
-    const inHold = new Promise<void>((resolve) => { reached = resolve; });
-    let open!: () => void;
-    const gate = new Promise<void>((resolve) => { open = resolve; });
-    strategy.initialize = async (...args: unknown[]) => {
-      if (own) strategy.initialize = initialize;
-      else delete strategy.initialize;
-      reached();
-      await gate;
-      await initialize?.apply(strategy, args);
-    };
-    openHold = open;
-    const move = framework.switchBranch('main');
-    await within(inHold, "the switch's hold");
+    const { inHold, open, move } = gatedSwitch();
+    await inHold;
     try {
       ctx().removeMessage(id);
       assert.equal(ctx().findMessageByExternalId('chat', 'e6'), null, 'a lookup finds the row gone');

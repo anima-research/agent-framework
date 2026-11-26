@@ -2091,7 +2091,7 @@ interface RecordedTurnCheckpoint {
   evicted: TurnCheckpoint[];
 }
 
-/** What a report of writes kept in memory says of them: how many of each kind (`metadata.kind`, else `message`), how many are mail, and the sentences that say so. */
+/** What a report of writes kept in memory says of them: how many of each kind (a change's `edit` or `remove`, a write's `metadata.kind`, else `message`), how many are mail, and the sentences that say so. */
 function heldWritesTold(writes: readonly HeldEntry[]): { kinds: Record<string, number>; mail: number; told: string } {
   const kinds: Record<string, number> = {};
   for (const write of writes) {
@@ -2109,7 +2109,7 @@ function heldWritesTold(writes: readonly HeldEntry[]): { kinds: Record<string, n
 }
 
 function heldWriteNamed(write: HeldEntry): string | undefined {
-  return 'mutation' in write ? undefined : write.direct?.agentName ?? write.opts?.forAgent;
+  return 'mutation' in write ? write.heldFor.name : write.direct?.agentName ?? write.opts?.forAgent;
 }
 
 /** Whether two checkpoints are one turn's: a redo puts its undo's back only where an undo cut short didn't leave it in place. */
@@ -26024,6 +26024,41 @@ export class AgentFramework {
     }
   }
 
+  private replayHeldMutation(write: HeldMutation, queue: HeldEntry[], unapplied: Map<string, { mutations: HeldMutation[]; reason: string }>): void {
+    const at = queue.indexOf(write);
+    if (at >= 0) queue.splice(at, 1);
+    const gone = this.heldWriteTargetGone(write);
+    if (gone !== undefined) {
+      this.passHeldWritesOn(gone, [write]);
+      return;
+    }
+    const agent = write.heldFor;
+    const { mutation } = write;
+    const what = `${mutation.kind === 'edit' ? 'an edit' : 'a removal'} of row ${mutation.id}`;
+    try {
+      if (!this.storeOrKeepMutation(agent, mutation, () => write, true)) {
+        console.error(`[surgery] ${what}, kept in memory, found no such row on the branch the move landed on, so it is skipped`);
+      }
+    } catch (error) {
+      console.error(`[surgery] ${what}, kept in memory, threw at the release, and may or may not have taken effect:`, error);
+      const entry = unapplied.get(agent.name) ?? { mutations: [], reason: thrownText(error) };
+      entry.mutations.push(write);
+      unapplied.set(agent.name, entry);
+    }
+  }
+
+  private tellHeldMutationsUnapplied(agentName: string, mutations: readonly HeldMutation[], reason: string): void {
+    const { kinds, told } = heldWritesTold(mutations);
+    const one = mutations.length === 1;
+    const message = `${one ? '1 edit or removal' : `${mutations.length} edits and removals`} of stored rows for ${agentName}, ` +
+      `kept in memory until a surgery's release, threw when applied there (${one ? '' : 'the first: '}${reason}). ` +
+      `Whether ${one ? 'it' : 'each'} took effect isn't known. ${told}`;
+    console.error(`[surgery] agent=${agentName}: ${message}`);
+    this.opsAlert('store-held-lost', agentName, message, {
+      data: { count: mutations.length, keptForRecovery: 0, heldBySurgery: mutations.length, kinds, mail: 0, mayBeApplied: mutations.length },
+    });
+  }
+
   /**
    * One write of releaseSurgeryHeldWrites's replay, the head of `queue`,
    * stored by the path it was held on; one that fails is noted in `lost`,
@@ -26035,43 +26070,6 @@ export class AgentFramework {
    * hold begun during its store (a listener of its clock row's trace)
    * keeps it at the head, unstored.
    */
-  private replayHeldMutation(write: HeldMutation, queue: HeldEntry[], unapplied: Map<string, { mutations: HeldMutation[]; reason: string }>): void {
-    const at = queue.indexOf(write);
-    if (at >= 0) queue.splice(at, 1);
-    const { mutation } = write;
-    const what = `${mutation.kind === 'edit' ? 'an edit' : 'a removal'} of row ${mutation.id}`;
-    const agent = this.deliveryAgent();
-    const failed = (agentName: string, reason: string): void => {
-      const entry = unapplied.get(agentName) ?? { mutations: [], reason };
-      entry.mutations.push(write);
-      unapplied.set(agentName, entry);
-    };
-    if (!agent) {
-      failed(write.heldFor.name, 'no agent is registered');
-      return;
-    }
-    try {
-      if (!this.storeOrKeepMutation(agent, mutation, () => write, true)) {
-        console.error(`[surgery] ${what}, kept in memory, found no such row on the branch the move landed on, so it is skipped`);
-      }
-    } catch (error) {
-      console.error(`[surgery] ${what}, kept in memory, threw at the release, and may or may not have taken effect:`, error);
-      failed(agent.name, thrownText(error));
-    }
-  }
-
-  private tellHeldMutationsUnapplied(agentName: string, mutations: readonly HeldMutation[], reason: string): void {
-    const { kinds, told } = heldWritesTold(mutations);
-    const one = mutations.length === 1;
-    const message = `${one ? '1 edit or removal' : `${mutations.length} edits and removals`} of stored rows for ${agentName}, ` +
-      `kept in memory until a surgery's release, threw when applied there (${one ? '' : 'the first: '}${reason}). ` +
-      `Whether ${one ? 'it' : 'each'} took effect isn't known, and the writes after ${one ? 'it' : 'them'} went on. ${told}`;
-    console.error(`[surgery] agent=${agentName}: ${message}`);
-    this.opsAlert('store-held-lost', agentName, message, {
-      data: { count: mutations.length, keptForRecovery: 0, heldBySurgery: mutations.length, kinds, mail: 0, mayBeApplied: mutations.length },
-    });
-  }
-
   private replayHeldWrite(
     write: SurgeryHeldWrite,
     queue: HeldEntry[],
@@ -36248,7 +36246,13 @@ export class AgentFramework {
     this.mutateStore(agent, { kind: 'remove', id });
   }
 
-  private mutateStore(agent: Agent, mutation: HeldMutation['mutation']): void {
+  private mutateStore(agent: Agent, given: HeldMutation['mutation']): void {
+    const cm = agent.getContextManager();
+    if (!cm.getMessage(this.storedIdOf(cm, given.id))) {
+      this.storeMutation(agent, given);
+      return;
+    }
+    const mutation: HeldMutation['mutation'] = given.kind === 'edit' ? { ...given, content: structuredClone(given.content) } : given;
     const kept = (): HeldMutation => ({ mutation, heldFor: agent, heldAt: Date.now(), heldOrder: ++this.heldWritesKept });
     if (this.surgeryHold || this.replayingHeld) {
       this.surgeryHeldWrites.push(kept());
@@ -36286,20 +36290,28 @@ export class AgentFramework {
     return !!this.surgeryHold || this.replayingHeld || (agent !== undefined && this.waitsForRecovery(agent.name));
   }
 
-  private heldMutationsFor(agent: Agent): Map<MessageId, ContentBlock[] | null> | undefined {
-    if (agent !== this.deliveryAgent()) return undefined;
-    const mutations = [...(this.heldForRecovery?.get(agent.name) ?? []), ...(this.surgeryHeldWrites ?? [])]
-      .filter((write): write is HeldMutation => 'mutation' in write)
+  private heldMutationsFor(agent: Agent): { rows: Map<MessageId, ContentBlock[] | null>; bodies: Set<string> } | undefined {
+    const mutations = [...(this.surgeryHeldWrites ?? []), ...[...(this.heldForRecovery?.values() ?? [])].flat()]
+      .filter((write): write is HeldMutation => 'mutation' in write && write.heldFor === agent)
       .sort((a, b) => a.heldOrder - b.heldOrder);
     if (mutations.length === 0) return undefined;
     const cm = agent.getContextManager();
-    const held = new Map<MessageId, ContentBlock[] | null>();
+    const rows = new Map<MessageId, ContentBlock[] | null>();
+    const bodies = new Set<string>();
     for (const { mutation } of mutations) {
       const id = this.storedIdOf(cm, mutation.id);
-      if (held.get(id) === null) continue;
-      held.set(id, mutation.kind === 'edit' ? mutation.content : null);
+      if (rows.get(id) === null) continue;
+      rows.set(id, mutation.kind === 'edit' ? mutation.content : null);
+      const body = mutation.kind === 'remove' ? cm.getMessage(id)?.bodyGroupId : undefined;
+      if (body) bodies.add(body);
     }
-    return held;
+    return { rows, bodies };
+  }
+
+  private heldView<T extends { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }>(row: T, held: { rows: Map<MessageId, ContentBlock[] | null>; bodies: Set<string> }): T | null {
+    const content = held.rows.get(row.id);
+    if (content === null || (row.bodyGroupId !== undefined && held.bodies.has(row.bodyGroupId))) return null;
+    return content ? { ...row, content } : row;
   }
 
   private getMessage(id: MessageId): ModuleMessage | null {
@@ -36311,9 +36323,9 @@ export class AgentFramework {
     const writeId = heldWriteId(id);
     const row = writeId === undefined ? cm.getMessage(id) : this.landedRow(cm, writeId);
     if (!row) return null;
-    const held = this.heldMutationsFor(agent)?.get(row.id);
-    if (held === null) return null;
-    return asModuleRow(held ? { ...row, content: held } : row, cm);
+    const held = this.heldMutationsFor(agent);
+    const shown = held ? this.heldView(row, held) : row;
+    return shown ? asModuleRow(shown, cm) : null;
   }
 
   /** The refusal of a module's `forAgent` that names no registered agent:
@@ -36338,7 +36350,9 @@ export class AgentFramework {
    *  empty one, throws, naming the registered ones, as a write's does. The
    *  rows come in store order, each marked `held` where it isn't in that
    *  agent's window (#291: stored and not yet presented to it, or taken out
-   *  of it as an undone turn's), and the count is the store's. */
+   *  of it as an undone turn's), and the count is the store's. Where the
+   *  framework keeps a module's changes in memory, the rows show them, and
+   *  the count leaves out the rows that a kept removal takes. */
   private queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): { messages: ModuleMessage[]; totalCount: number } {
     // A name given is a name: it doesn't fall back to the primary, as
     // deliveryAgent's would for the empty one, which is refused, as a
@@ -36353,10 +36367,7 @@ export class AgentFramework {
     const stored = cm.queryMessages(filter);
     const held = this.heldMutationsFor(agent);
     if (!held) return { ...stored, messages: stored.messages.map((row) => asModuleRow(row, cm)) };
-    const rows = stored.messages.flatMap((row) => {
-      const content = held.get(row.id);
-      return content === null ? [] : [content ? { ...row, content } : row];
-    });
+    const rows = stored.messages.flatMap((row) => this.heldView(row, held) ?? []);
     return { ...stored, messages: rows.map((row) => asModuleRow(row, cm)), totalCount: stored.totalCount - (stored.messages.length - rows.length) };
   }
 
