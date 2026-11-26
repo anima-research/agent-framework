@@ -1365,7 +1365,7 @@ interface TurnCarry {
   read: number;
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
-type ReleasedRouting = { wasRetry: boolean } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
+type ReleasedRouting = { wasRetry: boolean; rows?: string[] } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
 type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
@@ -2651,10 +2651,9 @@ export interface HostModeStatus {
    * provider admission behind an auxiliary call counts once in
    * `parkedAdmissions` instead, however many wakes are merged into it. A turn
    * a budget hold holds counts once, continuation or not. The wakes merged
-   * into its start are part of it, except those that joined its wait before
-   * a release: when the start it holds merged one released turn with them,
-   * the hold takes them back. Those, and wakes that joined it while it
-   * waited, count as other gated requests do. Other continuations (budget restart, tool
+   * into its start are part of it, except when the start it holds merged one
+   * released turn with other wakes: the hold takes those back. Those, and
+   * wakes that joined it while it waited, count as other gated requests do. Other continuations (budget restart, tool
    * results, the tool-result guard's retry) and a held turn's retry, which a
    * quiesce lets through, are never counted. */
   gatedRequests: number;
@@ -7756,9 +7755,10 @@ export class AgentFramework {
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     if (wrote && !wrote.wasRetry) delete turn[TURN_RETRY];
     const carried = budgetWaitOf(turn);
+    const stood = carried?.rows ?? wrote?.rows;
     const startedAt = Date.now();
-    const { standsOn, ownRows } = !continuesTurn(turn) && carried
-      ? { standsOn: [...(carried.rows ?? [])], ownRows: [] }
+    const { standsOn, ownRows } = !continuesTurn(turn) && (carried || stood)
+      ? { standsOn: [...(stood ?? [])], ownRows: [] }
       : this.rowsTurnStandsOn(agent, turn, released ? this.turnRouting.get(agent.name) ?? routing : routing);
     const wait: BudgetWait = {
       since: carried?.since ?? startedAt,
@@ -28721,9 +28721,10 @@ export class AgentFramework {
     }
     if (released && !(released.turn as MarkedRequest)[RELEASED_ROUTING]) {
       const wasRetry = isTurnRetry(released.turn);
+      const rows = budgetWaitOf(released.turn)?.rows;
       (released.turn as MarkedRequest)[RELEASED_ROUTING] = opensTurn
-        ? { wasRetry, opened: true, turn: this.turnRouting.get(agent.name), answered: this.answeredTurns.get(agent) }
-        : { wasRetry, opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) };
+        ? { wasRetry, rows, opened: true, turn: this.turnRouting.get(agent.name), answered: this.answeredTurns.get(agent) }
+        : { wasRetry, rows, opened: false, routing, ...(routing.wakeChannels ? { wakeChannels: [...routing.wakeChannels] } : {}) };
     }
     if (opensTurn) {
       const head = agent.branchHead();

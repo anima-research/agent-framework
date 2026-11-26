@@ -10,7 +10,7 @@
   reaches a joined wake while it waits beside the turn, unless the released
   start rendered its batch. If the released start rendered all of a joined
   wake's deferred batch for this agent, that wake reads the stored render
-  once the turn is dropped. A start that merged two released turns, or a
-  released turn and a continuation, still ends its joined wakes with the
-  turn. If the released start moved where the turn's speech lands, the move
-  and its notice stay.
+  once the turn is dropped, unless a surgery removed the render too. A start
+  that merged two released turns, or a released turn and a continuation,
+  still ends its joined wakes with the turn. If the released start moved
+  where the turn's speech lands, the move and its notice stay.
