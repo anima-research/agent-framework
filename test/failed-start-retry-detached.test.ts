@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { NormalizedRequest, YieldingStream } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
+import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
+import type { ContextInjection } from '@animalabs/context-manager';
 import type { ErrorAction, ErrorPolicy, EventResponse, Module, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -22,6 +24,10 @@ type Internals = {
   pendingRequests: Array<{ agentName: string }>;
   providerWaits: { set(agentName: string, model: string, ms: number, why: string): void };
   eventGate: { onInferenceStarted(agentName: string): void; getStatus?(): unknown } | null;
+  activeStreams: Map<string, unknown>;
+  lastInferenceAt: Map<string, { endedAt?: number }>;
+  startRetryErrors: unknown[];
+  noticeHeadMoves(agent: { name: string }): void;
   registry: { inspect(name: string): { incarnation: number } | undefined };
 };
 
@@ -30,12 +36,23 @@ class Gate {
   readonly promise = new Promise<void>((resolve) => { this.open = resolve; });
 }
 
-/** An event with `hold` keeps the scheduler in its onProcess until `held.gate` opens. */
 const held = { gate: null as Gate | null, entered: false };
 
 class InputModule implements Module {
   readonly name = 'input';
+  hooksFor: string | null = null;
+  hooks: Gate | null = null;
+  readonly hooksEntered = new Gate();
   constructor(private readonly log: string[]) {}
+  async gatherContext(agentName: string): Promise<ContextInjection[]> {
+    const hooks = agentName === this.hooksFor ? this.hooks : null;
+    if (hooks) {
+      this.hooks = null;
+      this.hooksEntered.open();
+      await hooks.promise;
+    }
+    return [];
+  }
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return []; }
@@ -56,9 +73,25 @@ class InputModule implements Module {
   }
 }
 
+class FailingStream implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  cancel(): void {}
+  provideToolResults(): void {}
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'error', error: new MembraneError({ type: 'server', retryable: true, httpStatus: 500, message: 'zz internal error', rawError: undefined } as ConstructorParameters<typeof MembraneError>[0]) } as StreamEvent;
+  }
+}
+
 class AnsweringMembrane extends MockMembrane {
+  failFirstStreamOf: string | null = null;
   override streamYielding(request: NormalizedRequest): YieldingStream {
     this.calls.push(request);
+    if (request.assistantParticipant === this.failFirstStreamOf) {
+      this.failFirstStreamOf = null;
+      return new FailingStream();
+    }
     return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'answered' }])]);
   }
 }
@@ -73,7 +106,7 @@ class RetryPolicy implements ErrorPolicy {
   }
 }
 
-async function boot(t: TestContext, opts: { delayMs: number; start: boolean; failedCompiles?: number; retries?: number; throwOnRetryFailure?: boolean; gate?: boolean }) {
+async function boot(t: TestContext, opts: { delayMs: number; start: boolean; failedCompiles?: number | number[]; retries?: number; throwOnRetryFailure?: boolean; gate?: boolean; firstStreamFails?: boolean }) {
   const dir = mkdtempSync(join(tmpdir(), 'af-failed-start-retry-'));
   let made: AgentFramework | undefined;
   t.after(async () => {
@@ -84,10 +117,13 @@ async function boot(t: TestContext, opts: { delayMs: number; start: boolean; fai
     }
   });
   const log: string[] = [];
+  const membrane = new AnsweringMembrane();
+  if (opts.firstStreamFails) membrane.failFirstStreamOf = 'a';
+  const input = new InputModule(log);
   const fw = await AgentFramework.create({
-    storePath: join(dir, 'store'), membrane: new AnsweringMembrane().asMembrane(),
+    storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
     agents: ['b', 'a'].map((name) => ({ name, model: 'zz-model', systemPrompt: 'system' })),
-    modules: [new InputModule(log)], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    modules: [input], syncIntervalMs: 0, maintenanceIntervalMs: 0,
     errorPolicy: new RetryPolicy(opts.delayMs, opts.retries, opts.throwOnRetryFailure),
     ...(opts.gate ? { gate: { config: { policies: [], default: 'always' as const } } } : {}),
   });
@@ -108,12 +144,13 @@ async function boot(t: TestContext, opts: { delayMs: number; start: boolean; fai
       state.secondEntered.open();
       if (state.secondCompile) await state.secondCompile.promise;
     }
-    if (state.compiles <= (opts.failedCompiles ?? 1)) throw new Error('zz compile failed');
+    const fails = opts.failedCompiles ?? 1;
+    if (Array.isArray(fails) ? fails.includes(state.compiles) : state.compiles <= fails) throw new Error('zz compile failed');
     return compile(...args);
   }) as typeof a.startStreamWithInjections;
   if (opts.start) fw.start();
   const i = fw as unknown as Internals;
-  return { fw, i, log, traces, state, agent: a };
+  return { fw, i, log, traces, state, agent: a, input };
 }
 
 const wake = (fw: AgentFramework, to: string) => fw.pushEvent({ type: 'external-message', source: 'test', content: `zz-hello ${to}`, metadata: { to } } as unknown as ProcessEvent);
@@ -137,7 +174,6 @@ async function within<T>(what: string, work: Promise<T>, ms = 10_000): Promise<T
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Staged at the condition: another agent under the name is a later incarnation of it. */
 function laterIncarnation(h: Awaited<ReturnType<typeof boot>>, name: string): void {
   h.i.registry.inspect(name)!.incarnation += 1;
 }
@@ -195,7 +231,6 @@ describe("a failed start's wait to retry", () => {
     const h = await boot(t, { delayMs: 2_000, start: true });
     wake(h.fw, 'a');
     await until("a's wait to retry", () => h.log.includes('waiting:a'));
-    // The drain runs out first, so the abandon reaches the turn in its wait.
     const status = await h.fw.quiesce({ abandon: true, timeoutMs: 50 });
     assert.equal((status.unabandonable ?? []).includes('a'), false, `a's turn was abandonable: ${JSON.stringify(status.unabandonable)}`);
     await until("a's turn to end", () => aborts(h.traces, 'a').length > 0);
@@ -353,7 +388,6 @@ describe("a failed start's wait to retry", () => {
     held.entered = false;
     let again: Promise<unknown> = Promise.resolve(null);
     let from = 0;
-    // The scheduler stays in the held event until the gate opens, and stop() waits for it, so the gate opens on every way out.
     try {
       h.fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hold', metadata: { hold: true } } as unknown as ProcessEvent);
       await until('the scheduler to hold in an event', () => held.entered);
@@ -538,5 +572,107 @@ describe("a failed start's wait to retry", () => {
     assert.equal(settled, false, "stop() waits while the retry's compile runs");
     h.state.secondCompile.open();
     await stopping;
+  });
+
+  it("a frame's retry whose start fails and waits again keeps the turn's gate window and its stream's record until the turn ends", async (t) => {
+    const h = await boot(t, { delayMs: 300, start: true, gate: true, retries: 2, firstStreamFails: true, failedCompiles: [2] });
+    assert.ok(h.i.eventGate, 'control: the framework has an event gate');
+    wake(h.fw, 'a');
+    await until("the second wait to retry", () => h.log.filter((line) => line === 'waiting:a').length === 2);
+    await sleep(100);
+    assert.equal(h.state.compiles, 2, "control: the stream's retry has failed its compile and waits");
+    assert.equal(inferring(h, 'a'), true, "the gate still counts a's turn");
+    assert.equal(h.i.activeStreams.has('a'), true, "the failed stream's frame still holds the turn's stream entry");
+    assert.equal(h.i.lastInferenceAt.get('a')?.endedAt, undefined, "the turn's record has no end yet");
+    await until("the turn's answer", () => h.log.includes('completed:a'));
+    await until('the turn to end at the gate', () => !inferring(h, 'a'));
+  });
+
+  it("a throw in a later start of a frame's retry goes to that frame, which ends the turn", async (t) => {
+    const errors: unknown[][] = [];
+    const error = console.error.bind(console);
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); error(...args); });
+    const h = await boot(t, { delayMs: 100, start: true, retries: 2, firstStreamFails: true, failedCompiles: [2] });
+    const notice = h.i.noticeHeadMoves.bind(h.fw);
+    let starts = 0;
+    h.i.noticeHeadMoves = (agent: { name: string }) => {
+      if (agent.name === 'a' && ++starts === 3) throw new Error('zz a step before the compile failed');
+      notice(agent);
+    };
+    wake(h.fw, 'a');
+    const loopWrote = () => errors.some((args) => args[0] === 'Error in event loop:');
+    const ended = () => h.traces.some((e) => (e.type === 'inference:exhausted' || e.type === 'inference:completed') && (e as { agentName?: string }).agentName === 'a');
+    await until("the turn's end, or the loop's line", () => ended() || loopWrote());
+    assert.equal(starts, 3, 'control: the third start threw before its compile');
+    assert.ok(!loopWrote(), 'nothing is left for the event loop');
+    assert.ok(ended(), "the turn ended through the stream's frame");
+    assert.equal(h.i.startRetryErrors.length, 0, 'nothing is kept for runUntilIdle()');
+  });
+
+  it("a compile that fails after a later incarnation took the name reports nothing under it, and leaves its window", async (t) => {
+    const h = await boot(t, { delayMs: 50, start: true, gate: true, failedCompiles: 2 });
+    h.state.secondCompile = new Gate();
+    wake(h.fw, 'a');
+    await within("the retry's compile", h.state.secondEntered.promise);
+    h.i.agents.set('a', Object.create(h.agent));
+    laterIncarnation(h, 'a');
+    h.i.activeTurnTokens.set('a', 987_654);
+    h.i.eventGate!.onInferenceStarted('a');
+    const from = h.traces.length;
+    h.state.secondCompile.open();
+    await retriesEnded(h);
+    const after = h.traces.slice(from).filter((e) => (e as { agentName?: string }).agentName === 'a').map((e) => e.type);
+    assert.deepEqual(after.filter((type) => ['inference:failed', 'inference:waiting', 'inference:exhausted', 'inference:aborted'].includes(type)), [], `nothing under the name: ${after.join(', ')}`);
+    assert.equal(inferring(h, 'a'), true, "the successor's window stays open");
+    assert.equal(h.i.activeTurnTokens.get('a'), 987_654, "the successor's token is untouched");
+    h.i.agents.set('a', h.agent);
+    h.i.activeTurnTokens.delete('a');
+  });
+
+  it("a start dropped after its hooks, when its job was resumed under the name meanwhile, sends no inference:aborted under it", async (t) => {
+    const h = await boot(t, { delayMs: 50, start: true });
+    const config = { model: 'zz-model', systemPrompt: 'system' };
+    const kid = await h.fw.createEphemeralAgent({ name: 'kid', ...config });
+    kid.contextManager.addMessage('user', [{ type: 'text', text: 'Do the task.' }]);
+    const hooks = new Gate();
+    h.input.hooksFor = 'kid';
+    h.input.hooks = hooks;
+    const run = h.fw.runEphemeralToCompletion(kid.agent, kid.contextManager, { idleTimeoutMs: 150, idlePollMs: 20 }).then(() => null, (error: unknown) => error);
+    let again: Promise<unknown> = Promise.resolve(null);
+    let from = 0;
+    try {
+      await within("the job's hooks", h.input.hooksEntered.promise);
+      assert.match(String(await within("the first run's end", run, 8_000)), /stalled/, 'control: the idle watchdog ended the run during its hooks');
+      const resumed = await h.fw.resumeAgent('kid', config);
+      resumed.contextManager.addMessage('user', [{ type: 'text', text: 'Go on.' }]);
+      again = h.fw.runEphemeralToCompletion(resumed.agent, resumed.contextManager, { idleTimeoutMs: 10_000 }).then(() => null, (error: unknown) => error);
+      await until('the resumed job to hold the name', () => h.fw.getAgent('kid') === resumed.agent);
+      assert.equal(h.i.activeTurnTokens.get('kid'), undefined, 'control: the resumed job has no turn yet');
+      from = h.traces.length;
+    } finally {
+      hooks.open();
+    }
+    assert.equal(await within("the resumed run's end", again), null, "the resumed job's run ends without an error");
+    const reasons = h.traces.slice(from).filter((e) => e.type === 'inference:aborted' && (e as { agentName?: string }).agentName === 'kid').map((e) => (e as { reason?: string }).reason);
+    assert.deepEqual(reasons, [], 'no inference:aborted under the name the resumed job holds');
+  });
+
+  it("a throw that a retry keeps after stop()'s wait for it ran out is written as the loop writes one", async (t) => {
+    const errors: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+    const h = await boot(t, { delayMs: 50, start: true, failedCompiles: 2, throwOnRetryFailure: true });
+    h.state.secondCompile = new Gate();
+    wake(h.fw, 'a');
+    await within("the retry's compile", h.state.secondEntered.promise);
+    let stopped: unknown;
+    try {
+      stopped = await h.fw.stop(50).then(() => null, (error: unknown) => error);
+    } finally {
+      h.state.secondCompile.open();
+    }
+    assert.match(String((stopped as Error | null)?.message), /start-retry:a/, "control: stop()'s wait ran out with the retry under way");
+    await retriesEnded(h);
+    assert.ok(errors.some((args) => args[0] === 'Error in event loop:' && /zz the policy threw/.test(String(args[1]))), 'the throw was written');
+    assert.equal(h.i.startRetryErrors.length, 0, 'none is kept with no reader');
   });
 });
