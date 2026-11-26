@@ -4000,23 +4000,6 @@ function shownReasonOf(err: Error): { shownReason?: string } {
   return own === undefined ? {} : { shownReason: own };
 }
 
-function heldThoughThrown(error: unknown, holds: (id: MessageId) => boolean): boolean {
-  if (error instanceof WriteLandedError) return error.landed.length > 0;
-  if (!(error instanceof WriteOutcomeUnknownError)) return false;
-  if (error.landed.length > 0) return true;
-  try {
-    return error.unknown.some(holds);
-  } catch {
-    return false;
-  }
-}
-
-function residentNoteOf(err: Error, agent: Agent): ResidentNote {
-  return isEmptyCompileError(err) ? { residentNote: err.residentNote, residentOf: agent } : {};
-}
-
-interface ResidentNote { residentNote?: string; residentOf?: Agent }
-
 function boundedCause(err: Error): Error {
   const cause = new Error(boundFailureText(String(err.message)));
   cause.name = boundFailureText(String(err.name), PROVIDER_ERROR_CODE_MAX_CHARS);
@@ -29278,7 +29261,7 @@ export class AgentFramework {
           // the site that sees it, since compile runs before the stream
           // exists). `retryable` is kept for observability.
           ...this.classifyInferenceError(err),
-        }, residentNoteOf(err, agent));
+        });
         this.eventGate?.onInferenceEnded(agent.name);
         if (action.emit) {
           this.pushEvent(action.emit);
@@ -31392,7 +31375,7 @@ export class AgentFramework {
                 // request's content or size, which a shed of the newest
                 // exchange may fix.
                 ...this.classifyInferenceError(err),
-              }, residentNoteOf(err, agent));
+              });
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
                 this.pushEvent(action.emit);
@@ -31784,7 +31767,7 @@ export class AgentFramework {
         error: err.message,
         ...shownReasonOf(err),
         ...this.classifyInferenceError(err),
-      }, residentNoteOf(err, agent));
+      });
       this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
@@ -36115,7 +36098,7 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: TraceEventInput, own: ResidentNote = {}): void {
+  private emitTrace(event: TraceEventInput): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -36134,9 +36117,6 @@ export class AgentFramework {
           providerErrorCode: event.providerErrorCode as string | undefined,
           shownReason: event.shownReason as string | undefined,
           operatorNote: event.operatorNote as string | undefined,
-          emptyCompileUsable: event.emptyCompileUsable as number | undefined,
-          residentNote: own.residentNote,
-          residentOf: own.residentOf,
         },
       );
     } else if (event.type === 'inference:completed') {
@@ -36612,7 +36592,7 @@ export class AgentFramework {
    */
   private classifyInferenceError(err: Error): {
     retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
-    operatorNote?: string; emptyCompileUsable?: number;
+    operatorNote?: string;
   } {
     // From either copy of membrane (isMembraneError). The fields are read as
     // data, and the type is bounded like describeFailure's, for every sink the
@@ -36630,7 +36610,7 @@ export class AgentFramework {
       };
     }
     if (isEmptyCompileError(err)) {
-      return { retryable: false, errorType: 'empty_compile', operatorNote: err.operatorNote, emptyCompileUsable: err.budgetTokens - err.reserveTokens };
+      return { retryable: false, errorType: 'empty_compile', operatorNote: err.operatorNote };
     }
     const refusal = compileRefusalType(err);
     return refusal !== undefined ? { errorType: refusal } : {};
@@ -36652,7 +36632,7 @@ export class AgentFramework {
     rawReason: string,
     retryable?: boolean,
     rawErrorType?: string,
-    detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string; operatorNote?: string; emptyCompileUsable?: number } & ResidentNote,
+    detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string; operatorNote?: string },
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -36728,18 +36708,15 @@ export class AgentFramework {
       });
     }
 
-    // (2) Agent-facing chronicle marker. It triggers no inference, except the
-    // one wake after an empty_compile's notice, so it makes no loop.
-    const sameAgent = detail?.residentOf === undefined || detail.residentOf === agent;
-    const forResident = sameAgent && typeof detail?.residentNote === 'string' ? detail.residentNote : detail?.shownReason;
-    const shownText = typeof forResident === 'string'
-      ? failureShown(boundFailureText(forResident, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
-    const notSent = sameAgent && !ended && errorType === 'empty_compile' && shownText !== undefined && !this.emptyCompileNoticed.has(agentName);
-    if (agent && sameAgent && (ended || notSent) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+    // (2) Agent-facing chronicle marker (no inference triggered → no loop).
+    const notSent = !ended && errorType === 'empty_compile' && !this.emptyCompileNoticed.has(agentName);
+    if (agent && (ended || notSent) && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
       const timedOut = errorType === 'timeout';
       const causeParts = errorType === 'safety' ? [] : [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined);
       const cause = timedOut && causeParts.length === 1 ? '' : causeParts.join(', ');
+      const shownText = typeof detail?.shownReason === 'string'
+        ? failureShown(boundFailureText(detail.shownReason, FAILURE_MARKER_REASON_MAX_CHARS)) : undefined;
       const shown = shownText !== undefined ? ` Reason: ${shownText}${/[.!?]$/.test(shownText) ? '' : '.'}` : '';
       try {
         storeOwnRow(
@@ -36748,7 +36725,7 @@ export class AgentFramework {
           [{
             type: 'text',
             text: !ended
-              ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn wasn't sent: ${shownText}${/[.!?]$/.test(shownText ?? '') ? '' : '.'}`
+              ? `[${NOTICE_TAG.inferenceFailed}] Your previous turn wasn't sent: none of your conversation was included in the request.`
               : `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: ` +
               `${timedOut ? 'its last call timed out' : 'it failed'}${cause ? ` (${suppliedValue(cause)})` : ''}.` +
               `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
@@ -36760,11 +36737,9 @@ export class AgentFramework {
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
-        if (notSent) this.noticedEmptyCompile(agent, detail?.emptyCompileUsable);
+        if (notSent) this.emptyCompileNoticed.add(agentName);
       } catch (err) {
-        if (notSent && heldThoughThrown(err, (id) => agent.getContextManager().getMessage(id) !== null)) {
-          this.noticedEmptyCompile(agent, detail?.emptyCompileUsable);
-        }
+        if (notSent && (err instanceof WriteLandedError || err instanceof WriteOutcomeUnknownError) && err.landed.length > 0) this.emptyCompileNoticed.add(agentName);
         console.error(`[inference-failed] could not record chronicle marker for ${agentName}: ${describeFailureWithFrames(err)}`);
       }
     }
@@ -36910,17 +36885,6 @@ export class AgentFramework {
     // Retry immediately on the repaired history (bounded by the cap above).
     const answered = this.answeredTurns.get(agent);
     this.pendingRequests.push(this.rewindRetry(agent.name, 'inference-failure-rewind-retry', answered, answered ?? this.turnRouting.get(agent.name)));
-  }
-
-  private noticedEmptyCompile(agent: Agent, usable: number | undefined): void {
-    this.emptyCompileNoticed.add(agent.name);
-    if ((usable ?? 0) <= 0 || this.ephemeralRuns.has(agent.name)) return;
-    const refused = this.turnRouting.get(agent.name);
-    this.pendingRequests.push({
-      ...this.rewindRetry(agent.name, 'empty-compile-notice', refused, refused),
-      ...(refused?.silent ? { suppressProse: true } : {}),
-      ...(refused ? { ...this.heartbeatTurnMark(refused), ...this.unpromptedTurnMark(refused) } : {}),
-    });
   }
 
   private rewindRetry(agentName: string, reason: string, answering: TurnRouting | undefined, wakes: TurnRouting | undefined): MarkedRequest {

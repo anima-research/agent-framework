@@ -182,8 +182,6 @@ export type TraceEvent =
       providerErrorCode?: string;
       /** For the operator: an `empty_compile`'s strategy, budget figures and what to change. */
       operatorNote?: string;
-      /** For an `empty_compile`: the tokens the budget leaves for the conversation once the room held back for the reply and any pending tool results is set aside. */
-      emptyCompileUsable?: number;
     })
   | (TraceEventBase & {
       /**

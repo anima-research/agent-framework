@@ -6,8 +6,7 @@ import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
 import { managerSees } from './context-options.js';
-import { EmptyCompileError, type NewestRow } from './empty-compile.js';
-import { rowNamed } from './author-presentation.js';
+import { EmptyCompileError } from './empty-compile.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
@@ -748,33 +747,9 @@ export class Agent {
       return source?.kind !== 'raw' || source.bodies.length === 0 || !source.bodies.every((b) => notConversation(metadataOf(b.messageId)));
     };
     if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
-    const newest = this.newestConversationRow(rows);
-    if (!newest) return;
-    const held = new Set(compiled.provenance?.messages.flatMap((source) => source?.kind === 'raw' ? source.bodies.map((b) => b.messageId) : []) ?? []);
-    const blocking = this.newestLeftOut(rows, held) ?? newest;
-    const mark = storedInjectionMarkOf(blocking.metadata);
-    const named: NewestRow = mark ? { injection: mark.namespace, rowId: blocking.id }
-      : notConversation(blocking.metadata) ? { notice: true, rowId: blocking.id }
-      : { ...rowNamed(blocking, this.name), rowId: blocking.id };
+    if (!rows.some((row) => hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata))) return;
     const at = compiledAt ?? DEFAULT_COMPILE_BUDGET;
-    const strategy = cm.getStrategy?.().name;
-    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, named, strategy);
-  }
-
-  private newestLeftOut(rows: readonly StoredMessage[], held: ReadonlySet<MessageId>): StoredMessage | undefined {
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const row = rows[i]!;
-      if (!held.has(row.id) && hasRenderedContent(row.content) && managerSees(this.contextManager, row.metadata)) return row;
-    }
-    return undefined;
-  }
-
-  private newestConversationRow(rows: readonly StoredMessage[]): StoredMessage | undefined {
-    for (let i = rows.length - 1; i >= 0; i--) {
-      const row = rows[i]!;
-      if (hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata)) return row;
-    }
-    return undefined;
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, cm.getStrategy?.().name);
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
