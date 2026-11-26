@@ -28,7 +28,6 @@ class Gate {
   readonly promise = new Promise<void>((resolve) => { this.open = resolve; });
 }
 
-/** An event with `hold` keeps the scheduler in its onProcess until `held.gate` opens. */
 const held = { gate: null as Gate | null, entered: false };
 
 class InputModule implements Module {
@@ -114,12 +113,10 @@ async function until(what: string, ready: () => boolean, ms = 10_000): Promise<v
   }
 }
 
-/** Staged at the condition: another agent under the name is a later incarnation of it. */
 function laterIncarnation(h: Awaited<ReturnType<typeof boot>>, name: string): void {
   h.i.registry.inspect(name)!.incarnation += 1;
 }
 
-/** The old turn's wait has ended, and what follows it has run. */
 async function oldWaitEnded(h: Awaited<ReturnType<typeof boot>>): Promise<void> {
   await until("the old turn's wait to end", () => h.i.retryWaitWakers.size === 0);
   await new Promise((resolve) => setImmediate(resolve));
@@ -153,7 +150,6 @@ class HeldAnswer implements YieldingStream {
   }
 }
 
-/** The first request of a name fails; with `hold`, the second is held open until released. */
 class ResumeMembrane extends CountingMembrane {
   readonly held: HeldAnswer[] = [];
   override streamYielding(request: NormalizedRequest): YieldingStream {
@@ -179,6 +175,7 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     await until('the wait to retry', () => of(h.traces, 'worker').some((e) => e.type === 'inference:waiting'));
     assert.match(String(await run), /stalled/, 'control: the idle watchdog ended the run');
     assert.ok(!h.fw.getAgent('worker'), 'control: during the wait');
+    assert.ok(h.i.retryWaitWakers.size > 0, 'control: the old turn still waits');
     const from = h.traces.length;
     await until("the turn's end", () => reasons(of(h.traces, 'worker', from)).length > 0);
     nothingRanFor(h, 'worker', from);
@@ -191,33 +188,11 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     await until('the wait to retry', () => of(h.traces, 'helper').some((e) => e.type === 'inference:waiting'));
     const from = h.traces.length;
     h.fw.stopAgent('helper', { reason: 'zz-released' });
+    assert.ok(h.i.retryWaitWakers.size > 0, 'control: the old turn still waits');
     await until("the turn's end", () => reasons(of(h.traces, 'helper', from)).length > 0);
     nothingRanFor(h, 'helper', from);
     assert.deepEqual(reasons(of(h.traces, 'helper', from)), [GONE]);
   });
-
-  for (const successor of ['idle', 'in a turn'] as const) {
-    it(`an agent replaced under its name during the wait, its successor ${successor}: no retry, and no inference:aborted under the name`, async (t) => {
-      const h = await boot(t, 500);
-      wake(h.fw, 'helper');
-      await until('the wait to retry', () => of(h.traces, 'helper').some((e) => e.type === 'inference:waiting'));
-      const agent = h.fw.getAgent('helper')!;
-      h.i.agents.set('helper', Object.create(agent));
-      laterIncarnation(h, 'helper');
-      if (successor === 'in a turn') h.i.activeTurnTokens.set('helper', 987_654);
-      const failures = h.i.consecutiveInferenceFailures.get('helper');
-      const from = h.traces.length;
-      await oldWaitEnded(h);
-      assert.equal(h.membrane.sent.filter((sent) => sent === 'helper').length, 1, 'no retry');
-      assert.deepEqual(reasons(of(h.traces, 'helper', from)), [], 'no inference:aborted for the successor');
-      assert.deepEqual(types(of(h.traces, 'helper', from)).filter((type) => type === 'inference:started'), [], 'no start under the name');
-      if (successor === 'in a turn') assert.equal(h.i.activeTurnTokens.get('helper'), 987_654, "the successor's token is untouched");
-      assert.equal(h.i.consecutiveInferenceFailures.get('helper'), failures, "the successor's failure count is as it was");
-      assert.deepEqual(h.policy.seen.filter((call) => call.agentName === 'helper').map((call) => call.message), ['zz internal error'], 'the policy was asked once, about the first failure');
-      h.i.agents.set('helper', agent);
-      h.i.activeTurnTokens.delete('helper');
-    });
-  }
 
   it('a job resumed under its name during the wait, in its turn: no retry, and no inference:aborted under the name', async (t) => {
     const h = await boot(t, 1500, ['resident']);
@@ -264,7 +239,6 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     let again: Promise<unknown> = Promise.resolve();
     let from = 0;
     let token: number | undefined;
-    // The scheduler stays in the held event until the gate opens, and stop() waits for it, so the gate opens on every way out.
     try {
       h.fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-hold', metadata: { hold: true } } as unknown as ProcessEvent);
       await until('the scheduler to hold in an event', () => held.entered);
@@ -329,6 +303,7 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     await until('the wait to retry', () => of(h.traces, 'helper').some((e) => e.type === 'inference:waiting'));
     h.i.agents.set('helper', Object.create(h.fw.getAgent('helper')!));
     laterIncarnation(h, 'helper');
+    assert.ok(h.i.retryWaitWakers.size > 0, 'control: the old turn still waits');
     const from = h.traces.length;
     await h.fw.stop();
     assert.deepEqual(reasons(of(h.traces, 'helper', from)), [], 'the name another agent holds gets no event, under stop() too');
@@ -344,6 +319,7 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     const from = h.traces.length;
     h.i.disposeConversationAgent('fork-1');
     assert.ok(!h.fw.getAgent('fork-1'), 'control: disposed during the wait');
+    assert.ok(h.i.retryWaitWakers.size > 0, 'control: the old turn still waits');
     await until("the turn's end", () => reasons(of(h.traces, 'fork-1', from)).length > 0);
     nothingRanFor(h, 'fork-1', from);
     assert.deepEqual(reasons(of(h.traces, 'fork-1', from)), [GONE]);

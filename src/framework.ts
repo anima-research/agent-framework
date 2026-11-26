@@ -1979,8 +1979,8 @@ const LIVE_SPEECH_UNRECEIPTED = `Plain speech its rounds routed live was handed 
 const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stopping is dropped before it sends anything';
 
 /** The reason on the inference:aborted that ends a turn whose agent was
- *  removed while it waited to retry, and whose name no later incarnation has
- *  taken since: driveStream's frame, and beginAgentTurn's for a failed start. */
+ *  replaced or removed while it waited to retry, when no later incarnation
+ *  has taken the name since. */
 const RETRY_AGENT_GONE = 'a retry waiting while the agent was replaced or removed is dropped before it sends anything';
 
 /** The reason on the inference:aborted that ends a turn whose continuation
@@ -29447,8 +29447,6 @@ export class AgentFramework {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
-    // The name's incarnation when this frame began: a later one under the name
-    // is someone else's, whose bracket a late event of this frame would end.
     const myIncarnation = this.registry.ref(agent.name).incarnation;
     // Membrane's usage events are cumulative across the stream's tool loop,
     // so the latest is everything the stream has been billed for so far:
@@ -31469,9 +31467,7 @@ export class AgentFramework {
               await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: policyAttempt + 2, action });
               if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
               // stop() ending the wait cancels the retry (this frame's finally
-              // clears the token); it is never permission to retry at once. So
-              // does the agent's removal or replacement: nothing is sent under
-              // a name the agent no longer holds.
+              // clears the token); it is never permission to retry at once.
               const gone = this.agents.get(agent.name) !== agent;
               if (!this.providerAdmissionClosed && !gone) {
                 const stop = agent.streamId === myStreamId ? this.takeStartStop(agent, retryWindow) : undefined;
@@ -31499,10 +31495,7 @@ export class AgentFramework {
                 // says why none does, as beginAgentTurn's cancelled retry
                 // gives. The finally ends its gate entry and its record. As
                 // in abortDroppedTurn, nothing when another turn of this name
-                // holds the token, whose bracket the event would end, and
-                // nothing when a later incarnation has taken the name since
-                // this frame began, registered now or ended already: a host
-                // keyed by name would read the event as that agent's.
+                // holds the token, whose bracket the event would end.
                 const owner = this.activeTurnTokens.get(agent.name);
                 const taken = this.registry.ref(agent.name).incarnation !== myIncarnation;
                 if (!taken && (owner === undefined || owner === myTurnToken)) {
