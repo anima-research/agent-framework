@@ -300,7 +300,7 @@ export const ERROR_MARK = ', error';
 
 interface IndexPart {
   text: string;
-  send?: { tool: string; args: Record<string, unknown> };
+  send?: { name: string; args: Record<string, unknown> };
 }
 
 /** Keep attribution with the same parts used to build the embedded text. */
@@ -318,7 +318,7 @@ function messageIndexParts(msg: StoredMessage, includePrivateTools: boolean, fai
       const said = speechOf(block.name, block.input);
       if (said) parts.push({
         text: `[${said.tool}${failed?.has(block.id) ? ERROR_MARK : ''}] ${said.words}`,
-        send: { tool: said.tool, args: block.input as Record<string, unknown> },
+        send: { name: block.name, args: block.input as Record<string, unknown> },
       });
     }
   }
@@ -326,12 +326,12 @@ function messageIndexParts(msg: StoredMessage, includePrivateTools: boolean, fai
 }
 
 function joinIndexParts(parts: IndexPart[]): string {
-  return parts.map((part) => part.text).join('\n').trim();
+  return parts.map((part) => part.text).join('\n');
 }
 
 /** Text to embed for one message, or '' when there is nothing worth indexing. */
 export function messageIndexText(msg: StoredMessage, includePrivateTools = true, failed?: ReadonlySet<string>): string {
-  return joinIndexParts(messageIndexParts(msg, includePrivateTools, failed));
+  return joinIndexParts(messageIndexParts(msg, includePrivateTools, failed)).trim();
 }
 
 function isCanonicalPublishChannel(id: unknown): id is string {
@@ -350,11 +350,16 @@ function isCanonicalPublishChannel(id: unknown): id is string {
   });
 }
 
-function sendChannel(tool: string, args: Record<string, unknown>): string | null {
+function sendChannel(name: string, args: Record<string, unknown>): string | null {
   const { to, type, channelId } = args;
-  if (tool === 'channel_publish') {
+  if (name === 'channel_publish') {
     return isCanonicalPublishChannel(channelId) ? channelId : null;
   }
+  // Stored calls carry either an explicit tool prefix or the default
+  // mcpl--<serverId> prefix. Don't infer the connector from bare tool names,
+  // argument shapes, or an unrecognized prefix.
+  const tool = /^(?:mcpl--)?zulip--(send_message|send_dm)$/.exec(name)?.[1];
+  if (!tool) return null;
   // Replies resolve by message id, regardless of other routing arguments.
   if (tool === 'send_message' && args.reply_to != null) return null;
   if (tool === 'send_message' && type === 'stream') {
@@ -373,19 +378,25 @@ function sendChannel(tool: string, args: Record<string, unknown>): string | null
   return null;
 }
 
-function channelOf(msg: StoredMessage, parts: IndexPart[]): string | null {
+function channelOf(msg: StoredMessage, parts: IndexPart[], indexedEnd: number): string | null {
   // Same metadata precedence as HistoryModule's getChannelId.
   const md = msg.metadata as { channelId?: unknown; external?: { channelId?: unknown } } | undefined;
   if (typeof md?.channelId === 'string') return md.channelId;
   if (typeof md?.external?.channelId === 'string') return md.external.channelId;
 
-  // Unlike the old mixed-prose rule, ordinary text and private-prose tools
-  // do not prevent tagging. The tag names the turn's single send destination
-  // as a denylist filtering hint, not as proof its prose was delivered there.
+  // Infer a channel only when all indexed prose comes from sends to the
+  // same known destination. Whitespace and parts beyond the cap don't count.
   let channel: string | null = null;
-  for (const { send } of parts) {
-    if (!send) continue;
-    const dest = sendChannel(send.tool, send.args);
+  let offset = 0;
+  for (const { text, send } of parts) {
+    const remaining = indexedEnd - offset;
+    if (remaining <= 0) break;
+    offset += text.length + 1; // part plus the joining newline
+    if (!send) {
+      if (text.slice(0, remaining).trim()) return null;
+      continue;
+    }
+    const dest = sendChannel(send.name, send.args);
     if (dest === null || (channel !== null && channel !== dest)) return null;
     channel = dest;
   }
@@ -404,14 +415,18 @@ export function messageToItem(msg: StoredMessage, cfg: { includePrivateTools?: b
   // would come back to a search as history.
   if (storedInjectionMarkOf(msg.metadata)) return null;
   const parts = messageIndexParts(msg, cfg.includePrivateTools ?? true);
-  const text = joinIndexParts(parts);
+  const joined = joinIndexParts(parts);
+  const leftTrimmed = joined.trimStart();
+  const text = safeSlice(leftTrimmed.trimEnd(), 0, cfg.maxChars ?? 32_000);
   if (!text) return null;
+  // Map the actual UTF-16-safe slice end back into the untrimmed parts.
+  const indexedEnd = joined.length - leftTrimmed.length + text.length;
   const tsMs = msg.timestamp.getTime();
   return {
     id: `msg:${String(msg.id)}`,
-    text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
+    text,
     ts: tsMs / 1000,
-    channel: channelOf(msg, parts),
+    channel: channelOf(msg, parts, indexedEnd),
     kind: 'message',
     cursor: tsMs,
     meta: { participant: msg.participant, author: authorOf(msg), seq: msg.sequence },
