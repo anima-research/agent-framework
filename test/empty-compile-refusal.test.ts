@@ -407,7 +407,7 @@ for (const [form, strategy, budget, participant, content, reason] of [
       assert.equal(h.notices()[0], `[inference-failed] Your previous turn wasn't sent: ${reason}`);
       if (strategy) {
         const note = h.exhausted()[0]!.operatorNote!;
-        assert.ok(note.endsWith(': raise contextBudgetTokens, or check the strategy\'s selection.') && !note.includes('stay out'), note);
+        assert.ok(note.endsWith(' Raise contextBudgetTokens, or check the strategy\'s selection.') && !note.includes('stay out'), note);
       }
     } finally { await h.close(); }
   });
@@ -795,6 +795,29 @@ test('a framework notice after an oversized message isn\'t conversation: a compi
       assert.ok(preview.includes('[routing] zz-routing') && preview.includes('[clock] zz-clock') && !preview.some((t) => t.startsWith('zz-long')), JSON.stringify(preview));
       await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
         assert.ok(err instanceof EmptyCompileError, String(err));
+        return true;
+      });
+    } finally { await cm.close(); }
+  } finally { await h.close(); }
+});
+
+test('when a stored injection newer than a small message is what didn\'t fit, the notice names the injection, not the message\'s sender', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
+    try {
+      const mark = { agent: 'zz-host', namespace: 'lessons', contentHash: 'zz-h', part: 0, parts: 1 };
+      const short = cm.addMessage('user', [{ type: 'text', text: 'zz-short hello' }], { author: { name: 'Alice' }, serverId: 'discord', channelId: 'general' } as never);
+      const big = cm.addMessage('system_context:lessons', [{ type: 'text', text: LONG }], { system: true, kind: 'context-injection', contextInjection: mark } as never);
+      cm.presentRows([short, big]);
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
+        assert.ok(err instanceof EmptyCompileError, String(err));
+        assert.ok(err.residentNote.includes('The newest row in your context is a context injection from lessons.'), err.residentNote);
+        assert.ok(!err.residentNote.includes('Alice') && !err.residentNote.includes('smaller parts'), err.residentNote);
+        assert.ok(err.operatorNote.includes(`The newest row it left out is a context injection from lessons (row ${big}).`), err.operatorNote);
+        assert.ok(!err.operatorNote.includes('Alice') && !err.operatorNote.includes('general'), err.operatorNote);
         return true;
       });
     } finally { await cm.close(); }
