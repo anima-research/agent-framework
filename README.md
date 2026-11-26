@@ -973,7 +973,7 @@ Each cut of a turn's call is traced as `inference:failed`, with its reason as `e
 framework.abortInference('assistant', 'user requested stop');
 ```
 
-A stop that cancels a live stream writes `[turn] NAME: a stop cancelled the turn's stream after 12 s; the turn ends there (reason=REASON)` on stderr, the time being the stream's. The reason is cut and escaped there, as one field, and it isn't redacted. It names what the stop reported, not who made it. This line names the agent in the `[turn] NAME:` form, and the `[inference-timeout]` and `[inference-failed]` lines in the `agent=NAME` form, so a search for one agent's lines takes both.
+A caller's stop that cancels a live stream writes `[turn] NAME: a stop cancelled the turn's stream after 12 s; the turn ends there (reason=REASON)` on stderr, the time being the stream's. The reason is cut and escaped there, as one field, and it isn't redacted. It names what the stop reported, not who made it. This line names the agent in the `[turn] NAME:` form, and the `[inference-timeout]` and `[inference-failed]` lines in the `agent=NAME` form, so a search for one agent's lines takes both.
 
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
