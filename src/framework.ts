@@ -3233,7 +3233,7 @@ function describeWait(ms: number): string {
 function deadlineRetryLine(agentName: string, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
   const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
   const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
-  return `[inference-timeout] agent=${agentName} retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/\s+/g, ' ').trim())}`;
+  return `[inference-timeout] agent=${agentName} retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/[\s\u0085]+/g, ' ').trim())}`;
 }
 interface BudgetHoldBaseline {
   progress: string | undefined;
@@ -9174,7 +9174,7 @@ export class AgentFramework {
       reason,
       durationMs,
     });
-    if (before === undefined) console.error(`[turn] ${agent.name}: a stop cancelled the turn mid-stream after ${describeWait(durationMs)}; it ends there (reason=${logValue(reason)})`);
+    if (before === undefined) console.error(`[turn] ${agent.name}: a stop cancelled the turn's stream after ${describeWait(durationMs)}; the turn ends there (reason=${logValue(reason)})`);
     // Agent-facing marker in the same system envelope as the failure marker
     // so surfaces render it the same way. The text names the act and not an
     // actor (the wire reason names the call, not who made it). Of delivery
