@@ -44,7 +44,9 @@ const meta = (author: string, where: Where = {}) => ({
   serverId: where.serverId ?? SERVER,
 });
 
-function world(opts: { subconscious?: boolean } = {}) {
+function world(opts: { subconscious?: boolean; branches?: boolean } = {}) {
+  let branch = 'main';
+  const origins = new Map<string, { parent: string; branchPoint: number }>();
   const stored: StoredMessage[] = [];
   /** The held messages a surgery's hold keeps in memory, not stored yet (getSurgeryHeldMessages). */
   const kept: Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>> = [];
@@ -63,6 +65,10 @@ function world(opts: { subconscious?: boolean } = {}) {
     quotedShown: (ref: { channelId: string }) => JSON.stringify(ref.channelId),
     listChannelsRaw: () => [NOISY, OTHER, 'disc:guild:work'].map((id) => ({ serverId: SERVER, descriptor: { id } })),
     getTuneOutState: (serverId: string, channelId: string) => active.get(`${serverId}\0${channelId}`) ?? null,
+    tuneOutsOnRecord: () => [...active].map(([key, { params }]) => {
+      const at = key.indexOf('\0');
+      return { serverId: key.slice(0, at), channelId: key.slice(at + 1), params, source: 'agent-tool' };
+    }),
     cancelTuneOut: (serverId: string, channelId: string) => {
       const key = `${serverId}\0${channelId}`;
       const ended = active.get(key) ?? null;
@@ -94,10 +100,13 @@ function world(opts: { subconscious?: boolean } = {}) {
     isPrivilegedAuthor: () => false,
     allowChannelSpeech: () => false,
     emitTrace: () => {},
+    ...(opts.branches ? { currentBranch: () => branch, branchOrigin: (name: string) => origins.get(name) } : {}),
   } as unknown as TuneOutFrameworkHooks;
   type Internals = {
     invokeSubconscious(serverId: string, channelId: string, trigger: 'cadence' | 'wake', count: number): void;
     startCadence(serverId: string, channelId: string, cadenceSeconds: number): void;
+    divertedSinceInvocation: Map<string, number>;
+    cadenceTimers: Map<string, unknown>;
   };
   let coordinator = new TuneOutCoordinator(registry, servers, hooks);
   let internals = coordinator as unknown as Internals;
@@ -141,6 +150,7 @@ function world(opts: { subconscious?: boolean } = {}) {
     keep(author: string, body: string, where: Where = {}): void {
       kept.push({ participant: 'user', content: [text(body)], metadata: meta(author, where) } as Pick<StoredMessage, 'participant' | 'content' | 'metadata'>);
     },
+    dropStored(): void { stored.splice(0); },
     /** The hold's release: what it kept is stored, in arrival order. */
     releaseHold(): void {
       for (const write of kept.splice(0)) {
@@ -148,6 +158,15 @@ function world(opts: { subconscious?: boolean } = {}) {
       }
     },
     wake: (serverId = SERVER, channelId = NOISY) => internals.invokeSubconscious(serverId, channelId, 'wake', 1),
+    moveTo(name: string, origin?: { parent: string; branchPoint: number }, unread = false, holdsThere?: () => void): void {
+      const before = coordinator.heldEpochs();
+      branch = name;
+      if (origin) origins.set(name, origin);
+      holdsThere?.();
+      coordinator.branchMoved(false, unread ? undefined : before);
+    },
+    endHolds(): void { active.clear(); },
+    followed: () => coordinator.branchFollowed(),
     startCadence: (seconds: number) => internals.startCadence(SERVER, NOISY, seconds),
   };
 }
@@ -155,6 +174,137 @@ function world(opts: { subconscious?: boolean } = {}) {
 const bodies = (invocation: ReaderInvocation) => invocation.backlog.map((m) => textOf(m.content));
 
 describe('reader forks and the messages a tune-out holds', () => {
+  it("after a branch move, a reader fork is handed only what no fork was handed there: a branch made past the hand-off keeps it, and one with no such origin is handed it all again (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    w.store('ann', 'S-1');
+    w.store('bo', 'S-2');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[0]!), ['S-1', 'S-2'], 'premise: both handed');
+    w.moveTo('fork', { parent: 'main', branchPoint: 2 });
+    w.followed();
+    w.store('cy', 'S-3');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), ['S-3'], 'S-1 and S-2 are not handed again on a branch made past them');
+    w.moveTo('elsewhere');
+    w.followed();
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[2]!), ['S-1', 'S-2', 'S-3'], 'on a branch not made from that one, all are handed again');
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("after a move to a branch made before a hold's held rows, its count is made again from the rows there, none (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.store('ann', 'S-1');
+    w.store('bo', 'S-2');
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    const count = () => w.internals.divertedSinceInvocation.get(JSON.stringify([SERVER, NOISY]));
+    assert.equal(count(), 2, 'premise: both counted at the start');
+    w.moveTo('early', { parent: 'main', branchPoint: 0 });
+    w.dropStored();
+    w.followed();
+    assert.equal(count(), 0);
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("after a move whose channel decisions couldn't be read, a later move that reads them drops what the holds kept, though the store is on the same branch (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    const cadence = () => w.internals.cadenceTimers.has(JSON.stringify([SERVER, NOISY]));
+    assert.ok(cadence(), 'premise: the hold has its cadence');
+    w.moveTo('clean', undefined, true);
+    assert.ok(cadence(), 'premise: kept, as the channel decisions were');
+    const before = w.coordinator.heldEpochs();
+    w.endHolds();
+    w.coordinator.branchMoved(false, before);
+    w.followed();
+    assert.equal(cadence(), false, "the branch left's hold stops");
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("at a branch move, the count of a hold that the branch moved to doesn't hold goes at once, before the agents follow, since the all-except hold's cadence reads every count (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.store('ann', 'S-1');
+    w.store('bo', 'S-2');
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    const count = () => w.internals.divertedSinceInvocation.get(JSON.stringify([SERVER, NOISY]));
+    assert.equal(count(), 2, 'premise: both counted at the start');
+    w.moveTo('elsewhere', undefined, false, () => w.endHolds());
+    assert.equal(count(), undefined);
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("a move back to the branch the coordinator is on keeps what reader forks were handed (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    w.store('ann', 'S-1');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[0]!), ['S-1'], 'premise: handed');
+    w.moveTo('main');
+    w.followed();
+    w.store('bo', 'S-2');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), ['S-2'], 'S-1 is not handed again');
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("after a branch move, a hold on a channel no server has registered is counted from its held rows, as at a start (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    const gone = { channelId: 'disc:guild:gone' };
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    w.store('ann', 'G-1', gone);
+    w.store('bo', 'G-2', gone);
+    const count = () => w.internals.divertedSinceInvocation.get(JSON.stringify([SERVER, gone.channelId]));
+    w.moveTo('elsewhere');
+    w.tuneOut(200, gone);
+    assert.equal(count(), undefined, 'premise: nothing counted for it yet');
+    w.followed();
+    assert.equal(count(), 2, 'counted from its held rows');
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("after a branch move, a hold's count of what its reader hasn't been handed stands until the agents follow, then is made again from its held rows and those a surgery's hold keeps in memory (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.store('ann', 'S-1');
+    w.store('bo', 'S-2');
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    const count = () => w.internals.divertedSinceInvocation.get(JSON.stringify([SERVER, NOISY]));
+    assert.equal(count(), 2, 'premise: both counted at the start');
+    w.moveTo('fork', { parent: 'main', branchPoint: 2 });
+    assert.equal(count(), 2, 'a cadence period meanwhile still sees them');
+    w.keep('cy', 'K-1 arrived during the move');
+    w.followed();
+    assert.equal(count(), 3, 'the two held rows, and the one kept in memory');
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
   it("a wake while the resident's turn runs hands the reader what was held, stored as it arrived, the one that woke it included", () => {
     const w = world();
     w.tuneOut();

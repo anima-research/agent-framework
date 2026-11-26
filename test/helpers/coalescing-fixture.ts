@@ -41,6 +41,9 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   const hostCaps: Array<Record<string, unknown>> = [];
   const published: Array<Record<string, unknown>> = [];
   const acknowledged: Array<Record<string, unknown>> = [];
+  const requests: string[] = [];
+  const heldMethods = new Set<string>();
+  const heldReplies: Array<(fail: boolean) => void> = [];
   let renderer: (params: Record<string, unknown>) => Promise<unknown> = async () => ({ content: [{ type: 'text', text: 'document_diff' }] });
   wss.on('connection', (ws) => {
     if (!online) { ws.close(); return; }
@@ -48,7 +51,14 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     ws.on('message', async (bytes) => {
       const m = JSON.parse(String(bytes));
       if (!m.method) { replies.get(m.id)?.(m); replies.delete(m.id); return; }
-      const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
+      const answer = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }));
+      const reply = (result: unknown) => {
+        if (!heldMethods.has(m.method)) answer(result);
+        else heldReplies.push((fail) => fail
+          ? ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32603, message: 'the server failed to answer' } }))
+          : answer(result));
+      };
+      requests.push(m.method);
       if (m.method === 'initialize') {
         hostCaps.push(m.params.capabilities.experimental.mcpl);
         reply({ protocolVersion: '2024-11-05', capabilities: { tools: {}, experimental: { mcpl: {
@@ -97,7 +107,9 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   });
   await create();
   return {
-    get framework() { return framework; }, membrane, renders, hostCaps, published, acknowledged, create, send, dir,
+    get framework() { return framework; }, membrane, renders, hostCaps, published, acknowledged, requests, create, send, dir,
+    holdReplies(method: string) { heldMethods.add(method); },
+    releaseReplies(options: { fail?: boolean } = {}) { heldMethods.clear(); for (const answer of heldReplies.splice(0)) answer(options.fail === true); },
     port: (wss.address() as AddressInfo).port,
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
