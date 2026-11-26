@@ -6310,6 +6310,7 @@ export class AgentFramework {
           at: new Date().toISOString(),
           gate,
           activeStreams: [...this.activeStreams.keys()],
+          startRetries: [...(this.activeStartRetries?.values() ?? [])],
           pendingRequests: this.pendingRequests.length,
           agents: [...this.agents.keys()],
         }),
@@ -6394,7 +6395,7 @@ export class AgentFramework {
    * A timed-out wait lets teardown go on while what it waited for may still
    * act on what is being torn down.
    * @param teardownTimeoutMs Optional budget for each of stop()'s waits, in
-   * turn: on the streams it cancels, on maintenance in flight (a pass or an
+   * turn: on the streams it cancels and each failed start's retry under way, on maintenance in flight (a pass or an
    * over-budget drain kick), on the event loop, on an operator's operations
    * already running, on modules and MCPL (its servers and the inference
    * requests they made) together, where a module whose start() is still
