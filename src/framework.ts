@@ -4644,6 +4644,7 @@ export class AgentFramework {
   private retryWaitWakers = new Set<() => void>();
   private activeStartRetries = new Map<Promise<void>, string>();
   private startRetryErrors: Array<{ error: unknown }> = [];
+  private stopReadStartRetryErrors = false;
   /** Each agent's error-policy retry wait in progress, for healthSnapshot():
    *  while it lasts the agent's state reads `idle` though its turn is alive.
    *  Keyed by the Agent, not its name: an agent registered under a removed
@@ -6732,6 +6733,7 @@ export class AgentFramework {
     leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
     await waitFor(waited, 'stream');
     for (const { error } of this.startRetryErrors.splice(0)) console.error('Error in event loop:', error);
+    this.stopReadStartRetryErrors = true;
     await waitFor(scriptsStopped ? [{ label: 'code_execution scripts', promise: scriptsStopped }] : []);
 
     // Stop sync timer
@@ -23740,7 +23742,7 @@ export class AgentFramework {
       // it takes its token it stands for them all.
       if (requests.length > 1 && requests.some((r) => !continuesTurn(r))) start[MERGED_BATCH] = [...requests];
       else delete start[MERGED_BATCH];
-      await this.startAgentStream(agent, start);
+      await this.startAgentStream(agent, start, 0, false, true);
     }
   }
 
@@ -27972,6 +27974,7 @@ export class AgentFramework {
     trigger?: InferenceRequest,
     attempt = 0,
     providerGateAlreadyHeld = false,
+    awaitedByScheduler = false,
   ): Promise<void> {
     if (attempt === 0) this.deadlineCuts.delete(agent.name);
     const ownsProviderGate = this.registry.ownsProviderScheduling(agent.name);
@@ -28125,7 +28128,7 @@ export class AgentFramework {
     this.checkAhead.set(agent, checkWindow);
     let tokenHandedOff = false;
     try {
-      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
+      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow, awaitedByScheduler);
     } catch (error) {
       this.endThrownStart(agent, trigger, turnToken, error);
       throw error;
@@ -28159,6 +28162,11 @@ export class AgentFramework {
    * run fails with the error rather than waiting out its watchdog. A silent
    * start has no part in an open turn.
    */
+  private keepStartRetryError(error: unknown): void {
+    if (this.stopReadStartRetryErrors) console.error('Error in event loop:', error);
+    else this.startRetryErrors.push({ error });
+  }
+
   private endThrownStart(agent: Agent, trigger: InferenceRequest | undefined, turnToken: number, error: unknown): void {
     this.failedLastTurnAt.set(agent, Date.now());
     if (this.agents.get(agent.name) === agent) {
@@ -28264,7 +28272,8 @@ export class AgentFramework {
     } else {
       const owner = this.activeTurnTokens.get(agentName);
       this.abortDroppedTurn(agentName, owner ?? -1,
-        drop.kind === 'dropped' ? (drop.reason ?? CONTINUATION_DROPPED) : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
+        drop.kind === 'dropped' ? (drop.reason ?? CONTINUATION_DROPPED) : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt,
+        this.registry.ref(agentName).incarnation);
       this.channelRegistry?.stopTyping();
       if (agent) {
         agent.toolResultGuard.recovering = false;
@@ -28298,11 +28307,11 @@ export class AgentFramework {
    * [speech-not-posted] notice, for speech the turn's rounds left unposted.
    * True when it ended the turn.
    */
-  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number, routing: TurnRouting): boolean {
+  private endFailureAtStop(agentName: string, turnToken: number, startedAt: number, routing: TurnRouting, incarnation: number): boolean {
     if (!this.providerAdmissionClosed) return false;
     const ending = this.agents?.get(agentName);
     if (ending) this.nameUnpostedSpeech(ending, routing);
-    this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt);
+    this.abortDroppedTurn(agentName, turnToken, RETRY_CANCELLED_BY_STOP, startedAt, incarnation);
     return true;
   }
 
@@ -28314,9 +28323,9 @@ export class AgentFramework {
    * find the held retry (abortInference's drop), not a window nothing will
    * collect.
    */
-  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number, routing: TurnRouting): void {
+  private endHeldStart(agent: Agent, checkWindow: CheckWindow, turnToken: number, startedAt: number, routing: TurnRouting, incarnation: number): void {
     if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-    this.endFailureAtStop(agent.name, turnToken, startedAt, routing);
+    this.endFailureAtStop(agent.name, turnToken, startedAt, routing, incarnation);
     this.eventGate?.onInferenceEnded(agent.name);
   }
 
@@ -28327,12 +28336,15 @@ export class AgentFramework {
    * gets inference:aborted with `reason`, and lastInference records its end
    * as driveStream's would, when the record is still this turn's. Nothing of
    * the kind when another turn of this agent's name holds the turn token (one
-   * begun by a replacement agent object): the event and the record carry only
-   * the name, so this frame's would end that newer turn instead.
+   * begun by a replacement agent object), or when a later incarnation than
+   * `incarnation`, the name's as the turn started, has taken the name since:
+   * the event and the record carry only the name, so this frame's would end
+   * that newer turn instead.
    */
-  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number): void {
+  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number, incarnation: number): void {
     const owner = this.activeTurnTokens.get(agentName);
     if (owner !== undefined && owner !== turnToken) return;
+    if (this.registry.ref(agentName).incarnation !== incarnation) return;
     const now = Date.now();
     // Only this turn's own record ends: a name whose run was disposed meanwhile
     // (runEphemeralToCompletion deletes its record) gets none back.
@@ -28520,10 +28532,9 @@ export class AgentFramework {
     /** This start's window (checkAhead), which its checks read for an
      *  operator's abandon. */
     checkWindow: CheckWindow,
+    awaitedByScheduler: boolean,
   ): Promise<boolean> {
     if (attempt === 0 && this.budgetWaitEnded(agent, trigger)) return false;
-    // The name's incarnation as the turn starts: a later one under the name
-    // is someone else's, whose bracket a late event of this turn would end.
     const myIncarnation = this.registry.ref(agent.name).incarnation;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
@@ -29030,10 +29041,8 @@ export class AgentFramework {
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        // Only this start's own window: a successor holding the token has
-        // its own, which this turn's drop doesn't end.
         if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
-        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
       }
       // A stop made while the hooks ran had no stream to cancel.
@@ -29127,10 +29136,8 @@ export class AgentFramework {
         }
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        // Only this start's own window: a successor holding the token has
-        // its own, which this turn's drop doesn't end.
         if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
-        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
       }
       // A stop made while the compile ran had no stream to cancel. The stream
@@ -29177,7 +29184,7 @@ export class AgentFramework {
               : this.agents.get(agent.name) !== agent ? 'the agent ended as the failure was reported, so nothing is held'
               : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
                 : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
-          this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing);
+          this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing, myIncarnation);
           this.activeStreams.delete(agent.name);
           this.pendingAssistantBlocks.delete(agent.name);
           this.channelRegistry?.stopTyping();
@@ -29231,6 +29238,16 @@ export class AgentFramework {
       // its finally now owns clearing it. The caller's finally must not.
       return true;
     } catch (error) {
+      if (this.agents.get(agent.name) !== agent) {
+        const reason = "a turn whose request couldn't be built while the agent was replaced or removed is dropped before it sends anything";
+        console.error(`[turn] ${agent.name}: ${reason}`);
+        agent.reset();
+        this.endDroppedTurn(agent.name, routing);
+        this.channelRegistry?.stopTyping();
+        if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
+        this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
+        return false;
+      }
       // The early typing indicator has no driveStream `finally` on this path —
       // a hook/compile/stream-setup failure must not leave "typing…" stuck.
       // (Retries below restart it; stopTyping is idempotent.)
@@ -29263,7 +29280,7 @@ export class AgentFramework {
           console.error(`[turn] ${agent.name}: ${reason}`);
           this.endDroppedTurn(agent.name, routing);
           this.eventGate?.onInferenceEnded(agent.name);
-          this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
+          this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
           return false;
         }
         this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn, released);
@@ -29288,14 +29305,14 @@ export class AgentFramework {
         // one later fresh compile; no immediate retry or exhaustion marker.
         // (Once stop() has closed admission, nothing is held, and the turn
         // ends here: endFailureAtStop.)
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing, myIncarnation);
         return false;
       }
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
       if (statedWait === 'held') {
         // A conversation agent held by the provider's stated wait, as a
         // resident is: the hold's release owns the later compile.
-        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing);
+        this.endHeldStart(agent, checkWindow, turnToken, turnStartedAt, routing, myIncarnation);
         return false;
       }
 
@@ -29308,56 +29325,56 @@ export class AgentFramework {
       else this.deadlineCuts.delete(agent.name);
       if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
+        const retryAfterWait = async (window: CheckWindow): Promise<void> => {
+          // A policy's delay can be a provider's retry-after: wait all of it.
+          await this.waitForRetry(action.delayMs, window, agent, { nextTry: policyAttempt + 2, action });
+          if (this.agents.get(agent.name) !== agent) {
+            this.abortDroppedTurn(agent.name, turnToken, this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_AGENT_GONE, turnStartedAt, myIncarnation);
+            return;
+          }
+          if (this.providerAdmissionClosed) {
+            // stop() ended the wait: that cancels the retry, it does not hasten
+            // it, and a stop kept for the turn goes with it. The turn ends as
+            // one dropped before it sends anything does: a terminal event
+            // saying why, after the inference:failed above, and its record's
+            // end. Nothing is written but the [speech-not-posted] notice.
+            this.nameUnpostedSpeech(agent, routing);
+            this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt, myIncarnation);
+            return;
+          }
+          // A stop made during the wait reached no stream: it ends the turn at
+          // this check, before the retry's start, as a stop during the hooks
+          // does at theirs.
+          const stopAfterWait = this.takeStartStop(agent, window);
+          if (stopAfterWait) {
+            this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn, released);
+            return;
+          }
+          // The retry re-enters startAgentStream, which replaces this frame's
+          // turn token with its own; cleanup belongs to the innermost frame.
+          // The retry is its turn's (TURN_RETRY): this frame has begun the turn,
+          // and once the retry's start is held at the last admission boundary
+          // (a conversation agent's own compression can record a wait during
+          // the policy's delay), this frame lets go of its token. No check of
+          // this start is ahead now, so its window closes first: a stop made
+          // once the retry is held finds the held retry (abortInference's
+          // drop), not a window nothing will collect.
+          if (this.checkAhead.get(agent) === window) this.checkAhead.delete(agent);
+          await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
+        };
+        if (!awaitedByScheduler) {
+          await retryAfterWait(checkWindow);
+          return false;
+        }
         const retryWindow: CheckWindow = { abandoned: false };
         this.checkAhead.set(agent, retryWindow);
         let task!: Promise<void>;
         task = (async () => {
-          // A throw from the catch's settlement or from the finally's cleanup
-          // goes where the catch's own does: nothing awaits this task, so a
-          // rejection would have no handler.
           try {
             try {
-              // A policy's delay can be a provider's retry-after: wait all of it.
-              await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: policyAttempt + 2, action });
-              if (this.agents.get(agent.name) !== agent) {
-                // No event where a later incarnation has taken the name since
-                // the turn started, registered now or ended already.
-                if (this.registry.ref(agent.name).incarnation === myIncarnation) {
-                  this.abortDroppedTurn(agent.name, turnToken, this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_AGENT_GONE, turnStartedAt);
-                }
-                return;
-              }
-              if (this.providerAdmissionClosed) {
-                // stop() ended the wait: that cancels the retry, it does not hasten
-                // it, and a stop kept for the turn goes with it. The turn ends as
-                // one dropped before it sends anything does: a terminal event
-                // saying why, after the inference:failed above, and its record's
-                // end. Nothing is written but the [speech-not-posted] notice.
-                this.nameUnpostedSpeech(agent, routing);
-                this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
-                return;
-              }
-              // A stop made during the wait reached no stream: it ends the turn at
-              // this check, before the retry's start, as a stop during the hooks
-              // does at theirs.
-              const stopAfterWait = this.takeStartStop(agent, retryWindow);
-              if (stopAfterWait) {
-                this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn, released);
-                return;
-              }
-              // The retry re-enters startAgentStream, which replaces this frame's
-              // turn token with its own; cleanup belongs to the innermost frame.
-              // The retry is its turn's (TURN_RETRY): this frame has begun the turn,
-              // and once the retry's start is held at the last admission boundary
-              // (a conversation agent's own compression can record a wait during
-              // the policy's delay), this frame lets go of its token. No check of
-              // this start is ahead now, so its window closes first: a stop made
-              // once the retry is held finds the held retry (abortInference's
-              // drop), not a window nothing will collect.
-              if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
-              await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
+              await retryAfterWait(retryWindow);
             } catch (error) {
-              this.startRetryErrors.push({ error });
+              this.keepStartRetryError(error);
               this.endThrownStart(agent, trigger, turnToken, error);
             } finally {
               this.activeStartRetries.delete(task);
@@ -29373,7 +29390,7 @@ export class AgentFramework {
               if (this.agents.get(agent.name) === agent) this.presentAtEndOf(agent);
             }
           } catch (error) {
-            this.startRetryErrors.push({ error });
+            this.keepStartRetryError(error);
           }
         })();
         this.activeStartRetries.set(task, agent.name);
@@ -31437,13 +31454,13 @@ export class AgentFramework {
             // A hold takes the turn's retry, or, once stop() has closed
             // admission, the turn ends here (endFailureAtStop).
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
-              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting, myIncarnation);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
             const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
             if (statedWait === 'held') {
-              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
+              this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting, myIncarnation);
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
@@ -31884,7 +31901,7 @@ export class AgentFramework {
       if (ownsProviderGate && this.holdProviderAcceleration(agent, err, retry)) {
         // Once stop() has closed admission, nothing is held, and the turn
         // ends here (endFailureAtStop).
-        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting, myIncarnation);
         logStream({ success: false,
           ...failedEntry('Provider acceleration cooldown: ', err),
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
@@ -31898,7 +31915,7 @@ export class AgentFramework {
       // says why it ends.
       const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, retry);
       if (statedWait === 'held') {
-        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting);
+        this.endFailureAtStop(agent.name, myTurnToken ?? -1, startTime, streamRouting, myIncarnation);
         logStream({ success: false,
           ...failedEntry('Provider wait: ', err),
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
