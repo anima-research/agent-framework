@@ -55,6 +55,7 @@ import {
   locateMessageIndices,
   removeStoredMessage,
   removeStoredMessages,
+  storedRowsRemovedWith,
   storedIdsBetween,
 } from './stored-removal.js';
 import type {
@@ -26036,7 +26037,7 @@ export class AgentFramework {
     const { mutation } = write;
     const what = `${mutation.kind === 'edit' ? 'an edit' : 'a removal'} of row ${mutation.id}`;
     try {
-      if (!this.storeOrKeepMutation(agent, mutation, () => write, true)) {
+      if (!this.storeOrKeepMutation(agent, mutation, () => ({ ...write, heldAt: Date.now(), heldOrder: ++this.heldWritesKept }), true)) {
         console.error(`[surgery] ${what}, kept in memory, found no such row on the branch the move landed on, so it is skipped`);
       }
     } catch (error) {
@@ -36246,31 +36247,38 @@ export class AgentFramework {
     this.mutateStore(agent, { kind: 'remove', id });
   }
 
-  private mutateStore(agent: Agent, given: HeldMutation['mutation']): void {
-    const cm = agent.getContextManager();
-    if (!cm.getMessage(this.storedIdOf(cm, given.id))) {
-      this.storeMutation(agent, given);
-      return;
-    }
-    const mutation: HeldMutation['mutation'] = given.kind === 'edit' ? { ...given, content: structuredClone(given.content) } : given;
-    const kept = (): HeldMutation => ({ mutation, heldFor: agent, heldAt: Date.now(), heldOrder: ++this.heldWritesKept });
+  private mutateStore(agent: Agent, mutation: HeldMutation['mutation']): void {
+    const kept = (): HeldMutation | undefined => {
+      const cm = agent.getContextManager();
+      if (!cm.getMessage(this.storedIdOf(cm, mutation.id))) return undefined;
+      return {
+        mutation: mutation.kind === 'edit' ? { ...mutation, content: structuredClone(mutation.content) } : mutation,
+        heldFor: agent, heldAt: Date.now(), heldOrder: ++this.heldWritesKept,
+      };
+    };
     if (this.surgeryHold || this.replayingHeld) {
-      this.surgeryHeldWrites.push(kept());
+      const write = kept();
+      if (write) this.surgeryHeldWrites.push(write);
+      else this.storeMutation(agent, mutation);
       return;
     }
     this.storeOrKeepMutation(agent, mutation, kept);
   }
 
-  private storeOrKeepMutation(agent: Agent, mutation: HeldMutation['mutation'], kept: () => HeldMutation, skipAbsent = false): boolean {
+  private storeOrKeepMutation(agent: Agent, mutation: HeldMutation['mutation'], kept: () => HeldMutation | undefined, skipAbsent = false): boolean {
     if (this.waitsForRecovery(agent.name)) {
-      this.keepForRecovery(agent.name, kept());
+      const write = kept();
+      if (!write) return this.storeMutation(agent, mutation, skipAbsent);
+      this.keepForRecovery(agent.name, write);
       return true;
     }
     try {
       return this.storeMutation(agent, mutation, skipAbsent);
     } catch (error) {
       if (!refusesUntilReinitialized(error)) throw error;
-      this.keepForRecovery(agent.name, kept(), error);
+      const write = kept();
+      if (!write) throw error;
+      this.keepForRecovery(agent.name, write, error);
       return true;
     }
   }
@@ -36290,28 +36298,26 @@ export class AgentFramework {
     return !!this.surgeryHold || this.replayingHeld || (agent !== undefined && this.waitsForRecovery(agent.name));
   }
 
-  private heldMutationsFor(agent: Agent): { rows: Map<MessageId, ContentBlock[] | null>; bodies: Set<string> } | undefined {
+  private heldMutationsFor(agent: Agent): Map<MessageId, ContentBlock[] | null> | undefined {
     const mutations = [...(this.surgeryHeldWrites ?? []), ...[...(this.heldForRecovery?.values() ?? [])].flat()]
       .filter((write): write is HeldMutation => 'mutation' in write && write.heldFor === agent)
       .sort((a, b) => a.heldOrder - b.heldOrder);
     if (mutations.length === 0) return undefined;
     const cm = agent.getContextManager();
     const rows = new Map<MessageId, ContentBlock[] | null>();
-    const bodies = new Set<string>();
     for (const { mutation } of mutations) {
       const id = this.storedIdOf(cm, mutation.id);
       if (rows.get(id) === null) continue;
-      rows.set(id, mutation.kind === 'edit' ? mutation.content : null);
-      const body = mutation.kind === 'remove' ? cm.getMessage(id)?.bodyGroupId : undefined;
-      if (body) bodies.add(body);
+      if (mutation.kind === 'edit') rows.set(id, mutation.content);
+      else for (const removed of storedRowsRemovedWith(cm, id)) rows.set(removed, null);
     }
-    return { rows, bodies };
+    return rows;
   }
 
-  private heldView<T extends { id: MessageId; content: ContentBlock[]; bodyGroupId?: string }>(row: T, held: { rows: Map<MessageId, ContentBlock[] | null>; bodies: Set<string> }): T | null {
-    const content = held.rows.get(row.id);
-    if (content === null || (row.bodyGroupId !== undefined && held.bodies.has(row.bodyGroupId))) return null;
-    return content ? { ...row, content } : row;
+  private heldView<T extends { id: MessageId; content: ContentBlock[] }>(row: T, held: Map<MessageId, ContentBlock[] | null>): T | null {
+    const content = held.get(row.id);
+    if (content === null) return null;
+    return content ? { ...row, content: structuredClone(content) } : row;
   }
 
   private getMessage(id: MessageId): ModuleMessage | null {

@@ -258,6 +258,62 @@ describe("a module's edits and removals while the store is held", () => {
     assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
   });
 
+  it("a module's read of a kept edit gives a copy, so a change of what it read doesn't reach the row", async () => {
+    const { inHold, open, rollback } = gatedRollback();
+    await inHold;
+    ctx().editMessage(ids[0]!, text('m1 edited'));
+    (ctx().getMessage(ids[0]!)!.content[0] as { text: string }).text = 'changed by a reader';
+    (ctx().queryMessages({}).messages[0]!.content[0] as { text: string }).text = 'changed by a reader';
+    assert.equal((ctx().getMessage(ids[0]!)!.content[0] as { text: string }).text, 'm1 edited');
+    open();
+    await rollback;
+    assert.deepEqual(texts(), ['m1 edited', 'm2', 'm3']);
+  });
+
+  it("a kept removal of a body hides that body's rows alone, though another body shares its group id", async () => {
+    type ShardStore = { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: string } } };
+    const append = (shard: string, shardIndex: number) =>
+      (cm() as unknown as ShardStore).messageStore.append('user', [{ type: 'text', text: shard }], {}, undefined, { bodyGroupId: 'g', shardIndex }).id as MessageId;
+    const first = [append('a0', 0), append('a1', 1)];
+    cm().addMessage('user', text('between'), {});
+    const second = [append('b0', 0), append('b1', 1)];
+    const counted = ctx().queryMessages({}).totalCount;
+    const { inHold, open, move } = gatedSwitch();
+    await inHold;
+    ctx().removeMessage(first[0]!);
+    for (const shard of first) assert.equal(ctx().getMessage(shard), null);
+    for (const shard of second) assert.notEqual(ctx().getMessage(shard), null, 'the other body shows');
+    assert.equal(ctx().queryMessages({}).totalCount, counted - 2);
+    open();
+    await move;
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'between', 'b0', 'b1']);
+  });
+
+  it("a write and a removal that the release keeps for the agent's recovery reach the store in the order they came", async () => {
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const { inHold, open, move } = gatedSwitch({ fail: true });
+      await inHold;
+      ctx().addMessage('user', text('added during the hold'));
+      ctx().removeMessage(ids[1]!);
+      open();
+      await move;
+    } finally {
+      console.error = quiet;
+    }
+    assert.equal(framework.getHostModeStatus().deferredWrites, 2, 'the release kept both for the recovery');
+    const order: string[] = [];
+    const store = cm() as unknown as { removeMessage: (...args: unknown[]) => unknown };
+    const removeMessage = store.removeMessage;
+    store.removeMessage = (...args: unknown[]) => { order.push('remove'); return removeMessage.apply(cm(), args); };
+    framework.onTrace((event) => { if (event.type === 'message:added' && event.source === 'surgery-release') order.push('write'); });
+    await framework.switchBranch(framework.getStore().currentBranch().name);
+    store.removeMessage = removeMessage;
+    assert.deepEqual(order, ['write', 'remove']);
+    assert.deepEqual(texts(), ['m1', 'm3', 'm4', 'm5', 'added during the hold']);
+  });
+
   it("while the agent's context manager refuses its work, its edits and removals wait in memory, and its recovery applies them", async () => {
     await refuseWork();
     const counted = ctx().queryMessages({}).totalCount;
