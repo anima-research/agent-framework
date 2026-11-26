@@ -161,6 +161,24 @@ export type SelectedForOpening = 'unrecorded' | 'server-bootstrap' | 'subscripti
 
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
+interface DesiredStateEntry {
+  state: DesiredChannelState;
+  source: string;
+  /** Present iff state === 'tuned-out'. */
+  tuneOut?: TuneOutParams;
+  /** Durable wake count for the active tune-out epoch (replayed from
+   *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
+  wakeCount?: number;
+}
+
+interface LabelHistoryMaps {
+  labelHistory: Map<string, string>;
+  allLabelsSeen: Map<string, Set<string>>;
+  dmRecipientIds: Map<string, string>;
+  dmRecipientNames: Map<string, string>;
+  dmClassified: Map<string, true>;
+}
+
 /** The sources of a decision the agent itself made: channel_open and
  *  channel_close, and channel_decline. */
 const AGENT_DECISION_SOURCES: ReadonlySet<string> = new Set(['agent-tool', 'invitation-declined']);
@@ -1396,15 +1414,7 @@ export class ChannelRegistry {
   /** Chronicle-projected desired lifecycle state, keyed by server + channel.
    *  Provenance is kept so reconcile can tell a pure default (nobody ever
    *  decided) from a real decision (agent-tool, invitation-declined, …). */
-  private desiredStates = new Map<string, {
-    state: DesiredChannelState;
-    source: string;
-    /** Present iff state === 'tuned-out'. */
-    tuneOut?: TuneOutParams;
-    /** Durable wake count for the active tune-out epoch (replayed from
-     *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
-    wakeCount?: number;
-  }>();
+  private desiredStates = new Map<string, DesiredStateEntry>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -1753,6 +1763,85 @@ export class ChannelRegistry {
     this.store = options?.store;
     this.initializeLifecycleStore();
     this.initializeLabelHistoryStore();
+  }
+
+  /**
+   * The store moved to another branch (the framework's followBranchMove, for
+   * any move but one to the branch it was on). The desired lifecycle states
+   * and the label history are read again from the destination, as a start on
+   * that branch reads them. Both logs are read before either replaces what
+   * memory holds, so a read that throws leaves memory as it was, and the
+   * error goes to the caller. Then each registered channel gets what a
+   * registration on the destination would give it, and a push's placeholder
+   * gets nothing. It gets its label sightings, and the legacy policy's
+   * migration where the destination hasn't had it. For a server whose
+   * lifecycle this host directs, each channel also gets its first decision.
+   * The agent is told of a channel that the policy opened, as at
+   * registration. Where a channel's transport isn't confirmed as that
+   * decision has it, an open or a close is sent, without waiting for the
+   * server. A failure there is traced as a registration's is
+   * (`mcpl:channel-reconcile-failed`), and the other channels go on.
+   */
+  branchMoved(): void {
+    const lifecycle = this.readLifecycleLog();
+    const labels = this.readLabelHistoryLog();
+    if (!lifecycle || !labels) return;
+    this.desiredStates = lifecycle.desiredStates;
+    this.migratedLegacyPolicies = lifecycle.migratedLegacyPolicies;
+    this.labelHistory = labels.labelHistory;
+    this.allLabelsSeen = labels.allLabelsSeen;
+    this.dmRecipientIds = labels.dmRecipientIds;
+    this.dmRecipientNames = labels.dmRecipientNames;
+    this.dmClassified = labels.dmClassified;
+    const byServer = new Map<string, ChannelEntry[]>();
+    for (const entry of this.channels.values()) {
+      if (entry.descriptor.metadata?.lazyRegistered === true) continue;
+      const entries = byServer.get(entry.serverId);
+      if (entries) entries.push(entry);
+      else byServer.set(entry.serverId, [entry]);
+    }
+    for (const [serverId, entries] of byServer) {
+      for (const entry of entries) {
+        try {
+          this.appendLabelSighting(entry.descriptor.id, entry.descriptor.label, extractDmMeta(entry.descriptor.metadata));
+        } catch (err) {
+          this.reconcileFailed(serverId, entry.descriptor.id, err);
+        }
+      }
+      try {
+        this.migrateLegacyPolicy(serverId, entries.map((entry) => entry.descriptor));
+      } catch (err) {
+        console.error(`[mcpl] the "${serverId}" server's legacy recipe policy couldn't be migrated on the branch moved to, so its channels get the decisions a registration gives:`, err);
+      }
+      if (!this.directsLifecycle(serverId)) continue;
+      const policyOpened: Array<{ channelId: string; label?: string }> = [];
+      const toApply: ChannelEntry[] = [];
+      for (const entry of entries) {
+        const channelId = entry.descriptor.id;
+        try {
+          if (this.ensureInitialDesiredState(serverId, entry.descriptor)) policyOpened.push({ channelId, label: entry.descriptor.label });
+          toApply.push(entry);
+        } catch (err) {
+          this.reconcileFailed(serverId, channelId, err);
+        }
+      }
+      if (policyOpened.length > 0) {
+        try {
+          this.onChannelAutoOpened?.({ serverId, source: 'subscription-policy', channels: policyOpened });
+        } catch (err) {
+          console.error('onChannelAutoOpened (policy) failed:', err);
+        }
+      }
+      for (const entry of toApply) {
+        const channelId = entry.descriptor.id;
+        const desired = this.getDesiredState(serverId, channelId);
+        if (desired === undefined) continue;
+        const wantOpen = desired === 'open' || desired === 'tuned-out';
+        const settled = !this.channelLifecycleTails.has(this.lifecycleKey(serverId, channelId));
+        if (settled && wantOpen === entry.open && !this.failedCloseTargets.has(entry) && !this.unconfirmedChannelTargets.has(entry)) continue;
+        void this.applyDesiredChannelState(serverId, channelId).catch((err: unknown) => this.reconcileFailed(serverId, channelId, err));
+      }
+    }
   }
 
   /**
@@ -2842,12 +2931,21 @@ export class ChannelRegistry {
   }
 
   private initializeLifecycleStore(): void {
-    if (!this.store) return;
+    const read = this.readLifecycleLog();
+    if (!read) return;
+    this.desiredStates = read.desiredStates;
+    this.migratedLegacyPolicies = read.migratedLegacyPolicies;
+  }
+
+  private readLifecycleLog(): { desiredStates: Map<string, DesiredStateEntry>; migratedLegacyPolicies: Set<string> } | null {
+    if (!this.store) return null;
 
     ensureStateRegistered(this.store, { id: CHANNEL_LIFECYCLE_LOG_ID, strategy: 'append_log' });
 
+    const desiredStates = new Map<string, DesiredStateEntry>();
+    const migratedLegacyPolicies = new Set<string>();
     const raw = this.store.getStateJson(CHANNEL_LIFECYCLE_LOG_ID);
-    if (!Array.isArray(raw)) return;
+    if (!Array.isArray(raw)) return { desiredStates, migratedLegacyPolicies };
 
     for (const item of raw) {
       if (!item || typeof item !== 'object') continue;
@@ -2855,7 +2953,7 @@ export class ChannelRegistry {
       if (typeof event.serverId !== 'string') continue;
       const decision = desiredStateRecord(item);
       if (decision) {
-        this.desiredStates.set(
+        desiredStates.set(
           this.lifecycleKey(decision.serverId, decision.channelId),
           { state: decision.state, source: decision.source, tuneOut: decision.tuneOut, wakeCount: 0 },
         );
@@ -2868,14 +2966,15 @@ export class ChannelRegistry {
         // epoch that recorded them is still the active desired state
         // (last-record-wins semantics, same as desired-state itself).
         const key = this.lifecycleKey(event.serverId, event.channelId);
-        const current = this.desiredStates.get(key);
+        const current = desiredStates.get(key);
         if (current?.state === 'tuned-out' && current.tuneOut?.epochId === event.epochId) {
           current.wakeCount = event.wakeCount;
         }
       } else if (event.kind === 'legacy-policy-migrated') {
-        this.migratedLegacyPolicies.add(event.serverId);
+        migratedLegacyPolicies.add(event.serverId);
       }
     }
+    return { desiredStates, migratedLegacyPolicies };
   }
 
   /**
@@ -2905,35 +3004,50 @@ export class ChannelRegistry {
    * map entry for its channelId naturally keeps only the latest sighting.
    */
   private initializeLabelHistoryStore(): void {
-    if (!this.store) return;
+    const read = this.readLabelHistoryLog();
+    if (!read) return;
+    this.labelHistory = read.labelHistory;
+    this.allLabelsSeen = read.allLabelsSeen;
+    this.dmRecipientIds = read.dmRecipientIds;
+    this.dmRecipientNames = read.dmRecipientNames;
+    this.dmClassified = read.dmClassified;
+  }
+
+  private readLabelHistoryLog(): LabelHistoryMaps | null {
+    if (!this.store) return null;
 
     ensureStateRegistered(this.store, { id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
 
+    const maps: LabelHistoryMaps = {
+      labelHistory: new Map(), allLabelsSeen: new Map(), dmRecipientIds: new Map(), dmRecipientNames: new Map(), dmClassified: new Map(),
+    };
     const raw = this.store.getStateJson(CHANNEL_LABEL_HISTORY_LOG_ID);
-    if (!Array.isArray(raw)) return;
+    if (!Array.isArray(raw)) return maps;
 
     for (const item of raw) {
       if (!item || typeof item !== 'object') continue;
       const event = item as Partial<ChannelLabelSightingEvent>;
       if (typeof event.channelId !== 'string' || typeof event.label !== 'string' || !event.label) continue;
-      this.labelHistory.set(event.channelId, event.label);
-      let seen = this.allLabelsSeen.get(event.channelId);
+      maps.labelHistory.set(event.channelId, event.label);
+      let seen = maps.allLabelsSeen.get(event.channelId);
       if (!seen) {
         seen = new Set();
-        this.allLabelsSeen.set(event.channelId, seen);
+        maps.allLabelsSeen.set(event.channelId, seen);
       }
       seen.add(event.label);
       if (typeof event.recipientId === 'string' && event.recipientId) {
-        this.dmRecipientIds.set(event.channelId, event.recipientId);
+        maps.dmRecipientIds.set(event.channelId, event.recipientId);
       }
       if (typeof event.recipientName === 'string' && event.recipientName) {
-        this.dmRecipientNames.set(event.channelId, event.recipientName);
+        maps.dmRecipientNames.set(event.channelId, event.recipientName);
       }
       if (event.isDm === true) {
-        this.dmClassified.set(event.channelId, true);
+        maps.dmClassified.set(event.channelId, true);
       }
     }
+    return maps;
   }
+
 
   /**
    * Record that `channelId` was most recently seen with `label` (and,
@@ -4078,21 +4192,25 @@ export class ChannelRegistry {
       try {
         await this.applyDesiredChannelState(serverId, channel.id);
       } catch (err) {
-        // Removal while queued is cancellation, not a failed subscription.
-        // Exhausted convergence and a substituted answer already emitted
-        // their own diagnostics.
-        if (!this.channels.has(destinationKey({ serverId, channelId: channel.id })) ||
-            (err instanceof ChannelLifecycleError &&
-              (err.kind === 'cancelled' || err.kind === 'converge' || err.kind === 'substituted'))) return;
-        this.emitTraceFn({
-          type: 'mcpl:channel-reconcile-failed',
-          serverId,
-          channelId: channel.id,
-          desired: this.getDesiredState(serverId, channel.id),
-          error: (err as Error).message,
-        });
+        this.reconcileFailed(serverId, channel.id, err);
       }
     }));
+  }
+
+  private reconcileFailed(serverId: string, channelId: string, err: unknown): void {
+    // Removal while queued is cancellation, not a failed subscription.
+    // Exhausted convergence and a substituted answer already emitted
+    // their own diagnostics.
+    if (!this.channels.has(destinationKey({ serverId, channelId })) ||
+        (err instanceof ChannelLifecycleError &&
+          (err.kind === 'cancelled' || err.kind === 'converge' || err.kind === 'substituted'))) return;
+    this.emitTraceFn({
+      type: 'mcpl:channel-reconcile-failed',
+      serverId,
+      channelId,
+      desired: this.getDesiredState(serverId, channelId),
+      error: (err as Error).message,
+    });
   }
 
   // ==========================================================================
