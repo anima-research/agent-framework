@@ -19,6 +19,7 @@ const NEXT = 'The next answer.';
 const RAN_NOT = "didn't run, because the response it was in was cut off at the output limit";
 const ADVICE = 'send less in one response';
 const UNNAMED = '[tool-boundary] Your response was cut off at the output limit inside a tool-call block, before any call in it was named, so nothing ran.';
+const OUTPUT_LIMIT = '[output-limit] The output limit was reached in the response just before this note. The rest was not generated.';
 
 function sse(reply: Reply): string {
   const out: string[] = [];
@@ -76,7 +77,7 @@ interface Run {
   routed: string[];
   /** Each posted text with the channel it went to. */
   routedTo: Array<[string, string]>;
-  rows: Array<{ participant: string; content: Array<Record<string, any>> }>;
+  rows: Array<{ participant: string; content: Array<Record<string, any>>; metadata?: Record<string, any> }>;
   requests: string[];
   boundaryLines: string[];
   failedTraces: Array<{ callId?: string; tool?: string; error?: string }>;
@@ -86,8 +87,8 @@ interface Run {
   held: Array<{ id: string; text: string; reason: string; note?: string }>;
 }
 
-/** What a turn's harness adds beside the agent's settings: framework config, modules, a first wake that is a heartbeat, labels the stand-in registry resolves, and the channel tools it offers (a script sees only those). */
-type TurnOptions = { framework?: Record<string, unknown>; modules?: Module[]; heartbeat?: boolean; resolves?: Record<string, string>; channelTools?: ToolDefinition[] };
+/** What a turn's harness adds beside the agent's settings: framework config, modules, a first wake that is a heartbeat, the messages after the first wake (`And next?` alone when left out), labels the stand-in registry resolves, and the channel tools it offers (a script sees only those). */
+type TurnOptions = { framework?: Record<string, unknown>; modules?: Module[]; heartbeat?: boolean; next?: string[]; resolves?: Record<string, string>; channelTools?: ToolDefinition[] };
 
 async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<string, unknown> = {}, opts: TurnOptions = {}): Promise<Run> {
   const requests: string[] = [];
@@ -169,8 +170,10 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
     }
     await framework.runUntilIdle();
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'And next?', metadata: {} } as unknown as ProcessEvent);
-    await framework.runUntilIdle();
+    for (const content of opts.next ?? ['And next?']) {
+      framework.pushEvent({ type: 'external-message', source: 'test', content, metadata: {} } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+    }
     const cm = framework.getAgent('resident')!.getContextManager() as unknown as { getAllMessages(): Run['rows'] };
     // Every draft the run held and didn't deliver, newest first, open or not:
     // the "And next?" turn leaves the first turn's drafts alone, which sets
@@ -200,6 +203,7 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
 }
 
 const blocks = (run: Run, type: string) => run.rows.flatMap((row) => row.content.filter((block) => block.type === type));
+const outputLimitNotes = (run: Run) => run.rows.filter((row) => row.content.some((block) => block.type === 'text' && String(block.text).startsWith('[output-limit]')));
 const toolResultText = (block: Record<string, any>) => JSON.stringify(block.content);
 const replyTexts = (run: Run) => run.rows.filter((row) => row.participant === 'resident')
   .flatMap((row) => row.content.filter((block) => block.type === 'text').map((block) => block.text as string));
@@ -264,6 +268,7 @@ describe('native tools: a response that ends at the output limit with calls in i
       assert.equal(run.requests.length, 2, 'one request for the cut-off turn and one for the next');
       assert.equal(run.boundaryLines.length, 1);
       assert.match(run.boundaryLines[0], /max_tokens inside 1 call\(s\) \(robot--move\)/);
+      assert.equal(outputLimitNotes(run).length, 0, 'the refused result tells the agent, and no output-limit note follows');
     });
   }
 
@@ -576,8 +581,86 @@ describe('XML tools: a response that ends at the output limit inside a tool-call
       assert.equal(replyTexts(run).at(-1), NEXT);
       assert.equal(run.boundaryLines.length, 1);
       assert.equal(run.requests.length, 2);
+      assert.equal(outputLimitNotes(run).length, 0, 'the tool-block notice tells the agent, and no output-limit note follows');
     });
   }
+});
+
+describe('a response that the output limit ends in plain prose', () => {
+  const CUT_PROSE = 'I have been thinking about the harbour lights and how they flick';
+  const rowTexts = (run: Run) => run.rows.filter((row) => !outputLimitNotes(run).includes(row))
+    .map((row) => [row.participant, row.content.map((block) => String(block.text ?? block.type)).join('|')]);
+  const assertNoteAfter = (run: Run, text: string, request: string) => {
+    const notes = outputLimitNotes(run);
+    assert.equal(notes.length, 1, 'exactly one note');
+    assert.deepEqual(notes[0]!.content, [{ type: 'text', text: OUTPUT_LIMIT }]);
+    assert.equal(notes[0]!.metadata?.kind, 'cut-off-reply');
+    const replyAt = run.rows.findIndex((row) => row.participant === 'resident' && row.content.some((block) => block.text === text));
+    assert.ok(replyAt >= 0, 'the cut reply is stored with its exact text');
+    assert.equal(run.rows.indexOf(notes[0]!), replyAt + 1, 'the note is stored right after the cut reply');
+    const at = request.indexOf(text);
+    assert.ok(at >= 0, 'the next request carries the cut reply');
+    assert.ok(request.indexOf(OUTPUT_LIMIT, at) > at, 'and the note after it');
+  };
+
+  it('native tools: tells the agent in its own context that the output limit ended the reply, and changes nothing else', async () => {
+    const cut = await turn('native', [{ blocks: [{ text: CUT_PROSE }], stop: 'max_tokens' }]);
+    const ended = await turn('native', [{ blocks: [{ text: CUT_PROSE }], stop: 'end_turn' }]);
+    assertNoteAfter(cut, CUT_PROSE, cut.requests[1]!);
+    assert.deepEqual(cut.routed, [CUT_PROSE, NEXT], 'the cut words go out as written');
+    assert.equal(cut.requests.length, 2, 'the cut starts no turn of its own');
+    assert.equal(outputLimitNotes(ended).length, 0, 'a reply the model ended gets no note');
+    assert.deepEqual(rowTexts(cut), rowTexts(ended), 'beside the note, the rows are those of a reply the model ended');
+    assert.deepEqual(cut.routed, ended.routed);
+    assert.equal(ended.requests.length, 2);
+  });
+
+  it('native tools: tells the agent when the reply after a round that ran is cut', async () => {
+    const run = await turn('native', [EAST_ROUND, { blocks: [{ text: 'Now heading north to the harb' }], stop: 'max_tokens' }]);
+    assert.deepEqual(run.moves, [{ dir: 'east' }], 'the first round ran, once');
+    assertNoteAfter(run, 'Now heading north to the harb', run.requests[2]!);
+    assert.deepEqual(run.routed, ['First I step east.', 'Now heading north to the harb', NEXT]);
+    assert.equal(run.requests.length, 3);
+  });
+
+  it('XML tools: tells the agent when prose with no tool block is cut', async () => {
+    const run = await turn('xml', [{ xml: CUT_PROSE, stop: 'max_tokens' }]);
+    assertNoteAfter(run, CUT_PROSE, run.requests[1]!);
+    assert.deepEqual(run.routed, [CUT_PROSE, NEXT]);
+    assert.equal(run.requests.length, 2);
+  });
+
+  it('writes no note when the limit falls inside thinking, before any reply text, so none points at an older reply', async () => {
+    const run = await turn('native', [{ blocks: [{ text: 'An earlier answer.' }], stop: 'end_turn' }, { blocks: [{ thinking: 'Where was I going with' }], stop: 'max_tokens' }]);
+    assert.equal(run.requests.length, 2, 'the second message was answered with the thinking alone');
+    assert.deepEqual(replyTexts(run), ['An earlier answer.'], 'no reply is stored for the thinking');
+    assert.deepEqual(run.routed, ['An earlier answer.']);
+    assert.equal(outputLimitNotes(run).length, 0);
+  });
+
+  for (const [label, cut] of [['no content blocks', []], ['one empty text block', [{ text: '' }]]] as const) {
+    it(`writes no note when the cut response holds ${label}, so the next request points at no older reply`, async () => {
+      const run = await turn('native', [{ blocks: [{ text: 'An earlier answer.' }], stop: 'end_turn' }, { blocks: [...cut], stop: 'max_tokens' }], {}, { next: ['And next?', 'And then?'] });
+      assert.equal(run.requests.length, 3, 'the cut answered the second message, and a third request followed it');
+      assert.equal(outputLimitNotes(run).length, 0);
+      assert.ok(!run.requests[2]!.includes(OUTPUT_LIMIT), 'the request after the cut carries no note');
+      assert.deepEqual(run.routed, ['An earlier answer.', NEXT]);
+    });
+  }
+
+  it('writes no note when the guard contains a cut tool-wrapper reply, which stores no reply', async () => {
+    const run = await turn('native', [{ blocks: [{ text: '<robot--move>east</robot--move>' }], stop: 'max_tokens' }], { toolWrapperProseGuard: true });
+    assert.ok(run.rows.some((row) => row.metadata?.kind === 'tool-wrapper-prose-contained'), 'premise: the guard contained the reply');
+    assert.equal(outputLimitNotes(run).length, 0);
+    assert.deepEqual(run.moves, []);
+  });
+
+  it("honours a ' !' continuation the cut reply asked for, once, and writes one note", async () => {
+    const words = 'Checking the lights, then the harb';
+    const run = await turn('native', [{ blocks: [{ text: `>>>#ops ! ${words}` }], stop: 'max_tokens' }], { proseRouting: 'hybrid' }, { resolves: { '#ops': 'ops' } });
+    assert.equal(run.requests.length, 3, 'the cut turn, its continuation and the next message');
+    assertNoteAfter(run, `>>>#ops ! ${words}`, run.requests[1]!);
+  });
 });
 
 describe('an ephemeral run whose response ends at the output limit with calls in its last round', () => {

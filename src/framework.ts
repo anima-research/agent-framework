@@ -30655,6 +30655,7 @@ export class AgentFramework {
             const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             let refusedReplyId: MessageId | undefined;
+            let terminalReplyId: MessageId | undefined;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -30683,9 +30684,9 @@ export class AgentFramework {
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: undefined, sent: terminalSent }, false);
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
-                if (response.stopReason === 'refusal') refusedReplyId = terminalId;
-                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+                terminalReplyId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                if (response.stopReason === 'refusal') refusedReplyId = terminalReplyId;
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalReplyId, sent: terminalSent }, false);
               } else {
                 // Nothing after the last results: the rows are judged as of now, the last batch settled.
                 this.noteStreamEnd(agent, stream, undefined, false);
@@ -30693,9 +30694,9 @@ export class AgentFramework {
             } else if (cut?.unnamed && terminalContent.length === 0) {
               this.noteStreamEnd(agent, stream, undefined, false);
             } else {
-              const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
-              if (response.stopReason === 'refusal') refusedReplyId = terminalId;
-              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+              terminalReplyId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              if (response.stopReason === 'refusal') refusedReplyId = terminalReplyId;
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalReplyId, sent: terminalSent }, false);
             }
             if (cutResults) {
               agent.toolResultGuard.storeResults(cutResults.blocks, cutResults.wire, cutResults.completed,
@@ -30709,6 +30710,12 @@ export class AgentFramework {
                 text: `[${NOTICE_TAG.toolBoundary}] Your response was cut off at the output limit inside a tool-call block, before any call in it ` +
                   'was named, so nothing ran. To make a call, send less in one response.',
               }], { system: true, kind: 'cut-off-tool-block', ...this.silentTurnRowMetadata(agent.name) });
+            } else if (response.stopReason === 'max_tokens' && terminalReplyId !== undefined
+              && terminalContent.some((b) => b.type === 'text' && b.text.trim().length > 0)) {
+              storeOwnRow(agent, 'user', [{
+                type: 'text',
+                text: `[${NOTICE_TAG.outputLimit}] The output limit was reached in the response just before this note. The rest was not generated.`,
+              }], { system: true, kind: 'cut-off-reply', ...this.silentTurnRowMetadata(agent.name) });
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
