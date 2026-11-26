@@ -730,8 +730,8 @@ export class Agent {
   }
 
   private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean, rows: readonly StoredMessage[]): void {
-    if (guarded) return;
     const cm = this.contextManager as Partial<ContextManager>;
+    if (guarded || cm.getStrategy?.().name !== 'passthrough') return;
     let byId: Map<MessageId, StoredMessage> | undefined;
     const metadataOf = (id: MessageId): unknown => {
       try {
@@ -749,7 +749,7 @@ export class Agent {
     if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
     if (!rows.some((row) => hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata))) return;
     const at = compiledAt ?? DEFAULT_COMPILE_BUDGET;
-    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, cm.getStrategy?.().name);
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, 'passthrough');
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager

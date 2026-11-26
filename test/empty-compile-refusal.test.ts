@@ -513,3 +513,18 @@ test('a notice whose write landed, though the write threw, counts as written: th
     assert.equal(h.notices().length, 1);
   } finally { await h.close(); }
 });
+
+test('a compile under another strategy that selects none of the conversation is sent as before', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const strategy = new PassthroughStrategy();
+    Object.defineProperty(strategy, 'name', { value: 'zz-windowed' });
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy } as never);
+    try {
+      cm.presentRows([cm.addMessage('User', [{ type: 'text', text: LONG }])]);
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      assert.equal((await host.buildActivationRequest([])).messages.length, 0);
+    } finally { await cm.close(); }
+  } finally { await h.close(); }
+});

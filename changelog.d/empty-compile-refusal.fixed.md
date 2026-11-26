@@ -1,6 +1,8 @@
-- A turn no longer sends a request when its compile holds none of the
-  conversation that the agent's window holds. Injections and the
-  framework's own notices don't count as conversation, except the
+- Under the passthrough strategy, a turn no longer sends a request when
+  its compile holds none of the conversation that the agent's window
+  holds. Other strategies are sent as before, since a strategy such as
+  windowed passthrough leaves rows of the window out by design. Injections
+  and the framework's own notices don't count as conversation, except the
   `[inference-failed]` notice, so a turn whose compile holds only its own
   routing notice is refused too. A compile made while a tool-result batch
   holds back its reserve is sent as before, so that the provider's answer
