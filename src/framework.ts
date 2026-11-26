@@ -1333,7 +1333,9 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * requests that don't carry the turn on (dropContinuations), where they run
  * as a turn of their own, as wakes queued while a turn streams do. Once the
  * start takes its token the turn reads them, and beginAgentTurn drops the
- * record. A symbol, as TURN_RETRY is, so spreads and rests copy it.
+ * record; a released turn's start (releasedTurnBatch) keeps it until its
+ * request is about to be sent. A symbol, as TURN_RETRY is, so spreads and
+ * rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
@@ -1409,12 +1411,11 @@ function mergedWakes(request: InferenceRequest): InferenceRequest[] {
 function releasedTurnBatch(request: InferenceRequest | undefined): ReleasedStart | undefined {
   const batch = request ? mergedBatch(request) : undefined;
   if (!batch) return undefined;
-  const turns = batch.filter((r) => budgetWaitOf(r) !== undefined);
-  const wakes = batch.filter((r) => !continuesTurn(r) && budgetWaitOf(r) === undefined);
+  const isReleasedTurn = (r: InferenceRequest) => budgetWaitOf(r) !== undefined || (r as MarkedRequest)[RELEASED_ROUTING] !== undefined;
+  const turns = batch.filter(isReleasedTurn);
+  const wakes = batch.filter((r) => !continuesTurn(r) && !isReleasedTurn(r));
   return turns.length === 1 && wakes.length > 0 && turns.length + wakes.length === batch.length ? { turn: turns[0]!, wakes } : undefined;
 }
-
-
 
 function isTurnRetry(request: InferenceRequest): boolean {
   return (request as MarkedRequest)[TURN_RETRY] === true;
@@ -7754,7 +7755,6 @@ export class AgentFramework {
       ? { ...released.turn }
       : retry ?? { agentName: agent.name, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now() };
     if (wrote && !wrote.wasRetry) delete turn[TURN_RETRY];
-    delete turn[RELEASED_ROUTING];
     const carried = budgetWaitOf(turn);
     const startedAt = Date.now();
     const { standsOn, ownRows } = !continuesTurn(turn) && carried
@@ -28444,7 +28444,9 @@ export class AgentFramework {
      *  it sent anything; otherwise the note says it was stopped before it
      *  finished. */
     opensTurn: boolean,
+    released?: ReleasedStart,
   ): void {
+    if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
     const sentNothing = opensTurn && !routing.roundsRan && !routing.unflushedRounds;
     console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${sentNothing ? 'sent anything' : 'finished'}; it ends there`);
     this.channelRegistry?.stopTyping();
@@ -28478,6 +28480,7 @@ export class AgentFramework {
     }
     const last = this.lastInferenceAt.get(agent.name);
     if (last?.startedAt === turnStartedAt) this.lastInferenceAt.set(agent.name, { ...last, endedAt: Date.now() });
+    if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
   }
 
   /**
@@ -28560,7 +28563,7 @@ export class AgentFramework {
     if (asReleased) {
       trigger = { ...trigger, [MERGED_BATCH]: [asReleased.turn, ...asReleased.wakes.map((wake) => restoredWake(wake, assembly))] } as MarkedRequest;
     }
-    const released = releasedTurnBatch(trigger);
+    let released = releasedTurnBatch(trigger);
 
     // A turn whose only causes were deferred batches, none of which gave it
     // anything to read (an empty or blank render, §5.2; cancelled; revoked; a
@@ -28651,6 +28654,10 @@ export class AgentFramework {
     }
     if (trigger && mergedBatch(trigger) && !releasedTurnBatch(trigger)) {
       const { [MERGED_BATCH]: _batch, ...own } = trigger as MarkedRequest;
+      trigger = own;
+    }
+    if (trigger && !released && (trigger as MarkedRequest)[RELEASED_ROUTING]) {
+      const { [RELEASED_ROUTING]: _record, ...own } = trigger as MarkedRequest;
       trigger = own;
     }
 
@@ -29003,9 +29010,7 @@ export class AgentFramework {
       // A stop made while the hooks ran had no stream to cancel.
       const stopAfterHooks = this.takeStartStop(agent, checkWindow);
       if (stopAfterHooks) {
-        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
-        this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn);
-        if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
+        this.endStoppedStart(agent, stopAfterHooks, routing, turnStartedAt, undefined, opensTurn, released);
         return false;
       }
       this.nameUnpostedSpeech(agent, routing);
@@ -29058,6 +29063,12 @@ export class AgentFramework {
         inferenceBounds: this.inferenceBounds,
       });
       if (trigger) delete (trigger as MarkedRequest)[BUDGET_WAIT];
+      if (trigger && released && budgetWaitOf(released.turn)) {
+        const { [BUDGET_WAIT]: _wait, ...turn } = released.turn as MarkedRequest;
+        const was = released.turn;
+        (trigger as MarkedRequest)[MERGED_BATCH] = mergedBatch(trigger)!.map((m) => (m === was ? turn : m));
+        released = { turn, wakes: released.wakes };
+      }
       // Each later round this stream sends is noted as it goes (noteRoundSent).
       if (noteRequestSent) this.streamRequestNotes.set(stream, { note: noteRequestSent, rounds: [], stopped: false });
       if (carriedBodies) this.streamCarried.set(stream, new Set(carriedBodies));
@@ -29100,9 +29111,7 @@ export class AgentFramework {
         // that started this one.
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
-        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
-        this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn);
-        if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
+        this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn, released);
         return false;
       }
       // A conversation agent takes no provider gate, so its own compression
@@ -29216,7 +29225,6 @@ export class AgentFramework {
       // it. A failed start with no stop goes on below as before.
       const stopAtFailure = this.takeStartStop(agent, checkWindow);
       if (stopAtFailure) {
-        if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
           const why = this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
             : 'the framework was stopping';
@@ -29227,8 +29235,7 @@ export class AgentFramework {
           this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
           return false;
         }
-        this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn);
-        if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
+        this.endStoppedStart(agent, stopAtFailure, routing, turnStartedAt, undefined, opensTurn, released);
         return false;
       }
 
@@ -29293,9 +29300,7 @@ export class AgentFramework {
         // does at theirs.
         const stopAfterWait = this.takeStartStop(agent, checkWindow);
         if (stopAfterWait) {
-          if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
-          this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn);
-          if (released && this.agents.get(agent.name) === agent && !this.providerAdmissionClosed) appendAll(this.pendingRequests, released.wakes);
+          this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn, released);
           return false;
         }
         // The retry re-enters startAgentStream, which replaces this frame's
