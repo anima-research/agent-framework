@@ -28152,6 +28152,15 @@ export class AgentFramework {
     }
   }
 
+  private keepStartRetryError(error: unknown): void {
+    if (this.stopReadStartRetryErrors) console.error('Error in event loop:', error);
+    else this.startRetryErrors.push({ error });
+  }
+
+  private endStartWindow(agentName: string, turnToken: number): void {
+    if (this.activeTurnTokens.get(agentName) === turnToken || !this.hasTurn(agentName)) this.eventGate?.onInferenceEnded(agentName);
+  }
+
   /**
    * A throw outside the stream's own failure handling (the checkpoint,
    * locus resolution, the typing indicator, a failed start's retry before
@@ -28163,11 +28172,6 @@ export class AgentFramework {
    * run fails with the error rather than waiting out its watchdog. A silent
    * start has no part in an open turn.
    */
-  private keepStartRetryError(error: unknown): void {
-    if (this.stopReadStartRetryErrors) console.error('Error in event loop:', error);
-    else this.startRetryErrors.push({ error });
-  }
-
   private endThrownStart(agent: Agent, trigger: InferenceRequest | undefined, turnToken: number, error: unknown): void {
     this.failedLastTurnAt.set(agent, Date.now());
     if (this.agents.get(agent.name) === agent) {
@@ -28187,7 +28191,7 @@ export class AgentFramework {
     // would close it otherwise, and while it is open every gate event
     // buffers, for every agent. A newer start holding the token owns the
     // window now, so it's left alone.
-    if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
+    this.endStartWindow(agent.name, turnToken);
   }
 
   /**
@@ -29042,7 +29046,7 @@ export class AgentFramework {
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
+        this.endStartWindow(agent.name, turnToken);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
       }
@@ -29137,7 +29141,7 @@ export class AgentFramework {
         }
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
+        this.endStartWindow(agent.name, turnToken);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
       }
@@ -29241,11 +29245,11 @@ export class AgentFramework {
     } catch (error) {
       if (this.agents.get(agent.name) !== agent) {
         const reason = "a turn whose request couldn't be built while the agent was replaced or removed is dropped before it sends anything";
-        console.error(`[turn] ${agent.name}: ${reason}`);
+        console.error(`[turn] ${agent.name}: ${reason}:`, error);
         agent.reset();
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
+        this.endStartWindow(agent.name, turnToken);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
       }
