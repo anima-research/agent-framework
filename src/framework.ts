@@ -493,8 +493,10 @@ const HOST_METADATA_KEYS = [
  * without having been shown gets no mark. A reaction or deletion so marked
  * is still a notice about that message and stays a marker. An edit of a
  * message the host never received looks like any other edit and stays a
- * marker too. A marker that wakes the agent can still set that turn's speech
- * channel (agent-framework#189); a `chat:system` notice can't (systemNotice).
+ * marker too. A marker that doesn't address the agent ranks last when a
+ * turn's speech channel is chosen (InferenceRequest.marker). A `chat:system`
+ * notice's wake from `channels/incoming` or `push/event` names no channel
+ * (systemNotice).
  */
 const isOwnScheduleWrite = (metadata?: MessageMetadata): boolean => {
   const m = metadata as { serverId?: unknown; source?: unknown; tags?: unknown } | undefined;
@@ -769,6 +771,9 @@ const ambientMark = (tags?: string[]): { ambient?: true } =>
  *  speech goes. */
 const systemNoticeMark = (tags?: string[]): { systemNotice?: true } =>
   isSystemNotice(tags) ? { systemNotice: true } : {};
+
+const markerMark = (tags: string[] | undefined, firstView: boolean): { marker?: true } =>
+  isMarkerTagged(tags, firstView) ? { marker: true } : {};
 
 /**
  * A wake from the heartbeat: a tick or a reminder, from the framework's own
@@ -7448,11 +7453,14 @@ export class AgentFramework {
    *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
    *  single subject), and the rows a wake reads. A wake with any of them
    *  can be withdrawn or dropped on its own, and must not stand for one
-   *  without. (coalescingBatch is set only beside one of the first two.) */
+   *  without. (coalescingBatch is set only beside one of the first two.)
+   *  It also compares `marker`. A marker's wake ranks below a message's
+   *  when a turn's channel is picked, so one can't stand for the other. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
+      a.marker === b.marker &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
       a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b);
   }
@@ -20979,6 +20987,7 @@ export class AgentFramework {
           ...ambientMark(event.tags),
           // A notice (chat:system) picks no channel for the turn.
           ...systemNoticeMark(event.tags),
+          ...markerMark(event.tags, event.firstView === true),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           ...this.readsRowFor(placement, agentName),
           ...this.answersOn(event),
@@ -22974,6 +22983,7 @@ export class AgentFramework {
           addressed: isAddressedMessage(event.tags),
           ...ambientMark(event.tags),
           ...systemNoticeMark(event.tags),
+          ...markerMark(event.tags, event.firstView === true),
           ...(silentHeartbeat ? {
             suppressProse: true,
             // The tick's instruction rides its request-only separator
@@ -23306,11 +23316,11 @@ export class AgentFramework {
         // a turn alive at the quiesce can finish; everything else parks.
         const passThrough = requests.filter((r) => passesQuiesce(r));
         const parked = requests.filter((r) => !passesQuiesce(r));
-        // Coalesce per (reason, addressed): every channel wake shares one
-        // reason, so keying on reason alone would let an ambient message
-        // parked later evict a DM/mention parked earlier — and the
-        // addressed-outranks-ambient trigger selection below would then
-        // route the resumed turn into the wrong channel.
+        // Coalesce per (reason, addressed or marker): every channel wake
+        // shares one reason, so keying on reason alone would let an ambient
+        // message parked later evict a DM/mention parked earlier, or a marker
+        // evict a message — and the trigger selection below would then route
+        // the resumed turn into the wrong channel.
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
@@ -23319,7 +23329,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${readsRowsKey(request)}|${budgetWaitOf(request) ? 'waited' : ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : request.marker ? 'm' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${readsRowsKey(request)}|${budgetWaitOf(request) ? 'waited' : ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           if (prev && !answersSameMessage(prev, request)) kept.answersMessageId = undefined;
@@ -23528,18 +23538,25 @@ export class AgentFramework {
       //      message is still in what the agent is sent ranking with them
       //      (RETRY_RANK 'sent');
       //   2. else a rewind's retry whose message isn't (RETRY_RANK 'aside');
-      //   3. else the most recent channel-bearing request (ambient message in
-      //      an open channel — legacy last-inbound semantics).
+      //   3. else the most recent channel-bearing request that isn't a
+      //      marker's (ambient message in an open channel — legacy
+      //      last-inbound semantics).
       // A chat:system notice (RFC-001 rev 3: weather in a world, someone
       // joining) names no channel at all: nobody spoke there, so a turn it
       // wakes alone takes the global fallback, and the agent sends there
       // explicitly if it means to.
+      // A marker that doesn't address the agent (a reaction, an edit or a
+      // deletion: isMarkerTagged) ranks last, below a continuation
+      // (agent-framework#189). It names the channel only if no other request
+      // names one. If a heartbeat's wake is in the batch, it names none. A
+      // marker that wakes the agent alone still names its channel. A notice
+      // doesn't.
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
-      // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback, which an
-      // ephemeral run never takes (takesGlobalFallback), except a heartbeat's
-      // turn, which takes none (heartbeatTurn below).
+      // Non-channel wakes (heartbeats, module events) leave both undefined →
+      // global fallback, which an ephemeral run never takes
+      // (takesGlobalFallback), except a heartbeat's turn, which takes none
+      // (heartbeatTurn below).
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -23555,16 +23572,21 @@ export class AgentFramework {
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
       // An autoContinue wake names the finished turn's locus. It speaks for
-      // the turn only when nothing else in the batch names a channel: a
-      // message that arrived meanwhile, ambient included, outranks it, though
-      // its wake was queued first.
+      // the turn only when nothing else in the batch but a marker names a
+      // channel. Any message that arrived meanwhile outranks it, ambient ones
+      // included.
       let continuationReq: InferenceRequest | undefined;
       let retryReq: InferenceRequest | undefined;
+      let markerReq: InferenceRequest | undefined;
       let sawAddressed = false;
       for (const r of requests) {
         if (!r.channelId || r.systemNotice) continue;
         if (r.reason === AUTO_CONTINUE_REASON) {
           continuationReq ??= r;
+          continue;
+        }
+        if (r.marker && !r.addressed) {
+          if (!markerReq || eventAt(r) >= eventAt(markerReq)) markerReq = r;
           continue;
         }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
@@ -23573,7 +23595,8 @@ export class AgentFramework {
         if ((r.addressed || rank === 'sent') && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
         if (rank === 'aside' && (!retryReq || eventAt(r) >= eventAt(retryReq))) retryReq = r;
       }
-      const channelReq = addressedReq ?? retryReq ?? ambientReq ?? continuationReq;
+      const heartbeatWake = requests.some((r) => isHeartbeatWake(r));
+      const channelReq = addressedReq ?? retryReq ?? ambientReq ?? continuationReq ?? (heartbeatWake ? undefined : markerReq);
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
@@ -23626,7 +23649,7 @@ export class AgentFramework {
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         // A heartbeat's turn when any cause is a heartbeat's wake and none
         // names a channel, whatever the batch's order (isHeartbeatWake).
-        heartbeatTurn: !channelReq && requests.some((r) => isHeartbeatWake(r)),
+        heartbeatTurn: !channelReq && heartbeatWake,
         // The channel and its server from the one request, so the turn's
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
@@ -23639,6 +23662,7 @@ export class AgentFramework {
         // inherited from requests[0], it would hide that message's channel
         // from the selection if this start were merged again.
         systemNotice: undefined,
+        marker: channelReq?.marker,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
