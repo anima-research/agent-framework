@@ -91,8 +91,8 @@ function residentReason(usable: number, newest: NewestRow, passthrough: boolean)
 }
 
 function newestNamed(newest: NewestRow): string | undefined {
-  if (newest.injection !== undefined) return `The newest row in your context is a context injection from ${newest.injection}`;
-  if (newest.notice) return 'The newest row in your context is a framework notice';
+  if (newest.injection !== undefined) return `The newest row left out of your context is a context injection from ${newest.injection}`;
+  if (newest.notice) return 'The newest row left out of your context is a framework notice';
   const lead = 'The newest message in your conversation';
   if (newest.toolResult) return `${lead} is a tool result${newest.tool ? ` from ${newest.tool}` : ''}`;
   if (newest.own === 'tool-call') return `${lead} is your own tool call`;

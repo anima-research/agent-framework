@@ -795,6 +795,7 @@ test('a framework notice after an oversized message isn\'t conversation: a compi
       assert.ok(preview.includes('[routing] zz-routing') && preview.includes('[clock] zz-clock') && !preview.some((t) => t.startsWith('zz-long')), JSON.stringify(preview));
       await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
         assert.ok(err instanceof EmptyCompileError, String(err));
+        assert.ok(!err.residentNote.includes('framework notice') && !err.operatorNote.includes('framework notice'), `${err.residentNote}\n${err.operatorNote}`);
         return true;
       });
     } finally { await cm.close(); }
@@ -814,7 +815,7 @@ test('when a stored injection newer than a small message is what didn\'t fit, th
       const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
       await assert.rejects(host.buildActivationRequest([]), (err: unknown) => {
         assert.ok(err instanceof EmptyCompileError, String(err));
-        assert.ok(err.residentNote.includes('The newest row in your context is a context injection from lessons.'), err.residentNote);
+        assert.ok(err.residentNote.includes('The newest row left out of your context is a context injection from lessons.'), err.residentNote);
         assert.ok(!err.residentNote.includes('Alice') && !err.residentNote.includes('smaller parts'), err.residentNote);
         assert.ok(err.operatorNote.includes(`The newest row it left out is a context injection from lessons (row ${big}).`), err.operatorNote);
         assert.ok(!err.operatorNote.includes('Alice') && !err.operatorNote.includes('general'), err.operatorNote);
