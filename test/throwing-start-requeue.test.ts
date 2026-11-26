@@ -107,7 +107,9 @@ test('the requests a throwing pass leaves go back ahead of those that arrived wh
 });
 
 test('a continuation dropped while the pass awaited stays dropped, and a wake of the same agent survives', async () => {
+  let restartInPass = false;
   const { framework, starts, failure } = harness((f) => {
+    restartInPass = [...f.passRequests].some((pass) => pass.get('b')?.includes(restart) ?? false);
     f.dropContinuations('b', { kind: 'caller', reason: 'stop', why: 'a stop ended the turn' });
   });
   const restart = request('b', 'context_budget_restart');
@@ -115,6 +117,7 @@ test('a continuation dropped while the pass awaited stays dropped, and a wake of
   framework.pendingRequests = [request('a', 'discord-message'), restart, wake];
 
   await assert.rejects(framework.processNextEvent(), (error) => error === failure);
+  assert.ok(restartInPass, "b's restart was in the pass when the stop came");
   assert.deepEqual(framework.pendingRequests, [wake], "only b's wake comes back");
 
   await framework.processNextEvent();
