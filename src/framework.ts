@@ -28095,7 +28095,7 @@ export class AgentFramework {
       // waiting out its watchdog. A silent start has no part in an open turn.
       if (!trigger?.suppressProse) {
         const err = error instanceof Error ? error : new Error(String(error));
-        this.stopTurnTyping(this.openLogical?.get(agent.name), { agent });
+        if (this.agents?.get(agent.name) === agent) this.stopTurnTyping(this.openLogical?.get(agent.name), { agent });
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: failureWords(err), cause: err,
         }, this.openLogical?.get(agent.name));
