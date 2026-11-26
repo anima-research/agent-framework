@@ -4642,6 +4642,8 @@ export class AgentFramework {
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
   private retryWaitWakers = new Set<() => void>();
+  private activeStartRetries = new Map<Promise<void>, string>();
+  private startRetryErrors: Array<{ error: unknown }> = [];
   /** Each agent's error-policy retry wait in progress, for healthSnapshot():
    *  while it lasts the agent's state reads `idle` though its turn is alive.
    *  Keyed by the Agent, not its name: an agent registered under a removed
@@ -6725,9 +6727,11 @@ export class AgentFramework {
     // waits for it (leftRunning). The list waited for is taken before it is
     // left running.
     const streams = [...this.activeStreams].map(([name, promise]) => ({ name, label: `stream:${name}`, promise }));
-    const waited = withLeftovers('stream', streams.filter(({ name }) => !uncancelled.has(name)));
+    const retries = [...this.activeStartRetries].map(([promise, name]) => ({ name, label: `start-retry:${name}`, promise }));
+    const waited = withLeftovers('stream', [...streams.filter(({ name }) => !uncancelled.has(name)), ...retries]);
     leaveRunning(streams.filter(({ name }) => uncancelled.has(name)), 'stream');
     await waitFor(waited, 'stream');
+    for (const { error } of this.startRetryErrors.splice(0)) console.error('Error in event loop:', error);
     await waitFor(scriptsStopped ? [{ label: 'code_execution scripts', promise: scriptsStopped }] : []);
 
     // Stop sync timer
@@ -19138,6 +19142,8 @@ export class AgentFramework {
         (r) => !this.quiesced || passesQuiesce(r),
       ) ||
       this.activeStreams.size > 0 ||
+      this.activeStartRetries.size > 0 ||
+      this.startRetryErrors.length > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
       await this.processNextEvent();
@@ -19656,6 +19662,8 @@ export class AgentFramework {
   }
 
   private async processNextEvent(): Promise<void> {
+    const failed = this.startRetryErrors.shift();
+    if (failed) throw failed.error;
     // Try to get next process event (with timeout to check running flag)
     const event = this.queue.tryPop();
 
@@ -19683,7 +19691,7 @@ export class AgentFramework {
     // turn; neither can recurse forever through already-resolved promises.
     if (!event) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-    } else if (this.pendingRequests.length > 0 || this.activeStreams.size > 0) {
+    } else if (this.pendingRequests.length > 0 || this.activeStreams.size > 0 || this.activeStartRetries.size > 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
@@ -28067,9 +28075,8 @@ export class AgentFramework {
     // boundary without the scheduler: a wait recorded meanwhile, by its own
     // auxiliary call or a non-retryable failure, binds them here too. An
     // ephemeral run records nothing, so nothing binds it here. A frame whose
-    // agent was replaced or removed (a fork disposed while its retry slept)
-    // installs no hold: its turn is dropped after the compile, as main drops
-    // any such turn.
+    // agent was replaced or removed installs no hold: its turn is dropped
+    // after the compile, as main drops any such turn.
     if (!this.ephemeralRuns.has(agent.name) && this.agents.get(agent.name) === agent) {
       const wait = this.providerWaits?.active(agent.name, agent.model);
       if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
@@ -28097,7 +28104,8 @@ export class AgentFramework {
     // it permanently requeues every wake for the agent (the 'idle+turn-alive'
     // wedge — worse than any single lost turn). Ownership is handed off
     // exactly once, to driveStream, the moment the stream handle is
-    // registered; on every other exit — including a throw from the turn-start
+    // registered, or to a failed start's retry as its wait begins; on every
+    // other exit — including a throw from the turn-start
     // flush, recordTurnCheckpoint, or locus resolution, none of which the
     // inner catch covers (ENOSPC-class store writes live there) — the finally
     // clears our own token. Token-matched, so when a retry frame has replaced
@@ -28119,31 +28127,7 @@ export class AgentFramework {
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate, checkWindow);
     } catch (error) {
-      this.failedLastTurnAt.set(agent, Date.now());
-      // A throw outside the stream's own failure handling (the checkpoint,
-      // locus resolution, the typing indicator) drops this start's trigger,
-      // and nothing retries or holds it. The agent's open logical turn is the
-      // one this start was opening, continuing or resuming, so it ends here,
-      // as a terminal failure in beginAgentTurn's own catch ends its turn:
-      // the next start opens a turn of its own rather than continuing this
-      // one's routing, and an ephemeral run fails with the error rather than
-      // waiting out its watchdog. A silent start has no part in an open turn.
-      if (!trigger?.suppressProse) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        this.settleAgent(agent.name, {
-          stopReason: 'exhausted', speech: '', error: failureWords(err), cause: err,
-        }, this.openLogical.get(agent.name));
-      }
-      this.endStatedWaitRun(agent.name);
-      // The agent's window at the event gate ends here too, while this start
-      // still holds the turn token, as at the provider-wait hold above. A
-      // start that resumes a turn (a budget restart, a tool-result-guard
-      // retry) arrives with the window its predecessor kept open for it, and
-      // a start that got as far as the typing indicator has taken the window
-      // itself. No frame would close it otherwise, and while it is open every
-      // gate event buffers, for every agent. A newer start holding the token
-      // owns the window now, so it's left alone.
-      if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
+      this.endThrownStart(agent, trigger, turnToken, error);
       throw error;
     } finally {
       // This start's checks are behind it, whether it handed its turn to a
@@ -28162,6 +28146,39 @@ export class AgentFramework {
       // enter only at the agent's next start.
       if (!tokenHandedOff) this.presentAtEndOf(agent);
     }
+  }
+
+  /**
+   * A throw outside the stream's own failure handling (the checkpoint,
+   * locus resolution, the typing indicator, a failed start's retry before
+   * its own start took over) drops the start's trigger, and nothing retries
+   * or holds it. The agent's open logical turn is the one the start was
+   * opening, continuing or resuming, so it ends here, as a terminal failure
+   * in beginAgentTurn's own catch ends its turn: the next start opens a turn
+   * of its own rather than continuing this one's routing, and an ephemeral
+   * run fails with the error rather than waiting out its watchdog. A silent
+   * start has no part in an open turn.
+   */
+  private endThrownStart(agent: Agent, trigger: InferenceRequest | undefined, turnToken: number, error: unknown): void {
+    this.failedLastTurnAt.set(agent, Date.now());
+    if (this.agents.get(agent.name) === agent) {
+      if (!trigger?.suppressProse) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.settleAgent(agent.name, {
+          stopReason: 'exhausted', speech: '', error: failureWords(err), cause: err,
+        }, this.openLogical.get(agent.name));
+      }
+      this.endStatedWaitRun(agent.name);
+    }
+    // The agent's window at the event gate ends here too, while this start
+    // still holds the turn token, as at the provider-wait hold. A start that
+    // resumes a turn (a budget restart, a tool-result-guard retry) arrives
+    // with the window its predecessor kept open for it, and a start that got
+    // as far as the typing indicator has taken the window itself. No frame
+    // would close it otherwise, and while it is open every gate event
+    // buffers, for every agent. A newer start holding the token owns the
+    // window now, so it's left alone.
+    if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
   }
 
   /**
@@ -28490,8 +28507,9 @@ export class AgentFramework {
 
   /**
    * Body of startAgentStream, split out so the caller's try/finally owns the
-   * turn token unconditionally. Returns true iff the token was handed off to
-   * driveStream (whose finally then owns clearing it).
+   * turn token unconditionally. Returns true iff the token was handed off:
+   * to driveStream, or to a failed start's detached retry (activeStartRetries),
+   * whose finally then owns clearing it.
    */
   private async beginAgentTurn(
     agent: Agent,
@@ -28504,6 +28522,9 @@ export class AgentFramework {
     checkWindow: CheckWindow,
   ): Promise<boolean> {
     if (attempt === 0 && this.budgetWaitEnded(agent, trigger)) return false;
+    // The name's incarnation as the turn starts: a later one under the name
+    // is someone else's, whose bracket a late event of this turn would end.
+    const myIncarnation = this.registry.ref(agent.name).incarnation;
     const resumesTurn = resumesLogicalTurn(trigger?.reason);
     let carry = turnCarryOf(trigger);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
@@ -29009,7 +29030,9 @@ export class AgentFramework {
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        this.eventGate?.onInferenceEnded(agent.name);
+        // Only this start's own window: a successor holding the token has
+        // its own, which this turn's drop doesn't end.
+        if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
         return false;
       }
@@ -29104,7 +29127,9 @@ export class AgentFramework {
         }
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
-        this.eventGate?.onInferenceEnded(agent.name);
+        // Only this start's own window: a successor holding the token has
+        // its own, which this turn's drop doesn't end.
+        if (this.activeTurnTokens.get(agent.name) === turnToken) this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
         return false;
       }
@@ -29283,43 +29308,76 @@ export class AgentFramework {
       else this.deadlineCuts.delete(agent.name);
       if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
       if (action.retry) {
-        // A policy's delay can be a provider's retry-after: wait all of it.
-        await this.waitForRetry(action.delayMs, checkWindow, agent, { nextTry: policyAttempt + 2, action });
-        if (this.providerAdmissionClosed) {
-          // stop() ended the wait: that cancels the retry, it does not hasten
-          // it, and a stop kept for the turn goes with it. The turn ends as
-          // one dropped before it sends anything does: a terminal event
-          // saying why, after the inference:failed above, and its record's
-          // end. Nothing is written
-          // but the [speech-not-posted] notice; this frame still owns its
-          // token, since no retry frame replaced it.
-          this.nameUnpostedSpeech(agent, routing);
-          this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
-          if (this.activeTurnTokens.get(agent.name) === turnToken) {
-            this.activeTurnTokens.delete(agent.name);
-            this.activeTurnTriggers.delete(agent.name);
+        const retryWindow: CheckWindow = { abandoned: false };
+        this.checkAhead.set(agent, retryWindow);
+        let task!: Promise<void>;
+        task = (async () => {
+          // A throw from the catch's settlement or from the finally's cleanup
+          // goes where the catch's own does: nothing awaits this task, so a
+          // rejection would have no handler.
+          try {
+            try {
+              // A policy's delay can be a provider's retry-after: wait all of it.
+              await this.waitForRetry(action.delayMs, retryWindow, agent, { nextTry: policyAttempt + 2, action });
+              if (this.agents.get(agent.name) !== agent) {
+                // No event where a later incarnation has taken the name since
+                // the turn started, registered now or ended already.
+                if (this.registry.ref(agent.name).incarnation === myIncarnation) {
+                  this.abortDroppedTurn(agent.name, turnToken, this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_AGENT_GONE, turnStartedAt);
+                }
+                return;
+              }
+              if (this.providerAdmissionClosed) {
+                // stop() ended the wait: that cancels the retry, it does not hasten
+                // it, and a stop kept for the turn goes with it. The turn ends as
+                // one dropped before it sends anything does: a terminal event
+                // saying why, after the inference:failed above, and its record's
+                // end. Nothing is written but the [speech-not-posted] notice.
+                this.nameUnpostedSpeech(agent, routing);
+                this.abortDroppedTurn(agent.name, turnToken, RETRY_CANCELLED_BY_STOP, turnStartedAt);
+                return;
+              }
+              // A stop made during the wait reached no stream: it ends the turn at
+              // this check, before the retry's start, as a stop during the hooks
+              // does at theirs.
+              const stopAfterWait = this.takeStartStop(agent, retryWindow);
+              if (stopAfterWait) {
+                this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn, released);
+                return;
+              }
+              // The retry re-enters startAgentStream, which replaces this frame's
+              // turn token with its own; cleanup belongs to the innermost frame.
+              // The retry is its turn's (TURN_RETRY): this frame has begun the turn,
+              // and once the retry's start is held at the last admission boundary
+              // (a conversation agent's own compression can record a wait during
+              // the policy's delay), this frame lets go of its token. No check of
+              // this start is ahead now, so its window closes first: a stop made
+              // once the retry is held finds the held retry (abortInference's
+              // drop), not a window nothing will collect.
+              if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
+              await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
+            } catch (error) {
+              this.startRetryErrors.push({ error });
+              this.endThrownStart(agent, trigger, turnToken, error);
+            } finally {
+              this.activeStartRetries.delete(task);
+              if (this.checkAhead.get(agent) === retryWindow) this.checkAhead.delete(agent);
+              if (this.activeTurnTokens.get(agent.name) === turnToken) {
+                this.activeTurnTokens.delete(agent.name);
+                this.activeTurnTriggers.delete(agent.name);
+              }
+              if (ownsProviderGate && !checkWindow.gateReleased) {
+                checkWindow.gateReleased = true;
+                this.releasePrimaryProviderGate(agent.name);
+              }
+              if (this.agents.get(agent.name) === agent) this.presentAtEndOf(agent);
+            }
+          } catch (error) {
+            this.startRetryErrors.push({ error });
           }
-          return false;
-        }
-        // A stop made during the wait reached no stream: it ends the turn at
-        // this check, before the retry's start, as a stop during the hooks
-        // does at theirs.
-        const stopAfterWait = this.takeStartStop(agent, checkWindow);
-        if (stopAfterWait) {
-          this.endStoppedStart(agent, stopAfterWait, routing, turnStartedAt, undefined, opensTurn, released);
-          return false;
-        }
-        // The retry re-enters startAgentStream, which replaces this frame's
-        // turn token with its own; cleanup belongs to the innermost frame.
-        // The retry is its turn's (TURN_RETRY): this frame has begun the turn,
-        // and once the retry's start is held at the last admission boundary
-        // (a conversation agent's own compression can record a wait during
-        // the policy's delay), this frame lets go of its token. No check of
-        // this start is ahead now, so its window closes first: a stop made
-        // once the retry is held finds the held retry (abortInference's
-        // drop), not a window nothing will collect.
-        if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
-        await this.startAgentStream(agent, retry && this.turnRetryOf(retry, routing), attempt + 1);
+        })();
+        this.activeStartRetries.set(task, agent.name);
+        return true;
       } else {
         if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         this.noteFailedTurnEnd(agent, routing);
@@ -29362,11 +29420,9 @@ export class AgentFramework {
         }
         this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, routing, asTransient);
       }
-      // No handoff on either failure branch: the terminal branch deleted the
-      // token above; the retry branch's recursive startAgentStream replaced
-      // it with the inner frame's token. Returning false lets the caller's
-      // token-matched finally no-op in both cases (and actually clear it if
-      // something above threw before either branch ran).
+      // The terminal branch deleted the token above. Returning false lets the
+      // caller's token-matched finally no-op (and actually clear it if
+      // something above threw before the branch ran).
       return false;
     }
   }
