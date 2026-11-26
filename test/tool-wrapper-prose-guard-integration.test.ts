@@ -480,12 +480,12 @@ describe('tool wrapper prose guard integration', () => {
       assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
       // The terminal frame's teardown stops typing and sends the complete.
       const until = Date.now() + 5000;
-      // A stop with no channel covers the run's channel, so either form shows it.
-      const stopped = () => typing.includes('stop:(all)') || typing.includes('stop:world:test');
+      const stopped = () => typing.includes('stop:world:test');
       while (Date.now() < until && !(stopped() && outgoing.some(([kind]) => kind === 'complete'))) {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       assert.ok(stopped(), `terminal physical frame stops typing for its channel after ephemeral caller disposal: ${typing.join(', ')}`);
+      assert.equal(typing.includes('stop:(all)'), false, `and no other channel: ${typing.join(', ')}`);
       assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
     } finally {
       await framework.stop();
@@ -542,13 +542,10 @@ describe('tool wrapper prose guard integration', () => {
       await within('the stream to be driven', membrane.driven);
       silenceRun(framework, created.agent.name);
       assert.match(String(await within('the run to end', ended)), /stalled/, 'the idle watchdog ended the run');
-      // The disposed frame's typing stops in its teardown, which runs once
-      // its late answer has come in.
+      assert.ok(events.includes('stop:world:test'), `the disposal stops typing in its own channel, before the stream answers: ${events.join(', ')}`);
+      assert.equal(events.includes('stop:(all)'), false, `and no other channel: ${events.join(', ')}`);
       membrane.release();
       await within('the late answer to reach the framework', membrane.answerOut);
-      const until = Date.now() + 60_000;
-      while (Date.now() < until && !events.includes('stop:(all)')) await new Promise((resolve) => setTimeout(resolve, 5));
-      assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
       assert.deepEqual(events.filter((event) => event.startsWith('chunk:') || event.startsWith('complete:')), [],
         "the partial text and the disposed frame's late answer were never delivered, so neither streams");
     } finally {

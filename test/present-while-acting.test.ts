@@ -2698,7 +2698,7 @@ describe('present while acting', () => {
     assert.deepEqual(routed, [
       { text: 'Hello, observatory.', locus: 'discord:guild:observatory' },
     ], 'control: the open gave the turn somewhere to speak');
-    assert.deepEqual(shown.filter((x) => x !== 'stop (all)'), ['start discord:guild:observatory'], `typing shows only in the opened channel, and nothing else is stopped: ${JSON.stringify(shown)}`);
+    assert.deepEqual(shown, ['start discord:guild:observatory', 'stop discord:guild:observatory'], `typing shows only in the opened channel, and the turn's end stops it there alone: ${JSON.stringify(shown)}`);
 
     await framework.stop();
   });
