@@ -298,30 +298,98 @@ function isHit(hit: unknown): boolean {
 
 export const ERROR_MARK = ', error';
 
-/** Text to embed for one message, or '' when there is nothing worth indexing. */
-export function messageIndexText(msg: StoredMessage, includePrivateTools = true, failed: ReadonlySet<string> = new Set()): string {
-  const parts: string[] = [];
+interface IndexPart {
+  text: string;
+  send?: { tool: string; args: Record<string, unknown> };
+}
+
+/** Keep attribution with the same parts used to build the embedded text. */
+function messageIndexParts(msg: StoredMessage, includePrivateTools: boolean, failed?: ReadonlySet<string>): IndexPart[] {
+  const parts: IndexPart[] = [];
   for (const block of msg.content as ContentBlock[]) {
     if (block.type === 'text' && typeof block.text === 'string') {
-      parts.push(block.text);
+      parts.push({ text: block.text });
     } else if (includePrivateTools && block.type === 'tool_use' && PRIVATE_PROSE_TOOLS.has(block.name)) {
       const input = (block as { input?: Record<string, unknown> }).input ?? {};
       for (const v of Object.values(input)) {
-        if (typeof v === 'string' && v.trim().length > 0) parts.push(`[${block.name}] ${v}`);
+        if (typeof v === 'string' && v.trim().length > 0) parts.push({ text: `[${block.name}] ${v}` });
       }
     } else if (block.type === 'tool_use') {
-      const said = speechOf(block.name, (block as { input?: unknown }).input);
-      if (said) parts.push(`[${said.tool}${failed.has(block.id) ? ERROR_MARK : ''}] ${said.words}`);
+      const said = speechOf(block.name, block.input);
+      if (said) parts.push({
+        text: `[${said.tool}${failed?.has(block.id) ? ERROR_MARK : ''}] ${said.words}`,
+        send: { tool: said.tool, args: block.input as Record<string, unknown> },
+      });
     }
   }
-  return parts.join('\n').trim();
+  return parts;
 }
 
-/** Same two metadata shapes HistoryModule's getChannelId reads: MCPL ingestion writes `metadata.channelId`, older paths `metadata.external.channelId`. */
-function channelOf(msg: StoredMessage): string | null {
+function joinIndexParts(parts: IndexPart[]): string {
+  return parts.map((part) => part.text).join('\n').trim();
+}
+
+/** Text to embed for one message, or '' when there is nothing worth indexing. */
+export function messageIndexText(msg: StoredMessage, includePrivateTools = true, failed?: ReadonlySet<string>): string {
+  return joinIndexParts(messageIndexParts(msg, includePrivateTools, failed));
+}
+
+function isCanonicalPublishChannel(id: unknown): id is string {
+  // Recognize Zulip descriptor ids, not the registry's server-qualified
+  // names or arbitrary connector-specific ids whose form we don't know.
+  if (typeof id !== 'string' || !id.startsWith('zulip:')) return false;
+  const suffix = id.slice('zulip:'.length);
+  if (/^[^:\r\n]+$/.test(suffix) && suffix === suffix.trim()) return true;
+  if (!suffix.startsWith('dm:')) return false;
+  let previous = 0;
+  return suffix.slice('dm:'.length).split('+').every((raw) => {
+    const n = Number(raw);
+    if (!Number.isSafeInteger(n) || n <= previous || String(n) !== raw) return false;
+    previous = n;
+    return true;
+  });
+}
+
+function sendChannel(tool: string, args: Record<string, unknown>): string | null {
+  const { to, type, channelId } = args;
+  if (tool === 'channel_publish') {
+    return isCanonicalPublishChannel(channelId) ? channelId : null;
+  }
+  // Replies resolve by message id, regardless of other routing arguments.
+  if (tool === 'send_message' && args.reply_to != null) return null;
+  if (tool === 'send_message' && type === 'stream') {
+    // Keep the supplied name or ID as written, without resolving aliases.
+    if ((typeof to === 'string' && to.trim()) ||
+        (typeof to === 'number' && Number.isSafeInteger(to) && to > 0)) return `zulip:${to}`;
+  }
+  if (tool === 'send_dm' || (tool === 'send_message' && type === 'private')) {
+    // Zulip keys DMs by numeric user id. Names, emails and groups need
+    // information that isn't in the call, so only use an explicit single id.
+    const recipient: unknown = Array.isArray(to) && to.length === 1 ? to[0] : to;
+    const id = typeof recipient === 'string' && /^\d+$/.test(recipient.trim())
+      ? Number(recipient) : recipient;
+    if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) return `zulip:dm:${id}`;
+  }
+  return null;
+}
+
+function channelOf(msg: StoredMessage, parts: IndexPart[]): string | null {
+  // Same metadata precedence as HistoryModule's getChannelId.
   const md = msg.metadata as { channelId?: unknown; external?: { channelId?: unknown } } | undefined;
   if (typeof md?.channelId === 'string') return md.channelId;
-  return typeof md?.external?.channelId === 'string' ? md.external.channelId : null;
+  if (typeof md?.external?.channelId === 'string') return md.external.channelId;
+
+  // Unlike the old mixed-prose rule, ordinary text and private-prose tools
+  // do not prevent tagging. The tag names the turn's single send destination
+  // as a denylist filtering hint, not as proof its prose was delivered there.
+  let channel: string | null = null;
+  for (const { send } of parts) {
+    if (!send) continue;
+    const dest = sendChannel(send.tool, send.args);
+    if (dest === null || (channel !== null && channel !== dest)) return null;
+    channel = dest;
+  }
+  return channel;
 }
 
 function authorOf(msg: StoredMessage): string | null {
@@ -335,14 +403,15 @@ export function messageToItem(msg: StoredMessage, cfg: { includePrivateTools?: b
   // such as retrieval's lessons, not something that happened: indexed, it
   // would come back to a search as history.
   if (storedInjectionMarkOf(msg.metadata)) return null;
-  const text = messageIndexText(msg, cfg.includePrivateTools ?? true);
+  const parts = messageIndexParts(msg, cfg.includePrivateTools ?? true);
+  const text = joinIndexParts(parts);
   if (!text) return null;
   const tsMs = msg.timestamp.getTime();
   return {
     id: `msg:${String(msg.id)}`,
     text: safeSlice(text, 0, cfg.maxChars ?? 32_000),
     ts: tsMs / 1000,
-    channel: channelOf(msg),
+    channel: channelOf(msg, parts),
     kind: 'message',
     cursor: tsMs,
     meta: { participant: msg.participant, author: authorOf(msg), seq: msg.sequence },
