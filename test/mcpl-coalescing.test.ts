@@ -256,7 +256,7 @@ test("a retraction withdraws a coalesced push that a hold kept, whose release ke
   assert.deepEqual(storeHeldLost(traces), []);
 });
 
-test('while a branch switch holds the store, a conversation fork\'s coalesced channel message and its update, both kept in memory, are withdrawn by a retraction', async (t) => {
+test('while a branch switch holds the store, an update replaces a conversation fork\'s coalesced channel message kept in memory, and a retraction withdraws the update', async (t) => {
   const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close); await f.register();
   await f.send('channels/incoming', { messages: [f.channel('w', 'fork_warmup', { initial: true }, 'chat', 'w')] });
   const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): { agentName: string } | undefined } }).conversationRouter;
@@ -288,7 +288,47 @@ test("a retraction after the release withdraws a conversation fork's coalesced c
   assert(!f.context(fork).includes('fork_original'));
 });
 
-test('a write kept in memory that an earlier try may have stored is never withdrawn, and lands at the release', async (t) => {
+test("while its agent's context manager refuses its work, a retraction that withdraws the one write kept for it leaves the wait in place, and the next write waits behind it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await whileHeld(f, async () => {}, { fail: true });
+  await f.send('push/event', f.params('1', 'kept_original', { initial: true }));
+  const retraction = await f.send('push/event', f.params('2', '', { retract: true }));
+  assert.equal(retraction.result.coalesce.outcome, 'retracted');
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { addMessage: (...args: unknown[]) => unknown };
+  const addMessage = cm.addMessage;
+  let tried = 0;
+  cm.addMessage = (...args: unknown[]) => { tried++; return addMessage.apply(cm, args); };
+  try {
+    await f.send('push/event', f.params('n', 'kept_later', { key: 'later', initial: true }));
+  } finally {
+    cm.addMessage = addMessage;
+  }
+  assert.equal(f.framework.getHostModeStatus().deferredWrites, 1, 'the later write waits in memory');
+  assert.equal(tried, 0, 'the later write joins the wait without trying the store');
+  await f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+  assert(f.context().includes('kept_later') && !f.context().includes('kept_original'));
+});
+
+test('the release fills a held write\'s placement as a store outside a hold fills it: the row it landed as, and no mark of a row left unpresented', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as {
+    addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+    storeInFork(target: unknown, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+  };
+  const added: CoalescingPlacement = { agent: '' };
+  const forked: CoalescingPlacement = { agent: '' };
+  await whileHeld(f, async () => {
+    internals.addMessage('user', [{ type: 'text', text: 'added_while_held' }], {}, { placement: added });
+    internals.storeInFork(f.framework.getAgent('agent'), [{ type: 'text', text: 'forked_while_held' }], {}, { placement: forked });
+    assert.deepEqual([added, forked], [{ agent: 'agent', presented: false }, { agent: 'agent', presented: false }]);
+  });
+  for (const [placement, text] of [[added, 'added_while_held'], [forked, 'forked_while_held']] as const) {
+    const row = f.framework.getAgent('agent')!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
+    assert.deepEqual(placement, { agent: 'agent', messageId: row?.id }, `${text}: the agent is at rest, so the release presents the row`);
+  }
+});
+
+test('a write kept in memory that an earlier try may have stored isn\'t withdrawn while it is kept, and lands at the release', async (t) => {
   const f = await fixture(); t.after(f.close);
   const internals = f.framework as unknown as {
     addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;

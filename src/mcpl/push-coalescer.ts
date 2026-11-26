@@ -71,8 +71,7 @@ export interface CoalescingPlacement {
   agent: string;
   /** Stored message id in that agent's context manager. Absent for a write
    *  kept in memory (a surgery's hold, or the wait for its agent's
-   *  recovery), which the host counts as unread, and can remove, while it
-   *  is kept, unless it may be stored already. */
+   *  recovery). */
   messageId?: string;
   /** Set on a placement that wasn't presented to `agent` at its write: a
    *  write kept in memory (no `messageId` yet), or one stored while a turn
@@ -1291,9 +1290,7 @@ export class PushCoalescer<E = unknown> {
           // Not presented to its agent: stored for another agent, whose
           // turn is alive, or for the assembling agent after its assembly
           // ended, as any write during its turn; or kept in memory (no id)
-          // until its hold's release stores it. Each is still unread (a kept
-          // one unless it may be stored already), so it stays replaceable
-          // and withdrawable. The turn being assembled
+          // until its hold's release stores it. The turn being assembled
           // doesn't read it, so it isn't materialized for that turn, and no
           // request has consumed it. The freeze withdrew the placement's
           // agent's wake for this batch; give it an ordinary wake, as any
