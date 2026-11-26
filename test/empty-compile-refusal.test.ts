@@ -824,3 +824,30 @@ test('when a stored injection newer than a small message is what didn\'t fit, th
     } finally { await cm.close(); }
   } finally { await h.close(); }
 });
+
+test('the refusal reads the window that the compile read: a row presented while the compile runs is neither refused nor named', async () => {
+  const h = await harness(12_000);
+  try {
+    const store = (h.framework as unknown as { store: JsStore }).store;
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new PassthroughStrategy() } as never);
+    try {
+      const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
+      const author = (name: string) => ({ author: { name }, serverId: 'discord', channelId: 'general' }) as never;
+      const budget = { maxTokens: 12_000, reserveForResponse: 4_096 };
+      const empty = host.compileContext(budget);
+      cm.presentRows([cm.addMessage('user', [{ type: 'text', text: 'zz-late-one' }], author('LateOne'))]);
+      assert.equal((await empty).messages.length, 0, 'the compile of an empty window returns as before');
+      const big = cm.addMessage('user', [{ type: 'text', text: LONG }], author('Large'));
+      cm.presentRows([big]);
+      const blocked = host.compileContext(budget);
+      cm.presentRows([cm.addMessage('user', [{ type: 'text', text: 'zz-late-two' }], author('LateTwo'))]);
+      await assert.rejects(blocked, (err: unknown) => {
+        assert.ok(err instanceof EmptyCompileError, String(err));
+        assert.ok(err.residentNote.includes('from Large') && !err.residentNote.includes('LateTwo'), err.residentNote);
+        assert.ok(err.operatorNote.includes(`(row ${big})`), err.operatorNote);
+        return true;
+      });
+      assert.ok((await host.compileContext(budget)).messages.flatMap((m) => m.content).some((b) => (b as { text?: string }).text === 'zz-late-two'));
+    } finally { await cm.close(); }
+  } finally { await h.close(); }
+});

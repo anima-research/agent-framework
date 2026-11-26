@@ -725,10 +725,14 @@ export class Agent {
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
-  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean): void {
+  private presentedRows(): readonly StoredMessage[] {
+    const cm = this.contextManager as Partial<ContextManager>;
+    return typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages() : [];
+  }
+
+  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean, rows: readonly StoredMessage[]): void {
     if (guarded) return;
     const cm = this.contextManager as Partial<ContextManager>;
-    const rows = typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages() : [];
     let byId: Map<MessageId, StoredMessage> | undefined;
     const metadataOf = (id: MessageId): unknown => {
       try {
@@ -1662,8 +1666,9 @@ export class Agent {
     const select = async () => {
       const at = this.compileBudget(budget);
       const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
+      const rows = this.presentedRows();
       const compiled = await this.contextManager.compile(at);
-      this.refuseEmptyCompile(compiled, at, guarded);
+      this.refuseEmptyCompile(compiled, at, guarded, rows);
       return compiled;
     };
     const compile = () => this.compileUnpinningOnRefusal(select);
@@ -1995,8 +2000,9 @@ export class Agent {
     const select = async () => {
       const at = this.compileBudget(budget);
       const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
+      const rows = opts?.dryRun ? [] : this.presentedRows();
       const compiled = await this.contextManager.compile(at, injections, opts as never);
-      if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at, guarded);
+      if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at, guarded, rows);
       return compiled;
     };
     const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
