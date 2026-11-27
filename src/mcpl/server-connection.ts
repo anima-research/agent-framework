@@ -24,7 +24,9 @@ import {
   logDroppedLine,
   redactServerText,
   redactedData,
+  serverInfoOf,
   serverTextRedactor,
+  type McpServerInfo,
   type ServerTextRedactor,
 } from './protocol-family.js';
 
@@ -271,6 +273,13 @@ export type HintRead =
   /** A standalone tools/hints (carrier 3). */
   | { kind: 'hints'; params: unknown };
 
+export type McplNoGrantEnd = 'unanswered' | 'errored' | 'refused' | 'no-mcpl' | 'host-error';
+
+export interface McplNoGrantRefusal {
+  method: string;
+  end: McplNoGrantEnd;
+}
+
 /** Requests whose results can carry hint state, remembered for a late answer (RFC-014 §6.1). */
 const HINTED_METHODS: ReadonlySet<string> = new Set(['tools/call', 'toolsets/open', 'toolsets/close', 'toolsets/list']);
 
@@ -436,6 +445,11 @@ function unmatchedResponse(
  *                            connection runs the §5.3 policy exchange again,
  *                            then opens the planes (the framework's listener
  *                            does).
+ * - `'no-grant-refusal'`   — The admission gate refused a message for lack of
+ *                            a capability while `noGrantEnd` is set:
+ *                            `{ method, end }`, the refused message's MCPL
+ *                            method and `noGrantEnd`. Raised for each such
+ *                            message, after the refusal, past the gate.
  */
 export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
@@ -459,6 +473,11 @@ export class McplServerConnection extends EventEmitter {
    *  2024-11-05 for this engine), or null before the first one. */
   protocolVersion: string | null = null;
 
+  /** The server's own name and version, as the answer to the last
+   *  successful handshake gave them; null when it gave neither, and before
+   *  the first one. */
+  serverInfo: McpServerInfo | null = null;
+
   /** Host-owned per-server authority for host/command (config
    *  allowHostCommands, default false). No capability path exists and the
    *  grant cannot confer it — server params never decide admin authority. */
@@ -478,6 +497,24 @@ export class McplServerConnection extends EventEmitter {
 
   /** True once the §5.3 initial policy Request has been answered. */
   policyEstablished = false;
+
+  /** How this transport's §5.3 policy exchange ended, when it ended with no
+   *  grant in force: `unanswered` or `errored` for a policy Request that got
+   *  no answer or an error answer, `refused` for a refused policy, `no-mcpl`
+   *  for a server that declared no MCPL, so none was offered, and
+   *  `host-error` for a host error in the policy step. After a manifest
+   *  change, a failed policy Request sets it too, when the grant left in
+   *  force admits none of the gated messages. Null until then. Whoever runs
+   *  the exchange sets it (the framework does); `establishGrant` and a
+   *  transport boundary clear it. */
+  noGrantEnd: McplNoGrantEnd | null = null;
+
+  /** Whether the agent has been told that this connection holds no grant, in
+   *  its current spell without one. Whoever tells the agent sets it (the
+   *  framework does, once its notice is written), and clears it when the
+   *  server accepts a grant that admits a gated message. A transport
+   *  boundary and the empty grant that a refusal sets keep it. */
+  noGrantTold = false;
 
   /**
    * RFC-007 §6: the server's `tools/observe` filter — interest, never
@@ -559,6 +596,7 @@ export class McplServerConnection extends EventEmitter {
   establishGrant(grant: CapabilityGrant): void {
     this.grant = grant;
     this.policyEstablished = true;
+    this.noGrantEnd = null;
     // RFC-007 §6.5: revoking observe discards the filter; the server sends
     // it again if the capability is granted later.
     if (!grant.has('toolLifecycle.observe')) this.toolObserveFilter = null;
@@ -570,6 +608,7 @@ export class McplServerConnection extends EventEmitter {
   private resetPolicyForTransportBoundary(): void {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
+    this.noGrantEnd = null;
     this.transportEpoch++;
     this.transportEnded.abort();
     this.transportEnded = new AbortController();
@@ -1067,6 +1106,10 @@ export class McplServerConnection extends EventEmitter {
         } else {
           console.error(`[mcpl] ${this.id}: discarded ${logValue(name)} — "${requiredCap}" ${phase}`);
         }
+        if (this.noGrantEnd !== null) {
+          const refusal: McplNoGrantRefusal = { method: McplServerConnection.methodOf(name), end: this.noGrantEnd };
+          super.emit('no-grant-refusal', refusal);
+        }
         return true;
       }
       // §6.6: a request that will never be answered MUST get an error. A
@@ -1197,6 +1240,10 @@ export class McplServerConnection extends EventEmitter {
     'tools-observe': 'toolLifecycle.observe',
   };
 
+  grantAdmitsNoGatedMessage(): boolean {
+    return Object.values(McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY).every((path) => !this.grant.has(path));
+  }
+
   private static isControlPlaneEvent(event: string): boolean {
     return event === 'stderr'
       || event === 'scope-elevate'
@@ -1268,13 +1315,14 @@ export class McplServerConnection extends EventEmitter {
       owner.holdUnreaped(error.transport, error.cleanup);
       throw new McplUnreapedLaunchError(owner, error.failure, error.cleanup);
     }
-    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, serverInfo, toolsetDeclarations } = established;
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
     connection.toolsetDeclarations = toolsetDeclarations;
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
     connection.protocolVersion = protocolVersion;
+    connection.serverInfo = serverInfo;
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
@@ -1325,7 +1373,7 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
     signal?: AbortSignal,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string; toolsetDeclarations: Record<string, unknown> | null }> {
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string; serverInfo: McpServerInfo | null; toolsetDeclarations: Record<string, unknown> | null }> {
     const closedWhileConnecting = () => new Error(`MCPL server "${config.id}" was closed while connecting`);
     if (signal?.aborted) throw closedWhileConnecting();
     let transport: McplTransport;
@@ -1374,7 +1422,7 @@ export class McplServerConnection extends EventEmitter {
 
       // Await the initialize response, racing an early transport close/error,
       // a timeout and the owner's close. Every path cleans up its listeners.
-      const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string }>((resolve, reject) => {
+      const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion, serverInfo } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string; serverInfo: McpServerInfo | null }>((resolve, reject) => {
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
@@ -1465,6 +1513,7 @@ export class McplServerConnection extends EventEmitter {
             mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
             mcpToolsAdvertised: caps?.tools !== undefined,
             protocolVersion: answered,
+            serverInfo: serverInfoOf(result?.serverInfo, config),
           });
         };
         const onClose = (info: TransportCloseInfo) => {
@@ -1531,7 +1580,7 @@ export class McplServerConnection extends EventEmitter {
       // I/O callback can emit.
       transport.off('error', logAfterSettled);
       return {
-        transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion,
+        transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion, serverInfo,
         toolsetDeclarations: toolsetDeclarationsOf(rawCapabilities),
       };
     } catch (err) {
@@ -2156,7 +2205,7 @@ export class McplServerConnection extends EventEmitter {
       if (!permanent) this.scheduleReconnect();
       return;
     }
-    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, toolsetDeclarations } = established;
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion, serverInfo, toolsetDeclarations } = established;
 
     if (signal.aborted) {
       // Closed by the host while the handshake finished: this launch never
@@ -2188,6 +2237,7 @@ export class McplServerConnection extends EventEmitter {
     this.droppedCapabilities = droppedCapabilities;
     this.mcpToolsAdvertised = mcpToolsAdvertised;
     this.protocolVersion = protocolVersion;
+    this.serverInfo = serverInfo;
     this.allowHostCommands = this.config?.allowHostCommands === true;
     this.closed = false;
     this.nextRequestId = 1;
@@ -2371,6 +2421,11 @@ export class McplServerConnection extends EventEmitter {
   // ==========================================================================
   // Private: inbound message routing
   // ==========================================================================
+
+  private static methodOf(event: string): string {
+    return Object.keys(McplServerConnection.METHOD_TO_EVENT)
+      .find((method) => McplServerConnection.METHOD_TO_EVENT[method] === event) ?? event;
+  }
 
   /**
    * Map from JSON-RPC method name to the EventEmitter event name.

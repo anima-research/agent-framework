@@ -22,6 +22,10 @@
 // IGNORE_SIGTERM=1 makes the process survive SIGTERM (only SIGKILL ends it),
 // noting each SIGTERM it gets in <startLog>.sigterm.
 //
+// SERVER_INFO (JSON) is the `ok` answer's serverInfo, which it has none of
+// otherwise. A JSON array gives one for each start recorded in startLog, and
+// its last for each later start. A null gives none.
+//
 // tools/list pages: by default three pages (cursors p2, p3). MODE_LIST picks
 // an edge case: loop (always nextCursor "same"), empty (nextCursor "" then a
 // second page), notools (no tools array), badcursor (nextCursor 5),
@@ -32,11 +36,15 @@ import { appendFileSync, closeSync, existsSync, openSync, readFileSync } from 'n
 
 let mode = process.argv[2] ?? 'ok';
 const startLog = process.argv[3];
+let priorStarts = 0;
 if (startLog) {
-  const priorStarts = existsSync(startLog) ? readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length : 0;
+  priorStarts = existsSync(startLog) ? readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length : 0;
   appendFileSync(startLog, `start ${process.pid}\n`);
   if (mode.startsWith('ok-then-')) mode = priorStarts === 0 ? 'ok' : mode.slice('ok-then-'.length);
 }
+const serverInfoGiven = process.env.SERVER_INFO === undefined ? null : JSON.parse(process.env.SERVER_INFO);
+const serverInfoNow = Array.isArray(serverInfoGiven) ? serverInfoGiven[Math.min(priorStarts, serverInfoGiven.length - 1)] : serverInfoGiven;
+const serverInfo = serverInfoNow === null ? {} : { serverInfo: serverInfoNow };
 if (process.env.IGNORE_SIGTERM === '1') {
   process.on('SIGTERM', () => { if (startLog) appendFileSync(`${startLog}.sigterm`, `sigterm ${process.pid}\n`); });
 }
@@ -93,7 +101,7 @@ process.stdin.on('data', (chunk) => {
         setInterval(() => {}, 1 << 30);
         return;
       }
-      else reply(m.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} } });
+      else reply(m.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} }, ...serverInfo });
     } else if (m.method === 'tools/list') {
       const cursor = m.params?.cursor;
       if (listMode === 'loop') reply(m.id, { tools: [tool(`loop-${cursor ?? 'first'}`)], nextCursor: 'same' });

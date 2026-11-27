@@ -112,7 +112,7 @@ export {
 
 // Server connection and registry
 export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './server-connection.js';
-export type { McplConnectionCloseInfo } from './server-connection.js';
+export type { McplConnectionCloseInfo, McplNoGrantEnd, McplNoGrantRefusal } from './server-connection.js';
 export type { TransportCloseInfo } from './transport.js';
 export { ModernMcpConnection } from './modern-connection.js';
 export type { ModernToolCallResult } from './modern-connection.js';
@@ -126,7 +126,7 @@ export {
   serverConfigWarnings,
   checkServerConfig,
 } from './protocol-family.js';
-export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './protocol-family.js';
+export type { McpProtocolFamily, McpServerInfo, McpTransportKind, ServerBinding } from './protocol-family.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)

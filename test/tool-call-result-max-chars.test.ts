@@ -175,13 +175,16 @@ describe('ToolCall.resultMaxChars', () => {
       assert.equal(stored.get('call_at'), 'x'.repeat(BOUNDED), 'a result of resultMaxChars is stored whole');
       // call_past's round, beside the utility's short result, fits the bound,
       // so each is stored as it would be alone. This framework has no
-      // workspace to spill to, so the store keeps the start.
+      // workspace to spill to, so the store keeps the head and tail.
       const past = stored.get('call_past')!;
-      const kept = /^x*/.exec(past)![0].length;
-      assert.ok(kept > 0 && kept < BOUNDED + 1, `one character more is cut to its start: kept ${kept}`);
+      const at = /chars (\d+) to (\d+) of (\d+) elided here/.exec(past);
+      assert.ok(at, past.slice(0, 200));
+      const [head, tailStart, whole] = [Number(at[1]), Number(at[2]), Number(at[3])];
+      assert.equal(whole, BOUNDED + 1);
+      assert.ok(head > 0 && tailStart > head && head + whole - tailStart < BOUNDED + 1, `one character more is cut to its head and tail: ${head}, ${tailStart}`);
       assert.equal(past,
-        `${'x'.repeat(kept)}\n\n[truncated — original was ${BOUNDED + 1} chars; no writable workspace mount without an include, full content not retained]`,
-        'its notice follows the start');
+        `${'x'.repeat(head)}\n\n[truncated — chars ${head} to ${tailStart} of ${whole} elided here; no writable workspace mount without an include, the middle was not retained]\n${'x'.repeat(whole - tailStart)}`,
+        'its notice sits between them');
       assert.ok(past.length <= BOUNDED, `what is stored fits the cap: ${past.length}`);
       // A utility run through toolsets--act is stored as that call's result.
       assert.equal(caps.get('call_utility'), BOUNDED);

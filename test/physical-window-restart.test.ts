@@ -417,7 +417,7 @@ describe('physical-window mid-turn restart (issue #92)', () => {
       assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
       // The second call's own figures: its 190k prompt and 10k output, the
       // appended round and the reserve. The first call's 30k output, kept,
-      // would project 258,049.
+      // would project 258,054.
       assert.strictEqual(t.restarts[0]!.inputTokens, 190_000 + 10_000 + APPENDED + 32_000);
       assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
       assert.ok(storedTexts(t.framework).includes('Answered after a restart'));
@@ -426,13 +426,14 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     }
   });
 
-  // Each blob tool round appends 6,049 tokens by the framework's estimate
-  // (estimateAppendedRoundTokens: the 24,000-character inline cap and the
-  // truncation notice after it, at chars/4, plus its per-block overhead).
+  // Each blob tool round appends 6,054 tokens by the framework's estimate
+  // (estimateAppendedRoundTokens: the head and tail the 24,000-character
+  // inline cap keeps and the truncation notice between them, at chars/4, plus
+  // its per-block overhead).
   // The notice's words are part of the figure, so rewording the notice moves
   // it. The restart trace's inputTokens is the projection, so the tests below
   // pin it whole.
-  const APPENDED = 6_049;
+  const APPENDED = 6_054;
 
   it("counts an embedded resource's image as the image it's sent as", async () => {
     // A 170k prompt with 2k output and the 32k reserve crosses the window
@@ -485,8 +486,8 @@ describe('physical-window mid-turn restart (issue #92)', () => {
 
   it('counts a cache-write prompt term toward a restart', async () => {
     // 10k fresh + 30k cache write + 120k cache read = a 160k prompt; with 2k
-    // output, the appended round and the 32k reserve it projects to 200,049.
-    // Without the cache-write term it would project 170,049 and fit.
+    // output, the appended round and the 32k reserve it projects to 200,054.
+    // Without the cache-write term it would project 170,054 and fit.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 10_000, cacheCreationTokens: 30_000, cacheReadTokens: 120_000, outputTokens: 2_000 }),
@@ -505,12 +506,12 @@ describe('physical-window mid-turn restart (issue #92)', () => {
   });
 
   it('projects the growth since the last call that reported a prompt: the rounds appended since count', async () => {
-    // Call 1 reports a 155k prompt and 2k output: 195,049 projected, it fits.
+    // Call 1 reports a 155k prompt and 2k output: 195,054 projected, it fits.
     // Call 2 reports 2k of output but no prompt (its input counts repeat the
     // running total). Its request was call 1's prompt and output plus the
     // round appended after call 1, so the next boundary adds that round and
-    // call 2's output to call 1's figures: 203,098, past the window. Keeping
-    // call 1's figures alone would project 195,049 again and dispatch.
+    // call 2's output to call 1's figures: 203,108, past the window. Keeping
+    // call 1's figures alone would project 195,054 again and dispatch.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 15_000, cacheReadTokens: 140_000, outputTokens: 2_000 }),
@@ -530,9 +531,9 @@ describe('physical-window mid-turn restart (issue #92)', () => {
   });
 
   it("counts the output of a call that reports output but no prompt", async () => {
-    // Call 1: a 150k prompt and 2k output, 190,049 projected. Call 2 reports
-    // 5k of output and no prompt: with it the next boundary projects 201,098
-    // and restarts; dropping it would project 196,098 and dispatch.
+    // Call 1: a 150k prompt and 2k output, 190,054 projected. Call 2 reports
+    // 5k of output and no prompt: with it the next boundary projects 201,108
+    // and restarts; dropping it would project 196,108 and dispatch.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 10_000, cacheReadTokens: 140_000, outputTokens: 2_000 }),
@@ -553,8 +554,8 @@ describe('physical-window mid-turn restart (issue #92)', () => {
   it('bounds the output of a call that reports a prompt but no output by maxTokens', async () => {
     // Call 1 reports a 150k prompt and no output, though it wrote a tool_use:
     // its output counts as the 32k it could have been, so the first boundary
-    // projects 150k + 32k + the appended round + the 32k reserve = 220,049,
-    // a restart. Counting it as 0 would project 188,049 and dispatch.
+    // projects 150k + 32k + the appended round + the 32k reserve = 220,054,
+    // a restart. Counting it as 0 would project 188,054 and dispatch.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 10_000, cacheReadTokens: 140_000, outputTokens: 0 }),
@@ -575,8 +576,8 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     // Call 2's usage event repeats the running total: no prompt and no
     // output reported. Its output is unknown, so the projection counts the
     // 32k it could have been: 120k + 5k + (the appended round + 32k) + the
-    // next appended round + the 32k reserve = 201,098, a restart. Counting
-    // it as 0 would project 169,098 and dispatch.
+    // next appended round + the 32k reserve = 201,108, a restart. Counting
+    // it as 0 would project 169,108 and dispatch.
     const first = { inputTokens: 20_000, cacheReadTokens: 100_000, outputTokens: 5_000 };
     const t = await windowTurn([
       [round('call_1', first), round('call_2', first), round(null, first)],
@@ -593,10 +594,10 @@ describe('physical-window mid-turn restart (issue #92)', () => {
 
   it('starts the growth again when a later call reports a prompt', async () => {
     // Call 1 reports a 100k prompt; call 2 reports nothing, so the second
-    // boundary projects 100k + 2k + (6,049 + 32k) + 6,049 + 32k = 178,098,
+    // boundary projects 100k + 2k + (6,054 + 32k) + 6,054 + 32k = 178,108,
     // which fits. Call 3 reports a 140k prompt and 2k output: the third
-    // boundary projects from it alone, 180,049, and fits. Carrying the growth
-    // past call 3 (6,049 + 32k + 6,049) would project 224,147 and restart.
+    // boundary projects from it alone, 180,054, and fits. Carrying the growth
+    // past call 3 (6,054 + 32k + 6,054) would project 224,162 and restart.
     const t = await windowTurn([
       [
         round('call_1', { inputTokens: 10_000, cacheReadTokens: 90_000, outputTokens: 2_000 }),

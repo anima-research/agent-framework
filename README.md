@@ -566,6 +566,17 @@ A server that refuses the host's policy is reported as an `mcpl:policy-refused`
 trace. With `fallback: 'close'` the host closes the connection; with
 `'mcp-only'` only plain MCP tools keep working.
 
+A server holds no grant when its first policy Request gets no answer or an
+error answer, when it refuses the policy, when it declares no MCPL, or when
+the host's own policy step fails. After a manifest change, a failed policy
+Request, or a failed step of the host's, leaves it without one only when the
+grant left in force admits none of the messages that need a capability. The host refuses the server's pushes
+and its other messages that need a capability. At the first such refusal,
+the agent gets a `[no-grant]` notice in its context, of kind `mcpl-no-grant`,
+which names the server and says why it holds no grant. If that server later
+accepts a grant on the same connection, and the grant admits one of those
+messages, the agent gets a row of kind `mcpl-no-grant-ended`, which says so.
+
 #### Event coalescing (RFC-006)
 
 The host advertises `eventCoalescing` (both lanes, deferred rendering,
@@ -922,6 +933,8 @@ static tools are listed like any server's.
 4. **Resume**: All results in → stream resumes with tool results
 5. **Budget restart**: If input tokens exceed `maxStreamTokens`, the stream is cancelled, context is recompressed (the turn's opening messages kept whole, as Context Management says), and a fresh stream starts. An agent whose model binds its thinking (`thinkingBinding.binds`) with `physicalWindowTokens` set skips this, and the window projection restarts it instead before a request the window can't hold
 6. **Complete**: Final response saved to context, agent returns to idle
+
+With a send in the same step, a `skip_reply` waits until the step's sends have answered. A send is a call of a tool in the framework's speech list (`src/send-tools.ts`), such as `send_message`, `send_dm` or `send_file`. The list matches the name without its server prefix. A `drafts` resend counts as a send. Only the step's own calls count, so a send made inside a script or through `toolsets--act` isn't one. When a send answers with `isError`, no `skip_reply` of that step runs. Each one gets an error that names the failed tools and asks for `skip_reply` again. Then the model is called again with every answer of the step. Another call of the step, such as `sleep`, can still end the turn. A failed send therefore costs one more model call. The refusal comes one time in a turn, and later `skip_reply` calls run as before. Beside a failed call that isn't a send, `skip_reply` runs as before. A `skip_reply` from inside a script runs at once.
 
 ### Inference bounds
 

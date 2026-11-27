@@ -399,6 +399,25 @@ export interface WorkspaceConfig {
    * with a warning, for the workspace's own miss to come first.
    */
   agentActionScanDeadlineMs?: number;
+  /**
+   * Whether read, read_image and write also take an absolute path, or one
+   * from the home directory (`~/…`), for a file outside every mount.
+   * `'read-only'` lets read and read_image take one, and `'read-write'` lets
+   * write take one too. Left out, every path is a mount's, as before.
+   *
+   * Such a file is disk's alone: read as it is now and written in place, as
+   * the host's own user, through no mount's boundary, include or symlink
+   * rule. Nothing of it is stored or watched, and an undo or other head move
+   * leaves a write to it on disk. One is read or written up to the size a
+   * mount takes by default, and only a regular file is. An absolute path
+   * that lies in a mount's directory is that mount's file, by that mount's
+   * own rules, so a read-only mount stays read-only; which mount holds it is
+   * judged by where disk has the path, its links followed.
+   *
+   * The tools' descriptions say what the setting allows, so setting it
+   * changes them.
+   */
+  outsideMounts?: 'read-only' | 'read-write';
 }
 
 // ============================================================================

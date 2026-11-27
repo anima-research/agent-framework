@@ -187,8 +187,8 @@ export function renderReturn(r: ScriptReturn, options: RenderOptions): string {
     return lines.join('\n');
   }
   // The output comes last, and past the agent's inline cap the framework's
-  // cut would take its tail first: it gets the room the rest leaves, its head
-  // and tail cut alike.
+  // cut would elide the return's middle wherever it fell: the output gets
+  // the room the rest leaves, its head and tail cut alike.
   const label = `${r.first ? 'Its output' : 'Its output since the last return'}:\n`;
   const rest = lines.join('\n').length + 1 + label.length;
   lines.push(label + renderOutput(r.output, (options.maxChars ?? Infinity) - rest));

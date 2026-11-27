@@ -303,7 +303,8 @@ describe('the wire without the stored copy', () => {
     const { content } = fw.toMembraneToolResult('zz-call', result, 300);
     const ids = (s: string) => s.replace(/ref_[A-Za-z0-9_-]+/g, 'ref_ID');
     assert.equal(ids(content as string), ids(nonErrorResultText(result, 300)));
-    assert.match(content as string, /\n\n\[truncated — original was \d+ chars\]$/);
+    assert.match(content as string, /\n\n\[truncated — chars \d+ to \d+ of \d+ elided here\]\n/);
+    assert.ok((content as string).endsWith('"more":"zz-tail"}'), String(content));
     assert.ok(!(content as string).includes(SIGNATURE), String(content));
   });
 });

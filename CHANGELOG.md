@@ -12,6 +12,115 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.35.4 — 2026-11-24
+
+### Added
+
+- An agent now gets a notice about an MCPL server that holds no grant. The server holds none because its policy exchange ended without one. The host refuses its pushes and its other privileged messages. At the first such refusal, the framework writes a `[no-grant]` notice into the agent's context, which wakes nobody. The row's kind is `mcpl-no-grant`, and it carries `serverId`. The notice names the server and the refused method, and says why the server holds no grant.
+- A policy exchange ends without a grant in these ways:
+  - the server doesn't answer its first policy Request;
+  - the server answers its first policy Request with an error;
+  - the server refuses the policy, at its first exchange or after a manifest change;
+  - the server declares no MCPL;
+  - the host can't send the first policy Request on a live connection;
+  - the host's own policy step throws, and the connection stays live;
+  - after a manifest change, the policy Request fails in one of the ways above, or the host's own step throws, and the grant left in force admits none of the messages that need a capability.
+- Where the first policy Request got no answer or an error answer, the notice uses the MCPL version that the server declares in its handshake. A version before 0.5 is given as the reason, since such a server doesn't take that request. A version of 0.5 or later gives no such reason. Where the host can't read a version, the notice names an old server as one possible cause. No text from the server goes into the notice.
+- The notice comes once for each spell without a grant. When only the transport drops and comes back, the spell goes on. A new connection starts a new spell: a connect of the server, a restart of the server through the host, or a start of the host. A server process that restarts on its own, and that the host reconnects on the same connection, stays in its spell. A grant that the server accepted ends a spell, and a later loss starts another. When a spell that the agent was told of ends on the same connection, with a grant that admits one of the messages that need a capability, the framework writes one more row, of kind `mcpl-no-grant-ended`, which says that the server now holds a grant. The refusal itself is unchanged, and so are its error answer and its stderr line.
+- The connection has two new fields and one new event. `McplServerConnection.noGrantEnd` names the end of a policy exchange that left no grant. Its values are `'unanswered'`, `'errored'`, `'refused'`, `'no-mcpl'` and `'host-error'`, and it is null at other times. `McplServerConnection.noGrantTold` says whether the agent has been told of the current spell. While `noGrantEnd` is set, a refusal for lack of a capability raises a `'no-grant-refusal'` event. The event carries `{ method, end }`. The package exports their types, `McplNoGrantEnd` and `McplNoGrantRefusal`.
+
+### Changed
+
+- A held draft its resident leaves alone for a whole turn is set aside when
+  that turn ends, as the resident's own `drafts(action: "dismiss")` would, so
+  speech a send, a missing destination or a `skip_reply` held back asks for no
+  call when the resident doesn't want it sent. The turn that holds a draft
+  never sets it aside, so a draft is open at least through the turn after; a
+  `drafts` call that names it (a read, or a resend, whatever comes of it)
+  keeps it through that turn; and only a turn the model ends itself (its last
+  response, or a tool that ends it) sets anything aside, not one that is
+  refused, cut off, fails, is stopped, or runs silently. A bounce is left
+  open, as is a draft that may already have been posted. A draft set aside
+  can't be resent; its words stay in the resident's history. Resident-facing
+  text: the
+  held-draft notice and the turn-end receipt now end "left alone for a whole
+  turn, it is / they are set aside when that turn ends" in place of the
+  `dismiss` call (a receipt names a turn's bounces apart, with the old
+  wording), and the `drafts` tool description states the rule. The
+  `prose:drafts-dismissed` trace carries `auto: true` for these.
+
+- The framework now writes `[no-grant]` notices. It marks `[no-grant` in text from a participant or a server, as it marks its other notice openings.
+- After a manifest change, the host sends a new policy, and the server can refuse it. The stderr line for that refusal now gives the server's reason. When the server gave none, the line says "no reason".
+- The stderr lines for a refused policy, the first one and one after a manifest change, print the server's reason as the host's log lines print other text that a server chose: redacted, escaped, and cut to at most 256 UTF-16 code units. A reason with a space or a line break prints as a quoted JSON string.
+
+### Fixed
+
+- A failed send beside `skip_reply` now reaches the model before the turn
+  ends. A send is a call of a tool in the framework's speech list, such as
+  `send_message`, `send_dm` or `send_file`, or a `drafts` call that resends.
+  Only the step's own calls count, so a send made inside a script or through
+  `toolsets--act` isn't one. With sends in the same step, a `skip_reply` now
+  waits for their answers. Only then does it arm its wake and send its
+  tool-lifecycle `started` event. Only an answer marked `isError` counts as
+  a failure. If a send failed, the step's `skip_reply` calls don't run. Each
+  gets an error that names the failed tools and asks for `skip_reply` again.
+  The model is then called again with every answer of the step, unless a
+  call such as `sleep` ends the turn. That costs one more model call. A
+  refused `skip_reply` reports no tool-lifecycle events, and the refusal
+  happens once per turn. Later in the turn, `skip_reply` runs as before,
+  even beside a failed send. Beside a failed call that isn't a send,
+  `skip_reply` runs as before. A `skip_reply` with bad arguments is still
+  answered at once. A script's own `skip_reply` also runs at once. With
+  `sameRoundSkipReplyTextPolicy: 'ask'`, a step can meet both rules. It then
+  gets one refusal: the policy's words and one added sentence.
+
+## 0.35.3 — 2026-11-24
+
+### Added
+
+- The workspace's `read`, `read_image` and `write` can take a file outside
+  every mount. `WorkspaceConfig.outsideMounts: 'read-only'` lets `read` and
+  `read_image` take an absolute path, or one that starts with `~/`, and
+  `'read-write'` lets `write` take one too. Left out, every path is a
+  mount's, and nothing changes. Such a file is read and written as the
+  host's own user, through no mount's boundary, include or symlink rule, up
+  to 5 MB, and only where it's a regular file. Nothing of it is stored or
+  watched, and an undo leaves a write to it on disk. An absolute path that
+  lies in a mount's directory, links followed, is that mount's file, by that
+  mount's rules, so a read-only mount stays read-only.
+  Where the setting is on, the descriptions of those tools say what they
+  take, and so does the framework's own `read_image`, so setting it changes
+  what the agent's tool list says.
+
+### Fixed
+
+- An emoji no longer makes the reply judge fail. The judge shortens a long
+  text to its head and its tail. Its cut kept a fixed number of UTF-16 units
+  at each end, so it could keep half of an emoji's surrogate pair. The
+  provider refused such a request with HTTP 400 ("lone leading surrogate in
+  hex escape"). Under the default `onError: "wake"`, each refused batch then
+  woke the agent. The cut now keeps each pair whole. The judge also replaces
+  each lone surrogate in its request with U+FFFD before it sends the
+  request. A rule's `instructions` can hold one, for example.
+
+## 0.35.2 — 2026-11-22
+
+### Added
+
+- **`listMcplServers()` gives each server's own name and version** as
+  `serverInfo`: the `name` and the `version` that the last handshake of the
+  server's connection gave in MCP's `serverInfo`, each null where it gave
+  none. Each is the server's text: redacted as the server's other text is,
+  kept to one line, and with each opening of a framework notice tag marked.
+  `serverInfo` is null when that handshake gave neither, and while the
+  server has no connection that has made a handshake: before its first one,
+  and once its connection is gone, as for a closed tab. A later handshake,
+  such as a reconnect's, replaces it. `McplServerConnection` and
+  `ModernMcpConnection` have it as `serverInfo` too, and the package exports
+  its type, `McpServerInfo`. The legacy engine reads it from the
+  `initialize` answer, and the modern engine from its client's handshake,
+  where a server on MCP 2026-07-28 may give none.
+
 ## 0.35.1 — 2026-11-20
 
 ### Added

@@ -945,19 +945,26 @@ describe('live operator surgery', () => {
     assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'd0', 'd1', 'd2'], 'the record keeps the body');
   });
 
-  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one retract', async () => {
+  // The call body right before the result body, and, for #737, with a system
+  // notice between them, which stays in the window.
+  for (const gap of [false, true]) it(`a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one retract (notice between: ${gap})`, async () => {
     // As context-manager's chunker stores them: the tool_use block on the
     // turn's first shard, text after it; then the result, also a body.
+    // Across a notice, stamped as scout's own rows, as production stores
+    // them: an unstamped body proves no pair across a notice.
     const store = (cm() as unknown as ShardStore).messageStore;
+    const own = () => (gap ? { audience: ['scout'], ownRowOf: 'scout' } : {});
     const turn = [
-      store.append('assistant', [{ type: 'tool_use', id: 't9', name: 'shell', input: {} }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 0 }).id,
-      store.append('assistant', [{ type: 'text', text: 'narration' }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 1 }).id,
+      store.append('assistant', [{ type: 'tool_use', id: 't9', name: 'shell', input: {} }], own(), undefined, { bodyGroupId: 'g-turn', shardIndex: 0 }).id,
+      store.append('assistant', [{ type: 'text', text: 'narration' }], own(), undefined, { bodyGroupId: 'g-turn', shardIndex: 1 }).id,
     ];
+    const notice = gap ? [cm().addMessage('user', [{ type: 'text', text: 'system notice' }], { system: true })] : [];
     const result = [
-      store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
-      store.append('user', [{ type: 'text', text: 'r1' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
+      store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], own(), undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
+      store.append('user', [{ type: 'text', text: 'r1' }], own(), undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
     ];
     cm().presentRows([turn[0] as never]);
+    if (gap) cm().presentRows(notice);
     cm().presentRows([result[0] as never]);
     const c = cm() as unknown as {
       removeMessages: (a: string, b: string) => void;
@@ -987,7 +994,8 @@ describe('live operator surgery', () => {
       c.retractRows = originalRetract;
     }
     for (const id of [...turn, ...result]) assert.equal(cm().windowStatusOf(id as never), 'undone');
-    assert.equal(cm().getMessageCount(), 9, 'the record keeps the exchange');
+    for (const id of notice) assert.equal(cm().windowStatusOf(id as never), 'in', 'separate notice survives recovery');
+    assert.equal(cm().getMessageCount(), 9 + notice.length, 'the record keeps the exchange');
   });
 
   // --- failure path ----------------------------------------------------------
