@@ -25050,13 +25050,7 @@ export class AgentFramework {
    * agent once. No-op otherwise.
    */
   private appendClosedChannelNoteAlone(agent: Agent, routing: TurnRouting): void {
-    const seen = new Set<string>();
-    const landed = routing.deliveries.filter((channel) => {
-      const key = destinationKey(channel);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const landed = distinctDestinations(routing.deliveries);
     routing.deliveries = [];
     const notes = this.closedChannelNotes(agent.name, landed);
     if (notes.length === 0) return;
