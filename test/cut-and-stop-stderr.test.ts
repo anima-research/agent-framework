@@ -78,11 +78,13 @@ class LiveStream implements YieldingStream {
   toolDepth = 0;
   private release: (() => void) | null = null;
   private cancelled = false;
-  constructor(private readonly reports: 'aborted' | 'error') {}
+  constructor(private readonly reports: 'aborted' | 'error' | 'throws' | 'closes') {}
   cancel(): void { this.cancelled = true; this.release?.(); }
   provideToolResults(): void {}
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
     if (!this.cancelled) await new Promise<void>((resolve) => { this.release = resolve; });
+    if (this.reports === 'throws') throw new Error('zz the stream threw at its cancel');
+    if (this.reports === 'closes') return;
     yield (this.reports === 'aborted' ? { type: 'aborted', reason: 'user' } : { type: 'error', error: new Error('stream cancelled') }) as StreamEvent;
   }
 }
@@ -103,8 +105,15 @@ function stderrOf(t: TestContext): string[] {
 const physicalLines = (calls: string[]) => calls.flatMap((text) => text.split(/\r\n|[\n\r\v\f\u2028\u2029\u0085]/));
 const timeoutCalls = (calls: string[]) => calls.filter((text) => physicalLines([text]).some((line) => line.startsWith('[inference-timeout]')));
 const stopCalls = (calls: string[]) => calls.filter((text) => text.includes(STOP_WORDS));
-const timeoutLine = (reason: string, scheduled = 'in 1000ms (2 of 2)', agent = 'resident') => `[inference-timeout] agent=${agent} retry scheduled ${scheduled}: ${reason}`;
-const stopLine = (reason: string, agent = 'resident') => new RegExp(`^\\[turn\\] ${agent}: ${STOP_WORDS} after \\d+ (s|min); the turn ends there \\(reason=${reason}\\)$`);
+const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const timeoutLine = (reason: string, scheduled = 'in 1000ms (2 of 2)', agent = 'resident') =>
+  new RegExp(`^\\[inference-timeout\\] agent=${literal(agent)} cut after \\d+ms; retry scheduled ${literal(scheduled)}: ${literal(reason)}$`);
+const stopLine = (reason: string, agent = 'resident') => new RegExp(`^\\[turn\\] ${literal(agent)}: ${STOP_WORDS} after \\d+ms; the turn ends there: ${literal(reason)}$`);
+function oneTimeoutLine(stderr: string[], line: RegExp, message?: string): void {
+  const calls = timeoutCalls(stderr);
+  assert.equal(calls.length, 1, `${message ?? 'one [inference-timeout] line'}: ${JSON.stringify(calls)}`);
+  assert.match(calls[0]!, line);
+}
 const markedDeadline = (message: string) => () => {
   const error = new MembraneError({ type: 'timeout', retryable: true, message, rawError: undefined } as ConstructorParameters<typeof MembraneError>[0]);
   Object.defineProperty(error, Symbol.for('membrane.deadlineExpiry'), { value: true });
@@ -164,7 +173,7 @@ describe('a deadline expiry whose call the error policy retries writes one stder
     await within('the turn', fw.runUntilIdle());
     assert.equal(membrane.calls.length, 2, 'one fresh call');
     assert.ok(traces.some((e) => e.type === 'inference:completed'), 'the fresh call answered');
-    assert.deepEqual(timeoutCalls(stderr), [timeoutLine(`No provider event within 150s ${HOST_SETTING}`)]);
+    oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`));
   });
 
   it("a deadline that membrane reports with its mark writes the line too, with membrane's reason", async (t) => {
@@ -173,7 +182,7 @@ describe('a deadline expiry whose call the error policy retries writes one stder
     hello(fw);
     await within('the turn', fw.runUntilIdle());
     assert.equal(membrane.calls.length, 2, 'one fresh call');
-    assert.deepEqual(timeoutCalls(stderr), [timeoutLine('Request timed out.')]);
+    oneTimeoutLine(stderr, timeoutLine('Request timed out.'));
   });
 
   it('a second cut ends the turn: the first cut wrote the one [inference-timeout] line, and the end has its [inference-failed] line', async (t) => {
@@ -182,7 +191,7 @@ describe('a deadline expiry whose call the error policy retries writes one stder
     hello(fw);
     await within('the turn', fw.runUntilIdle());
     assert.equal(membrane.calls.length, 2);
-    assert.deepEqual(timeoutCalls(stderr), [timeoutLine(`No provider event within 150s ${HOST_SETTING}`)], 'the first cut, whose call was made again');
+    oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`), 'the first cut, whose call was made again');
     const failed = stderr.filter((text) => text.startsWith('[inference-failed] agent=resident'));
     assert.equal(failed.length, 1);
     assert.ok(failed[0]!.includes('No content within 60s'), `the end names the second cut: ${failed[0]}`);
@@ -205,7 +214,7 @@ describe('a deadline expiry whose call the error policy retries writes one stder
     const calls = timeoutCalls(stderr);
     assert.equal(calls.length, 1);
     assert.equal(physicalLines(calls).length, 1, 'one physical line');
-    assert.equal(calls[0], timeoutLine(`No provider event within 150s upstream said: idle done twice ${HOST_SETTING}`));
+    assert.match(calls[0]!, timeoutLine(`No provider event within 150s upstream said: idle done twice ${HOST_SETTING}`));
   });
 
   for (const [action, scheduled] of [
@@ -220,29 +229,31 @@ describe('a deadline expiry whose call the error policy retries writes one stder
       const { fw } = await boot(t, [cut('No provider event within 150s')], retryOnce(action));
       hello(fw);
       await within('the turn', fw.runUntilIdle());
-      assert.deepEqual(timeoutCalls(stderr), [timeoutLine(`No provider event within 150s ${HOST_SETTING}`, scheduled)]);
+      oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`, scheduled));
     });
   }
 
-  it('a stop during the wait: the line is there before the stop, says the retry was scheduled, and no second call is sent', async (t) => {
+  it("a stop during the wait: the line is there before the stop, and the stop writes the turn's own line, with no second call", async (t) => {
     const stderr = stderrOf(t);
     const { fw, membrane, traces } = await boot(t, [cut('No provider event within 150s')], retryOnce({ retry: true, delayMs: 60_000, maxTries: 2 }));
     hello(fw);
     await until('the wait to retry', () => traces.some((e) => e.type === 'inference:waiting'));
     const line = timeoutLine(`No provider event within 150s ${HOST_SETTING}`, 'in 60000ms (2 of 2)');
-    assert.deepEqual(timeoutCalls(stderr), [line], 'written before the wait');
-    assert.equal(fw.abortInference('resident', 'zz-stop-in-wait'), true);
+    oneTimeoutLine(stderr, line, 'written before the wait');
+    assert.equal(fw.abortInference('resident', 'zz stop in the wait'), true);
     await within('the turn', fw.runUntilIdle());
     assert.equal(membrane.calls.length, 1, 'no second call');
     assert.ok(traces.some((e) => e.type === 'inference:aborted'), 'the turn ended as a stop');
-    assert.deepEqual(timeoutCalls(stderr), [line]);
+    oneTimeoutLine(stderr, line);
     assert.deepEqual(stopCalls(stderr), [], 'no stream was live');
+    assert.deepEqual(stderr.filter((text) => text.startsWith('[turn] ')), ["[turn] resident: a stop ended the turn in its wait to retry; the retry wasn't sent: \"zz stop in the wait\""]);
   });
 });
 
-describe("a caller's stop that cancels a live stream writes one stderr line", () => {
-  for (const reports of ['aborted', 'error'] as const) {
-    it(`abortInference() on a live stream that reports the cancel as ${reports === 'aborted' ? 'aborted' : 'an error'}: one [turn] line with the stop's reason`, async (t) => {
+describe("a caller's stop that cancels a live stream writes a [turn] line on stderr", () => {
+  const shapes = { aborted: 'reports the cancel as aborted', error: 'reports the cancel as an error', throws: 'throws at the cancel', closes: 'just closes at the cancel' } as const;
+  for (const reports of ['aborted', 'error', 'throws', 'closes'] as const) {
+    it(`abortInference() on a live stream that ${shapes[reports]}: one [turn] line with the stop's reason`, async (t) => {
       const stderr = stderrOf(t);
       const { fw, membrane, traces } = await boot(t, [() => new LiveStream(reports)]);
       hello(fw);
@@ -255,6 +266,18 @@ describe("a caller's stop that cancels a live stream writes one stderr line", ()
       assert.match(calls[0]!, stopLine('operator-probe'));
     });
   }
+
+  it("a stream that throws at the cancel: its [stream] line comes first, then the [turn] line", async (t) => {
+    const stderr = stderrOf(t);
+    const { fw, membrane } = await boot(t, [() => new LiveStream('throws')]);
+    hello(fw);
+    await until('the stream', () => membrane.calls.length === 1 && fw.getAgent('resident')!.state.status === 'streaming');
+    assert.equal(fw.abortInference('resident', 'operator-probe'), true);
+    await within('the turn', fw.runUntilIdle());
+    const thrown = stderr.findIndex((text) => text.startsWith("[stream] resident: the stream threw after a caller's stop (operator-probe)"));
+    const stopped = stderr.findIndex((text) => text.includes(STOP_WORDS));
+    assert.ok(thrown >= 0 && stopped > thrown, `the [stream] line, then the [turn] line: ${JSON.stringify(stderr)}`);
+  });
 
   it("Agent.cancelStream() on a live stream writes the same line", async (t) => {
     const stderr = stderrOf(t);
@@ -269,7 +292,19 @@ describe("a caller's stop that cancels a live stream writes one stderr line", ()
     assert.match(calls[0]!, stopLine('operator-probe'));
   });
 
-  it("a stop's reason with a line break and spaces is one field on the line", async (t) => {
+  it("a stop's reason with spaces ends the line as plain text", async (t) => {
+    const stderr = stderrOf(t);
+    const { fw, membrane } = await boot(t, [() => new LiveStream('aborted')]);
+    hello(fw);
+    await until('the stream', () => membrane.calls.length === 1 && fw.getAgent('resident')!.state.status === 'streaming');
+    fw.abortInference('resident', 'interrupted from the Web UI');
+    await within('the turn', fw.runUntilIdle());
+    const calls = stopCalls(stderr);
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0]!.endsWith('; the turn ends there: "interrupted from the Web UI"'), calls[0]);
+  });
+
+  it("a stop's reason with a line break stays on the line, and reads back as the reason", async (t) => {
     const stderr = stderrOf(t);
     const reason = 'two lines\nof reason';
     const { fw, membrane } = await boot(t, [() => new LiveStream('aborted')]);
@@ -280,9 +315,9 @@ describe("a caller's stop that cancels a live stream writes one stderr line", ()
     const calls = stopCalls(stderr);
     assert.equal(calls.length, 1);
     assert.equal(physicalLines(calls).length, 1, 'one physical line');
-    const field = /\(reason=(.*)\)$/.exec(calls[0]!)?.[1];
-    assert.ok(field !== undefined && !/\s/.test(field), `one field: ${field}`);
-    assert.equal(JSON.parse(field), reason, 'the field reads back as the reason');
+    const tail = /; the turn ends there: (.*)$/.exec(calls[0]!)?.[1];
+    assert.ok(tail !== undefined, calls[0]);
+    assert.equal(JSON.parse(tail), reason, 'the line\'s end reads back as the reason');
   });
 
   it("a stop while the round's tools run: the stream is live, so it writes the line", async (t) => {
@@ -318,18 +353,15 @@ describe("a caller's stop that cancels a live stream writes one stderr line", ()
   });
 });
 
-describe('an agent name with a line break stays one field on each new line', () => {
-  const name = 'night\nowl';
-  const field = '"night\\nowl"';
+describe('an agent name prints as it is on each new line, as the lines beside them print it', () => {
+  const name = 'research bot';
 
   it('on the [inference-timeout] line', async (t) => {
     const stderr = stderrOf(t);
     const { fw } = await boot(t, [cut('No provider event within 150s')], undefined, name);
     hello(fw);
     await within('the turn', fw.runUntilIdle());
-    const calls = timeoutCalls(stderr);
-    assert.equal(physicalLines(calls).length, 1, 'one physical line');
-    assert.deepEqual(calls, [timeoutLine(`No provider event within 150s ${HOST_SETTING}`, 'in 1000ms (2 of 2)', field)]);
+    oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`, 'in 1000ms (2 of 2)', name));
   });
 
   it('on the [turn] stop line', async (t) => {
@@ -340,8 +372,7 @@ describe('an agent name with a line break stays one field on each new line', () 
     fw.abortInference(name, 'operator-probe');
     await within('the turn', fw.runUntilIdle());
     const calls = stopCalls(stderr);
-    assert.equal(physicalLines(calls).length, 1, 'one physical line');
     assert.equal(calls.length, 1);
-    assert.match(calls[0]!, stopLine('operator-probe', field.replace(/\\/g, '\\\\')));
+    assert.match(calls[0]!, stopLine('operator-probe', name));
   });
 });
