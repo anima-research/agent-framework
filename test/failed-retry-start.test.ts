@@ -184,10 +184,10 @@ test("a turn whose stream fails, and whose policy retry's start fails at its com
   await withFramework('compile', async (fw, _internal, membrane, _exhausted, traces) => {
     fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
     let settled = false;
-    const idle = fw.runUntilIdle().then(() => { settled = true; });
+    const idle = fw.runUntilIdle().then(() => { settled = true; return [...traces]; });
     await until(() => settled, 'runUntilIdle settling');
-    await idle;
-    assert.ok(traces.includes('inference:completed'), `the second retry's turn answered before runUntilIdle settled: ${traces.join(',')}`);
+    const atSettle = await idle;
+    assert.ok(atSettle.includes('inference:completed'), `the second retry's turn answered before runUntilIdle settled: ${atSettle.join(',')}`);
     assert.equal(membrane.primary, 2, 'the failed call, then the second retry\'s');
   }, twiceAfterAWait);
 });
@@ -297,8 +297,10 @@ test("a conversation agent disposed while the stream of its turn's second retry 
     bindAsConversationFork(fw, 'resident', { serverId: 'stub', channelId: 'world:zz' });
     fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
     await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+    const failedFrame = internal.activeStreams.get('resident') as Promise<void>;
+    assert.equal(membrane.held.length, 0, "the frame was read before the retries' stream registered");
     await until(() => membrane.held.length === 1, "the second retry's stream");
-    await sleep(50);
+    await failedFrame;
     internal.disposeConversationAgent('resident');
     assert.equal(membrane.held[0]!.cancelled, true, 'the disposal cancelled the stream');
   }, twice, true);
