@@ -9201,6 +9201,8 @@ export class AgentFramework {
     const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before } = args;
     const stream = args.stream ?? closes;
     const durationMs = Date.now() - startTime;
+    // A stopped turn between two refused ones ends the run of refused turns (noteRefusedTurn).
+    this.refusedTurnsNote.delete(agent.name);
     if (closes && this.answeredTurns.get(agent) === closes) this.answeredTurns.delete(agent);
     if (stream) this.abandonAgentScripts(agent.name, 'stream cancelled', stream);
     agent.reset();
@@ -15542,8 +15544,10 @@ export class AgentFramework {
    * message the agent couldn't answer. Once a call is answered (a round's,
    * or a turn's last) the agent has read the note, so it stays as written
    * and the next refused turn starts a new one. So does a turn that ended
-   * another way in between, a failure or a refusal that isn't told, so that
-   * the turns the note counts are the ones right after it. A note that has
+   * another way in between (a failure, a stop, a refusal that isn't told),
+   * so that the turns the note counts are the ones right after it. A
+   * refusal a rewind takes doesn't end the run: its turn goes on as the
+   * retry. A note that has
    * left the agent's window (removed from the record, or taken out of the
    * window by an undo) is started anew too, and so is one from before a
    * restart: the run is kept in memory.

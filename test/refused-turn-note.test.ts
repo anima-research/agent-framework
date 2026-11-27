@@ -32,6 +32,24 @@ class FailedCall implements YieldingStream {
   }
 }
 
+/** A call the provider hasn't answered when its turn is stopped. */
+class RunsUntilStopped implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  private stopped!: () => void;
+  private readonly stop = new Promise<void>((resolve) => { this.stopped = resolve; });
+  provideToolResults(): void {}
+  cancel(): void { this.isCancelled = true; this.stopped(); }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await this.stop;
+    yield { type: 'aborted', reason: 'user' } as StreamEvent;
+  }
+}
+
+type Scripted = NormalizedResponse | 'failed' | 'stopped';
+
 type Internals = {
   logFailure(record: Record<string, unknown>): void;
   channelRegistry: { getDesiredState(serverId: string, channelId: string): string | undefined };
@@ -56,15 +74,26 @@ async function rig(t: TestContext, opts: { agents?: unknown[]; tools?: unknown[]
   await f.send('channels/register', { channels: [{ id: ROOM, type: 'discord', label: 'room', initiallyOpen: true }] });
   await eventually(() => fw.channelRegistry.getDesiredState('editor', ROOM) === 'open', 'room is open');
   let sent = 0;
-  /** One addressed message, and the turn it wakes, answered by `responses` (one per call). */
-  const turn = async (...responses: Array<NormalizedResponse | 'failed'>) => {
+  /**
+   * One addressed message, and the turn it wakes, answered by `responses`
+   * (one per call). Given lists, each is a stream's: the turn's own, then
+   * its retry's. 'failed' is a call that fails, 'stopped' a turn stopped
+   * before its call is answered.
+   */
+  const turn = async (...responses: Array<Scripted | Scripted[]>) => {
     const before = f.membrane.calls.length;
     const messageId = `m-${++sent}`;
-    streams.push(() => (responses[0] === 'failed' ? new FailedCall() : new MockYieldingStream(responses as NormalizedResponse[])));
+    const perStream = (responses.every((r) => Array.isArray(r)) ? responses : [responses]) as Scripted[][];
+    for (const script of perStream) {
+      streams.push(() => (script[0] === 'failed' ? new FailedCall()
+        : script[0] === 'stopped' ? new RunsUntilStopped()
+        : new MockYieldingStream(script as NormalizedResponse[])));
+    }
     await f.send('channels/incoming', {
       messages: [{ channelId: ROOM, messageId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ADDRESSED, content: [{ type: 'text', text: `message ${messageId}` }] }],
     });
     await eventually(() => f.membrane.calls.length > before, `the turn for ${messageId}`);
+    if (perStream[0]![0] === 'stopped') assert.equal(f.framework.abortInference('agent', 'operator stop'), true, 'premise: the stop was taken');
     await f.framework.runUntilIdle();
   };
   const rows = (kind: string) => f.framework.getAgent('agent')!.getContextManager().getAllMessages()
@@ -157,6 +186,22 @@ describe('a turn the provider refused leaves the agent a note, one for a run of 
     await r.turn(refused());
     assert.equal(r.f.window().split(NOTE).length - 1, 1, 'the window holds the new note');
     assert.deepEqual(r.notes(), [NOTE, NOTE]);
+  });
+
+  it('a turn stopped before its call was answered, between two refused ones: it ends the run, so the second note counts from itself', async (t) => {
+    const r = await rig(t);
+    await r.turn(refused());
+    await r.turn('stopped');
+    await r.turn(refused());
+    assert.deepEqual(r.notes(), [NOTE, NOTE]);
+  });
+
+  it('a refused turn whose rewind\'s retry is refused too, with no rewind left: the turn is told, after the rewind\'s note', async (t) => {
+    const r = await rig(t, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test', refusalHandling: { retries: 0, autoRewind: true, maxRewinds: 1 } }] });
+    await r.turn([refused()], [refused()]);
+    assert.equal(r.rows('refusal-rewind').length, 1, 'premise: the rewind took the first refusal');
+    assert.equal(r.f.membrane.calls.length, 2, 'premise: the retry was made, and refused');
+    assert.deepEqual(r.notes(), [NOTE]);
   });
 
   it('a refused turn a rewind takes leaves the rewind\'s note only', async (t) => {
