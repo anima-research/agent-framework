@@ -156,20 +156,22 @@ describe("a marker's wake and the turn's channel", () => {
     assert.equal(r.starts[0]!.heartbeatTurn, true);
   });
 
-  it("while the host is quiesced, a marker parked after a message doesn't take the message's place: resumed, the turn speaks in A", async (t) => {
-    const r = await resident(t, [], ['scout', 'second']);
-    await r.fw.quiesce();
-    await r.arrive('stream:A', ['chat:ambient']);
-    await r.arrive('stream:B', ['chat:ambient', 'chat:reaction']);
-    await r.pass();
-    assert.equal(r.starts.length, 0, 'premise: nothing starts while quiesced');
-    assert.ok(r.parked('second') >= 1, "premise: the second resident's wakes are parked");
-    await r.fw.resume();
-    await r.run();
-    const second = r.starts.filter((s) => s.agentName === 'second');
-    assert.equal(second.length, 1, "premise: the second resident's wakes, which read no row, start one turn");
-    assert.equal(second[0]!.channelId, 'stream:A');
-  });
+  for (const tag of ['chat:reaction', 'chat:system'] as const) {
+    it(`while the host is quiesced, a ${tag} line parked after a message doesn't take the message's place: resumed, the turn speaks in A`, async (t) => {
+      const r = await resident(t, [], ['scout', 'second']);
+      await r.fw.quiesce();
+      await r.arrive('stream:A', ['chat:ambient']);
+      await r.arrive('stream:B', ['chat:ambient', tag]);
+      await r.pass();
+      assert.equal(r.starts.length, 0, 'premise: nothing starts while quiesced');
+      assert.equal(r.parked('second'), 2, "the second resident's two wakes are parked apart");
+      await r.fw.resume();
+      await r.run();
+      const second = r.starts.filter((s) => s.agentName === 'second');
+      assert.equal(second.length, 1, "premise: the second resident's wakes, which read no row, start one turn");
+      assert.equal(second[0]!.channelId, 'stream:A');
+    });
+  }
 
   describe('a turn queued again keeps the rank of the request that named its channel', () => {
     it("a marker alone starts a turn, a stated wait holds its retry, and a heartbeat's wake joins it: the turn is a heartbeat's", async (t) => {
