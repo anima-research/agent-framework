@@ -6,8 +6,9 @@
   without one gets none. On the channel lane, the host sometimes knows a
   message only by its event's id, and such a message gets none. An edit
   gets a request only when its id is its message's id. On the channel
-  lane that holds for an edit that carries an `eventId` (MCPL SPEC
-  §20.3.1). On either lane it holds for an edit that the host delivers
-  as the agent's first view of its message. Other edits get none, such
-  as zulip_mcp's `edit:77:…` lines. A held message still gets its
-  request. The reader's wake is unchanged, and #476 stays open for it.
+  lane that holds for an edit that the server sends with `coalesce`
+  (MCPL SPEC §20.3.1). On either lane it holds for an edit that the host
+  delivers as the agent's first view of its message. Other edits get
+  none, such as zulip_mcp's `edit:77:…` lines. A held message still gets
+  its request. The reader's wake is unchanged, and #476 stays open for
+  it.
