@@ -3230,10 +3230,10 @@ type BudgetHoldOutcome = 'released' | 'stopped' | 'removed';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
 }
-function deadlineRetryLine(agentName: string, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
+function deadlineRetryLine(agentName: string, ranMs: number, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
   const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
   const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
-  return `[inference-timeout] agent=${logValue(agentName)} retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/[\s\u0085]+/g, ' ').trim())}`;
+  return `[inference-timeout] agent=${agentName} cut after ${ranMs}ms; retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/[\s\u0085]+/g, ' ').trim())}`;
 }
 interface BudgetHoldBaseline {
   progress: string | undefined;
@@ -9109,8 +9109,9 @@ export class AgentFramework {
    * for implementations that report cancel() that way — see
    * host-quiesce.test.ts), so the two cannot drift: settle the turn, ONE
    * inference:aborted carrying the caller's reason, the neutral
-   * [turn-interrupted] marker, an attributable inference-log terminal, one
-   * stderr line when a live stream was cancelled, gate release. Deliberately
+   * [turn-interrupted] marker, an attributable inference-log terminal, a
+   * [turn] line on stderr when a live stream was cancelled or a wait was
+   * stopped (inWait), gate release. Deliberately
    * none of the failure accounting: inference:failed /
    * inference:exhausted feed the consecutive-failure streak, hard-down ops
    * alerts, the poison-history breaker and the "[inference-failed]" marker,
@@ -9137,8 +9138,11 @@ export class AgentFramework {
      *  'finishing' for a start that continues a turn and for the guard's
      *  wait. The note says which, instead of a cut-off stream. */
     before?: 'sending' | 'finishing';
+    /** The wait that the stop ended, where no other line on stderr says so:
+     *  the error policy's wait to retry, or the tool-result guard's. */
+    inWait?: 'retry' | 'guard';
   }): void {
-    const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before } = args;
+    const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before, inWait } = args;
     const stream = args.stream ?? closes;
     const durationMs = Date.now() - startTime;
     if (closes && this.answeredTurns.get(agent) === closes) this.answeredTurns.delete(agent);
@@ -9174,7 +9178,11 @@ export class AgentFramework {
       reason,
       durationMs,
     });
-    if (before === undefined) console.error(`[turn] ${logValue(agent.name)}: a stop cancelled the turn's stream after ${describeWait(durationMs)}; the turn ends there (reason=${logValue(reason)})`);
+    const stopped = before === undefined ? `a stop cancelled the turn's stream after ${durationMs}ms; the turn ends there`
+      : inWait === 'retry' ? "a stop ended the turn in its wait to retry; the retry wasn't sent"
+      : inWait === 'guard' ? "a stop ended the turn in the tool-result guard's wait; its retry wasn't sent"
+      : undefined;
+    if (stopped !== undefined) console.error(`[turn] ${agent.name}: ${stopped}: ${logDetail(reason)}`);
     // Agent-facing marker in the same system envelope as the failure marker
     // so surfaces render it the same way. The text names the act and not an
     // actor (the wire reason names the call, not who made it). Of delivery
@@ -30438,7 +30446,7 @@ export class AgentFramework {
                   lifecyclePhase = 'aborted';
                   this.settleDeliberateCancel({
                     agent, myStreamId, startTime, compiledRequest,
-                    reason: callerStop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing',
+                    reason: callerStop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing', inWait: 'guard',
                   });
                   return;
                 }
@@ -31310,7 +31318,7 @@ export class AgentFramework {
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
             if (action.retry) {
-              if (cuts !== undefined) console.error(deadlineRetryLine(agent.name, err.message, action, policyAttempt + 2));
+              if (cuts !== undefined) console.error(deadlineRetryLine(agent.name, durationMs, err.message, action, policyAttempt + 2));
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
               // does. Until then, that check is ahead, in a window of its own
@@ -31336,7 +31344,7 @@ export class AgentFramework {
                   } else {
                     this.settleDeliberateCancel({
                       agent, myStreamId, startTime, compiledRequest,
-                      reason: stop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing',
+                      reason: stop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing', inWait: 'retry',
                     });
                   }
                   return;
