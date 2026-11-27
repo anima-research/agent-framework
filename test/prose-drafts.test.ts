@@ -455,7 +455,7 @@ function onSecondStream(membrane: MockMembrane, response: NormalizedResponse): v
 }
 
 async function harness(opts: {
-  agents?: Array<{ name: string; /** AgentConfig.sendSilencing; on unless a test says false, since most of these read the hold. */ sendSilencing?: boolean; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled'; sameRoundThinkTextPolicy?: 'public' | 'private'; sameRoundSkipReplyTextPolicy?: 'private' | 'ask'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
+  agents?: Array<{ name: string; /** AgentConfig.sendSilencing; on unless a test says false, since most of these read the hold. */ sendSilencing?: boolean; proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'locked' | 'disabled'; /** AgentConfig.proseLock, for locked routing. */ proseLock?: string; sameRoundThinkTextPolicy?: 'public' | 'private'; sameRoundSkipReplyTextPolicy?: 'private' | 'ask'; autoContinue?: boolean; toolResultGuard?: boolean; maxStreamTokens?: number }>;
   gate?: boolean;
   xml?: boolean;
   roundPreamble?: boolean;
@@ -490,6 +490,7 @@ async function harness(opts: {
   const agents = (opts.agents ?? [{ name: 'scout' }]).map((a) => ({
     name: a.name, model: 'test-model', systemPrompt: `You are ${a.name}.`, sendSilencing: a.sendSilencing ?? true,
     ...(a.proseRouting ? { proseRouting: a.proseRouting } : {}),
+    ...(a.proseLock ? { proseLock: a.proseLock } : {}),
     ...(a.sameRoundThinkTextPolicy ? { sameRoundThinkTextPolicy: a.sameRoundThinkTextPolicy } : {}),
     ...(a.sameRoundSkipReplyTextPolicy ? { sameRoundSkipReplyTextPolicy: a.sameRoundSkipReplyTextPolicy } : {}),
     ...(a.autoContinue ? { autoContinue: a.autoContinue } : {}),
@@ -4544,6 +4545,39 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [GENERAL]);
         assert.ok(failureNote(h).includes(receiptOf(GENERAL_SHOWN)), failureNote(h));
         assert.ok(!failureNote(h).includes(ROOM_SHOWN), failureNote(h));
+        assert.equal(receipts(h).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('locked mode: a failure after a live-routed round names the locked channel, and not the channel that woke the turn', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'locked', proseLock: GENERAL }], retries: 0 });
+      try {
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
+        await h.turn([round()]);
+        await h.until(() => published(h, SPEECH).length === 1, 'premise: the speech was routed live');
+        assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [GENERAL]);
+        assert.ok(failureNote(h).includes(receiptOf(GENERAL_SHOWN)), failureNote(h));
+        assert.ok(!failureNote(h).includes(ROOM_SHOWN), failureNote(h));
+        assert.equal(receipts(h).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("locked mode: a user's Stop after a live-routed round names the locked channel, and not the channel that woke the turn", async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'locked', proseLock: GENERAL }] });
+      try {
+        breakAfterToolRound(h.membrane, 'stop', { stopEnds: 'aborted' });
+        await startTurn(h);
+        await h.until(() => published(h, SPEECH).length === 1, "premise: the round's speech was routed live");
+        await speechSettled(h);
+        assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [GENERAL]);
+        assert.equal(h.framework.abortInference('scout', 'operator stop'), true);
+        await turnEnded(h);
+        assert.ok(stopNote(h).includes(receiptOf(GENERAL_SHOWN)), stopNote(h));
+        assert.ok(!stopNote(h).includes(ROOM_SHOWN), stopNote(h));
         assert.equal(receipts(h).length, 0);
       } finally {
         await h.close();
