@@ -1597,9 +1597,9 @@ describe('a judge that keeps failing tells the agent one time', () => {
     await until(() => verdictsOf(gate, rule).error === before + 1, `the failure of ${rule} counted`);
   }
 
-  async function answerFor(gate: EventGate, judge: ReturnType<typeof scriptedJudge>, rule: string): Promise<void> {
+  async function answerFor(gate: EventGate, judge: ReturnType<typeof scriptedJudge>, rule: string, info?: Partial<GateEventInfo>): Promise<void> {
     const before = verdictsOf(gate, rule).wait;
-    gate.evaluate(chat(`for ${rule}`, { channelId: CHANNEL_OF[rule] ?? 'c1' }));
+    gate.evaluate(chat(`for ${rule}`, { channelId: CHANNEL_OF[rule] ?? 'c1', ...info }));
     await until(() => judge.waiting() === 1, `the judge is asked for ${rule}`);
     judge.answer({ reply: false, reason: 'not now' });
     await until(() => verdictsOf(gate, rule).wait === before + 1, `the verdict for ${rule} counted`);
@@ -1796,6 +1796,51 @@ describe('a judge that keeps failing tells the agent one time', () => {
     gate.dispose();
   });
 
+  it('J1b: for an event that is not in context, the notice comes before the batch\'s row', async () => {
+    const judge = scriptedJudge();
+    const config: GateConfig = { policies: [{ name: 'ambient', match: { scope: ['test:quoted'] }, behavior: { judge: { debounceMs: 100, instructions: 'Wake me for questions.' } } }] };
+    const { gate, order } = makeGate(writeConfig('j1b.json', config), { judge: judge.fn });
+    await quietly(async () => {
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'ambient', undefined, { eventType: 'test:quoted' });
+    });
+    assert.deepStrictEqual(order.slice(-3), ['notice', 'row', 'wake']);
+    gate.dispose();
+  });
+
+  it('J15: two agents and two rules that both fail: each agent gets one notice that names its rule, and an answer goes to the agent told of that rule', async () => {
+    const judge = scriptedJudge();
+    const { gate, messages } = makeGate(writeConfig('j15.json', TWO_RULES), { judge: judge.fn, agents: ['agent', 'scout'] });
+    const forAgent = { recipients: ['agent'] };
+    const forScout = { recipients: ['scout'] };
+    await quietly(async () => {
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'ambient', undefined, forAgent);
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'garden', undefined, forScout);
+      await failFor(gate, judge, 'garden', undefined, forAgent);
+      await failFor(gate, judge, 'ambient', undefined, forScout);
+    });
+    assert.deepStrictEqual(failingNotices(messages).map((m) => [ruleOf(m), m.audience]), [['ambient', ['agent']], ['garden', ['scout']]]);
+    await quietly(async () => {
+      await answerFor(gate, judge, 'ambient', forAgent);
+      await failFor(gate, judge, 'garden', undefined, forScout);
+    });
+    assert.deepStrictEqual(answeringNotices(messages).map((m) => [ruleOf(m), m.audience]), [['ambient', ['agent']]]);
+    assert.strictEqual(failingNotices(messages).length, 2, "scout's notice stays open");
+    await quietly(() => answerFor(gate, judge, 'garden', forScout));
+    assert.deepStrictEqual(answeringNotices(messages).map((m) => [ruleOf(m), m.audience]), [['ambient', ['agent']], ['garden', ['scout']]]);
+    gate.dispose();
+  });
+
+  it('J15b: a batch whose events name no agent tells only the agents that have no open notice', async () => {
+    const judge = scriptedJudge();
+    const { gate, messages } = makeGate(writeConfig('j15b.json', TWO_RULES), { judge: judge.fn, agents: ['agent', 'scout'] });
+    await quietly(async () => {
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'ambient', undefined, { recipients: ['agent'] });
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'garden');
+    });
+    assert.deepStrictEqual(failingNotices(messages).map((m) => [ruleOf(m), m.audience]), [['ambient', ['agent']], ['garden', ['scout']]]);
+    gate.dispose();
+  });
+
   it('J8: two failures, a verdict and two failures write no notice', async () => {
     const judge = scriptedJudge();
     const { gate, messages } = makeGate(writeConfig('j8.json', JUDGED), { judge: judge.fn });
@@ -1851,15 +1896,18 @@ describe('a judge that keeps failing tells the agent one time', () => {
 
   it('J10c: a judge call that was out when its rule changed counts for nothing', async () => {
     const judge = scriptedJudge();
-    const { gate, messages } = makeGate(writeConfig('j10c.json', JUDGED), { judge: judge.fn });
+    const { gate, messages, traces } = makeGate(writeConfig('j10c.json', JUDGED), { judge: judge.fn });
+    const settled = () => traces.filter((t) => t.type === 'gate:judge-verdict').length;
     await quietly(async () => {
       await failFor(gate, judge, 'ambient');
       await failFor(gate, judge, 'ambient');
       gate.evaluate(chat('in flight'));
       await until(() => judge.waiting() === 1, 'the judge is asked');
       gate.addPolicy({ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100, instructions: 'Wake me for jokes.' } } });
+      const before = settled();
       judge.fail(new Error('400 model not found'));
-      await until(() => verdictsOf(gate, 'ambient').error === 3, 'the old call settled');
+      await until(() => settled() === before + 1, 'the old call settled');
+      assert.deepStrictEqual(verdictsOf(gate, 'ambient'), { reply: 0, wait: 0, error: 2 }, 'the old call counted no verdict');
       await failFor(gate, judge, 'ambient');
       await failFor(gate, judge, 'ambient');
       assert.strictEqual(failingNotices(messages).length, 0, 'two failures under the new behavior write no notice');
@@ -1867,6 +1915,45 @@ describe('a judge that keeps failing tells the agent one time', () => {
     });
     assert.strictEqual(failingNotices(messages).length, 1);
     assert.ok(textOf(failingNotices(messages)[0]!).includes('failed its last 3 requests'), textOf(failingNotices(messages)[0]!));
+    gate.dispose();
+  });
+
+  it('J10d: a call that was out when its rule was removed counts for nothing in a rule of that name added with another judge', async () => {
+    const judge = scriptedJudge();
+    const { gate, traces } = makeGate(writeConfig('j10d.json', JUDGED), { judge: judge.fn });
+    const settled = () => traces.filter((t) => t.type === 'gate:judge-verdict').length;
+    await quietly(async () => {
+      gate.evaluate(chat('in flight'));
+      await until(() => judge.waiting() === 1, 'the judge is asked');
+      gate.removePolicy('ambient');
+      gate.addPolicy({ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100, instructions: 'Wake me for jokes.' } } });
+      judge.fail(new Error('400 model not found'));
+      await until(() => settled() === 1, 'the old call settled');
+    });
+    const status = gate.getStatus().policies.find((p) => p.name === 'ambient')!.judgeState!;
+    assert.deepStrictEqual(status.verdicts, { reply: 0, wait: 0, error: 0 });
+    assert.strictEqual(status.last, undefined);
+    gate.dispose();
+  });
+
+  it('J10e: a batch that a change of its rule sends to the old judge counts for nothing', async () => {
+    const judge = scriptedJudge();
+    const { gate, messages, traces } = makeGate(writeConfig('j10e.json', JUDGED), { judge: judge.fn });
+    const settled = () => traces.filter((t) => t.type === 'gate:judge-verdict').length;
+    await quietly(async () => {
+      await failFor(gate, judge, 'ambient');
+      await failFor(gate, judge, 'ambient');
+      gate.evaluate(chat('waiting out its quiet period'));
+      gate.addPolicy({ name: 'ambient', match: { scope: ['mcpl:push-event'] }, behavior: { judge: { debounceMs: 100, instructions: 'Wake me for jokes.' } } });
+      await until(() => judge.waiting() === 1, 'the change sends the batch to the judge');
+      assert.strictEqual(judge.requests[judge.requests.length - 1]!.instructions, 'Wake me for questions.', 'premise: the old judge');
+      judge.fail(new Error('400 model not found'));
+      await until(() => settled() === 3, 'the old judge failed');
+      assert.strictEqual(verdictsOf(gate, 'ambient').error, 2);
+      await failFor(gate, judge, 'ambient');
+      await failFor(gate, judge, 'ambient');
+      assert.strictEqual(failingNotices(messages).length, 0, 'two failures under the new judge write no notice');
+    });
     gate.dispose();
   });
 
@@ -1950,6 +2037,8 @@ describe('a judge that keeps failing tells the agent one time', () => {
       await until(() => gate.getStatus().policies[0]!.judgeState!.pendingCount === 0, 'the queued batch waits behind the judge');
       judge.fail(new Error('400 model not found'));
       await until(() => verdictsOf(gate, 'ambient').error === 3, 'the third failure counted');
+      await until(() => judge.waiting() === 1, 'the queued batch goes to the judge next');
+      assert.ok(JSON.stringify(judge.requests[judge.requests.length - 1]!.events).includes('queued'), 'premise: the queued event was behind the failed batch');
     });
     assert.deepStrictEqual(failingNotices(messages)[0]!.audience, ['scout']);
     gate.dispose();
@@ -1965,6 +2054,7 @@ describe('a judge that keeps failing tells the agent one time', () => {
       gate.evaluate(chat('open', { recipients: ['agent'] }));
       gate.evaluate(chat('tuned out', { channelId: 'c9', recipients: ['scout'] }));
       await until(() => judge.waiting() === 1, 'the judge is asked for both');
+      assert.ok(JSON.stringify(judge.requests[judge.requests.length - 1]!.events).includes('tuned out'), 'premise: the event of c9 is in the judged batch');
       held = true;
       judge.fail(new Error('400 model not found'));
       await until(() => verdictsOf(gate, 'ambient').error === 3, 'the third failure counted');
@@ -2011,18 +2101,24 @@ describe('a judge that keeps failing tells the agent one time', () => {
     gate.dispose();
   });
 
-  it('J13b: an end that the store refuses is logged, and the next verdict for the rule writes it', async () => {
+  it('J13b: an "answers again" notice that the store refuses is logged, and the judge\'s next answer for the rule writes it', async () => {
     const judge = scriptedJudge();
     let refuse = false;
     const { gate, messages } = makeGate(writeConfig('j13b.json', JUDGED), { judge: judge.fn, judgeOnError: 'skip', refuseWrite: () => refuse });
-    await quietly(async () => {
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+    try {
       for (let i = 0; i < 3; i++) await failFor(gate, judge, 'ambient');
       refuse = true;
       await answerFor(gate, judge, 'ambient');
       assert.strictEqual(answeringNotices(messages).length, 0);
       refuse = false;
       await answerFor(gate, judge, 'ambient');
-    });
+    } finally {
+      console.error = original;
+    }
+    assert.strictEqual(logged.filter((line) => line.includes('the notice that its reply judge answers again could not be written')).length, 1, logged.join('\n'));
     assert.strictEqual(answeringNotices(messages).length, 1);
     gate.dispose();
   });

@@ -274,7 +274,6 @@ interface JudgingState {
   /** Batches of the same rule that fired meanwhile, judged once this one is
    *  decided: delivered with it on reply, judged afresh on wait. */
   queued: PendingEvent[];
-  stale?: true;
 }
 
 /** A rule's verdict counts and newest verdict (gate_status judgeState). */
@@ -2331,7 +2330,7 @@ export class EventGate {
   /** Lifetime count of events dropped from batches waiting on the judge, at
    *  the inference buffer's cap (MAX_INFERENCE_BUFFER per rule). */
   private droppedJudgeEvents = 0;
-  private judgeNotice: { policyName: string; audience: readonly string[] | undefined } | null = null;
+  private judgeNotices: Array<{ policyName: string; audience: readonly string[] | undefined; agents: ReadonlySet<string> }> = [];
 
   // Rate-limit state — policy name → key → bucket.
   private rateLimitBuckets = new Map<string, Map<string, RateBucket>>();
@@ -3062,11 +3061,7 @@ export class EventGate {
       const record = this.judgeRecords.get(name);
       if (record) record.failing = 0;
     }
-    for (const name of [...removed, ...cleared]) {
-      const deciding = this.judging.get(name);
-      if (deciding) deciding.stale = true;
-    }
-    if (this.judgeNotice && [...removed, ...cleared].includes(this.judgeNotice.policyName)) this.judgeNotice = null;
+    this.judgeNotices = this.judgeNotices.filter((n) => !removed.includes(n.policyName) && !cleared.includes(n.policyName));
     for (const name of [...removed, ...cleared]) this.fireDebounce(name);
     return { removed, cleared };
   }
@@ -4391,6 +4386,11 @@ export class EventGate {
   }
 
   /** The rule's judge as it is now, when the rule is still a judge rule; else the one the batch was asked with. */
+  private judgesAsAsked(policyName: string, asked: JudgeConfig): boolean {
+    const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
+    return typeof now === 'object' && 'judge' in now && JSON.stringify(now.judge) === JSON.stringify(asked);
+  }
+
   private currentJudge(policyName: string, asked: JudgeConfig): JudgeConfig {
     const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
     return typeof now === 'object' && 'judge' in now ? now.judge : asked;
@@ -4502,17 +4502,20 @@ export class EventGate {
       ? (err !== undefined ? judgeFailureWords(err) : 'the judge gave no verdict')
       : typeof verdict.reason === 'string' ? verdict.reason : '';
     const record = this.judgeRecords.get(policyName) ?? { verdicts: { reply: 0, wait: 0, error: 0 }, failing: 0 };
-    record.verdicts[outcome]++;
-    if (!state.stale) record.failing = failed ? record.failing + 1 : 0;
-    record.last = {
-      at: Date.now(),
-      verdict: outcome,
-      reason: cutToFit(suppliedValue(reason), 300),
-      eventCount: state.events.length,
-      durationMs,
-      ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
-    };
-    if (this.config.policies.some((p) => p.name === policyName)) this.judgeRecords.set(policyName, record);
+    const counts = this.judgesAsAsked(policyName, state.judge);
+    if (counts) {
+      record.verdicts[outcome]++;
+      record.failing = failed ? record.failing + 1 : 0;
+      record.last = {
+        at: Date.now(),
+        verdict: outcome,
+        reason: cutToFit(suppliedValue(reason), 300),
+        eventCount: state.events.length,
+        durationMs,
+        ...(!failed && typeof verdict.inputTokens === 'number' ? { inputTokens: verdict.inputTokens } : {}),
+      };
+      this.judgeRecords.set(policyName, record);
+    }
     const wake = outcome === 'reply' || (outcome === 'error' && this.judgeOnError === 'wake');
     if (failed) {
       console.error(
@@ -4533,7 +4536,7 @@ export class EventGate {
       ...(!failed && typeof verdict.outputTokens === 'number' ? { outputTokens: verdict.outputTokens } : {}),
     });
     if (this.disposed) return;
-    if (!state.stale) this.tellJudgeState(policyName, record, wake ? [...state.events, ...state.queued] : state.events);
+    if (counts) this.tellJudgeState(policyName, record, wake ? [...state.events, ...state.queued] : state.events);
     const judge = this.currentJudge(policyName, state.judge);
     if (wake) {
       const judged = outcome === 'reply' ? state.events.map((e) => (this.answeredWhenJudged(e) ? withoutWrite(e) : e)) : state.events;
@@ -4545,27 +4548,32 @@ export class EventGate {
 
   private tellJudgeState(policyName: string, record: JudgeRecord, events: readonly PendingEvent[]): void {
     if (this.judgeRecords.get(policyName) !== record) return;
-    const open = this.judgeNotice;
     if (record.failing === 0) {
-      if (open?.policyName !== policyName) return;
       const text = `[${NOTICE_TAG.gate}] The reply judge answers again for the wake rule ${quotedValue(policyName)}.`;
-      if (this.writeJudgeNotice('gate-judge-answers', policyName, text, open.audience)) this.judgeNotice = null;
+      for (const notice of this.judgeNotices.filter((n) => n.policyName === policyName)) {
+        if (this.writeJudgeNotice('gate-judge-answers', policyName, text, notice.audience)) this.judgeNotices = this.judgeNotices.filter((n) => n !== notice);
+      }
       return;
     }
-    if (open !== null || record.failing < JUDGE_FAILING_STREAK) return;
+    if (record.failing < JUDGE_FAILING_STREAK) return;
     const reached = this.notHeld(events);
     const audience = this.recipientsOf(reached);
     if (reached.length === 0 || audience?.length === 0) return;
+    const told = new Set(this.judgeNotices.flatMap((n) => [...n.agents]));
+    const reaches = audience ?? this.getAgentNamesFn();
+    const untold = reaches.filter((name) => !told.has(name));
+    if (untold.length === 0) return;
+    const writeTo = audience === undefined && untold.length === reaches.length ? undefined : untold;
     const text = `[${NOTICE_TAG.gate}] The reply judge failed its last ${record.failing} requests for the wake rule ${quotedValue(policyName)} `
       + `(the newest: ${record.last?.reason ?? ''}). `
       + (this.judgeOnError === 'wake'
         ? 'While it fails, each batch of this rule wakes you with no judgement, as a debounce of the same quiet period would. '
         : "While it fails, this rule's batches don't wake you. ")
       + "Other judge rules can fail in the same way, and gate_status shows each rule's newest verdict. Nothing is asked of you. "
-      + "The host says this one time. It says it again only after the judge has answered for this rule or the rule's behavior has changed, "
+      + "The host says this one time. It says it again only after the judge has answered for this rule, after the rule has been removed or its behavior has changed, "
       + 'or after the host has started anew.';
-    if (this.writeJudgeNotice('gate-judge-failing', policyName, text, audience) && this.judgeRecords.get(policyName) === record && record.failing > 0) {
-      this.judgeNotice = { policyName, audience };
+    if (this.writeJudgeNotice('gate-judge-failing', policyName, text, writeTo) && this.judgeRecords.get(policyName) === record && record.failing > 0) {
+      this.judgeNotices.push({ policyName, audience: writeTo, agents: new Set(untold) });
     }
   }
 
@@ -4574,7 +4582,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], { system: true, kind, policyName }, undefined, undefined, audience);
       return true;
     } catch (err) {
-      console.error(`[gate] Rule ${quotedValue(policyName)}: the notice that its reply judge ${kind === 'gate-judge-failing' ? 'keeps failing' : 'answers again'} could not be written, and the rule's next ${kind === 'gate-judge-failing' ? 'failure' : 'verdict'} tries again:`, err);
+      console.error(`[gate] Rule ${quotedValue(policyName)}: the notice that its reply judge ${kind === 'gate-judge-failing' ? 'keeps failing' : 'answers again'} could not be written; ${kind === 'gate-judge-failing' ? 'a later failure of the rule that reaches an agent' : "the judge's next answer for the rule"} tries again:`, err);
       return false;
     }
   }
