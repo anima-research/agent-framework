@@ -90,6 +90,10 @@ class LiveStream implements YieldingStream {
 }
 
 const cut = (message: string) => () => new EventsStream([{ type: 'aborted', reason: 'timeout', message } as StreamEvent]);
+const tokenThenCut = (message: string) => () => new EventsStream([
+  { type: 'tokens', content: 'zz-partial ', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent,
+  { type: 'aborted', reason: 'timeout', message } as StreamEvent,
+]);
 const serverError = () => () => new EventsStream([{
   type: 'error',
   error: new MembraneError({ type: 'server', retryable: true, httpStatus: 500, message: 'zz internal error', rawError: undefined } as ConstructorParameters<typeof MembraneError>[0]),
@@ -107,7 +111,7 @@ const timeoutCalls = (calls: string[]) => calls.filter((text) => physicalLines([
 const stopCalls = (calls: string[]) => calls.filter((text) => text.includes(STOP_WORDS));
 const literal = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const timeoutLine = (reason: string, scheduled = 'in 1000ms (2 of 2)', agent = 'resident') =>
-  new RegExp(`^\\[inference-timeout\\] agent=${literal(agent)} cut after \\d+ms; retry scheduled ${literal(scheduled)}: ${literal(reason)}$`);
+  new RegExp(`^\\[inference-timeout\\] agent=${literal(agent)} stream cut after \\d+ms; retry scheduled ${literal(scheduled)}: ${literal(reason)}$`);
 const stopLine = (reason: string, agent = 'resident') => new RegExp(`^\\[turn\\] ${literal(agent)}: ${STOP_WORDS} after \\d+ms; the turn ends there: ${literal(reason)}$`);
 function oneTimeoutLine(stderr: string[], line: RegExp, message?: string): void {
   const calls = timeoutCalls(stderr);
@@ -168,10 +172,11 @@ const hello = (fw: AgentFramework) => fw.pushEvent({ type: 'external-message', s
 describe('a deadline expiry whose call the error policy retries writes one stderr line', () => {
   it('a cut call that gets a fresh call writes one [inference-timeout] line with the delay, the tries and the reason, and the fresh call answers', async (t) => {
     const stderr = stderrOf(t);
-    const { fw, membrane, traces } = await boot(t, [cut('No provider event within 150s')]);
+    const { fw, membrane, traces } = await boot(t, [tokenThenCut('No provider event within 150s')]);
     hello(fw);
     await within('the turn', fw.runUntilIdle());
     assert.equal(membrane.calls.length, 2, 'one fresh call');
+    assert.ok(traces.some((e) => e.type === 'inference:failed'), 'control: the cut came after a token, as a failed call');
     assert.ok(traces.some((e) => e.type === 'inference:completed'), 'the fresh call answered');
     oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`));
   });
@@ -194,7 +199,8 @@ describe('a deadline expiry whose call the error policy retries writes one stder
     oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`), 'the first cut, whose call was made again');
     const failed = stderr.filter((text) => text.startsWith('[inference-failed] agent=resident'));
     assert.equal(failed.length, 1);
-    assert.ok(failed[0]!.includes('No content within 60s'), `the end names the second cut: ${failed[0]}`);
+    assert.ok(failed[0]!.includes(' type=timeout') && failed[0]!.includes('No content within 60s'), `the end names the second cut as a timeout: ${failed[0]}`);
+    assert.ok(stderr.indexOf(timeoutCalls(stderr)[0]!) < stderr.indexOf(failed[0]!), 'the [inference-timeout] line comes first');
   });
 
   it('a retried failure of another class writes no [inference-timeout] line', async (t) => {
