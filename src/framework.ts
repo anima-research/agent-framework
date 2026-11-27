@@ -1953,7 +1953,7 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
 }
 
 const CALLS_CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
-const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
+const SPEECH_STILL_ROUTING = "Some of that turn's plain speech was still being routed when the turn ended, so it may yet be posted; check the channel before sending it again.";
 
 function distinctDestinations(list: readonly ChannelRef[]): ChannelRef[] {
   const seen = new Set<string>();
