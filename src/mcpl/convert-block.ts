@@ -9,13 +9,21 @@ import type { ContentBlock } from '@animalabs/membrane';
 import {
   AUDIO_NO_DATA_TEXT,
   AUDIO_NO_MEDIA_TYPE_TEXT,
+  EMBEDDED_RESOURCE_NEVER_TEXT,
   IMAGE_NO_DATA_TEXT,
   IMAGE_NO_MEDIA_TYPE_TEXT,
   INLINE_WITHHELD_TEXT,
+  REFERENCE_LIMITS,
+  REFERENCE_LINK_TOO_LONG_TEXT,
   classifyBlock,
+  contentClaims,
+  embeddedWithheld,
   isInlineContradiction,
+  referenceRegistry,
   referenceStubOrNull,
   unknownBlockText,
+  uriWithheld,
+  type ResultClaims,
 } from './references.js';
 import { NON_STRING_TEXT_PLACEHOLDER } from './visible-content.js';
 import type { McplContentBlock } from './types.js';
@@ -32,7 +40,8 @@ import { markNoticeOpenings } from '../supplied-text.js';
  * a tool result's references are, so fetch_reference can fetch it through that
  * server's address, where it has one.
  */
-export function convertBlock(block: McplContentBlock, provenance: string, serverId: string): ContentBlock {
+export function convertBlock(block: McplContentBlock, provenance: string, serverId: string, claims: ResultClaims = messageClaims([block], serverId)): ContentBlock {
+  const stub = (): ContentBlock => ({ type: 'text', text: referenceStubOrNull(block, provenance, serverId, { claims }) ?? `[${NOTICE_TAG.reference}]` });
   switch (block.type) {
     case 'text':
       // Text that isn't a string can't be shown, so the agent reads that a
@@ -46,13 +55,15 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
+      // RFC-005 §8: a block whose uri violates the schema is rejected whole.
+      if (isFilledString(block.uri) && block.uri.length > REFERENCE_LIMITS.uri) return { type: 'text', text: REFERENCE_LINK_TOO_LONG_TEXT };
       if (isFilledString(block.uri) && block.disposition !== undefined) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it. Any disposition given
         // is a claim, one the reference rejects included, as classifyBlock
         // and isInlineContradiction read it: a falsy one such as 0, false
         // or '' stubs too, rather than sending the URI as the image's source.
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+        return stub();
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -61,6 +72,7 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         } as ContentBlock;
       }
       if (isFilledString(block.uri)) {
+        if (uriWithheld(block.uri, claims)) return stub();
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
@@ -74,11 +86,12 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
+      if (isFilledString(block.uri) && block.uri.length > REFERENCE_LIMITS.uri) return { type: 'text', text: REFERENCE_LINK_TOO_LONG_TEXT };
       if (isFilledString(block.uri) && block.disposition !== undefined) {
         // RFC-005 uri-form media with a disposition claim, a falsy one
         // included, as for an image (above): stub, do not hand the URI to
         // the provider or inline it.
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+        return stub();
       }
       if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
@@ -90,22 +103,22 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
 
     case 'resource': {
       // MCP's embedded resource shows as the block its contents make would
-      // show here (RFC-005 §8.1), its uri never.
+      // show here (RFC-005 §8.1), its uri never, or, where a `never` names
+      // its uri, as the notice that its content is withheld.
       const c = classifyBlock(block);
+      if (c.kind === 'embedded' && embeddedWithheld(block, claims)) return { type: 'text', text: EMBEDDED_RESOURCE_NEVER_TEXT };
       if (c.kind === 'embedded' && c.contents.kind === 'block') {
-        return convertBlock(c.contents.block as McplContentBlock, provenance, serverId);
+        return convertBlock(c.contents.block as McplContentBlock, provenance, serverId, claims);
       }
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
-      return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
+      return stub();
     }
 
     default: {
       // MCP's link to a resource isn't one of MCPL's own blocks, but a server
       // can send one, and RFC-005 §8.1 makes it a reference, shown as one.
-      if ((block as { type?: unknown }).type === 'resource_link') {
-        return { type: 'text', text: referenceStubOrNull(block, provenance, serverId) ?? `[${NOTICE_TAG.reference}]` };
-      }
+      if ((block as { type?: unknown }).type === 'resource_link') return stub();
       // Unknown wire block types previously fell off the exhaustive switch
       // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
       // that isn't a string is no type, and is never converted to one: an
@@ -115,15 +128,22 @@ export function convertBlock(block: McplContentBlock, provenance: string, server
   }
 }
 
-export function convertBlocks(blocks: readonly McplContentBlock[], provenance: string, serverId: string): ContentBlock[] {
-  const converted = blocks.map((block) => convertBlock(block, provenance, serverId));
-  return markNoticeOpenings(converted, (index) => sendersText(blocks[index]));
+function messageClaims(blocks: readonly McplContentBlock[], serverId: string): ResultClaims {
+  const nevers = new Map([...contentClaims(blocks)].filter(([, claim]) => claim.never));
+  referenceRegistry.markNevers(nevers, serverId);
+  return nevers;
 }
 
-function sendersText(block: McplContentBlock | undefined): boolean {
+export function convertBlocks(blocks: readonly McplContentBlock[], provenance: string, serverId: string): ContentBlock[] {
+  const claims = messageClaims(blocks, serverId);
+  const converted = blocks.map((block) => convertBlock(block, provenance, serverId, claims));
+  return markNoticeOpenings(converted, (index) => sendersText(blocks[index], claims));
+}
+
+function sendersText(block: McplContentBlock | undefined, claims: ResultClaims): boolean {
   if (block?.type === 'text') return typeof block.text === 'string';
   const c = classifyBlock(block);
-  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text';
+  return c.kind === 'embedded' && c.contents.kind === 'block' && c.contents.block.type === 'text' && !embeddedWithheld(block, claims);
 }
 
 /** A string with something in it: the only data, mimeType or uri a block's

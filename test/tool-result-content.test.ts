@@ -41,7 +41,7 @@ test('error results pass through unchanged', () => {
   assert.equal(result.content, 'boom');
 });
 
-test('beside an image, a text block whose text is not a string shows the placeholder, and a reference is still a stub', () => {
+test('beside an image, a text block whose text is not a string shows the placeholder, and a `never` reference no server marked shows the not-shown notice', () => {
   // The native blocks used to give way to the JSON fallback, which sent the
   // image as base64 text and the reference's uri as it was.
   const fw = makeFw();
@@ -53,6 +53,7 @@ test('beside an image, a text block whose text is not a string shows the placeho
   assert.ok(Array.isArray(result.content), String(result.content).slice(0, 200));
   assert.deepEqual(result.content[0], { type: 'text', text: NON_STRING_TEXT_PLACEHOLDER });
   assert.equal(result.content[1].type, 'image');
-  assert.ok(result.content[2].text.startsWith('[ref_'), result.content[2].text);
+  assert.deepEqual(result.content[2], { type: 'text', text: '[Reference not shown "f.txt": its content is marked never to reach you or your tools.]' });
+  assert.ok(!/ref_[a-z0-9]/.test(JSON.stringify(result.content)), JSON.stringify(result.content));
   assert.ok(!JSON.stringify(result.content).includes('RAW_TOKEN'));
 });
