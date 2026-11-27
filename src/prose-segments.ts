@@ -10,9 +10,7 @@
  * collapsing those distinct messages into one (item 4). This helper instead
  * yields each contiguous run of text — the segments a surface should deliver as
  * separate, ordered messages. Contiguous text blocks merge into one segment;
- * `tool_use` / `tool_result` blocks are segment boundaries, as are XML tool
- * mode's `tool_attempt` / `tool_notice` (a refused attempt and the harness's
- * notice end a round just as a call and its results do); empty or
+ * `tool_use` / `tool_result` blocks are segment boundaries; empty or
  * whitespace-only runs are dropped.
  */
 
@@ -38,12 +36,7 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
     const type = block.type as string;
     if (type === 'text') {
       buf.push((block as ContentBlock & { type: 'text' }).text);
-    } else if (
-      type === 'tool_use' ||
-      type === 'tool_result' ||
-      type === 'tool_attempt' ||
-      type === 'tool_notice'
-    ) {
+    } else if (type === 'tool_use' || type === 'tool_result') {
       flush();
     }
     // Other block types (thinking, redacted_thinking, image, …) are neither

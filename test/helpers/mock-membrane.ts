@@ -23,8 +23,12 @@ export function createMockResponse(
     .join('');
 
   const toolCalls = content
-    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown>; unparseableInput?: string } => b.type === 'tool_use')
-    .map((b) => ({ id: b.id, name: b.name, input: b.input, ...(b.unparseableInput !== undefined ? { unparseableInput: b.unparseableInput } : {}) }));
+    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown>; unparseableInput?: string; unparseableReason?: string } => b.type === 'tool_use')
+    .map((b) => ({
+      id: b.id, name: b.name, input: b.input,
+      ...(b.unparseableInput !== undefined ? { unparseableInput: b.unparseableInput } : {}),
+      ...(b.unparseableReason !== undefined ? { unparseableReason: b.unparseableReason } : {}),
+    }));
 
   return {
     content,
@@ -106,11 +110,12 @@ export class MockYieldingStream implements YieldingStream {
       this._pendingToolCallIds = response.toolCalls.map((c) => c.id);
       this.events.push({
         type: 'tool-calls',
-        calls: response.toolCalls.map((tc) => ({
+        calls: response.toolCalls.map((tc: (typeof response.toolCalls)[number] & { unparseableReason?: string }) => ({
           id: tc.id,
           name: tc.name,
           input: tc.input as Record<string, unknown>,
           ...(tc.unparseableInput !== undefined ? { unparseableInput: tc.unparseableInput } : {}),
+          ...(tc.unparseableReason !== undefined ? { unparseableReason: tc.unparseableReason } : {}),
         })),
         context: {
           rawText: '',
