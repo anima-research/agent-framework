@@ -807,7 +807,9 @@ export interface InferenceRequest {
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient
    * chatter for the turn's frozen speech locus: overheard conversation must
-   * not capture the agent's voice just by being newest.
+   * not capture the agent's voice just by being newest. A resident's wake
+   * from `channels/incoming` or `push/event` for a deletion or a removed
+   * reaction is never addressed, whatever its tags, since it asks nothing.
    */
   addressed?: boolean;
   /**

@@ -775,6 +775,13 @@ const systemNoticeMark = (tags?: string[]): { systemNotice?: true } =>
 const markerMark = (tags: string[] | undefined, firstView: boolean): { marker?: true } =>
   isMarkerTagged(tags, firstView) ? { marker: true } : {};
 
+/** A resident's wake claims its channel as addressed only when its message
+ *  asks something: a server may give a deletion or a removed reaction the
+ *  addressing tags of the message it removes (zulip_mcp does), and neither
+ *  asks the agent anything. */
+const claimsAddressed = (tags: string[] | undefined): boolean =>
+  isAddressedMessage(tags) && !tags?.some((t) => t === 'chat:deleted' || t === 'chat:reaction-remove');
+
 /**
  * A wake from the heartbeat: a tick or a reminder, from the framework's own
  * heartbeat or from an MCPL server whose id is `heartbeat` (heartbeat-mcpl),
@@ -20983,7 +20990,7 @@ export class AgentFramework {
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
-          addressed,
+          addressed: claimsAddressed(event.tags),
           ...ambientMark(event.tags),
           // A notice (chat:system) picks no channel for the turn.
           ...systemNoticeMark(event.tags),
@@ -22980,7 +22987,7 @@ export class AgentFramework {
           // DMs and addressed-while-closed messages arrive as push events;
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
-          addressed: isAddressedMessage(event.tags),
+          addressed: claimsAddressed(event.tags),
           ...ambientMark(event.tags),
           ...systemNoticeMark(event.tags),
           ...markerMark(event.tags, event.firstView === true),
