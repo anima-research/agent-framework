@@ -24,7 +24,7 @@ At logical turn end, unless the turn failed or was stopped, a `[delivered]`
 receipt names canonical destinations (or a bounce explains failure), so
 authored intent cannot impersonate delivery. Failed and stopped turns write
 no such receipt. A failure or stop note lists each destination where a server
-confirmed the turn's speech.
+confirmed the turn's speech before the turn ended.
 Unprefixed prose after a successful envelope follows that explicit destination
 for the remainder of the turn; a fresh turn begins at its ordinary locus.
 After `>>>skip_reply`, or a `>>>` envelope that is malformed, doesn't resolve
