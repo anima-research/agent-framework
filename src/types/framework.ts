@@ -448,7 +448,9 @@ export interface FrameworkConfig {
    * and explicit and disabled routing deliver no unprefixed prose, as
    * always. A
    * message wake is a channel message's or a server event's
-   * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's.
+   * (`mcpl:channel-incoming`, `mcpl:push-event`) other than the heartbeat's,
+   * silent or not, and never a turn's retry, re-arm or release from a budget
+   * hold, which keep their message reason and have waited already.
    * Each message's own decision stays what the gate gives it: who wakes a
    * sleeping agent, where a reply goes, what tune-out and conversation
    * routing see. Held messages are already in context, so another burst's
@@ -459,9 +461,9 @@ export interface FrameworkConfig {
    * burst leaves unassembled, a notice that arrives meanwhile included; a
    * channel-less burst another turn has read is dropped,
    * addressed or not, as its wake asks for no reply in a channel. The turn's
-   * `incoming` anchor (what servers are told the agent replies to, and what a
-   * refusal reacts to) stays the latest delivered inbound message, which can
-   * be a held channel's. Any other wake (a timer, an operator's, a tool
+   * `incoming` anchor (what servers are told the agent replies to) stays the
+   * latest delivered inbound message, which can be a held channel's; a
+   * refusal's reaction goes on the message the turn answers, as always. Any other wake (a timer, an operator's, a tool
    * result) isn't held: it starts now, with the wakes that name no channel
    * and at most one channel's burst (the channel it names, else the ready
    * burst that waited longest), the other channels' bursts still waiting. A

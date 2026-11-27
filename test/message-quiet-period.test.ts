@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import { quietSplit, quietBurstKey, carryQuietSinceForTests } from '../src/framework.js';
+import { quietSplit, quietBurstKey, carryQuietSinceForTests, markRequestForTests } from '../src/framework.js';
 import type { InferenceRequest } from '../src/types/agent.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import { MockMembrane, OneResponsePerTurnMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -99,6 +99,11 @@ describe('quietSplit', () => {
     const named = inChannel(T0, 'g:room', { source: 'heartbeat', channelServerId: 'heartbeat' });
     assert.equal(remaining([named], T0 + 100), 1_900);
     assert.equal(remaining([message(T0, { reason: 'mcpl:push-event', source: 'gate', heartbeatTurn: true })], T0 + 100), 0);
+    // A silent tick (heartbeat-mcpl's, suppressProse) is a tick too, though
+    // isHeartbeatWake leaves it out (R6-2).
+    const silent = message(T0, { reason: 'mcpl:push-event', source: 'heartbeat', suppressProse: true, silentHeartbeat: { eventId: 'e1', serverId: 'heartbeat' } });
+    assert.equal(remaining([silent], T0 + 100), 0);
+    assert.equal(remaining([message(T0), silent], T0 + 100), 0, 'a silent tick in the batch starts it');
   });
 
   it('a continuation or a retry of the turn is not held', () => {
@@ -108,6 +113,15 @@ describe('quietSplit', () => {
     assert.equal(remaining([guard], T0 + 100), 0);
     const auto = message(T0, { autoContinueRun: { stop: 'call skip_reply' } });
     assert.equal(remaining([auto], T0 + 100), 0);
+    // The marks the scheduler sets, which keep the message reason and the
+    // first wake's age: a retry (TURN_RETRY, R6-13), a re-arm, which drops
+    // the retry mark, and a turn a budget hold released (R6-1).
+    for (const mark of ['retry', 'rearmed', 'budget-wait'] as const) {
+      const marked = message(T0);
+      markRequestForTests(marked, mark);
+      assert.equal(remaining([marked], T0 + 100), 0, `a ${mark} turn is not held`);
+      assert.equal(remaining([message(T0 + 50), marked], T0 + 100), 0, `a ${mark} turn starts the batch`);
+    }
   });
 
   it('bursts are per channel: one channel\'s chatter does not move another\'s deadline (R1-1)', () => {
@@ -634,6 +648,29 @@ describe('messageQuietPeriod in the scheduler', () => {
     return { ...started, x, occ, old, capLeft };
   }
 
+  it("a replacement carries the age of its own burst only: an origin moved to another channel begins a new one (R6-6)", async () => {
+    let placed: InferenceRequest | undefined;
+    const { framework, x, occ, old, capLeft } = await replacing((x, wake) => { placed = wake; x.pendingRequests.push(wake); });
+    try {
+      const inA = { ...old, channelId: 'g:a', channelServerId: 'discord' };
+      const subject = old.coalescingSubject!;
+      for (const [channelId, expect] of [['g:b', 'fresh'], ['g:a', 'carried']] as const) {
+        x.queueCoalescedWakes = async () => {
+          placed = inChannel(Date.now(), channelId, { reason: 'mcpl:push-event', source: 'tsm', coalescingSubject: subject });
+          x.pendingRequests.push(placed);
+        };
+        x.pendingRequests.length = 0;
+        x.pendingRequests.push({ ...inA });
+        await x.wakeForCoalescedBatch(occ);
+        const left = capLeft(placed!);
+        if (expect === 'fresh') assert.ok(left !== undefined && left > 8_000, `another channel's burst counts from its own first wake: ${left} ms left`);
+        else assert.ok(left === undefined || left < 2_000, `the same channel's burst keeps its age: ${left} ms left`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
   it("a replacement already in a pass's hands when the age is carried still carries it (b9034c4 review, 3)", async () => {
     let placed: InferenceRequest | undefined;
     const pass = new Map<string, InferenceRequest[]>();
@@ -774,7 +811,7 @@ describe('messageQuietPeriod in the scheduler', () => {
     const [held] = f.upcomingWakesFor('agent');
     assert.equal(held?.kind, 'queued');
     assert.equal(held?.at, undefined, 'no time of its own: a busy agent starts it when free, if that is later');
-    assert.match(held!.what, /, held by the message quiet period, not before [12] s$/, 'the earliest start, busy or idle');
+    assert.match(held!.what, /, held by the message quiet period, not before 1\.[4-6] s$/, 'the earliest start, busy or idle, to a tenth (R6-10)');
     f.quietPeriod = undefined;
     assert.doesNotMatch(f.upcomingWakesFor('agent')[0]!.what, /quiet period/, 'with the option off, it is due as soon as the agent is free');
   });

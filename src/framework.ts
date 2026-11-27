@@ -1160,12 +1160,16 @@ export function quietSplit(
 }
 
 /** A wake a message made: a channel message's or a server event's, other
- *  than the heartbeat's (isHeartbeatWake), that neither continues nor
- *  retries a turn. */
+ *  than the heartbeat's (isHeartbeatWake, or a silent tick's, which
+ *  isHeartbeatWake leaves out for its own reasons), that neither continues
+ *  nor retries a turn, and is no turn re-armed or released from a budget
+ *  hold: those keep their message reason and their first wake's age, and
+ *  have waited their hold already. */
 function isMessageWake(r: InferenceRequest): boolean {
   return (r.reason === 'mcpl:channel-incoming' || r.reason === 'mcpl:push-event')
-    && !isHeartbeatWake(r)
-    && !continuesTurn(r) && !carriesContinuation(r) && mergedBatch(r) === undefined;
+    && !isHeartbeatWake(r) && r.silentHeartbeat === undefined
+    && !continuesTurn(r) && !carriesContinuation(r) && mergedBatch(r) === undefined
+    && !isRearmed(r) && budgetWaitOf(r) === undefined && (r as MarkedRequest)[RELEASED_ROUTING] === undefined;
 }
 
 const settingBoolean = (name: string, value: unknown): boolean => {
@@ -3336,6 +3340,16 @@ const testAbandonGraces = new WeakMap<AgentFramework, number>();
  *  `since`, as a coalesced batch's replacement or a quiesce's coalescing does. */
 export function carryQuietSinceForTests(request: InferenceRequest, since: number): void {
   carryQuietSince(request, since);
+}
+
+/** Test-only: marks `request` as the scheduler marks a turn's retry
+ *  (TURN_RETRY), a re-armed turn (REARMED) or a turn a budget hold released
+ *  (BUDGET_WAIT), whose symbols a test can't name. */
+export function markRequestForTests(request: InferenceRequest, mark: 'retry' | 'rearmed' | 'budget-wait'): void {
+  const r = request as MarkedRequest;
+  if (mark === 'retry') r[TURN_RETRY] = true;
+  else if (mark === 'rearmed') r[REARMED] = true;
+  else r[BUDGET_WAIT] = { since: request.timestamp };
 }
 
 /**
@@ -7357,7 +7371,7 @@ export class AgentFramework {
         certain: queued.some((r) => !droppableAsRead(r)),
         kind: 'queued',
         what: `${queued.length === 1 ? 'a wake' : `${queued.length} wakes`} already queued (${safeSlice(String(reason), 0, 80)})` +
-          (heldMs !== undefined ? `, held by the message quiet period, not before ${Math.round(heldMs / 1000)} s` : ''),
+          (heldMs !== undefined ? `, held by the message quiet period, not before ${Math.ceil(heldMs / 100) / 10} s` : ''),
       });
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
@@ -22869,12 +22883,16 @@ export class AgentFramework {
     // queued, so a replacement traces no `gone`, and a start assembling in
     // between still leaves the batch (quietLeaves reads the queue at the
     // take, under the coalescer's lock, which this notice holds).
+    // The same burst is the same agent's and the same burst key's: a subject
+    // whose origin moves to another channel begins a new burst there, on its
+    // own clock (R6-6).
     const since = new Map<string, number>();
+    const burstOf = (w: InferenceRequest) => JSON.stringify([w.agentName, quietBurstKey(w)]);
     if (this.quietPeriod) {
       this.forEachQueuedRequest((r) => {
         for (const w of [r, ...(mergedBatch(r) ?? [])]) {
           if (w.coalescingSubject !== subject) continue;
-          since.set(w.agentName, Math.min(since.get(w.agentName) ?? Infinity, quietSince(w)));
+          since.set(burstOf(w), Math.min(since.get(burstOf(w)) ?? Infinity, quietSince(w)));
         }
       });
     }
@@ -22882,7 +22900,7 @@ export class AgentFramework {
     await this.queueCoalescedWakes(occ);
     if (since.size > 0) {
       this.forEachQueuedRequest((r) => {
-        const was = r.coalescingSubject === subject ? since.get(r.agentName) : undefined;
+        const was = r.coalescingSubject === subject ? since.get(burstOf(r)) : undefined;
         if (was !== undefined) carryQuietSince(r, was);
       });
     }

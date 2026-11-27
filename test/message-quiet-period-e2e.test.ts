@@ -422,9 +422,13 @@ describe('messageQuietPeriod and a deferred coalesced batch', () => {
       render.release!();
       await stopping;
       const held = traces.filter((e) => e.type === 'quiet-period:held').map((e) => `${e.agentName} ${e.burst}`);
-      const released = traces.filter((e) => e.type === 'quiet-period:released').map((e) => `${e.agentName} ${e.burst}`);
+      const releases = traces.filter((e) => e.type === 'quiet-period:released');
+      const released = releases.map((e) => `${e.agentName} ${e.burst}`);
       assert.ok(held.some((h) => h.startsWith('helper ')), `the pass held the helper's burst after the stop began: ${JSON.stringify(traces.filter((e) => e.type.startsWith('quiet-period')))}`);
       assert.deepEqual(released.sort(), held.sort(), 'every hold traced is released');
+      // The late hold ends with the stop, as gone, not as a burst that started (R6-12).
+      const causes = releases.filter((e) => e.agentName === 'helper').map((e) => e.cause);
+      assert.ok(causes.length > 0 && causes.every((c) => c === 'gone'), `each of the helper's holds ends as gone: ${JSON.stringify(causes)}`);
     } finally {
       await f.close();
     }
