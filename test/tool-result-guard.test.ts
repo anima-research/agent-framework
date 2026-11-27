@@ -1345,16 +1345,13 @@ test('a staged batch omitted by compilation does not claim the refusal; autoRewi
     toolResultGuard: true, maxStreamTokens: 1, strategy: new OmitToolExchange(),
     refusalHandling: { autoRewind: true },
   });
-  const exhausted: string[] = [];
-  h.framework.onTrace((e) => { if (e.type === 'inference:exhausted') exhausted.push(String((e as { errorType?: unknown }).errorType)); });
   try {
     await h.run();
     const guard = h.framework.getAgent('assistant')!.toolResultGuard;
     assert.equal(guard.hasPending, false, 'unsubmitted batch must be settled, not stranded');
     assert.equal(guard.recovering, false);
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
-    assert.equal(h.membrane.requests.length, 2, 'the strategy omits the tool exchange, so the retry holds only framework notices and isn\'t sent');
-    assert.deepEqual(exhausted, ['empty_compile'], 'ordinary refusal rewind retry must run');
+    assert.equal(h.membrane.requests.length, 3, 'ordinary refusal rewind retry must run');
     const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
     assert.ok(JSON.stringify(messages).includes(`[${NOTICE_TAG.refusalRewind}]`));
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;

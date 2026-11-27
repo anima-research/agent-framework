@@ -145,7 +145,7 @@ test('a newest message the budget can\'t hold ends its turn with no request and 
     const refused = h.exhausted().at(-1)!;
     assert.equal(refused.errorType, 'empty_compile');
     assert.equal(refused.retryable, false);
-    assert.equal(refused.operatorNote, "the passthrough strategy selected none of the agent's conversation; 7904 of a 12000-token budget is usable after 4096 held back for the reply and any pending tool results: raise contextBudgetTokens, or check the strategy's selection.");
+    assert.equal(refused.operatorNote, "the passthrough strategy selected none of the agent's conversation; 7904 of a 12000-token budget is usable after 4096 held back for the reply. A row too large for that room keeps the conversation out: raise contextBudgetTokens, or remove that row.");
     assert.deepEqual(h.notices(), ["[inference-failed] Your previous turn wasn't sent: none of your conversation was included in the request."]);
     const alert = h.alerts().at(-1)!;
     assert.ok(alert.message!.startsWith('compile refused (empty_compile), its request not sent: the passthrough strategy selected none'), alert.message);
@@ -183,7 +183,7 @@ test('a budget that leaves no room for any message fails every wake, a new messa
     assert.ok(!h.stderr.some((l) => l.startsWith('[inference-rewind]')), 'the breaker sheds nothing');
     assert.ok(!h.rows().some((r) => r.startsWith('[refusal-rewind]')), 'no rewind notice is written');
     assert.ok(h.stderr.some((l) => l.startsWith('[inference-hard-down]')), 'from the third failure the agent is reported hard-down');
-    assert.ok(h.alerts()[0]!.message!.includes("compile refused (empty_compile), its request not sent: the passthrough strategy selected none of the agent's conversation; contextBudgetTokens (4000) leaves no room once 4096 tokens are held back for the reply and any pending tool results: raise contextBudgetTokens."), h.alerts()[0]!.message);
+    assert.ok(h.alerts()[0]!.message!.includes("compile refused (empty_compile), its request not sent: the passthrough strategy selected none of the agent's conversation; contextBudgetTokens (4000) leaves no room once 4096 tokens are held back for the reply: raise contextBudgetTokens."), h.alerts()[0]!.message);
   } finally { await h.close(); }
 });
 
@@ -305,7 +305,7 @@ test('the direct API rejects a compile that selects nothing before it sends, tho
       assert.ok(err instanceof EmptyCompileError, String(err));
       assert.equal(err.retryable, false);
       assert.equal(err.message, 'the compile selected none of the conversation in the agent\'s window, so its request was not sent');
-      assert.match(err.operatorNote, /^the passthrough strategy selected none of the agent's conversation; 4 of a 4100-token budget is usable after 4096 held back for the reply and any pending tool results:/);
+      assert.match(err.operatorNote, /^the passthrough strategy selected none of the agent's conversation; 4 of a 4100-token budget is usable after 4096 held back for the reply\./);
       return true;
     });
     assert.equal(h.membrane.sent.length, sentBefore, 'nothing is sent');
@@ -410,7 +410,7 @@ test('a committing compileContext refuses as compileWithInjections does', async 
   } finally { await h.close(); }
 });
 
-test('a compile made while a tool-result batch holds back its reserve isn\'t refused: its request is sent as before', async () => {
+test('a compile made while a tool-result batch holds back its reserve isn\'t refused: its request is built as before', async () => {
   const h = await harness(12_000);
   try {
     const store = (h.framework as unknown as { store: JsStore }).store;
@@ -422,6 +422,7 @@ test('a compile made while a tool-result batch holds back its reserve isn\'t ref
       Object.defineProperty(guard, 'pendingWireReserveTokens', { configurable: true, get: () => 20_000 });
       const sent = await host.buildActivationRequest([]);
       assert.ok(!texts(sent).includes('zz-short'), 'premise: the reserve left no room for the message');
+      assert.equal(sent.messages.length, 0);
     } finally { await cm.close(); }
   } finally { await h.close(); }
 });
@@ -514,17 +515,22 @@ test('a notice whose write landed, though the write threw, counts as written: th
   } finally { await h.close(); }
 });
 
-test('a compile under another strategy that selects none of the conversation is sent as before', async () => {
+test('a compile under a subclass of passthrough that leaves rows out by design isn\'t refused: its request is sent as before', async () => {
+  class Anchored extends PassthroughStrategy {
+    override select(...args: Parameters<PassthroughStrategy['select']>) {
+      return super.select(...args).filter(() => false);
+    }
+  }
   const h = await harness(12_000);
   try {
     const store = (h.framework as unknown as { store: JsStore }).store;
-    const strategy = new PassthroughStrategy();
-    Object.defineProperty(strategy, 'name', { value: 'zz-windowed' });
-    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy } as never);
+    const cm = await ContextManager.open({ store, namespace: 'zz-host', isolate: true, strategy: new Anchored() } as never);
     try {
-      cm.presentRows([cm.addMessage('User', [{ type: 'text', text: LONG }])]);
+      cm.presentRows([cm.addMessage('User', [{ type: 'text', text: 'zz-short' }])]);
       const host = new Agent({ name: 'zz-host', model: 'zz-model', systemPrompt: 'system', contextBudgetTokens: 12_000 } as never, cm, h.membrane.asMembrane());
-      assert.equal((await host.buildActivationRequest([])).messages.length, 0);
+      await host.runInference([]).catch(() => undefined);
+      assert.equal(h.membrane.sent.length, 1, 'the request is sent');
+      assert.equal(h.membrane.sent[0]!.messages.length, 0, 'holding none of the window, by the strategy\'s design');
     } finally { await cm.close(); }
   } finally { await h.close(); }
 });

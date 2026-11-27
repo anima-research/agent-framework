@@ -1,33 +1,32 @@
 /**
- * Thrown before a request is sent when its compile selected none of the
- * conversation the agent's window holds. Sent, such a request is refused by
- * the provider, or answered with a turn that sees none of the conversation.
- * Not retryable: the same store compiles to the same nothing.
+ * Thrown before a request is sent when a compile under the passthrough
+ * strategy selected none of the conversation the agent's window holds.
+ * Sent, such a request is refused by the provider, or answered with a turn
+ * that sees none of the conversation. Not retryable: the same store compiles
+ * to the same nothing.
  *
- * `operatorNote` gives the strategy, the budget's figures and what to
- * change.
+ * `operatorNote` gives the budget's figures and what to change.
  */
 export class EmptyCompileError extends Error {
   readonly retryable = false;
+  readonly strategy = 'passthrough';
   readonly budgetTokens: number;
   readonly reserveTokens: number;
-  readonly strategy?: string;
   readonly operatorNote: string;
 
-  constructor(budgetTokens: number, reserveTokens: number, strategy?: string) {
+  constructor(budgetTokens: number, reserveTokens: number, windowTokens?: number) {
     super('the compile selected none of the conversation in the agent\'s window, so its request was not sent');
     const usable = budgetTokens - reserveTokens;
     this.name = 'EmptyCompileError';
     this.budgetTokens = budgetTokens;
     this.reserveTokens = reserveTokens;
-    if (strategy !== undefined) this.strategy = strategy;
-    const selector = strategy ? `the ${strategy} strategy` : 'the compile';
+    const cap = windowTokens !== undefined ? `, up to the model's context window of ${windowTokens} tokens` : '';
     this.operatorNote = usable <= 0
-      ? `${selector} selected none of the agent's conversation; contextBudgetTokens (${budgetTokens}) leaves no room once ` +
-        `${reserveTokens} tokens are held back for the reply and any pending tool results: raise contextBudgetTokens.`
-      : `${selector} selected none of the agent's conversation; ` +
-        `${usable} of a ${budgetTokens}-token budget is usable after ${reserveTokens} held back for the reply and any pending tool results: ` +
-        'raise contextBudgetTokens, or check the strategy\'s selection.';
+      ? `the passthrough strategy selected none of the agent's conversation; contextBudgetTokens (${budgetTokens}) leaves no room once ` +
+        `${reserveTokens} tokens are held back for the reply: raise contextBudgetTokens${cap}.`
+      : `the passthrough strategy selected none of the agent's conversation; ` +
+        `${usable} of a ${budgetTokens}-token budget is usable after ${reserveTokens} held back for the reply. ` +
+        `A row too large for that room keeps the conversation out: raise contextBudgetTokens${cap}, or remove that row.`;
   }
 }
 

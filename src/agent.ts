@@ -724,14 +724,15 @@ export class Agent {
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
-  private presentedRows(): readonly StoredMessage[] {
+  private passthroughWindow(): readonly StoredMessage[] | undefined {
     const cm = this.contextManager as Partial<ContextManager>;
+    const strategy: unknown = cm.getStrategy?.();
+    if (typeof strategy !== 'object' || strategy === null || Object.getPrototypeOf(strategy)?.constructor?.name !== 'PassthroughStrategy') return undefined;
     return typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages() : [];
   }
 
-  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean, rows: readonly StoredMessage[]): void {
-    const cm = this.contextManager as Partial<ContextManager>;
-    if (guarded || cm.getStrategy?.().name !== 'passthrough') return;
+  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean, rows: readonly StoredMessage[] | undefined): void {
+    if (guarded || !rows) return;
     let byId: Map<MessageId, StoredMessage> | undefined;
     const metadataOf = (id: MessageId): unknown => {
       try {
@@ -749,7 +750,7 @@ export class Agent {
     if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
     if (!rows.some((row) => hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata))) return;
     const at = compiledAt ?? DEFAULT_COMPILE_BUDGET;
-    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, 'passthrough');
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, this.physicalWindowTokens);
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
@@ -1641,7 +1642,7 @@ export class Agent {
     const select = async () => {
       const at = this.compileBudget(budget);
       const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
-      const rows = this.presentedRows();
+      const rows = this.passthroughWindow();
       const compiled = await this.contextManager.compile(at);
       this.refuseEmptyCompile(compiled, at, guarded, rows);
       return compiled;
@@ -1975,7 +1976,7 @@ export class Agent {
     const select = async () => {
       const at = this.compileBudget(budget);
       const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
-      const rows = opts?.dryRun ? [] : this.presentedRows();
+      const rows = opts?.dryRun ? undefined : this.passthroughWindow();
       const compiled = await this.contextManager.compile(at, injections, opts as never);
       if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at, guarded, rows);
       return compiled;

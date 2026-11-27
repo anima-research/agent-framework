@@ -1,5 +1,5 @@
 - **Hosts that call an Agent directly:** seven calls now throw
-  `EmptyCompileError` when a compile under the passthrough strategy
+  `EmptyCompileError` when a compile under the plain passthrough strategy
   selects none of the conversation that the agent's window holds. They are
   `runInference`, `runInferenceWithInjections`, `startStream`,
   `startStreamWithInjections` and `compileContext`, and
