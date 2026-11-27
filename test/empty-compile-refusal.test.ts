@@ -145,7 +145,8 @@ test('a newest message the budget can\'t hold ends its turn with no request and 
     const refused = h.exhausted().at(-1)!;
     assert.equal(refused.errorType, 'empty_compile');
     assert.equal(refused.retryable, false);
-    assert.equal(refused.operatorNote, "the passthrough strategy selected none of the agent's conversation; 7904 of a 12000-token budget is usable after 4096 held back for the reply. A row too large for that room keeps the conversation out: raise contextBudgetTokens, or remove that row.");
+    const long = h.framework.getAgent('resident')!.getContextManager().getAllMessages().find((m) => m.content.some((c) => (c as { text?: string }).text === LONG))!;
+    assert.equal(refused.operatorNote, `the passthrough strategy selected none of the agent's conversation; 7904 of a 12000-token budget is usable after 4096 held back for the reply. A row too large for that room keeps the conversation out; the newest row that the compile left out is ${String(long.id)}: raise contextBudgetTokens, or remove that row.`);
     assert.deepEqual(h.notices(), ["[inference-failed] Your previous turn wasn't sent: none of your conversation was included in the request."]);
     const alert = h.alerts().at(-1)!;
     assert.ok(alert.message!.startsWith('compile refused (empty_compile), its request not sent: the passthrough strategy selected none'), alert.message);

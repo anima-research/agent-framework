@@ -749,8 +749,10 @@ export class Agent {
     };
     if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
     if (!rows.some((row) => hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata))) return;
+    const held = new Set(compiled.provenance?.messages.flatMap((source) => (source.kind === 'raw' ? source.bodies.map((b) => b.messageId) : [])));
+    const leftOut = [...rows].reverse().find((row) => !held.has(row.id) && hasRenderedContent(row.content) && managerSees(this.contextManager, row.metadata));
     const at = compiledAt ?? DEFAULT_COMPILE_BUDGET;
-    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, this.physicalWindowTokens);
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, this.physicalWindowTokens, leftOut && String(leftOut.id));
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
