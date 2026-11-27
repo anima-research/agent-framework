@@ -36,7 +36,7 @@ import {
   type ForkReaderConfig,
   type TuneOutReader,
 } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, heldAcknowledgementId, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
 import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
@@ -20904,8 +20904,11 @@ export class AgentFramework {
       // The admission record rides the message; the hold's own bookkeeping
       // (cadence tally, suppressed-mention ack, reader wake) follows.
       metadata.tuneOut = { epochId: decision.held.epochId };
+      // An edit that carries an eventId shares its message's messageId (MCPL SPEC §20.3.1).
       this.tuneOutCoordinator?.recordHeld(
-        event.serverId, event.channelId, event.messageId, event.tags, event.author?.id, decision.gatePass, event.firstView === true,
+        event.serverId, event.channelId,
+        heldAcknowledgementId(event.eventIdAsMessageId ? undefined : event.messageId, event.tags, event.firstView === true || event.eventId !== undefined),
+        event.tags, event.author?.id, decision.gatePass,
       );
     }
 
@@ -22988,9 +22991,11 @@ export class AgentFramework {
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
+      // A pushed edit's origin.messageId can be the edit line's own id (zulip_mcp), so only a first view counts as its message.
       this.tuneOutCoordinator?.recordHeld(
-        event.serverId, triggerChannel.channelId, event.eventId, event.tags,
-        typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass, event.firstView === true,
+        event.serverId, triggerChannel.channelId,
+        heldAcknowledgementId(typeof event.origin?.messageId === 'string' && event.origin.messageId !== '' ? event.origin.messageId : undefined, event.tags, event.firstView === true),
+        event.tags, typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass,
       );
     }
 

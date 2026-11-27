@@ -1045,6 +1045,17 @@ export interface TuneOutFrameworkHooks {
   emitTrace: (event: TraceEventInput) => void;
 }
 
+/**
+ * The id that a held line's `channels/acknowledge` names, or undefined when
+ * the line gets none. An acknowledgement names a platform message, or it
+ * isn't sent (#476): `id` is that message's id where the lane knows one. A
+ * marker (isMarkerTagged) gets none, since it is no mention. An edit counts
+ * as its message when `editNamesItsMessage`.
+ */
+export function heldAcknowledgementId(id: string | undefined, tags: string[] | undefined, editNamesItsMessage: boolean): string | undefined {
+  return id && !isMarkerTagged(tags, editNamesItsMessage) ? id : undefined;
+}
+
 export class TuneOutCoordinator {
   private cadenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Each duration's pending timer: a step toward its end time
@@ -4299,7 +4310,7 @@ export class TuneOutCoordinator {
   ): { epochId: string } | null {
     const hold = this.holdFor(serverId, channelId);
     if (!hold) return null;
-    this.recordHeld(serverId, channelId, messageId, tags, authorId, gatePass);
+    this.recordHeld(serverId, channelId, heldAcknowledgementId(messageId, tags, false), tags, authorId, gatePass);
     return hold;
   }
 
@@ -4815,20 +4826,17 @@ export class TuneOutCoordinator {
    * Bookkeeping for one held message, after admission decided the hold:
    * the cadence tally, the deterministic acknowledgement of a suppressed
    * mention, and the reader wake when the resident's gate would have woken
-   * them (`gatePass` is that verdict, probed without side effects). A
-   * marker gets no acknowledgement, since it is no mention. A marker is a
-   * reaction, an edit, a deletion or a `chat:system` notice (isMarkerTagged).
-   * An edit still counts as its message when the host delivered it as the
-   * first version that the agent sees (`firstView`).
+   * them (`gatePass` is that verdict, probed without side effects).
+   * `acknowledgeId` is the platform message that an acknowledgement would
+   * name (heldAcknowledgementId), or undefined when the line gets none.
    */
   recordHeld(
     serverId: string,
     channelId: string,
-    messageId: string,
+    acknowledgeId: string | undefined,
     tags: string[] | undefined,
     authorId?: string,
     gatePass = true,
-    firstView = false,
   ): void {
     const key = this.key(serverId, channelId);
     this.divertedSinceInvocation.set(key, (this.divertedSinceInvocation.get(key) ?? 0) + 1);
@@ -4842,13 +4850,13 @@ export class TuneOutCoordinator {
     // mentions and gate-privileged authors wake, per the issue.
     const addressed = Array.isArray(tags) && tags.includes('chat:addressed');
     const privileged = this.hooks.isPrivilegedAuthor(authorId);
-    if (gatePass && addressed && !isMarkerTagged(tags, firstView)) {
+    if (gatePass && addressed && acknowledgeId !== undefined) {
       // The mention-er always gets a deterministic signal, independent of
       // what the subconscious later decides (grant-gated; decline
       // precedent). Gate-suppressed mentions get NO reaction: main would
       // not have signaled either, and reacting would leak the resident's
       // standing mute to its subject.
-      void this.acknowledgeSuppressed(serverId, channelId, messageId);
+      void this.acknowledgeSuppressed(serverId, channelId, acknowledgeId);
     }
     if (gatePass && (addressed || privileged) && this.readerAvailable()) {
       this.scheduleWakeInvocation(serverId, channelId);
