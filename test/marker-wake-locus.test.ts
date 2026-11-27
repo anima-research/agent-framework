@@ -131,6 +131,33 @@ describe("a marker's wake and the turn's channel", () => {
     assert.equal(r.starts[0]!.channelId, 'stream:B');
   });
 
+  it('a mention on A, then the deletion of a mention on B, tagged as addressed as zulip_mcp tags it: the turn speaks in A', async (t) => {
+    const r = await resident(t);
+    await r.arrive('stream:A', ['chat:mention', 'chat:addressed']);
+    await r.arrive('stream:B', ['chat:deleted', 'chat:mention', 'chat:addressed']);
+    await r.run();
+    assert.equal(r.starts.length, 1, 'premise: one turn, from one batch');
+    assert.equal(r.starts[0]!.channelId, 'stream:A');
+  });
+
+  it('an ambient message on A, then a deletion in a direct message, tagged as addressed: the turn speaks in A', async (t) => {
+    const r = await resident(t);
+    await r.arrive('stream:A', ['chat:ambient']);
+    await r.arrive('dm:C', ['chat:deleted', 'chat:dm', 'chat:addressed', 'chat:private']);
+    await r.run();
+    assert.equal(r.starts.length, 1, 'premise: one turn, from one batch');
+    assert.equal(r.starts[0]!.channelId, 'stream:A');
+  });
+
+  it('an ambient message on A, then a removed reaction on B, tagged as addressed: the turn speaks in A', async (t) => {
+    const r = await resident(t);
+    await r.arrive('stream:A', ['chat:ambient']);
+    await r.arrive('stream:B', ['chat:reaction-remove', 'chat:addressed']);
+    await r.run();
+    assert.equal(r.starts.length, 1, 'premise: one turn, from one batch');
+    assert.equal(r.starts[0]!.channelId, 'stream:A');
+  });
+
   it("an autoContinue wake's channel outranks a newer marker's", async (t) => {
     const r = await resident(t);
     r.queue({ reason: 'auto-continue', source: 'framework', channelId: 'stream:A', channelServerId: 'zulip', autoContinueRun: { stop: 'call skip_reply' } });
@@ -246,6 +273,17 @@ describe("a marker's wake and the turn's channel", () => {
       assert.equal(r.starts.length, 2);
       assert.equal(r.starts[1]!.channelId, 'stream:B');
     });
+
+    it("an addressed deletion alone starts a turn whose retries run out; re-armed, it meets an ambient message on A: it keeps its channel B", async (t) => {
+      const r = await resident(t, [serverError, serverError, serverError]);
+      await r.arrive('stream:B', ['chat:deleted', 'chat:mention', 'chat:addressed']);
+      await r.run();
+      assert.equal(r.held(), 1, 'premise: the turn is re-armed and waits');
+      await r.arrive('stream:A', ['chat:ambient']);
+      await r.run();
+      assert.equal(r.starts.length, 2);
+      assert.equal(r.starts[1]!.channelId, 'stream:B');
+    });
   });
 });
 
@@ -313,6 +351,21 @@ describe("a marker's wake and where the reply is published, over the wire", () =
           payload: { content: [{ type: 'text', text: 'zz-pat reacted 👍' }] },
           origin: { source: 'discord', mcplChannelId: TYPO, authorId: 'U2', authorName: 'pat', messageId: 't0' },
           tags: ['chat:reaction'],
+        });
+      }));
+    } finally { await f.close(); }
+  });
+
+  it('an ambient message on A and a deletion pushed on B with the tag of the mention it deletes, as zulip_mcp tags one, wait together: the reply is published in A', async () => {
+    const f = await fixture();
+    try {
+      assertSpokeInLunch(await busyThenBatch(f, async () => {
+        await incoming(f, LUNCH, 'l1', 'zz-lunch at one?', AMBIENT);
+        await f.send('push/event', {
+          featureSet: 'doc', eventId: 'd1', timestamp: TS,
+          payload: { content: [{ type: 'text', text: '[deleted] zz-agent, nvm' }] },
+          origin: { source: 'zulip', mcplChannelId: TYPO, authorId: 'U2', authorName: 'pat', messageId: 't0' },
+          tags: ['chat:deleted', 'chat:mention'],
         });
       }));
     } finally { await f.close(); }
