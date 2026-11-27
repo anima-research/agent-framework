@@ -797,8 +797,9 @@ export interface InferenceRequest {
    * which copies its trigger), and on a merged batch whose causes include a
    * heartbeat's wake and name no channel; false on a merged batch with none,
    * so the batch's first request doesn't decide it. Unset, a wake is a
-   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it. Here a
-   * marker's wake that doesn't address the agent (`marker`) names no channel.
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it. In such a
+   * merged batch, a marker's wake that doesn't address the agent (`marker`)
+   * names no channel.
    */
   heartbeatTurn?: boolean;
   /**
@@ -839,11 +840,11 @@ export interface InferenceRequest {
    * ranks last in its batch. It names the turn's channel only if no other
    * request names one. If the batch holds a heartbeat's wake, the turn then
    * has no channel. The wake keeps its `channelId` in every case. Only a
-   * resident's wake from `channels/incoming` or `push/event` carries the
-   * mark. A conversation fork's wake, a deferred batch's wake and the
-   * wake-onboarding wake carry none. A merged start carries the mark of the
-   * request that named its channel. A `chat:system` notice's wake from those
-   * two lanes names no channel (`systemNotice`).
+   * wake from `channels/incoming` or `push/event` carries the mark. A
+   * conversation fork's wake from `channels/incoming`, a deferred batch's
+   * wake and the wake-onboarding wake carry none. A merged start carries the
+   * mark of the request that named its channel. A `chat:system` notice's
+   * wake from those two lanes names no channel (`systemNotice`).
    */
   marker?: true;
   /**
