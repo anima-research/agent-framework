@@ -19,6 +19,7 @@ import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/pro
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { ToolLifecycleEmitter, type ToolLifecycleParams } from '../src/mcpl/tool-lifecycle.js';
+import { withAudience } from '../src/dendrite/audience.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import { bySequence, headOf, legacyMarkFrom, newestCovered, rowAt } from './helpers/read-mark-rows.js';
 import { jsonLines } from './helpers/json-lines.js';
@@ -942,6 +943,8 @@ describe('held prose drafts, end to end', () => {
       ], 'scout', 'request');
       const [mine] = h.drafts('scout');
       assert.ok(mine);
+      const otherCm = h.framework.getAgent('other')!.getContextManager();
+      otherCm.presentRows([otherCm.addMessage('user', [{ type: 'text', text: 'list and resend' }], withAudience(undefined, ['other']))]);
       await h.turn([
         createMockResponse([drafts('o1', { action: 'list' })], 'tool_use'),
         createMockResponse([drafts('o2', { action: 'resend', draftIds: [mine.id], destination: ROOM })], 'tool_use'),

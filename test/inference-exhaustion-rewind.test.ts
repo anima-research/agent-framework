@@ -57,6 +57,7 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const fw = Object.create(AgentFramework.prototype) as any;
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();
+  fw.emptyCompileNoticed = new Set<string>();
   fw.turnRouting = new Map();
   fw.answeredTurns = new WeakMap();
   fw.rewindEpisode = new Map();

@@ -1926,7 +1926,8 @@ test('a budget restart held at the last boundary is inferring at the event gate 
     });
     const internal = fw as unknown as NonOwning & { eventGate: { inferenceDiagnostics(): { inferring: string[] } } };
     try {
-      fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-first' }]);
+      const cm = fw.getAgent('resident')!.getContextManager();
+      cm.presentRows([cm.addMessage('User', [{ type: 'text', text: 'zz-first' }])]);
       internal.pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
       await waitFor(fw, () => internal.retryWaitWakers.size > 0, 'the restart asleep before its retry');
       internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the restart slept');

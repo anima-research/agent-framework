@@ -5,6 +5,8 @@ import { isAbortedResponse } from '@animalabs/membrane';
 import { streamBounds, type InferenceBounds } from './inference-bounds.js';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard } from './tool-result-guard.js';
+import { managerSees } from './context-options.js';
+import { EmptyCompileError } from './empty-compile.js';
 import { storeOwnRow } from './dendrite/audience.js';
 import { withoutTokenEstimates } from './thinking-token-stamp.js';
 import { placeThinkingDrops, type CompiledForRequest, type PlacedDrop } from './thinking-drops.js';
@@ -132,6 +134,7 @@ import type {
   MessageId,
   MessageMetadata,
   RequestIdentity,
+  StoredMessage,
   ThinkingStrip,
 } from '@animalabs/context-manager';
 import type {
@@ -156,6 +159,12 @@ import type {
 } from './types/index.js';
 
 
+function notConversation(metadata: unknown): boolean {
+  if (storedInjectionMarkOf(metadata) !== undefined) return true;
+  if (typeof metadata !== 'object' || metadata === null || !('system' in metadata) || metadata.system !== true) return false;
+  return !('kind' in metadata) || metadata.kind !== 'inference-failed';
+}
+
 /**
  * Whether a request's messages, as sanitized, end on `agentName`'s own
  * message, apart from `injectionTail` stored context injections after it
@@ -174,6 +183,7 @@ function wireDigest(value: unknown): string {
 }
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
+const DEFAULT_COMPILE_BUDGET: TokenBudget = { maxTokens: DEFAULT_CONTEXT_BUDGET_TOKENS, reserveForResponse: 4_000 };
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
 const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
 const TURN_INPUTS_PIN = 'agent-framework:turn-inputs';
@@ -710,8 +720,39 @@ export class Agent {
     const reserve = this.toolResultGuard.pendingWireReserveTokens;
     if (reserve === 0) return resolved;
     // Mirrors ContextManager.compile's own default when no budget is set.
-    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    const base = resolved ?? DEFAULT_COMPILE_BUDGET;
     return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+  }
+
+  private passthroughWindow(): readonly StoredMessage[] | undefined {
+    const cm = this.contextManager as Partial<ContextManager>;
+    const strategy: unknown = cm.getStrategy?.();
+    if (typeof strategy !== 'object' || strategy === null || Object.getPrototypeOf(strategy)?.constructor?.name !== 'PassthroughStrategy') return undefined;
+    return typeof cm.getPresentedMessages === 'function' ? cm.getPresentedMessages() : [];
+  }
+
+  private refuseEmptyCompile(compiled: CompileResult, compiledAt: TokenBudget | undefined, guarded: boolean, rows: readonly StoredMessage[] | undefined): void {
+    if (guarded || !rows) return;
+    let byId: Map<MessageId, StoredMessage> | undefined;
+    const metadataOf = (id: MessageId): unknown => {
+      try {
+        const own = this.contextManager.getMessage(id);
+        if (own) return own.metadata;
+      } catch { /* the presented rows answer */ }
+      byId ??= new Map(rows.map((row) => [row.id, row]));
+      return byId.get(id)?.metadata;
+    };
+    const conversation = (i: number) => {
+      const source = compiled.provenance?.messages[i];
+      if (source?.kind === 'injection') return false;
+      return source?.kind !== 'raw' || source.bodies.length === 0 || !source.bodies.every((b) => notConversation(metadataOf(b.messageId)));
+    };
+    if (compiled.messages.some((m, i) => hasRenderedContent(m.content) && conversation(i))) return;
+    if (!rows.some((row) => hasRenderedContent(row.content) && !notConversation(row.metadata) && managerSees(this.contextManager, row.metadata))) return;
+    const held = new Set(compiled.provenance?.messages.flatMap((source) => (source.kind === 'raw' ? source.bodies.map((b) => b.messageId) : [])));
+    const leftOut = [...rows].reverse().find((row) => !held.has(row.id) && hasRenderedContent(row.content) && managerSees(this.contextManager, row.metadata));
+    const at = compiledAt ?? DEFAULT_COMPILE_BUDGET;
+    throw new EmptyCompileError(at.maxTokens, at.reserveForResponse, this.physicalWindowTokens, leftOut && String(leftOut.id));
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
@@ -1600,7 +1641,15 @@ export class Agent {
     const marksBefore = this.watermarkMarks;
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const compile = () => this.compileUnpinningOnRefusal(() => this.contextManager.compile(this.compileBudget(budget)));
+    const select = async () => {
+      const at = this.compileBudget(budget);
+      const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
+      const rows = this.passthroughWindow();
+      const compiled = await this.contextManager.compile(at);
+      this.refuseEmptyCompile(compiled, at, guarded, rows);
+      return compiled;
+    };
+    const compile = () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
       result = budget ? await compile() : await this.compileAtLiveBudget(compile);
@@ -1926,7 +1975,14 @@ export class Agent {
     // agent before the consumed watermark moves, once it returns.
     const shownBefore = this.shownWatermark;
     if (watermark) this.shownWatermark = watermark;
-    const select = () => this.contextManager.compile(this.compileBudget(budget), injections, opts as never);
+    const select = async () => {
+      const at = this.compileBudget(budget);
+      const guarded = this.toolResultGuard.pendingWireReserveTokens > 0;
+      const rows = opts?.dryRun ? undefined : this.passthroughWindow();
+      const compiled = await this.contextManager.compile(at, injections, opts as never);
+      if (!opts?.dryRun) this.refuseEmptyCompile(compiled, at, guarded, rows);
+      return compiled;
+    };
     const compile = opts?.dryRun ? select : () => this.compileUnpinningOnRefusal(select);
     let result: CompileResult;
     try {
