@@ -448,6 +448,9 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.driveStream': { count: 2, when: 'end', what: "the contained tool-wrapper prose marker, and main's cut-off tool-block notice" },
   'framework.ts AgentFramework.updateRewindMarker': { count: 1, when: 'end', what: "a refusal rewind's marker" },
   'framework.ts AgentFramework.noteInferenceExhausted': { count: 1, when: 'end', what: "an exhausted turn's [inference-failed] marker" },
+  // Written where the rewind marker is, in the refused stream's completion,
+  // after the ownership recheck and with nothing awaited since.
+  'framework.ts AgentFramework.noteRefusedTurn': { count: 1, when: 'end', what: "a refused turn's [inference-failed] note" },
   'framework.ts AgentFramework.settleDeliberateCancel': { count: 1, when: 'held-back', what: "a stop's [turn-interrupted] marker, held back once the stream no longer owns the agent" },
   'framework.ts AgentFramework.sweepExpiredConversations': { count: 1, when: 'held-back', what: "a fork's closure prompt, held back while a turn of the fork's is alive" },
   'framework.ts AgentFramework.storeBudgetHoldNote': { count: 1, when: 'held-back', what: "a budget wait's note at its release, held back while a turn of the agent's is alive" },

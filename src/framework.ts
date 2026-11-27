@@ -4835,6 +4835,11 @@ export class AgentFramework {
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
   private rewindEpisode: Map<string, { markerId: MessageId; count: number; category: string }> = new Map();
+  /** Per-agent note of the current run of refused turns: its row, and how
+   *  many turns it tells of. One note per run, updated in place (see
+   *  noteRefusedTurn); cleared once the provider answers a call of the
+   *  agent's, which has then read it. */
+  private refusedTurnsNote: Map<string, { id: MessageId; turns: number }> = new Map();
   /** Active `/unstick` sessions: an admin-forced rewind-until-clean loop that
    *  runs even when the agent's autoRewind toggle is off. Tracks the remaining
    *  budget, what was shed (for the report), and where to post the outcome. */
@@ -9196,6 +9201,8 @@ export class AgentFramework {
     const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before } = args;
     const stream = args.stream ?? closes;
     const durationMs = Date.now() - startTime;
+    // A stopped turn between two refused ones ends the run of refused turns (noteRefusedTurn).
+    this.refusedTurnsNote.delete(agent.name);
     if (closes && this.answeredTurns.get(agent) === closes) this.answeredTurns.delete(agent);
     if (stream) this.abandonAgentScripts(agent.name, 'stream cancelled', stream);
     agent.reset();
@@ -13558,6 +13565,7 @@ export class AgentFramework {
     this.refusalStreak.delete(name);
     this.refusalRewinds.delete(name);
     this.rewindEpisode.delete(name);
+    this.refusedTurnsNote.delete(name);
     const session = this.forcedRewind.get(name);
     if (session) {
       this.forcedRewind.delete(name);
@@ -15527,6 +15535,54 @@ export class AgentFramework {
   }
 
   /**
+   * Tell the agent that the provider refused its turn's last call, with ONE
+   * note for a run of refused turns. The run's first refused turn appends the
+   * note after what the turn stored. Each refused turn after it, while the
+   * provider has answered no call of the agent's in between, updates that
+   * row in place with how many turns followed: a run of refusals adds one
+   * row to the context, where a note per turn would add a row for every
+   * message the agent couldn't answer. Once a call is answered (a round's,
+   * or a turn's last) the agent has read the note, so it stays as written
+   * and the next refused turn starts a new one. So does a turn that ended
+   * another way in between (a failure, a stop, a refusal that isn't told),
+   * so that the turns the note counts are the ones right after it. A
+   * refusal a rewind takes doesn't end the run: its turn goes on as the
+   * retry. A note that has
+   * left the agent's window (removed from the record, or taken out of the
+   * window by an undo) is started anew too, and so is one from before a
+   * restart: the run is kept in memory.
+   *
+   * The note opens as a failed turn's does and names no category: it holds
+   * the framework's words only, none of the provider's (see failureWords).
+   * The category goes to the row's metadata, as the first refusal's.
+   * `SUPPRESS_INFERENCE_FAILED_MARKER=1` leaves it out, as it does a failed
+   * turn's note. No inference is triggered: the agent reads it at its next
+   * turn.
+   */
+  private noteRefusedTurn(agent: Agent, category: string): void {
+    if (process.env.SUPPRESS_INFERENCE_FAILED_MARKER === '1') return;
+    const cm = agent.getContextManager();
+    const run = this.refusedTurnsNote.get(agent.name);
+    const row = run && !this.rowLeftWindow(agent, run.id) ? run : undefined;
+    const after = row?.turns ?? 0;
+    const text =
+      `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: the provider API refused its last call.` +
+      (after === 0 ? '' : after === 1 ? ' The turn after it ended the same way.' : ` The ${after} turns after it ended the same way.`);
+    const blocks: ContentBlock[] = [{ type: 'text', text }];
+    try {
+      if (row) {
+        cm.editMessage(row.id, blocks);
+        row.turns = after + 1;
+      } else {
+        const id = storeOwnRow(agent, 'user', blocks, { system: true, kind: 'inference-refused', category });
+        this.refusedTurnsNote.set(agent.name, { id, turns: 1 });
+      }
+    } catch (err) {
+      console.error(`[inference-refusal] could not record the note for ${agent.name}: ${describeFailureWithFrames(err)}`);
+    }
+  }
+
+  /**
    * A turn that ended WITHOUT a refusal (a natural completion that wasn't
    * one, or a tool-ended turn) ends the rewind episode: the model responded.
    * Leave the consolidated marker in place as the durable record; just
@@ -15541,6 +15597,7 @@ export class AgentFramework {
     }
     this.rewindEpisode.delete(agentName);
     this.refusalStreak.delete(agentName);
+    this.refusedTurnsNote.delete(agentName);
   }
 
   /**
@@ -30024,6 +30081,9 @@ export class AgentFramework {
             releaseGuardHeld();
             adoptInjectedRound();
             hadToolCalls = true;
+            // The provider answered this round's call, so a note of refused
+            // turns above it has been read: a later refusal starts a new one.
+            this.refusedTurnsNote.delete(agent.name);
             const toolRound = toolRounds++;
             streamRouting.unflushedRounds = (streamRouting.unflushedRounds ?? 0) + 1;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, calls.length);
@@ -30996,6 +31056,12 @@ export class AgentFramework {
               // refusal feeds the next one.)
               if (!handledByRewind) {
                 void this.reactToRefusal(agent.name, category);
+                // The agent is told too, in its own context, where the
+                // reaction never reaches it: one note for a run of such
+                // turns (noteRefusedTurn).
+                if (category === 'reasoning_extraction') this.noteRefusedTurn(agent, category);
+                // A turn refused untold ends the run: the next note counts from itself.
+                else this.refusedTurnsNote.delete(agent.name);
               }
             } else {
               this.endRefusalEpisode(agent.name);
@@ -36756,6 +36822,10 @@ export class AgentFramework {
       excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
+    // A failed turn between two refused ones ends the run of refused turns
+    // (noteRefusedTurn). Optional, as forcedRewind is below: tests call this
+    // on a framework they assembled field by field.
+    this.refusedTurnsNote?.delete(agentName);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
     const agent = this.agents.get(agentName);
     if (agent) this.failedLastTurnAt.set(agent, Date.now());

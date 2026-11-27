@@ -319,6 +319,9 @@ export interface AgentConfig {
    * giving up. This keeps the agent
    * on its own model (no fallback-model substitution) while self-healing around
    * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
+   * A `reasoning_extraction` refusal no rewind takes also leaves the agent a
+   * note that its turn did not complete, one for a run of such turns (see
+   * AgentFramework.noteRefusedTurn).
    */
   refusalHandling?: {
     /**
