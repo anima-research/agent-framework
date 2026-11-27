@@ -16,3 +16,11 @@
   such a write as answered. And `upcomingWakes` no longer says that a
   debounced batch will certainly wake its agent where each of its events is
   such a write placed for that agent.
+- **Wakes of a withdrawn write:** a wake whose only cause is a write kept
+  in memory now starts no turn once that write is withdrawn. Such a wake is
+  a debounced gate batch whose every message is kept, or a wake to read a
+  render that is kept. Before, the wake started a turn after the release,
+  and that turn read nothing of the write. A batch with a message still to
+  read wakes for it. Where each event of a debounced batch is such a
+  withdrawn write, `upcomingWakes` no longer says that the batch will
+  certainly wake its agent.

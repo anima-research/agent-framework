@@ -2425,6 +2425,7 @@ export class EventGate {
   private resolveRouteChannelFn: (info: GateEventInfo) => string | undefined;
   private channelShownFn?: (channel: { serverId: string; channelId: string }) => string;
   private isAnsweredFn?: (after: WritePlacement) => boolean;
+  private isWithdrawnFn?: (after: WritePlacement) => boolean;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -2495,6 +2496,10 @@ export class EventGate {
      *  turn. Absent, or an answer other than `false` (a throw included): the
      *  event counts as answered then. */
     isAnswered?: (after: WritePlacement) => boolean;
+    /** Whether the host withdrew a write that it kept in memory, before the
+     *  write was stored. Such a write names no message, and its wake starts
+     *  no turn. Absent: the host withdrew no write. */
+    isWithdrawn?: (after: WritePlacement) => boolean;
     /** The event types the gate can see from a source, when the host knows
      *  them (an MCPL server's id: MCPL_GATE_EVENT_TYPES), else undefined.
      *  The rule-order notes (findShadowedPolicies) leave out types a rule's
@@ -2516,6 +2521,7 @@ export class EventGate {
     this.resolveRouteChannelFn = opts.resolveRouteChannel ?? defaultRouteChannel;
     this.channelShownFn = opts.channelShown;
     this.isAnsweredFn = opts.isAnswered;
+    this.isWithdrawnFn = opts.isWithdrawn;
     this.eventTypesFromFn = opts.eventTypesFrom;
     this.now = opts.now ?? (() => Date.now());
     this.judgeFn = opts.judge;
@@ -4416,7 +4422,8 @@ export class EventGate {
             at: state.dueAt,
             certain: agentNames.some((agent) => {
               const seen = state.events.filter((e) => e.recipients === undefined || e.recipients.includes(agent));
-              return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && isWrite(after) && after.agent === agent);
+              return seen.length > 0 && !seen.every(({ inContext, after }) => inContext && after !== undefined && after.agent === agent
+                && (isWrite(after) || this.isWithdrawnFn?.(after) === true));
             }),
             kind: 'debounce',
             what: `rule ${quotedValue(name)}'s debounced batch of ${batch}`,

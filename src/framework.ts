@@ -1341,6 +1341,7 @@ const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
+const KEPT_WRITES: unique symbol = Symbol('kept-writes');
 /**
  * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
  * the wake of every agent the batch wakes: a fresh start of the turn it
@@ -1366,10 +1367,20 @@ interface TurnCarry {
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
 type ReleasedRouting = { wasRetry: boolean; rows?: string[] } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside'; [KEPT_WRITES]?: readonly WritePlacement[] };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
+}
+
+function keptWritesOf(request: InferenceRequest | undefined): readonly WritePlacement[] | undefined {
+  return request === undefined ? undefined : (request as MarkedRequest)[KEPT_WRITES];
+}
+
+function sameKeptWrites(a: InferenceRequest | undefined, b: InferenceRequest | undefined): boolean {
+  const x = keptWritesOf(a);
+  const y = keptWritesOf(b);
+  return x === y || (x !== undefined && y !== undefined && x.length === y.length && x.every((p, i) => p === y[i]));
 }
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
@@ -2776,7 +2787,9 @@ interface FrameworkWriteOptions {
    *  stored while a turn of the agent's was alive, outside its start's
    *  assembly, or at rest with a presentation that failed. A write kept
    *  in memory (a surgery's hold, or its agent's recovery) names only its
-   *  agent, with no id, and is not presented. */
+   *  agent, with no id, and is not presented, until a release stores it:
+   *  that release fills this placement as a store outside a hold does
+   *  (its agent, its id, and `presented` set anew). */
   placement?: WritePlacement;
   /**
    * Who the message is for, when that is decided before it gets here:
@@ -4456,7 +4469,7 @@ function answersSameMessage(a: InferenceRequest, b: InferenceRequest | undefined
 function droppableAsRead(request: InferenceRequest): boolean {
   const batch = mergedBatch(request);
   if (batch?.length) return batch.every(droppableAsRead);
-  return request.readsRow !== undefined || request.readsRows !== undefined;
+  return request.readsRow !== undefined || request.readsRows !== undefined || keptWritesOf(request) !== undefined;
 }
 
 /** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
@@ -4619,6 +4632,7 @@ export class AgentFramework {
   private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   /** Run records whose failure repeated one already reported, and whose report was suppressed. */
   private maintenanceRepeats = new WeakSet<ContextMaintenanceAgentRun>();
+  private readonly withdrawnPlacements = new WeakSet<WritePlacement>();
   /** An operator's maintain (maintenanceTick) asked for the pass running or about to run: the run it records is kept in the history whatever it met. A pass with nothing to run records none. */
   private maintenancePassRequested = false;
   private providerGates: Map<string, LocalProviderGate> = new Map();
@@ -5999,6 +6013,7 @@ export class AgentFramework {
         // names it back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId),
         isAnswered: (after) => framework.answeredWrite(after),
+        isWithdrawn: (after) => framework.withdrawnPlacements.has(after),
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
         // module's events carry a source of the module's own, such as "cli"
@@ -7487,7 +7502,8 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b);
+      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
+      sameKeptWrites(a, b);
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
@@ -22089,6 +22105,7 @@ export class AgentFramework {
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
       wakeToRead: (occ, placement, allAmbient) => this.queueCoalescedWakes(
         { ...occ, deliverTo: placement.agent }, true, this.readsRowFor(placement, placement.agent).readsRow, allAmbient,
+        placement.messageId === undefined ? placement : undefined,
       ),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
@@ -22545,7 +22562,9 @@ export class AgentFramework {
    *  its turn being assembled doesn't read (wakeToRead), reading `readsRow`
    *  (readsRowFor), marked ambient when every notice the render folds was
    *  (`allAmbient`). */
-  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false): Promise<void> {
+  private async queueCoalescedWakes(
+    occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false, kept?: WritePlacement,
+  ): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const push = occ.event.event;
@@ -22625,7 +22644,7 @@ export class AgentFramework {
     }
     if (!decision.wake) return;
     for (const agentName of await this.coalescedAudience(occ)) {
-      this.pendingRequests.push({
+      const request: MarkedRequest = {
         agentName,
         reason: 'mcpl:push-event',
         source: occ.serverId,
@@ -22642,7 +22661,9 @@ export class AgentFramework {
         // alone; only its wake is judged by what was read (readsRow).
         ...(plain && allAmbient ? { ambient: true as const } : {}),
         ...(plain ? (readsRow ? { readsRow } : {}) : { coalescingSubject: subject, coalescingBatch: true }),
-      });
+        ...(plain && !readsRow && kept ? { [KEPT_WRITES]: [kept] } : {}),
+      };
+      this.pendingRequests.push(request);
     }
   }
 
@@ -22826,6 +22847,7 @@ export class AgentFramework {
       const held = this.heldWriteOf(p);
       if (!held) return false;
       held.writes.splice(held.at, 1);
+      this.withdrawnPlacements.add(p);
       return true;
     }
     if (this.surgeryHold) return false;
@@ -23497,6 +23519,8 @@ export class AgentFramework {
       // agent, so reading it was all its wake was for, as for a chat:system
       // notice. One with neither tag is judged as addressed.
       const read = requests.filter((r) => {
+        const kept = keptWritesOf(r);
+        if (kept !== undefined) return kept.every((p) => this.withdrawnPlacements.has(p));
         if (r.readsRows !== undefined) return r.readsRows.every(({ row, replyTo }) => this.rowDone(agent, row, replyTo));
         if (r.readsRow === undefined) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
@@ -23511,7 +23535,7 @@ export class AgentFramework {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         appendAll(requests, left);
-        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed` +
+        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed or withdrawn` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
           this.endPendingPrimary(agentName);
@@ -23684,6 +23708,7 @@ export class AgentFramework {
           ? trigger?.answersMessageId : undefined,
         readsRows: requests.every((r) => readsRowsKey(r) === readsRowsKey(trigger))
           ? trigger?.readsRows : undefined,
+        [KEPT_WRITES]: requests.every((r) => sameKeptWrites(r, trigger)) ? keptWritesOf(trigger) : undefined,
         // A batched wake's line names the rows of every batch the turn is
         // for, and none where a wake that isn't a batch's is merged in.
         [BATCH_ROWS]: trigger ? this.mergedBatchRows(trigger.agentName, requests) : undefined,
@@ -28677,8 +28702,9 @@ export class AgentFramework {
     // once this attempt's compile has moved the watermark past the row.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined
+      || keptWritesOf(trigger) !== undefined) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, [KEPT_WRITES]: _kept, ...retry } = trigger as MarkedRequest;
       trigger = retry;
     }
     if (trigger && mergedBatch(trigger) && !releasedTurnBatch(trigger)) {
@@ -35897,13 +35923,19 @@ export class AgentFramework {
     return placement.messageId ? { readsRow: placement.messageId } : {};
   }
 
-  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<InferenceRequest, 'readsRows'> {
+  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<MarkedRequest, 'readsRows' | typeof KEPT_WRITES> {
     const rows: NonNullable<InferenceRequest['readsRows']> = [];
+    const kept: WritePlacement[] = [];
     for (const { after, replyTo } of writes) {
+      if (after.agent === agentName && after.messageId === undefined) {
+        kept.push(after);
+        continue;
+      }
       const row = this.readsRowFor(after, agentName).readsRow;
       if (row === undefined) return {};
       rows.push({ row, ...(replyTo ? { replyTo } : {}) });
     }
+    if (kept.length > 0) return rows.length === 0 ? { [KEPT_WRITES]: kept } : {};
     return rows.length > 0 ? { readsRows: rows } : {};
   }
 
