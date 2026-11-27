@@ -9192,7 +9192,7 @@ export class AgentFramework {
     const ownsAgent = args.stream === undefined || closes !== undefined;
     const handedOn = before === 'sending' ? ''
       : `${(stream?.unflushedRounds ?? 0) > 0 ? ` ${CALLS_CUT_OFF}` : ''}` +
-        `${stream?.liveSpeech ? this.confirmedSpeech(stream.deliveries) : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
+        `${stream?.liveSpeech ? this.confirmedSpeech(agent.name, stream.deliveries) : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
     try {
       storeOwnRow(
         agent,
@@ -25022,11 +25022,15 @@ export class AgentFramework {
     }
   }
 
-  private confirmedSpeech(deliveries: readonly ChannelRef[]): string {
-    const shown = distinctDestinations(deliveries).map((channel) => this.channelShown(channel));
-    return shown.length === 0 ? ''
-      : ` Confirmed delivered before that turn ended: plain speech → ${shown.join(' · ')}.` +
-        ` No [${NOTICE_TAG.delivered}] line was written for this speech, so this note is its receipt.`;
+  private confirmedSpeech(agentName: string, deliveries: readonly ChannelRef[]): string {
+    const landed = distinctDestinations(deliveries);
+    if (landed.length === 0) return '';
+    // What a [delivered] line adds for the same list: speech that stayed in a
+    // channel the agent closed or declined says so.
+    const closedNotes = this.closedChannelNotes(agentName, landed);
+    return ` Confirmed delivered before that turn ended: plain speech → ${landed.map((channel) => this.channelShown(channel)).join(' · ')}.` +
+      ` No [${NOTICE_TAG.delivered}] line was written for this speech, so this note is its receipt.` +
+      (closedNotes.length > 0 ? ` ${closedNotes.join(' ')}${this.closedChannelNoteOff(agentName)}` : '');
   }
 
   private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
@@ -36722,7 +36726,7 @@ export class AgentFramework {
               `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
               `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
               `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
-              `${ended.liveSpeech ? this.confirmedSpeech(ended.deliveries) : ''}` +
+              `${ended.liveSpeech ? this.confirmedSpeech(agentName, ended.deliveries) : ''}` +
               `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}` +
               `${shown}${timedOut ? ` ${TIMEOUT_ADVICE}` : ''}`,
           }],

@@ -4427,6 +4427,12 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
     const failureNote = (h: H) => presented(h, '[inference-failed]');
     const stopNote = (h: H) => presented(h, '[turn-interrupted]');
     const STILL_ROUTING = "Some of that turn's plain speech was still being routed when the turn ended, so it may yet be posted; check the channel before sending it again.";
+    const CLOSED_GENERAL = `${GENERAL_SHOWN} stays closed: you closed it, and your words there don't open it.`;
+    const NOTE_OFF = 'To stop this note, set closed_channel_note to false with agent_settings.';
+    const closeGeneral = async (h: H) => {
+      const registry = (h.framework as unknown as { channelRegistry: { handleChannelToolCall(tool: string, args: Record<string, unknown>, origin: { kind: 'agent'; agentName: string }): Promise<{ success: boolean }> } }).channelRegistry;
+      assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: GENERAL }, { kind: 'agent', agentName: 'scout' })).success, true);
+    };
     for (const [how, shown] of [['error', 'an error'], ['throw', 'a throw'], ['abort', "an abort that isn't a stop"]] as const) {
       it(`a failure after a live-routed round, reported as ${shown}, says the rounds ran and names the channel where the speech was confirmed delivered, and writes no receipt`, async () => {
         const h = await harness({ retries: 0 });
@@ -4545,6 +4551,47 @@ describe('a turn whose stream fails or is stopped after a tool round', () => {
         assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [GENERAL]);
         assert.ok(failureNote(h).includes(receiptOf(GENERAL_SHOWN)), failureNote(h));
         assert.ok(!failureNote(h).includes(ROOM_SHOWN), failureNote(h));
+        assert.ok(!failureNote(h).includes('stays closed') && !failureNote(h).includes(NOTE_OFF), failureNote(h));
+        assert.equal(receipts(h).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('hybrid mode: a failure after a round whose >>> envelope went to a channel the resident closed adds the closed-channel note after the list, as a [delivered] line does', async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }], retries: 0 });
+      try {
+        await closeGeneral(h);
+        breakAfterToolRound(h.membrane, 'error', { beforeFailure: () => speechSettled(h) });
+        await h.turn([createMockResponse([text(`>>>${GENERAL} ${SPEECH}`), call('l1', 'channel_list', {})], 'tool_use')]);
+        await h.until(() => published(h, SPEECH).length === 1, 'premise: the envelope was delivered');
+        assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [GENERAL]);
+        const note = failureNote(h);
+        assert.ok(note.includes(`${receiptOf(GENERAL_SHOWN)} ${CLOSED_GENERAL}`), note);
+        assert.ok(note.indexOf(NOTE_OFF) > note.indexOf(CLOSED_GENERAL), note);
+        assert.equal(receipts(h).length, 0);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("hybrid mode: a user's Stop after a round whose >>> envelope went to a channel the resident closed adds the closed-channel note after the list", async () => {
+      const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+      try {
+        await closeGeneral(h);
+        breakAfterToolRound(h.membrane, 'stop', { stopEnds: 'aborted' });
+        h.membrane.pushResponse(createMockResponse([text(`>>>${GENERAL} ${SPEECH}`), call('l1', 'channel_list', {})], 'tool_use'));
+        h.membrane.pushResponse(createMockResponse([]));
+        h.command({ op: 'incoming', channelId: ROOM, messageId: `in-${Date.now()}`, mode: 'addressed', text: 'a question' });
+        await h.until(() => h.messages().some((m) => m.content.some((b) => b.type === 'tool_result')), "the round's results are stored");
+        await h.until(() => published(h, SPEECH).length === 1, 'premise: the envelope was delivered');
+        await speechSettled(h);
+        assert.deepEqual(published(h, SPEECH).map((p) => p.channelId), [GENERAL]);
+        assert.equal(h.framework.abortInference('scout', 'operator stop'), true);
+        await turnEnded(h);
+        const note = stopNote(h);
+        assert.ok(note.includes(`${receiptOf(GENERAL_SHOWN)} ${CLOSED_GENERAL}`), note);
+        assert.ok(note.indexOf(NOTE_OFF) > note.indexOf(CLOSED_GENERAL), note);
         assert.equal(receipts(h).length, 0);
       } finally {
         await h.close();
