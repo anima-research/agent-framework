@@ -3233,7 +3233,7 @@ function describeWait(ms: number): string {
 function deadlineRetryLine(agentName: string, ranMs: number, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
   const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
   const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
-  return `[inference-timeout] agent=${agentName} cut after ${ranMs}ms; retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/[\s\u0085]+/g, ' ').trim())}`;
+  return `[inference-timeout] agent=${agentName} stream cut after ${ranMs}ms; retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/[\s\u0085]+/g, ' ').trim())}`;
 }
 interface BudgetHoldBaseline {
   progress: string | undefined;
