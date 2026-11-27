@@ -594,7 +594,7 @@ test('connectMcplServer rejects a duplicate id and a colliding prefix', async ()
   });
 });
 
-test('create() refuses a boolean setting that holds anything but true or false, before it spawns any server', async () => {
+test('create() refuses invalid server settings before it spawns any server', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'mcpl-lifecycle-'));
   const marker = join(tempDir, 'spawned');
   // A valid server listed first writes a marker when it starts, so a refusal
@@ -606,7 +606,8 @@ test('create() refuses a boolean setting that holds anything but true or false, 
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ['inheritEnv', { inheritEnv: 'false' }, 'true or false, unquoted, not a string'],
     ['reconnect', { reconnect: 'true' }, 'true or false, unquoted, not a string'],
-    ['allowHostCommands', { allowHostCommands: 1 }, 'true or false, not a number'],
+    ['allowHostCommands', { allowHostCommands: { only: ['operator'] } }, 'true or false, not an object'],
+    ['hostCommandRole', { hostCommandRole: 'admin' }, "'operator', not another string"],
   ];
   try {
     for (const [setting, extra, wanted] of cases) {
@@ -621,7 +622,7 @@ test('create() refuses a boolean setting that holds anything but true or false, 
       // assertion rather than a file held open by its server.
       await assert.rejects(
         created.then(async (framework) => { await framework.stop(); return framework; }),
-        new RegExp(`MCPL server "quoted" ${setting} must be ${wanted}: `),
+        (error: Error) => error.message.startsWith(`MCPL server "quoted" ${setting} must be ${wanted}`),
       );
       assert.equal(existsSync(marker), false, `no server was spawned before ${setting} was refused`);
     }
@@ -630,24 +631,34 @@ test('create() refuses a boolean setting that holds anything but true or false, 
   }
 });
 
-test('connectMcplServer refuses a boolean setting that holds anything but true or false, and registers nothing', async () => {
+test('connectMcplServer refuses invalid server settings, and registers nothing', async () => {
   await withFramework(true, async (framework) => {
-    for (const [setting, value] of [['inheritEnv', 'false'], ['reconnect', 'false'], ['allowHostCommands', 'true']]) {
+    for (const [setting, value, wanted] of [
+      ['inheritEnv', 'false', 'true or false, unquoted, not a string'],
+      ['reconnect', 'false', 'true or false, unquoted, not a string'],
+      ['allowHostCommands', { only: ['operator'] }, 'true or false, not an object'],
+      ['hostCommandRole', 'admin', "'operator', not another string"],
+    ] as const) {
       await assert.rejects(
         framework.connectMcplServer(serverConfig('second', { [setting]: value }) as never),
-        new RegExp(`MCPL server "second" ${setting} must be true or false, unquoted, not a string: `),
+        (error: Error) => error.message.startsWith(`MCPL server "second" ${setting} must be ${wanted}`),
       );
     }
     assert.deepEqual(framework.listMcplServers().map(s => s.id), ['first']);
   });
 });
 
-test('restartMcplServer refuses such a setting before it disconnects the running server, which stays up', async () => {
+test('restartMcplServer refuses invalid server settings before it disconnects the running server', async () => {
   await withFramework(true, async (framework) => {
-    for (const [setting, value] of [['inheritEnv', 'true'], ['reconnect', 'true'], ['allowHostCommands', 'false']]) {
+    for (const [setting, value, wanted] of [
+      ['inheritEnv', 'true', 'true or false, unquoted, not a string'],
+      ['reconnect', 'true', 'true or false, unquoted, not a string'],
+      ['allowHostCommands', { only: ['operator'] }, 'true or false, not an object'],
+      ['hostCommandRole', 'admin', "'operator', not another string"],
+    ] as const) {
       await assert.rejects(
         framework.restartMcplServer('first', serverConfig('first', { [setting]: value }) as never),
-        new RegExp(`MCPL server "first" ${setting} must be true or false, unquoted, not a string: `),
+        (error: Error) => error.message.startsWith(`MCPL server "first" ${setting} must be ${wanted}`),
       );
       const servers = framework.listMcplServers();
       assert.equal(servers.length, 1);

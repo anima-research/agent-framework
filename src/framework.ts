@@ -3393,10 +3393,78 @@ function extractGateFields(event: ProcessEvent): {
 }
 
 /**
- * The main agent framework.
+ * Host control-plane hook. Origin/actor/realm validation belongs to the host.
+ * `runBuiltIn` runs one built-in `host/command` verb (`unstick`,
+ * `unstick-outcome`, `nudge`, `undo`, ...) with exactly the checks and
+ * answers a server granted `allowHostCommands: true` gets, attributed to
+ * this `serverId`; which verbs to run is the host's choice. `operator` is
+ * not a built-in ("Unknown host command"), and once stop() has begun it
+ * refuses every command.
  */
+export type HostCommandHandler = (
+  serverId: string,
+  params: Record<string, unknown>,
+  runBuiltIn: (params: HostCommandParams) => Promise<HostCommandResult>,
+) => Promise<{ ok: boolean; message?: string }>;
+
+/** A `host/command` answer, as an MCPL surface server receives it. */
+export interface HostCommandResult {
+  ok: boolean;
+  error?: string;
+  /** Refusal code from live surgery (e.g. 'agent-busy'), when applicable. */
+  code?: string;
+  undone?: number;
+  requested?: number;
+  /** For quiesce/resume/maintain/host-status: the host mode snapshot. */
+  hostMode?: HostModeStatus;
+  /** For `maintain`: the context-maintenance snapshot after the pass. */
+  maintenance?: ContextMaintenanceSnapshot;
+  messagesRemoved?: number;
+  /** Discord addresses removed by message-granular undo. The durable outbox
+   *  owns eventual delivery; this is also returned for immediate surfaces. */
+  removedRefs?: Array<{ serverId: string; channelId: string; messageId: string }>;
+  /** For message-granular undo: whether awareness marks were scheduled
+   *  (not whether Discord has accepted them). */
+  markers?: SurgeryMarkerReceipt;
+  /** For the `marks` command: the ledger's batches and retracts (`list`)
+   *  or the action's receipt. */
+  awareness?:
+    | DiscordAwarenessView[]
+    | DiscordAwarenessCancelReceipt
+    | DiscordAwarenessRetractReceipt;
+  hidden?: number;
+  /** For `hide`: the Discord (channelId, messageId) of each removed message
+   *  that carried one. A hide places no framework marks and refuses a
+   *  marks choice: a surface that marks hidden messages, as discord-mcpl
+   *  0.3.0's `/hide` does, places those marks itself, outside the ledger. */
+  hiddenRefs?: Array<{ channelId: string; messageId: string }>;
+  lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+  /** For `unstick`: acknowledges the forced-rewind loop has started; the
+   *  outcome report is posted to the channel asynchronously. */
+  started?: boolean;
+  cap?: number;
+  /** For `unstick`: true, since `unstick-outcome` answers for it, with
+   *  `agentName`, the agent its session is on. For `unstick-outcome`: how
+   *  it came out (UnstickAnswer), with `rewinds` and `cause`. */
+  outcome?: true | UnstickAnswer['outcome'];
+  agentName?: string;
+  rewinds?: number;
+  cause?: UnstickAnswer['cause'];
+  /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
+   *  until resume rather than running. */
+  quiesced?: boolean;
+  /** For `nudge`: agent state at queue time ('idle' = no turn holds the
+   *  agent, so it runs on the next pass unless a provider hold, a stated
+   *  wait or a capacity cooldown, holds it, or a start of the agent's that
+   *  waits for an auxiliary call to finish goes first; else it runs once the
+   *  current turn settles). */
+  agentStatus?: string;
+  /** For `release-provider-wait`: the waits released. */
+  released?: Array<{ model: string; until: string | null }>;
+}
+
 /** Params for a `host/command` request from an MCPL surface server. */
-interface HostCommandParams {
+export interface HostCommandParams {
   command?: string;
   agentName?: string;
   turns?: number;
@@ -4509,6 +4577,7 @@ function isLegacyFamily(config: McplServerConfig): boolean {
   }
 }
 
+/** The main agent framework. */
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -15702,6 +15771,17 @@ export class AgentFramework {
     return { ok: true, agentName: name, agentStatus, ...(this.quiesced ? { quiesced: true } : {}) };
   }
 
+  private hostCommandHandler: HostCommandHandler | null = null;
+
+  /** Register (or clear) the host control-plane handler. Only servers configured
+   * with `hostCommandRole: 'operator'` can reach it. Parameters
+   * pass through unchanged; the host owns authentication, grammar and replies.
+   * Delivery stays live while quiesced and does not ingest chat or wake a model.
+   */
+  setHostCommandHandler(handler: HostCommandHandler | null): void {
+    this.hostCommandHandler = handler;
+  }
+
   /**
    * Handle a `host/command` request from an MCPL surface server (e.g. a
    * Discord slash command). Currently supports:
@@ -15749,68 +15829,28 @@ export class AgentFramework {
   private handleHostCommand(
     serverId: string,
     params: HostCommandParams,
-  ): ReturnType<AgentFramework['runHostCommand']> {
-    return this.trackOperatorOperation(`host/command:${String(params.command)}`, () => this.runHostCommand(serverId, params));
+    operatorOnly = false,
+  ): Promise<HostCommandResult> {
+    return this.trackOperatorOperation(`host/command:${String(params.command)}`, () => this.runHostCommand(serverId, params, operatorOnly));
   }
 
   /** handleHostCommand's work, run where stop() can wait for it. */
   private async runHostCommand(
     serverId: string,
     params: HostCommandParams,
-  ): Promise<{
-    ok: boolean;
-    error?: string;
-    /** Refusal code from live surgery (e.g. 'agent-busy'), when applicable. */
-    code?: string;
-    undone?: number;
-    requested?: number;
-    /** For quiesce/resume/maintain/host-status: the host mode snapshot. */
-    hostMode?: HostModeStatus;
-    /** For `maintain`: the context-maintenance snapshot after the pass. */
-    maintenance?: ContextMaintenanceSnapshot;
-    messagesRemoved?: number;
-    /** Discord addresses removed by message-granular undo. The durable outbox
-     *  owns eventual delivery; this is also returned for immediate surfaces. */
-    removedRefs?: Array<{ serverId: string; channelId: string; messageId: string }>;
-    /** For message-granular undo: whether awareness marks were scheduled
-     *  (not whether Discord has accepted them). */
-    markers?: SurgeryMarkerReceipt;
-    /** For the `marks` command: the ledger's batches and retracts (`list`)
-     *  or the action's receipt. */
-    awareness?:
-      | DiscordAwarenessView[]
-      | DiscordAwarenessCancelReceipt
-      | DiscordAwarenessRetractReceipt;
-    hidden?: number;
-    /** For `hide`: the Discord (channelId, messageId) of each removed message
-     *  that carried one. A hide places no framework marks and refuses a
-     *  marks choice: a surface that marks hidden messages, as discord-mcpl
-     *  0.3.0's `/hide` does, places those marks itself, outside the ledger. */
-    hiddenRefs?: Array<{ channelId: string; messageId: string }>;
-    lastVisible?: { participant?: string; role?: string; preview?: string } | null;
-    /** For `unstick`: acknowledges the forced-rewind loop has started; the
-     *  outcome report is posted to the channel asynchronously. */
-    started?: boolean;
-    cap?: number;
-    /** For `unstick`: true, since `unstick-outcome` answers for it, with
-     *  `agentName`, the agent its session is on. For `unstick-outcome`: how
-     *  it came out (UnstickAnswer), with `rewinds` and `cause`. */
-    outcome?: true | UnstickAnswer['outcome'];
-    agentName?: string;
-    rewinds?: number;
-    cause?: UnstickAnswer['cause'];
-    /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
-     *  until resume rather than running. */
-    quiesced?: boolean;
-    /** For `nudge`: agent state at queue time ('idle' = no turn holds the
-     *  agent, so it runs on the next pass unless a provider hold, a stated
-     *  wait or a capacity cooldown, holds it, or a start of the agent's that
-     *  waits for an auxiliary call to finish goes first; else it runs once the
-     *  current turn settles). */
-    agentStatus?: string;
-    /** For `release-provider-wait`: the waits released. */
-    released?: Array<{ model: string; until: string | null }>;
-  }> {
+    operatorOnly = false,
+  ): Promise<HostCommandResult> {
+    if (operatorOnly) {
+      // No legacy fallback, even when the hook is unset or rejects a command.
+      if (params.command !== 'operator') return { ok: false, error: 'Control role accepts only operator' };
+      if (!this.hostCommandHandler) return { ok: false, error: 'No host command handler registered' };
+      const result = await this.hostCommandHandler(serverId, params as Record<string, unknown>, (builtIn) => {
+        if (this.stopHasBegun()) return Promise.resolve({ ok: false, error: 'host shutdown has begun' });
+        return this.handleHostCommand(serverId, builtIn ?? {});
+      });
+      if (result === undefined) throw new Error('Host command handler returned no result');
+      return result;
+    }
     if (
       params.command !== 'undo' &&
       params.command !== 'hide' &&
@@ -39227,8 +39267,8 @@ export class AgentFramework {
    * notifies the agent of newly available tools. Throws if the MCPL
    * subsystem is not initialized, the id is already connected, or the
    * connection/handshake fails. A config whose `inheritEnv` (on a stdio
-   * server), `reconnect` or `allowHostCommands` holds anything but true,
-   * false or null is refused, as `create()` refuses one.
+   * server) or `reconnect` holds anything but true, false or null is refused.
+   * Use `hostCommandRole: 'operator'` for hook-only access, as in `create()`.
    */
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
@@ -39721,8 +39761,11 @@ export class AgentFramework {
     maskedCapabilities: string[];
     /** Advertised paths removed by a host deny-by-default rule (§13.4). */
     deniedCapabilities: string[];
-    /** Host-owned authority; deliberately separate from the portable grant. */
+    /** Host-owned authority to call built-in admin commands directly;
+     *  deliberately separate from the portable grant. */
     allowHostCommands: boolean;
+    /** The configured restricted role, which reaches only the host's command hook. */
+    hostCommandRole?: 'operator';
     /**
      * RFC-007 §10: the server's current tools/observe filter — its own
      * statement of which calls and argument fields it uses, shown next to
@@ -39760,7 +39803,7 @@ export class AgentFramework {
       transport: 'stdio' | 'websocket' | 'http' | null; refused: string | null;
       toolPrefix: string; toolCount: number; policyEstablished: boolean | null;
       effectiveGrant: string[]; maskedCapabilities: string[];
-      deniedCapabilities: string[]; allowHostCommands: boolean;
+      deniedCapabilities: string[]; allowHostCommands: boolean; hostCommandRole?: 'operator';
       toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
       toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
       manifestState: {
@@ -39811,6 +39854,7 @@ export class AgentFramework {
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
+        ...(config.hostCommandRole === 'operator' ? { hostCommandRole: 'operator' as const } : {}),
         toolObserveFilter: connection?.toolObserveFilter ?? null,
         toolClasses: ownTools.map(({ tool, serverTool }) => {
           const { classes, source } = this.effectiveToolClass(tool, true);
@@ -40229,7 +40273,7 @@ export class AgentFramework {
         this.refuseServerItem('host/command', connection.id, responder);
         return;
       }
-      const result = await this.handleHostCommand(connection.id, params ?? {});
+      const result = await this.handleHostCommand(connection.id, params ?? {}, connection.hostCommandRole === 'operator');
       responder.respond(result);
     });
 

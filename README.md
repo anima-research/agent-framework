@@ -404,7 +404,8 @@ shows its `family`, `protocolVersion` and `transport`. Its config differs in
 three ways:
 - It has no MCPL surface (grant, push, channels, inference requests, feature
   sets). A setting that asks for that surface can't apply, so it is a
-  configuration error: `allowHostCommands: true`, an `enabledCapabilities`
+  configuration error: `allowHostCommands: true`, `hostCommandRole: 'operator'`,
+  an `enabledCapabilities`
   pattern that matches a capability denied by default, `channelSubscription:
   'auto'` or a non-empty list, a scope's non-empty `whitelist`, a
   `toolLifecycle` `observe` or `inputs` block, a
@@ -1019,12 +1020,62 @@ await framework.resume();            // throws ResumeBlockedError if the layout 
 Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
 `POST /maintenance/tick`, `GET /hostmode`; options via query string) and as
 `host/command` verbs (`quiesce`, `resume`, `maintain`, `host-status`) from MCPL
-servers granted `allowHostCommands`. The same servers can lift a provider's
+servers granted `allowHostCommands: true`. The same servers can lift a provider's
 stated wait with `release-provider-wait` (`agentName`, optional `model`), as
 `host.releaseProviderWait` does over the WebSocket API, and
 `host.providerWaits` lists the waits that bind. The HTTP host verbs accept an
 optional shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`)
 for deployments that front the port with a proxy.
+
+For a connector dedicated to host-owned operator control, configure
+`hostCommandRole: 'operator'` on its MCPL server config and leave
+`allowHostCommands` off. Setting both `hostCommandRole: 'operator'` and
+`allowHostCommands: true` is a configuration error. Register the handler in
+the embedding host:
+
+```typescript
+framework.setHostCommandHandler(async (serverId, params, runBuiltIn) => {
+  // Validate the trusted connector's realm, origin and numeric actor here.
+  // runBuiltIn runs a built-in host/command verb the host chooses, e.g.
+  //   await runBuiltIn({ command: 'unstick', agentName: 'scout' });
+  //   await runBuiltIn({ command: 'unstick-outcome', agentName: 'scout' });
+  return homeControl.handle(serverId, params, runBuiltIn);
+});
+// framework.setHostCommandHandler(null) removes the hook, not the restriction.
+```
+
+Only selected control-role servers reach the hook; all other commands from
+those servers are refused, with no legacy fallback. `listMcplServers()` keeps
+`allowHostCommands` boolean: a control-role server reports `false` for direct
+built-in access and has the additional field `hostCommandRole: 'operator'`.
+Use both status fields if you need to show whether a server can send any
+host command. `allowHostCommands: true` still grants only the existing
+built-ins; without either opt-in, all host commands are denied.
+
+A request sent before registration is refused, not queued. For a connector
+that can send commands at startup, register the handler before calling
+`connectMcplServer()` rather than listing the connector in `create()`.
+Delivery and tool replies remain live while quiesced, outside chat ingestion
+and model wakes. The hook receives the connection's `serverId` separately and
+passes params unchanged. A chat connector can include the sender ID, realm
+and channel alongside the command text. Those fields are connector-reported:
+the framework does not authenticate the sender or validate the realm, channel,
+freshness or command syntax. The host must reject missing or mismatched
+identity and origin before acting, and handle deduplication if needed.
+
+The hook's third argument, `runBuiltIn(params)`, runs one built-in verb
+(`unstick`, `unstick-outcome`, `nudge`, `undo`, `hide`, `quiesce`, `resume`,
+`maintain`, `host-status`, `marks`, `release-provider-wait`) with the same
+checks and answers an `allowHostCommands: true` server gets, attributed to the
+hook's `serverId`. Only the host handler is given this callback; it does not
+grant the server direct access to the built-ins.
+With a `channelId`, `unstick` attempts a best-effort report through the control
+server's `send_message`. Use `unstick-outcome` to get the result without relying
+on channel delivery.
+Once `stop()` has begun, `runBuiltIn` answers
+`{ok: false, error: 'host shutdown has begun'}`, even after shutdown completes.
+Shutdown waits for admitted handlers, so do not await `stop()` from within
+a handler.
 
 ### Live surgery and Discord awareness marks
 
@@ -1181,7 +1232,7 @@ still holds them keeps them.
   ledger is `failed`. A framework with neither `storePath` nor
   `discordAwarenessOutboxPath` has no ledger: it refuses a marks choice as
   `invalid`, and so do its controls.
-- **Over `host/command`** (servers granted `allowHostCommands`): an `undo` by
+- **Over `host/command`** (servers granted `allowHostCommands: true`): an `undo` by
   messages takes `marks: 'none' | 'addressed' | 'all'` (default `none`; any
   other value is refused) and returns `markers`. It holds the store like
   every surgery, so it is refused while any agent sharing the store is

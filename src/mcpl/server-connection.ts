@@ -482,6 +482,8 @@ export class McplServerConnection extends EventEmitter {
    *  allowHostCommands, default false). No capability path exists and the
    *  grant cannot confer it — server params never decide admin authority. */
   allowHostCommands = false;
+  /** Separate authority: only the operator verb reaches the host hook. */
+  hostCommandRole?: 'operator';
 
   /**
    * The effective capability grant (§5.4) — the sole authorization
@@ -1088,14 +1090,21 @@ export class McplServerConnection extends EventEmitter {
       // exists and none is invented here. Default DENY; only the operator's
       // config confers it (PR #79 review blocker 9: any server could
       // request undo/hide/unstick).
-      if (name === 'host-command' && !this.allowHostCommands) {
+      if (name === 'host-command') {
+        const operatorOnly = this.hostCommandRole === 'operator';
         const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
-        if (responder?.respondError) {
-          responder.respondError(CAPABILITY_DISABLED, 'host/command requires host-owned authority (McplServerConfig.allowHostCommands)', {});
-        } else {
-          console.error(`[mcpl] ${this.id}: discarded host/command — allowHostCommands not set`);
+        if (this.allowHostCommands !== true && !operatorOnly) {
+          if (responder?.respondError) {
+            responder.respondError(CAPABILITY_DISABLED, 'host/command requires host-owned authority (McplServerConfig.allowHostCommands or hostCommandRole)', {});
+          } else {
+            console.error(`[mcpl] ${this.id}: discarded host/command — no host-owned authority`);
+          }
+          return true;
         }
-        return true;
+        if (operatorOnly && (args[0] as { command?: unknown } | undefined)?.command !== 'operator') {
+          responder?.respondError?.(CAPABILITY_DISABLED, 'host/command control role accepts only operator');
+          return true;
+        }
       }
       const requiredCap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name];
       if (requiredCap && !this.grant.has(requiredCap)) {
@@ -1324,6 +1333,7 @@ export class McplServerConnection extends EventEmitter {
     connection.protocolVersion = protocolVersion;
     connection.serverInfo = serverInfo;
     connection.allowHostCommands = config.allowHostCommands === true;
+    connection.hostCommandRole = config.hostCommandRole === 'operator' ? 'operator' : undefined;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Its configuration, which a reconnect reads and every log line of the
@@ -2239,6 +2249,7 @@ export class McplServerConnection extends EventEmitter {
     this.protocolVersion = protocolVersion;
     this.serverInfo = serverInfo;
     this.allowHostCommands = this.config?.allowHostCommands === true;
+    this.hostCommandRole = this.config?.hostCommandRole === 'operator' ? 'operator' : undefined;
     this.closed = false;
     this.nextRequestId = 1;
     this.pendingRequests.clear();

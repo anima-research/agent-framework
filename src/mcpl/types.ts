@@ -356,6 +356,13 @@ export interface McplServerConfig {
   allowHostCommands?: boolean;
 
   /**
+   * Lets this MCPL server send only the `operator` verb of `host/command` to
+   * the host's registered handler, with no fallback to built-ins. null counts
+   * as unset. Cannot be combined with `allowHostCommands: true`.
+   */
+  hostCommandRole?: 'operator';
+
+  /**
    * Feature sets to enable on connect (`.`-segment wildcards). Omitted:
    * every declared set is a candidate. `[]`: none. Either way a set is
    * enabled only if its declared `uses` are recognized capabilities the

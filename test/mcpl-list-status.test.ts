@@ -137,3 +137,26 @@ test('listMcplServers lists a refused configuration as refused, shows urls redac
   assert.equal(byId.get('zap')!.url, 'https://mcp.zapier.com/api/mcp/s/redacted/mcp');
   assert.ok(!/sekret|pw@/.test(JSON.stringify(listed)), 'no credential in the status');
 });
+
+test('listMcplServers tells the operator-only control role apart from full host-command authority', () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.mcplServerConfigs = new Map<string, Record<string, unknown>>([
+    ['control', { id: 'control', command: 'node', hostCommandRole: 'operator' }],
+    ['admin', { id: 'admin', command: 'node', allowHostCommands: true }],
+    ['off', { id: 'off', command: 'node', allowHostCommands: false }],
+    ['omitted', { id: 'omitted', command: 'node' }],
+  ]);
+  framework.mcplServerRegistry = { getServer: () => null };
+  framework.mcplTools = [];
+  framework.mcplPrefixMap = new Map();
+  const listed = (framework as AgentFramework).listMcplServers();
+  assert.deepEqual(listed.map((s) => {
+    const allowHostCommands: boolean = s.allowHostCommands;
+    return [s.id, allowHostCommands, s.hostCommandRole];
+  }), [
+    ['control', false, 'operator'],
+    ['admin', true, undefined],
+    ['off', false, undefined],
+    ['omitted', false, undefined],
+  ]);
+});

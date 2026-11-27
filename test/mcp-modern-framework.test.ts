@@ -371,6 +371,10 @@ test('MCPL policy on a modern server is a configuration error at connect', async
       /"allowHostCommands" asks for MCPL behaviour/,
     );
     await assert.rejects(
+      framework.connectMcplServer({ id: 'bad', url: 'https://example.invalid/mcp', hostCommandRole: 'operator' }),
+      /"hostCommandRole" asks for MCPL behaviour/,
+    );
+    await assert.rejects(
       framework.connectMcplServer({ id: 'bad2', url: 'https://example.invalid/mcp', protocol: 'modern' }),
       /applies only to stdio/,
     );

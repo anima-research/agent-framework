@@ -218,3 +218,55 @@ test('an allowHostCommands that is not true reads as off, at connect and again a
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('hostCommandRole accepts only operator, null or omission and cannot accompany full authority', () => {
+  for (const config of [STDIO, WEBSOCKET]) {
+    check({ ...config, hostCommandRole: 'operator' });
+    check({ ...config, hostCommandRole: null });
+    check({ ...config, hostCommandRole: 'operator', allowHostCommands: false });
+    for (const hostCommandRole of [true, 'admin', '', {}, ['operator'], { only: ['operator'] }]) {
+      assert.throws(() => check({ ...config, hostCommandRole }), /hostCommandRole must be 'operator'/);
+    }
+    assert.throws(() => check({ ...config, hostCommandRole: 'operator', allowHostCommands: true }),
+      /hostCommandRole cannot be set with allowHostCommands: true/);
+    assert.throws(() => check({ ...config, allowHostCommands: { only: ['operator'] } }),
+      /allowHostCommands must be true or false/);
+  }
+});
+
+test('the operator-only role survives connect and reconnect', { timeout: 30_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcpl-control-role-'));
+  const flag = join(dir, 'up');
+  writeFileSync(flag, '');
+  let connection: McplServerConnection | undefined;
+  try {
+    const config: McplServerConfig = { ...flaky(flag, true), hostCommandRole: 'operator' };
+    const configuredAuthority: boolean | undefined = config.allowHostCommands;
+    assert.equal(configuredAuthority, undefined);
+    connection = await McplServerConnection.connect(config, HOST_CAPS);
+    const liveAuthority: boolean = connection.allowHostCommands;
+    assert.equal(liveAuthority, false);
+    assert.equal(connection.hostCommandRole, 'operator');
+    const live = connection;
+    const reconnected = new Promise<void>((resolve) => live.once('reconnect', () => resolve()));
+    live.ready();
+    live.sendToolsList().catch(() => {});
+    // Clear the live value before the next handshake to prove reconnect
+    // reads the configured role instead of merely keeping the old value.
+    live.hostCommandRole = undefined;
+    await reconnected;
+    assert.equal(live.hostCommandRole, 'operator');
+    assert.equal(live.allowHostCommands, false);
+    live.readyControlPlane();
+    let denied = 0;
+    live.emit('host-command', { command: 'undo' }, { respondError() { denied++; } });
+    assert.equal(denied, 1, 'reconnect did not widen the restricted role');
+    let admitted = 0;
+    live.on('host-command', () => { admitted++; });
+    live.emit('host-command', { command: 'operator' });
+    assert.equal(admitted, 1, 'the operator verb still passes the connection gate');
+  } finally {
+    await connection?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -27,7 +27,7 @@ import WebSocket from 'ws';
 
 import type { McplServerConfig } from './types.js';
 import { WITHHELD_TEXT, describeCredentialError, headerCarries, maskedError, noteDialSent, redactServerText, redactUrl, resolveServerBinding, serverConfigProblems, serverTextRedactor, tokenTransportProblem, urlAsDialed, type Redaction } from './protocol-family.js';
-import { assertBooleanSetting } from '../config-checks.js';
+import { assertBooleanSetting, assertOneOfSetting } from '../config-checks.js';
 import { logDetail } from './log-value.js';
 
 /** Why/how a transport closed. `code`/`signal` are populated for stdio child
@@ -1045,6 +1045,11 @@ export function assertServerConfigBooleans(config: McplServerConfig): void {
   for (const [setting, whatTrueDoes] of Object.entries(SERVER_CONFIG_BOOLEANS) as Array<[BooleanSetting, string]>) {
     if (setting === 'inheritEnv' && dialsNetwork(config)) continue;
     assertBooleanSetting(`MCPL server "${config.id}" ${setting}`, config[setting], whatTrueDoes);
+  }
+  assertOneOfSetting(`MCPL server "${config.id}" hostCommandRole`, config.hostCommandRole, ['operator'],
+    "'operator' allows only the host's operator hook; leaving it out grants no hook access");
+  if (config.hostCommandRole === 'operator' && config.allowHostCommands === true) {
+    throw new Error(`MCPL server "${config.id}" hostCommandRole cannot be set with allowHostCommands: true`);
   }
   // Not a boolean, but read the same way: a value that isn't one of the
   // three would otherwise be taken for the default.
