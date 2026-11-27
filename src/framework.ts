@@ -14332,7 +14332,7 @@ export class AgentFramework {
    * turn's rejection never carries a provider's message: a provider's failure
    * is told by membrane's type and the HTTP status, a safety failure only as
    * a request that couldn't be completed, a progress bound's cut, a stream's
-   * abort and context-manager's refusal of a compile in their own words, and
+   * abort or silent close and context-manager's refusal of a compile in their own words, and
    * any other failure as the turn failing. Where an error ended the turn, the
    * rejection's `cause` is a bounded copy of it: a plain `Error` with its
    * `name`, its message and stack cut to 2,000 characters, and, from a
@@ -29821,13 +29821,17 @@ export class AgentFramework {
     // is decided by the paths themselves: `completed` by default; `aborted`
     // for a stream that a stop, the framework's cancel or a replacement
     // ended, as each case tells them; `failed` where a failure is
-    // established, in the `error` and `aborted` cases and the catch.
+    // established, in the `error` and `aborted` cases, a silent close and the catch.
     // Best-effort notifications — consumers dedupe by inferenceId and keep a
     // timeout.
     let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
     // Set by the complete / aborted / error cases: the stream SAID how it
     // ended. An iterator that just closes says nothing (see after the loop).
     let streamTerminal = false;
+    // Set where an uncancelled stream closes with no terminal event: the
+    // failure that end established, which its settlement, trace and log entry
+    // all name, whatever a listener of the trace does to the agent meanwhile.
+    let silentFailure: string | undefined;
     let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
@@ -31813,8 +31817,7 @@ export class AgentFramework {
       // operator's quiesce abandon settle as stops; endTurn writes its turn's
       // receipt and starts a continuation it was asked for; a budget restart
       // keeps the gate window its successor owns, which the finally would
-      // otherwise end. Only a silent end nobody asked for keeps the prior
-      // behaviour.
+      // otherwise end. A silent end nobody asked for is a failure (below).
       // Greptile on #172, 2026-09-28; Anarchid's review, 2026-10-12.
       if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
         const callerCancel = agent.takeCancel();
@@ -31830,6 +31833,31 @@ export class AgentFramework {
             closes: streamRouting,
             log: logStream,
           });
+        } else {
+          // Nobody cancelled the stream, and it ended without saying how:
+          // a failure (§10.5), settled as the `aborted` case settles one,
+          // so the agent stops streaming and a later wake starts a new
+          // inference. Nothing retries it or starts its turn again (#907).
+          lifecyclePhase = 'failed';
+          const terminal = 'Stream ended without a final response';
+          silentFailure = terminal;
+          this.abandonAgentScripts(agent.name, 'stream ended without a terminal event', streamRouting);
+          agent.reset();
+          this.noteFailedTurnEnd(agent, streamRouting);
+          this.settleAgent(agent.name, {
+            stopReason: 'exhausted',
+            speech: '',
+            error: terminal,
+          }, streamRouting);
+          this.emitTrace({
+            type: 'inference:exhausted',
+            agentName: agent.name,
+            error: terminal,
+            shownReason: terminal,
+          });
+          // Not transient, so nothing re-arms it; a re-armed turn's operator is told why its re-arming ends.
+          this.rearmExhaustedTurn(agent, new Error(terminal), trigger, ownsProviderGate, streamRouting, false);
+          if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         }
       }
     } catch (error) {
@@ -31948,16 +31976,18 @@ export class AgentFramework {
         // newer one, a disposed agent's stream) writes one now, as a failure
         // naming what ended it, so the log carries what the totals count. A
         // stop that reaches its terminal writes its own, through logStream.
-        // With no finished round there is nothing to carry, and no entry is
-        // written, as before.
-        if (countedUsage && !usageLogged) {
+        // A silent uncancelled end also logs its failure when no round
+        // finished, naming the failure it established even when a listener of
+        // its trace has since disposed the agent. Other ends without usage keep
+        // their prior no-entry behavior.
+        if (!usageLogged && (countedUsage !== undefined || silentFailure !== undefined)) {
           const replaced = this.agents.get(agent.name) !== agent;
           const superseded = generationLost || agent.streamId !== myStreamId;
-          const ended = replaced
+          const ended = silentFailure ?? (replaced
             ? 'Stream abandoned: its agent was disposed or replaced'
             : superseded
               ? 'Stream superseded: a newer stream of the agent took over'
-              : 'Stream ended without a final response';
+              : 'Stream ended without a final response');
           logStream({
             success: false,
             error: ended,

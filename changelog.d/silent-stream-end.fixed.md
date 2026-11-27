@@ -1,0 +1,1 @@
+- Fail uncancelled streams that end without a terminal event, preserve the failure reason for operator traces and, when the turn got partway, the next turn's failure note, release streaming state, and allow the next nudge to start an inference. (#907) This applies when the stream iterator closes; a contentless stream kept open by JSON ping events remains outside this fix (#980).
