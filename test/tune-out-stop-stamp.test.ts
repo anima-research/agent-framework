@@ -97,11 +97,13 @@ function stampSetup() {
   const key = (s: string, c: string) => `${s}\0${c}`;
   /** A listener inside each write, as a host's synchronous trace listener of the store write runs. */
   let onWrite: ((row: Row) => void) | undefined;
+  /** A hold's stored params, which both of the registry's reads give, as the real one's do. */
+  const paramsOf = (h: (typeof holds)[number]) => ({ epochId: h.epochId, startedAtSequence: h.startedAt, cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 });
   const registry = {
-    tuneOutsOnRecord: () => holds.map((h) => ({ serverId: h.serverId, channelId: h.channelId, params: { epochId: h.epochId, startedAtSequence: h.startedAt }, source: 'agent-tool' })),
+    tuneOutsOnRecord: () => holds.map((h) => ({ serverId: h.serverId, channelId: h.channelId, params: paramsOf(h), source: 'agent-tool' })),
     getTuneOutState: (s: string, c: string) => {
       const h = holds.find((x) => x.serverId === s && x.channelId === c);
-      return h ? { params: { epochId: h.epochId, startedAtSequence: h.startedAt, cadenceSeconds: 3600, backlogCap: 10, maxWakes: 5 }, wakeCount: state.wakeCount } : null;
+      return h ? { params: paramsOf(h), wakeCount: state.wakeCount } : null;
     },
     cancelTuneOut: (s: string, c: string) => {
       if (state.endFails) throw new Error('the end could not be recorded (test)');
@@ -1174,8 +1176,9 @@ test("pin: the boot's own release of a hold past its wake budget, its end unreco
     h.state.registered = false;
     assert.equal(h.holds.length, 1, 'premise: its end was not recorded');
     h.boot();
+    // This boot takes up the hold though its channel isn't registered, finds it past its budget, and ends it.
     assert.equal(textOf(h.unrecorded().at(-1)!.content),
-      `${opening(e)}A cancel of it that wasn't yours (wake budget exhausted (5)) ran: its release reached scout. ${STILL}]`);
+      `${opening(e)}A cancel of it that wasn't yours (wake budget exhausted (5)) ran: its release reached scout. Its end was not recorded, and that tune-out has ended since.]`);
   } finally { h.stopAll(); }
 }));
 

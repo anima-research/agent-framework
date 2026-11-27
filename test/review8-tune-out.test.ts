@@ -34,6 +34,17 @@ import { SUB, internals, registerOpen, enter, textOf as storedText, type Fixture
 
 interface Added { participant: string; content: ContentBlock[]; metadata?: Record<string, unknown>; forAgent?: string }
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
+
+/** The tune-outs on record, as a fake registry has them: each registered channel's, from its own state. */
+interface FakeChannels {
+  listChannelsRaw: () => Array<{ serverId: string; descriptor: { id: string } }>;
+  getTuneOutState: (serverId: string, channelId: string) => { params: unknown } | null;
+}
+const onRecordOf = (registry: FakeChannels): Array<{ serverId: string; channelId: string; params: unknown; source: string }> =>
+  registry.listChannelsRaw().flatMap(({ serverId, descriptor }) => {
+    const state = registry.getTuneOutState(serverId, descriptor.id);
+    return state ? [{ serverId, channelId: descriptor.id, params: state.params, source: 'agent-tool' }] : [];
+  });
 const textOf = (content: ContentBlock[]): string =>
   content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
 
@@ -49,6 +60,8 @@ function deferredSetup() {
     quotedShown: (channel: { channelId: string }) => JSON.stringify(channel.channelId),
     cancelTuneOut: () => { if (!state.inForce) return null; state.inForce = false; return { params, wakeCount: 0 }; },
     listChannelsRaw: () => [],
+    // On record whether or not its channel is registered, as the real registry's record is.
+    tuneOutsOnRecord: () => (state.inForce ? [{ serverId: 'disc', channelId: 'disc:guild:a', params, source: 'agent-tool' }] : []),
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
@@ -226,6 +239,7 @@ function epochSetup(options: { forks?: boolean; stored?: boolean } = {}) {
     nameShown: (c: { channelId: string }) => c.channelId,
     quotedShown: (c: { channelId: string }) => JSON.stringify(c.channelId),
     listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: 'disc:guild:a' } }],
+    tuneOutsOnRecord: (): ReturnType<typeof onRecordOf> => onRecordOf(registry),
   };
   const hooks = {
     addMessage: (participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, forAgent?: string) => {
@@ -1551,6 +1565,7 @@ function anchored(options: { active: Array<{ epochId: string; sequence: number }
   const channels = () => control.active.map((a) => ({ serverId: 'disc', descriptor: { id: `disc:guild:${a.epochId}` } }));
   const registry = {
     listChannelsRaw: channels,
+    tuneOutsOnRecord: (): ReturnType<typeof onRecordOf> => onRecordOf(registry),
     getTuneOutState: (_s: string, channelId: string) => {
       const a = control.active.find((e) => `disc:guild:${e.epochId}` === channelId);
       return a ? { params: { epochId: a.epochId, startedAtSequence: a.sequence, cadenceSeconds: 300, backlogCap: 10, maxWakes: 3 }, wakeCount: 0 } : null;

@@ -263,3 +263,23 @@ test("ending the all-except hold leaves a channel's own tune-out its pending wak
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a start whose read of the holds on record throws still ends a registered channel's tune-out whose end time passed", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'last-looks-unread-connected-'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  try {
+    const params: TuneOutParams = { epochId: 'eA', cadenceSeconds: 1800, backlogCap: 200, maxWakes: 5, startedAtSequence: 7, expiresAtMs: Date.now() - 1 };
+    registryOn(store).enterTuneOut('disc', CHANNEL, params, 'agent-tool');
+    const registry = registryOn(store);
+    await registry.handleRegister('disc', { channels: [{ id: CHANNEL, type: 'discord', label: '#a', direction: 'bidirectional' }] });
+    registry.tuneOutsOnRecord = () => { throw new Error('the store could not read the holds (test)'); };
+    t.mock.method(console, 'error', () => {});
+    const coordinator = coordinatorOn(registry);
+    coordinator.resumeActiveEpochs();
+    coordinator.stop();
+    assert.equal(registry.getTuneOutState('disc', CHANNEL), null, "its end time passed while the process was down: the start ends it, found among the connected channels' tune-outs");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
