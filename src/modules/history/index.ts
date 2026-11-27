@@ -78,7 +78,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
-import { ERROR_MARK, EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
+import { ERROR_MARK, EmbedServiceError, SemanticIndexClient, SemanticIndexer, messageIndexText, messageToItem, parseSummaryKey, summaryIndexText, type SearchResponse, type SemanticIndexConfig, type SyncReport, type PendingChanges, type SyncCursors } from './semantic.js';
 import { unknownToolMessage } from '../unknown-tool.js';
 import { speechOf } from '../../send-tools.js';
 import { safeSlice } from '../../safe-slice.js';
@@ -884,8 +884,8 @@ export class HistoryModule implements Module {
         'background sync is already running, the search waits for that run to finish instead). ' +
         'Purely a read: nothing is written to your history. Hits are checked against your current branch ' +
         `before they come back: ${windowed ? 'a message or ' : 'a message you undid or '}a summary from a branch you left is dropped and ` +
-        'counted in index.droppedOffBranch; a message edited down to nothing searchable is dropped and ' +
-        'counted in index.droppedStale. When that leaves fewer than `limit` hits and the index may hold more, it ' +
+        'counted in index.droppedOffBranch; a message with nothing searchable or whose current channel tag no longer ' +
+        'matches the filter is dropped and counted in index.droppedStale. When that leaves fewer than `limit` hits and the index may hold more, it ' +
         'searches again, deeper, down to its first 200 hits; if a search after the first fails, the hits found so ' +
         'far come back, with why in index.searchAgainError. Message snippets ' +
         'always show the current text of the message.' +
@@ -897,7 +897,7 @@ export class HistoryModule implements Module {
           limit: { type: 'number', description: `Max hits (default ${SEMANTIC_DEFAULT_LIMIT}, cap ${SEMANTIC_MAX_LIMIT}).` },
           from: { type: 'string', description: 'ISO 8601 inclusive lower bound on the message timestamp / summary span start. Omit for open-ended.' },
           to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
-          channelId: { type: 'string', description: 'Only raw messages from this channel (label like "#general" or the raw internal id). Summaries are not per-channel and are excluded when this is set; combining it with kinds="summaries" or level is an error.' },
+          channelId: { type: 'string', description: 'Match raw messages by semantic channel tag (label like "#general" or raw id). The tag can be inferred from a send destination as written, not proof of delivery, and may not match history--search or history--extract channel filters, which use stored metadata. Summaries are excluded when this is set; combining it with kinds="summaries" or level is an error.' },
           kinds: { type: 'string', enum: ['messages', 'summaries', 'both'], description: 'What to search: raw messages, compression summaries, or both (default).' },
           level: { type: 'number', description: 'Only summaries of this exact level (implies kinds=summaries).' },
           minScore: { type: 'number', description: 'Drop hits below this cosine score (0..1). Default none.' },
@@ -2022,19 +2022,18 @@ export class HistoryModule implements Module {
     // its creation time too, and a hit whose time isn't this branch's
     // summary's is another branch's. k is small, so this is at most `limit`
     // local lookups.
-    // A message hit whose current text has nothing left to index (edited
-    // blank, delete not yet applied) is dropped too, so its stale snippet is
-    // never served. Dropped hits are replaced by over-fetching: when the
-    // top k held droppable entries, re-query with a larger k (service cap
-    // 200) so lower-ranked on-branch matches still fill `limit`.
+    // A message hit is stale if nothing remains searchable or its current
+    // channel no longer matches the filter. Dropped hits are replaced by
+    // over-fetching: when the top k held droppable entries, re-query with a
+    // larger k (service cap 200) so lower-ranked matches still fill `limit`.
     const cm = this.cm as ContextManager;
     const includePrivate = this.semanticCfg.includePrivateTools ?? true;
-    // A message hit's snippet is rebuilt from the CURRENT local text, never
-    // the remote copy: an edit not yet synced (or one the index never got)
-    // must not leak a passage the edit removed. Only the ranking can be stale.
+    // A message hit's snippet and channel come from the CURRENT local item,
+    // never the remote copy. The remote index can still rank by old text
+    // or miss messages whose channel has changed since it indexed them.
     // A summary hit's snippet is rebuilt from the local summary too, so a
     // service that keeps only vectors and ids (no text) still yields one.
-    const currentText = new Map<string, { text: string; shown: string }>();
+    const currentText = new Map<string, { text: string; shown: string; channel?: string | null }>();
     // Each message hit's mark for the caller (viewFor), by the hit's id.
     const marks = new Map<string, WindowMark>();
     const keep = (h: { id: string }): 'ok' | 'offBranch' | 'stale' | 'superseded' | 'leftOut' => {
@@ -2046,10 +2045,11 @@ export class HistoryModule implements Module {
         if (view?.leaves(m)) return 'leftOut';
         const mark = view?.mark(m);
         if (mark !== undefined) marks.set(h.id, mark);
-        const text = safeSlice(messageIndexText(m, includePrivate), 0, this.semanticCfg!.maxChars ?? 32_000);
-        if (!text) return 'stale';
+        const item = messageToItem(m, this.semanticCfg!);
+        if (!item?.text || (channelId && item.channel !== channelId)) return 'stale';
+        const { text, channel } = item;
         const failed = this.failedSpeech(m);
-        currentText.set(h.id, { text, shown: failed.size ? safeSlice(messageIndexText(m, includePrivate, failed), 0, this.semanticCfg!.maxChars ?? 32_000) : text });
+        currentText.set(h.id, { text, channel, shown: failed.size ? safeSlice(messageIndexText(m, includePrivate, failed), 0, this.semanticCfg!.maxChars ?? 32_000) : text });
         return 'ok';
       }
       if (sum !== null) {
@@ -2142,6 +2142,7 @@ export class HistoryModule implements Module {
       const id = sum ? `sum:${sum.id}` : h.id;
       const missing = [...(h.ts !== null && timestamp === null ? ['ts'] : []), ...(meta === null ? ['meta'] : [])];
       if (missing.length > 0) unread.push(`${shown(id)} (${missing.join(' and ')})`);
+      const local = currentText.get(h.id);
       return {
         id,
         /** Raw message id for a `msg:` hit (null for summaries) — pass it to extract({ aroundId }). */
@@ -2150,12 +2151,12 @@ export class HistoryModule implements Module {
         level: h.level,
         score: h.score,
         timestamp,
-        channelId: h.channel,
+        channelId: local?.channel === undefined ? h.channel : local.channel,
         ...windowField(marks.get(h.id)),
         participant: meta?.participant ?? null,
         author: meta?.author ?? null,
-        snippet: currentText.has(h.id) ? snippetOf(currentText.get(h.id)!.shown) : (h.text ?? ''),
-        chars: currentText.has(h.id) ? currentText.get(h.id)!.text.length : h.chars,
+        snippet: local ? snippetOf(local.shown) : (h.text ?? ''),
+        chars: local ? local.text.length : h.chars,
       };
     });
     if (unread.length > 0) {

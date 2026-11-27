@@ -2,7 +2,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { HistoryModule } from '../src/modules/history/index.js';
-import { messageIndexText } from '../src/modules/history/semantic.js';
+import { messageIndexText, messageToItem } from '../src/modules/history/semantic.js';
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 
@@ -92,6 +92,130 @@ const messages = [
 const summaries = [
   { id: 's1', level: 1, content: 'Summary of the evening', tokens: 10, startMs: T0, endMs: T0 + 5000, firstSequence: 1, lastSequence: 4, createdMs: T0 + 9000 },
 ];
+
+describe('semantic index send channels', () => {
+  const send = (name: string, args: Record<string, unknown>): ContentBlock =>
+    ({ type: 'tool_use', id: name, name, input: { content: 'a reply', ...args } });
+  const publish = send('channel_publish', { channelId: 'zulip:private room' });
+  const dm = send('mcpl--zulip--send_dm', { to: ['0042'] });
+  const unresolved = [
+    ['a stream list', send('zulip--send_message', { type: 'stream', to: ['Secret'] })],
+    ['a reply without an explicit destination', send('zulip--send_message', { reply_to: 42 })],
+    ['a DM group', send('zulip--send_dm', { to: ['7', '42'] })],
+    ['a qualified publish target', send('channel_publish', { channelId: 'zulip:zulip:secret' })],
+  ] as const;
+
+  for (const [label, block, expected] of [
+    ['a Zulip stream name', send('mcpl--zulip--send_message', { type: 'stream', to: 'general' }), 'zulip:general'],
+    ['a mixed-case stream name', send('zulip--send_message', { type: 'stream', to: 'Secret Room' }), 'zulip:Secret Room'],
+    ['a numeric stream string', send('zulip--send_message', { type: 'stream', to: '0017' }), 'zulip:0017'],
+    ['a numeric stream ID', send('zulip--send_message', { type: 'stream', to: 17 }), 'zulip:17'],
+    ['a blank stream name', send('zulip--send_message', { type: 'stream', to: ' ' }), null],
+    ['a numeric private recipient', send('zulip--send_message', { type: 'private', to: [42] }), 'zulip:dm:42'],
+    ['a single DM recipient', dm, 'zulip:dm:42'],
+    ['a channel_publish target', publish, 'zulip:private room'],
+    ['a canonical mixed-case publish target', send('channel_publish', { channelId: 'zulip:Secret' }), 'zulip:Secret'],
+    ['a canonical DM publish target', send('channel_publish', { channelId: 'zulip:dm:7+42' }), 'zulip:dm:7+42'],
+    ['a noncanonical DM publish target', send('channel_publish', { channelId: 'zulip:dm:42+7' }), null],
+    ['an unknown publish target', send('channel_publish', { channelId: 'custom:private room' }), null],
+    ['a bare publish target', send('channel_publish', { channelId: 'private room' }), null],
+    ['an email address', send('zulip--send_message', { type: 'private', to: 'bo@example.invalid' }), null],
+    ['a DM name', send('zulip--send_dm', { to: ['Bo'] }), null],
+    ['a non-Zulip DM with a numeric recipient', send('mcpl--slack--send_dm', { to: 42 }), null],
+    ['a bare DM tool', send('send_dm', { to: 42 }), null],
+    ['an unknown server with a Zulip-shaped stream send', send('mcpl--work-chat--send_message', { type: 'stream', to: 'general' }), null],
+    ['a server tool named channel_publish', send('slack--channel_publish', { channelId: 'zulip:private room' }), null],
+    ['a non-Zulip DM shape', send('slack--send_dm', { userId: 'U42' }), null],
+    ['an invalid numeric id', send('zulip--send_dm', { to: '0' }), null],
+    ['a reply with conflicting routing arguments', send('zulip--send_message', { reply_to: 42, type: 'private', to: [42] }), null],
+    ['a default publish target', send('channel_publish', {}), null],
+  ] as const) {
+    it(`indexes the channel for ${label} as ${expected}`, () => {
+      assert.equal(messageToItem(msg('m9', T0, [block]), {})!.channel, expected);
+    });
+  }
+
+  for (const [label, block] of unresolved) {
+    it(`leaves ${label} untagged alone and alongside a known send`, () => {
+      const item = (...blocks: ContentBlock[]) => messageToItem(msg('m9', T0, blocks), {})!;
+      assert.equal(item(block).channel, null);
+      assert.equal(item(publish, block).channel, null);
+    });
+  }
+
+  it('prefers message channel metadata over a send destination', () => {
+    const stored = msg('m9', T0, [publish, { type: 'text', text: 'plain prose' }], 'legacy');
+    assert.equal(messageToItem(stored, {})!.channel, 'legacy');
+    assert.equal(messageToItem({ ...stored, metadata: { ...stored.metadata, channelId: 'current' } }, {})!.channel, 'current');
+  });
+
+  it('uses a common destination and leaves distinct or unresolved send destinations null', () => {
+    const item = (...blocks: ContentBlock[]) => messageToItem(msg('m9', T0, blocks), { includePrivateTools: false })!;
+    assert.equal(item(dm, send('channel_publish', { channelId: 'zulip:dm:42' })).channel, 'zulip:dm:42');
+    assert.equal(item(publish, send('channel_publish', { channelId: 'zulip:another room' })).channel, null);
+    assert.equal(item(publish, send('zulip--send_dm', { to: ['Bo'] })).channel, null);
+    assert.equal(item(publish, send('channel_publish', { channelId: 'zulip:elsewhere', content: ' ' })).channel, 'zulip:private room');
+    assert.equal(item({ type: 'text', text: 'plain prose' }).channel, null);
+  });
+
+  it('leaves a mixed-prose item with two distinct send destinations untagged', () => {
+    const stored = msg('m9', T0, [
+      send('zulip--send_message', { type: 'stream', to: 'Secret Room' }),
+      { type: 'text', text: 'ordinary prose' },
+      send('zulip--send_message', { type: 'stream', to: 17 }),
+    ]);
+    assert.equal(messageToItem(stored, {})!.channel, null);
+  });
+
+  it('leaves the channel null when the item also indexes ordinary text', () => {
+    const stored = msg('m9', T0, [{ type: 'text', text: 'private prose' }, publish]);
+    const item = messageToItem(stored, { includePrivateTools: false })!;
+    assert.equal(item.text, 'private prose\n[channel_publish] a reply');
+    assert.equal(item.channel, null);
+  });
+
+  it('leaves the channel null when the item also indexes private tools', () => {
+    const stored = msg('m9', T0, [publish, send('think', { content: 'private prose' }), send('journal', { content: 'diary' })]);
+    const item = messageToItem(stored, {})!;
+    assert.equal(item.text, '[channel_publish] a reply\n[think] private prose\n[journal] diary');
+    assert.equal(item.channel, null);
+    assert.equal(messageToItem(stored, { includePrivateTools: false })!.channel, 'zulip:private room');
+  });
+
+  it('derives a channel from only the parts retained by maxChars', () => {
+    const stored = msg('m9', T0, [
+      { type: 'text', text: '  ' }, publish, send('zulip--send_dm', { to: 42 }),
+    ]);
+    const first = '[channel_publish] a reply';
+    const item = messageToItem(stored, { maxChars: first.length + 1 })!;
+    assert.equal(item.text, first + '\n');
+    assert.equal(item.channel, 'zulip:private room');
+
+    // Even a partially retained send contributes to attribution.
+    const partial = messageToItem(stored, { maxChars: first.length + 2 })!;
+    assert.equal(partial.text, first + '\n[');
+    assert.equal(partial.channel, null);
+  });
+
+  it('ignores blank prose and non-indexed blocks when deriving a channel', () => {
+    const stored = msg('m9', T0, [
+      { type: 'text', text: ' ' }, send('think', { content: ' ' }), publish,
+      { type: 'tool_result', toolUseId: 'channel_publish', content: 'ignored' },
+    ]);
+    assert.equal(messageToItem(stored, {})!.channel, 'zulip:private room');
+  });
+
+  it('keeps an item when the character cap leaves no complete character of nonblank text', () => {
+    const stored = msg('m9', T0, [{ type: 'text', text: '😀 hello' }], 'chan-A');
+    for (const maxChars of [0, 1]) {
+      const item = messageToItem(stored, { maxChars });
+      assert.ok(item, `nonblank message with maxChars=${maxChars}`);
+      assert.equal(item.text, '');
+      assert.equal(item.channel, 'chan-A');
+    }
+    assert.equal(messageToItem(msg('m10', T0, [{ type: 'text', text: ' ' }]), { maxChars: 0 }), null);
+  });
+});
 
 describe('HistoryModule semantic_search', () => {
   const svc = new FakeService();
@@ -216,6 +340,35 @@ describe('HistoryModule semantic_search', () => {
     await mod.handleToolCall({ id: 'c2', name: 'semantic_search', input: { query: 'evening', level: 1 } });
     assert.deepEqual(svc.searches.at(-1)!.kinds, ['summary']);
     await mod.stop();
+  });
+
+  it('checks and reports the current channel of an edited message before re-sync', async () => {
+    const svc2 = new FakeService(); await svc2.start();
+    try {
+      const channelId = 'zulip:room';
+      const store = [msg('m9', T0, [
+        { type: 'tool_use', id: 'u', name: 'zulip--send_message', input: { type: 'stream', to: 'room', content: 'old words' } },
+      ])];
+      const mod = new HistoryModule({
+        semantic: { url: svc2.url, token: 'tok', namespace: 'test/ns', syncIntervalMs: 0, maxSyncBeforeSearch: 0 },
+      });
+      mod.bind(stubCm(store));
+      await mod.syncSemanticIndex()!;
+      const search = async (channelId?: string) => {
+        const res = await mod.handleToolCall({ id: 'q', name: 'semantic_search', input: { query: 'old words', channelId } });
+        assert.equal(res.success, true, JSON.stringify(res));
+        return res.data as { hits: Array<{ id: string; snippet: string; channelId: string | null }>; index: { droppedStale: number } };
+      };
+
+      assert.equal((await search(channelId)).hits[0]?.channelId, channelId);
+      store[0] = msg('m9', T0, [{ type: 'text', text: 'private draft' }]);
+      const filtered = await search(channelId);
+      assert.deepEqual(filtered.hits, []);
+      assert.equal(filtered.index.droppedStale, 1);
+      assert.equal(svc2.items.get('msg:m9')?.channel, channelId, 'the remote item still has the old tag');
+      assert.deepEqual((await search()).hits.map((h) => [h.id, h.snippet, h.channelId]), [['msg:m9', 'private draft', null]]);
+      await mod.stop();
+    } finally { await svc2.stop(); }
   });
 
   it('drops hits for messages and summaries that are no longer on the current branch (/undo, /checkout)', async () => {
