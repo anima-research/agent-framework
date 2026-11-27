@@ -776,8 +776,8 @@ const markerMark = (tags: string[] | undefined, firstView: boolean): { marker?: 
   isMarkerTagged(tags, firstView) ? { marker: true } : {};
 
 /** A resident's wake claims its channel as addressed only when its message
- *  asks something: a server may give a deletion or a removed reaction the
- *  addressing tags of the message it removes (zulip_mcp does), and neither
+ *  asks something. A server may give a deletion or a removed reaction an
+ *  addressing tag, as zulip_mcp gives a deletion its message's, and neither
  *  asks the agent anything. */
 const claimsAddressed = (tags: string[] | undefined): boolean =>
   isAddressedMessage(tags) && !tags?.some((t) => t === 'chat:deleted' || t === 'chat:reaction-remove');
