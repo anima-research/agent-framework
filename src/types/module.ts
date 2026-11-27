@@ -47,6 +47,14 @@ export interface MessageQuery {
  * binds a reply's thinking to everything before it, every reply after its old
  * place loses its thinking. It has no effect on a `system` or `beforeUser`
  * injection, which `compile()` always places.
+ *
+ * A `beforeUser` one is deprecated (agent-framework#171): `compile()` places
+ * it again at every compile before the newest user message, or at the
+ * window's end where there is none, so it moves whenever that place does: the
+ * request misses the cache from there on, and it can split a tool call from
+ * its result. A `system` one goes into the system prompt: a change to its text
+ * misses the cache from the system prompt on, and the conversation doesn't
+ * store it.
  */
 export type ModuleContextInjection = ContextInjection & { placedEachCompile?: true };
 
