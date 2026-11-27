@@ -12,6 +12,13 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/
 
 const GONE = 'a retry waiting while the agent was replaced or removed is dropped before it sends anything';
 const STOPPING = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+const REMOVED = "the agent was removed in its wait to retry; the retry wasn't sent";
+/** The removal's [turn] lines on stderr from here on, for one name. */
+function removalLines(t: TestContext): (name: string) => string[] {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  return (name) => lines.filter((line) => line.startsWith(`[turn] ${name}: ${REMOVED}`));
+}
 
 type Internals = {
   agents: Map<string, unknown>;
@@ -296,7 +303,8 @@ describe("a failed start's wait to retry", () => {
     await until("a's next turn to answer", () => h.log.includes('completed:a'));
   });
 
-  it('stopAgent during the wait: no retry, one inference:aborted that says why, and its admission is given back', async (t) => {
+  it('stopAgent during the wait: no retry, one inference:aborted that says why, one line on stderr, and its admission is given back', async (t) => {
+    const removed = removalLines(t);
     const h = await boot(t, { delayMs: 300, start: true });
     wake(h.fw, 'a');
     await until("a's wait to retry", () => h.log.includes('waiting:a'));
@@ -306,11 +314,13 @@ describe("a failed start's wait to retry", () => {
     await retriesEnded(h);
     assert.equal(h.state.compiles, 1, 'no second compile');
     assert.deepEqual(aborts(h.traces, 'a'), [GONE]);
+    assert.deepEqual(removed('a'), [`[turn] a: ${REMOVED}`]);
     assert.equal(h.i.providerGates.get('a')?.primaryDepth ?? 0, 0, "a's admission is given back");
   });
 
   for (const successor of ['idle', 'in a turn'] as const) {
-    it(`an agent that replaced a under its name during the wait, ${successor}: no retry, no inference:aborted, and its token untouched`, async (t) => {
+    it(`an agent that replaced a under its name during the wait, ${successor}: no retry, no inference:aborted or removal line, and its token untouched`, async (t) => {
+      const removed = removalLines(t);
       const h = await boot(t, { delayMs: 300, start: true });
       wake(h.fw, 'a');
       await until("a's wait to retry", () => h.log.includes('waiting:a'));
@@ -320,6 +330,7 @@ describe("a failed start's wait to retry", () => {
       await retriesEnded(h);
       assert.equal(h.state.compiles, 1, 'no second compile');
       assert.deepEqual(aborts(h.traces, 'a'), [], 'no inference:aborted under the name');
+      assert.deepEqual(removed('a'), [], 'no removal line under the name');
       if (successor === 'in a turn') assert.equal(h.i.activeTurnTokens.get('a'), 987_654, "the successor's token is untouched");
       h.i.agents.set('a', h.agent);
       h.i.activeTurnTokens.delete('a');
