@@ -1982,6 +1982,8 @@ const RETRY_CANCELLED_BY_STOP = 'a retry waiting while the framework was stoppin
  *  replaced or removed while it waited to retry, when no later incarnation
  *  has taken the name since. */
 const RETRY_AGENT_GONE = 'a retry waiting while the agent was replaced or removed is dropped before it sends anything';
+/** stderr's line for that drop: the journal has no line of its own for an agent's removal. */
+const retryDroppedLine = (agentName: string) => `[turn] ${agentName}: the agent was removed in its wait to retry; the retry wasn't sent`;
 
 /** The reason on the inference:aborted that ends a turn whose continuation
  *  was dropped before it started, other than by an abandon or a stop. */
@@ -28344,18 +28346,19 @@ export class AgentFramework {
    * begun by a replacement agent object), or when a later incarnation than
    * `incarnation`, the name's as the turn started, has taken the name since:
    * the event and the record carry only the name, so this frame's would end
-   * that newer turn instead.
+   * that newer turn instead. Returns whether the turn got its event.
    */
-  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number, incarnation: number): void {
+  private abortDroppedTurn(agentName: string, turnToken: number, reason: string, startedAt: number, incarnation: number): boolean {
     const owner = this.activeTurnTokens.get(agentName);
-    if (owner !== undefined && owner !== turnToken) return;
-    if (this.registry.ref(agentName).incarnation !== incarnation) return;
+    if (owner !== undefined && owner !== turnToken) return false;
+    if (this.registry.ref(agentName).incarnation !== incarnation) return false;
     const now = Date.now();
     // Only this turn's own record ends: a name whose run was disposed meanwhile
     // (runEphemeralToCompletion deletes its record) gets none back.
     const last = this.lastInferenceAt.get(agentName);
     if (last?.startedAt === startedAt) this.lastInferenceAt.set(agentName, { ...last, endedAt: now });
     this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: now - startedAt });
+    return true;
   }
 
   /**
@@ -29334,7 +29337,10 @@ export class AgentFramework {
           // A policy's delay can be a provider's retry-after: wait all of it.
           await this.waitForRetry(action.delayMs, window, agent, { nextTry: policyAttempt + 2, action });
           if (this.agents.get(agent.name) !== agent) {
-            this.abortDroppedTurn(agent.name, turnToken, this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_AGENT_GONE, turnStartedAt, myIncarnation);
+            const stopping = this.providerAdmissionClosed;
+            if (this.abortDroppedTurn(agent.name, turnToken, stopping ? RETRY_CANCELLED_BY_STOP : RETRY_AGENT_GONE, turnStartedAt, myIncarnation) && !stopping) {
+              console.error(retryDroppedLine(agent.name));
+            }
             return;
           }
           if (this.providerAdmissionClosed) {
@@ -31526,6 +31532,7 @@ export class AgentFramework {
                     type: 'inference:aborted', agentName: agent.name,
                     durationMs: Date.now() - startTime, reason: this.providerAdmissionClosed ? RETRY_CANCELLED_BY_STOP : RETRY_AGENT_GONE,
                   });
+                  if (!this.providerAdmissionClosed) console.error(retryDroppedLine(agent.name));
                 }
               }
             } else {
