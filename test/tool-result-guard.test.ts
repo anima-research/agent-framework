@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@animalabs/context-manager';
+import { OverBudgetError, PassthroughStrategy, type StoredMessage, type StrategyContext } from '@animalabs/context-manager';
 import type { ContentBlock, Membrane, NormalizedRequest, NormalizedResponse, YieldingStreamOptions } from '@animalabs/membrane';
 import { MembraneError, Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type ProviderRequest,
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
@@ -4344,4 +4344,85 @@ test("storeResults tells the own-row sink of the results it stores, guarded or n
     guarded.storeResults(results('tu-3'), wire('tu-3'), [], undefined, undefined);
     assert.equal(told.length, 2, 'with the sink off, nothing is told');
   } finally { cm.close(); }
+});
+
+test('a guard retry whose compile is refused for budget ends the turn with no stream live, and settles the guard', async () => {
+  const h = await harness([[calls('a'), refused()]], { toolResultGuard: true, refusalHandling: { retries: 3 } });
+  const agent = h.framework.getAgent('assistant')!;
+  const cm = agent.getContextManager();
+  const compile = cm.compile.bind(cm);
+  // The guard retry's compile is the one made while the guard is recovering.
+  let refusedCompiles = 0;
+  cm.compile = ((...args: Parameters<typeof cm.compile>) => {
+    if (agent.toolResultGuard.recovering) {
+      refusedCompiles++;
+      return Promise.reject(new OverBudgetError({
+        budget: 4000, actual: 8000,
+        diagnostics: { headTokens: 1, tailTokens: 2, middleTokens: 3, middleChunkCount: 1, deepestLevel: 1 },
+      }));
+    }
+    return compile(...args);
+  }) as typeof cm.compile;
+  let exhausted = false;
+  h.framework.onTrace((event) => { if (event.type === 'inference:exhausted') exhausted = true; });
+  const quiet = console.error;
+  console.error = () => {};
+  let bound: ReturnType<typeof setTimeout> | undefined;
+  try {
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    const settled = await Promise.race([
+      h.framework.runUntilIdle().then(() => true),
+      new Promise<false>((resolve) => { bound = setTimeout(() => resolve(false), 30_000); }),
+    ]);
+    assert.ok(refusedCompiles > 0, "the guard retry's compile was refused");
+    assert.equal(exhausted, true, 'the turn exhausted');
+    assert.equal(settled, true, 'runUntilIdle settled');
+    assert.deepEqual((h.framework.healthSnapshot() as { activeStreams: string[] }).activeStreams, [], 'no stream is reported live');
+    assert.equal(agent.toolResultGuard.recovering, false, 'the guard is not left recovering');
+    assert.equal(agent.toolResultGuard.hasPending, false, 'no batch is left pending');
+  } finally {
+    clearTimeout(bound);
+    console.error = quiet;
+    await h.framework.stop();
+  }
+});
+
+test('a budget restart whose compile is refused for budget ends the turn and lets its held batch go', async () => {
+  const h = await harness([[calls('one')]], { toolResultGuard: true, maxStreamTokens: 1 });
+  const agent = h.framework.getAgent('assistant')!;
+  const cm = agent.getContextManager();
+  const compile = cm.compile.bind(cm);
+  // The restart's compile is the one made while the turn's batch is held.
+  let refusedCompiles = 0;
+  cm.compile = ((...args: Parameters<typeof cm.compile>) => {
+    if (agent.toolResultGuard.hasPending) {
+      refusedCompiles++;
+      return Promise.reject(new OverBudgetError({
+        budget: 4000, actual: 8000,
+        diagnostics: { headTokens: 1, tailTokens: 2, middleTokens: 3, middleChunkCount: 1, deepestLevel: 1 },
+      }));
+    }
+    return compile(...args);
+  }) as typeof cm.compile;
+  let exhausted = false;
+  h.framework.onTrace((event) => { if (event.type === 'inference:exhausted') exhausted = true; });
+  const quiet = console.error;
+  console.error = () => {};
+  let bound: ReturnType<typeof setTimeout> | undefined;
+  try {
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    const settled = await Promise.race([
+      h.framework.runUntilIdle().then(() => true),
+      new Promise<false>((resolve) => { bound = setTimeout(() => resolve(false), 30_000); }),
+    ]);
+    assert.ok(refusedCompiles > 0, "the restart's compile was refused");
+    assert.equal(exhausted, true, 'the turn exhausted');
+    assert.equal(settled, true, 'runUntilIdle settled');
+    assert.equal(agent.toolResultGuard.hasPending, false, 'no batch is left pending');
+    assert.equal(agent.toolResultGuard.recovering, false, 'the guard is not left recovering');
+  } finally {
+    clearTimeout(bound);
+    console.error = quiet;
+    await h.framework.stop();
+  }
 });
