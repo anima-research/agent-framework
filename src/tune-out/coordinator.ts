@@ -1050,7 +1050,10 @@ export interface TuneOutFrameworkHooks {
  * the line gets none. An acknowledgement names a platform message, or it
  * isn't sent (#476): `id` is that message's id where the lane knows one. A
  * marker (isMarkerTagged) gets none, since it is no mention. An edit counts
- * as its message when `editNamesItsMessage`.
+ * as its message when `editNamesItsMessage`. This differs from the
+ * framework's answersOn on purpose: a reply anchors on a message, and the
+ * acknowledgement answers whether a mention was seen, which an edit that
+ * adds a mention asks.
  */
 export function heldAcknowledgementId(id: string | undefined, tags: string[] | undefined, editNamesItsMessage: boolean): string | undefined {
   return id && !isMarkerTagged(tags, editNamesItsMessage) ? id : undefined;
