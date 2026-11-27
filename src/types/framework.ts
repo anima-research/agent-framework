@@ -598,6 +598,15 @@ export interface ContextMaintenanceAgentRun {
   progressBefore?: Record<string, unknown>;
   progressAfter?: Record<string, unknown>;
   /**
+   * When the agent's tick left this pass because a provider call of that
+   * agent parked at its provider gate while the tick ran: the tick's own,
+   * behind the agent's turn or a provider cooldown, or another of the
+   * agent's calls, such as an over-budget drain's. The tick goes on by
+   * itself, and the entry is finished when it settles.
+   * Absent for an entry whose work finished in its pass.
+   */
+  leftPassAt?: number;
+  /**
    * The agent's failure in this pass: a tick that threw, or its readiness
    * that couldn't be read, before the ticks or after them.
    */
