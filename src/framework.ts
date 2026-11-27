@@ -4483,6 +4483,8 @@ const JUDGE_PARAMETER: ToolParameter = {
     'you aren\'t woken (the events stay in your context, as for "defer"); the next batch is judged afresh. ' +
     'If the judge fails or times out you are woken, unless your host set it to stay quiet then or every ' +
     'event in the batch was written for you and you\'ve already read and answered it. ' +
+    'If the judge keeps failing for a rule, the host tells you so one time. It tells you again when the judge answers for that rule. ' +
+    'While one such notice stands, another rule that fails is shown only in gate_status. ' +
     'Its verdicts and reasons are in gate_status.',
   properties: {
     debounceMs: { type: 'number', description: 'Quiet period (ms) before the batch is judged (100–300000).' },
