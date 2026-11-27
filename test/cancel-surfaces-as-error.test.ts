@@ -605,28 +605,28 @@ for (const reports of ['aborted', 'error', 'close', 'throw', 'error-then-throw']
 
   it("a budget restart whose new start fails before its stream exists ends the event gate's window", async () => {
     // The first stream leaves the window open for the new stream. A new start
-    // that throws before it has a stream, here at its turn checkpoint's store
-    // write, has to end it: left open, every gate event buffers, for every
-    // agent.
+    // that throws before it has a stream, here at the head-move notice every
+    // start takes (a restart records no checkpoint of its own, #1013), has to
+    // end it: left open, every gate event buffers, for every agent.
     const { framework, traces, teardown, terminals } = await toolTurn('fetch', reports);
     const internals = framework as unknown as {
-      recordTurnCheckpoint: (name: string) => void;
+      noticeHeadMoves: (agent: unknown) => void;
       eventGate: { inferenceDiagnostics(): { inferring: string[] } };
     };
-    const record = internals.recordTurnCheckpoint.bind(framework);
+    const notice = internals.noticeHeadMoves.bind(framework);
     let threw = 0;
-    internals.recordTurnCheckpoint = (name: string) => {
+    internals.noticeHeadMoves = (agent: unknown) => {
       if (types(traces, 'inference:stream_restarted').length > 0) {
         threw++;
         throw new Error('ENOSPC: no space left on device');
       }
-      record(name);
+      notice(agent);
     };
     try {
       await waitFor(() => threw > 0 && terminals().length > 0, 10_000);
       // The failed start's catch runs a few microtasks after the throw.
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(threw, 1, "the restart's new start threw at its checkpoint");
+      assert.equal(threw, 1, "the restart's new start threw before its stream");
       assert.deepEqual(internals.eventGate.inferenceDiagnostics().inferring, [], 'no agent is left inferring at the event gate');
     } finally {
       await teardown();

@@ -1749,3 +1749,48 @@ describe("a conversation agent's disposal while its turn's continuation is held"
     }
   });
 });
+
+describe('an undo after a budget restart', () => {
+  // #1013: the restart's start took a checkpoint of its own, so an undo took
+  // back only the rows since it, the reply, and the round's tool call and its
+  // result stayed in the window; the next request still held both.
+  it("takes the whole turn back, the tool call and its result with the reply, as an undo of a turn that didn't restart does", async () => {
+    let before: number | undefined;
+    const h = await restartTurn({
+      wait: false,
+      onTrace: (framework, e) => {
+        if (e.type === 'inference:started' && before === undefined) before = framework.getAgent('prime')!.getContextManager().indexLength();
+      },
+    });
+    try {
+      const { framework, membrane } = h;
+      // The continuation ran and the turn ended with its reply.
+      await waitFor('the turn to end', () => membrane.calls.length === 2 && framework.getHostModeStatus().activeTurns === 0
+        && framework.getAgent('prime')!.state.status === 'idle');
+      const cm = framework.getAgent('prime')!.getContextManager();
+      assert.equal(framework.getUndoRedoState('prime').undoDepth, 1, 'one logical turn, one checkpoint');
+
+      const added = cm.indexLength() - before!;
+      const undone = framework.undoLastTurn('prime');
+      assert.equal(undone.undone, true);
+      // Every row the turn added left: the call, its result and the reply,
+      // not the reply alone (the index keeps them as undone, so its length
+      // isn't what moves back; the count retracted is).
+      assert.ok(added >= 3, `the turn added the call, its result and the reply (${added} rows)`);
+      assert.equal(undone.window?.retracted, added, 'the whole turn left the window');
+      assert.equal(framework.getUndoRedoState('prime').undoDepth, 0);
+
+      // The next request carries neither the call nor its result.
+      framework.pushEvent({
+        type: 'external-message', source: 'test', content: [{ type: 'text', text: 'what did it say?' }], metadata: {}, triggerInference: true,
+      } as unknown as ProcessEvent);
+      await waitFor('the next request', () => membrane.calls.length === 3);
+      const next = membrane.calls[2]!;
+      const blocks = JSON.stringify(next);
+      assert.ok(!blocks.includes('tool_use') && !blocks.includes('tool_result'), 'no tool round of the undone turn in the next request');
+      assert.ok(!blocks.includes('Recovered.'), 'nor its reply');
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
