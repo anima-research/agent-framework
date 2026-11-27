@@ -89,7 +89,7 @@ describe('a held marker in a tuned-out channel is not acknowledged', () => {
       await (f.framework as unknown as { handleMcplChannelIncoming(event: Record<string, unknown>): Promise<unknown> }).handleMcplChannelIncoming({
         type: 'mcpl:channel-incoming', serverId: 'editor', channelId: 'noisy', messageId: 'd2',
         author: { id: 'U1', name: 'U1' }, content: [{ type: 'text', text: '[deleted] agent, lunch?' }],
-        timestamp: TS, metadata: {}, tags: ['chat:deleted', 'chat:edited', 'chat:mention', 'chat:addressed'], triggerInference: true, firstView: true,
+        timestamp: TS, metadata: {}, tags: ['chat:deleted', 'chat:edited', 'chat:mention', 'chat:addressed'], triggerInference: true, firstView: true, eventId: 'd2-e1',
       });
       await settle(f);
       assert.ok(held(find(f, '[deleted]')), 'premise: the line is held');
@@ -128,12 +128,12 @@ describe('what a held line got before, it still gets', () => {
     } finally { await f.close(); }
   });
 
-  it("an edit that the coalescer delivers as the agent's first view of its message, through the push lane, is acknowledged too", async () => {
+  it("an edit that the coalescer delivers as the agent's first view of its message, through the push lane, is acknowledged by its message's id", async () => {
     const f = await tunedOut();
     try {
       const push = (eventId: string, text: string, tags: string[], flags: Record<string, unknown>) => f.send('push/event', {
         ...f.params(eventId, text, { key: 'message:m5', ...flags }),
-        origin: { mcplChannelId: 'noisy', authorId: 'U1', authorName: 'antra' }, tags,
+        origin: { mcplChannelId: 'noisy', messageId: 'm5', authorId: 'U1', authorName: 'antra' }, tags,
       });
       await push('p1', 'agent, dinner?', ['chat:mention'], { initial: true });
       await settle(f);
@@ -143,7 +143,7 @@ describe('what a held line got before, it still gets', () => {
       assert.ok(held(row), 'premise: the edit is held');
       assert.equal(row.metadata?.firstView, true, "premise: the coalescer marked the edit as the agent's first view");
       assert.equal(wakesScheduled(f), 2, 'a wake for the message, and one for the edit');
-      assert.deepEqual(await ackedBefore(f), ['p1', 'p2'], "the message, then the edit that stands for it, each by its event's id, as the push lane names it");
+      assert.deepEqual(await ackedBefore(f), ['m5', 'm5'], "the message, then the edit that stands for it, each by its message's id");
     } finally { await f.close(); }
   });
 
@@ -154,6 +154,92 @@ describe('what a held line got before, it still gets', () => {
       await settle(f);
       assert.ok(held(find(f, 'reacted')), 'premise: the line is held');
       assert.equal(wakesScheduled(f), 1);
+      assert.deepEqual(await ackedBefore(f), []);
+    } finally { await f.close(); }
+  });
+});
+
+describe('an acknowledgement names a platform message, or none is sent', () => {
+  const push = (f: Fixture, params: Record<string, unknown>) => f.send('push/event', { featureSet: 'doc', timestamp: TS, ...params });
+
+  it("an addressed edit that discord-mcpl pushes, channel-scoped, is acknowledged by its message's id, though it isn't a first view", async () => {
+    const f = await tunedOut();
+    try {
+      await push(f, {
+        eventId: 'discord_edit_1234_t_1', coalesce: { key: 'message:1234', channelId: 'noisy' },
+        origin: { source: 'discord', mcplChannelId: 'noisy', messageId: '1234', authorId: 'U1', authorName: 'U1' },
+        tags: ['chat:edited', 'chat:mention', 'chat:addressed', 'chat:from-human'],
+        payload: { content: [{ type: 'text', text: '[message edited] U1: agent, forgot to tag you' }] },
+      });
+      await settle(f);
+      const row = find(f, 'forgot to tag you');
+      assert.ok(held(row), 'premise: the edit is held');
+      assert.notEqual(row.metadata?.firstView, true, "premise: the edit isn't a first view");
+      assert.deepEqual(await ackedBefore(f), ['1234']);
+    } finally { await f.close(); }
+  });
+
+  it("an addressed edit that comes as a coalesced channels/incoming message is acknowledged by its message's id, though it isn't a first view", async () => {
+    const f = await tunedOut();
+    try {
+      await f.send('channels/incoming', { messages: [{ ...f.channel('e9', 'agent, lunch at two?', {}, 'noisy', 'm9'), tags: ['chat:edited', 'chat:mention'] }] });
+      await settle(f);
+      const row = find(f, 'lunch at two');
+      assert.ok(held(row), 'premise: the edit is held');
+      assert.notEqual(row.metadata?.firstView, true, "premise: the edit isn't a first view");
+      assert.deepEqual(await ackedBefore(f), ['m9']);
+    } finally { await f.close(); }
+  });
+
+  it("a held message pushed with origin.messageId, as zulip_mcp pushes one, is acknowledged by that id and not the event's", async () => {
+    const f = await tunedOut();
+    try {
+      await push(f, {
+        eventId: 'zulip_msg_77', origin: { mcplChannelId: 'noisy', messageId: '77', authorId: 'U1', authorName: 'U1' },
+        tags: ['chat:mention'], payload: { content: [{ type: 'text', text: 'agent, standup moved?' }] },
+      });
+      await settle(f);
+      assert.ok(held(find(f, 'standup moved')), 'premise: the message is held');
+      assert.deepEqual(await ackedBefore(f), ['77']);
+    } finally { await f.close(); }
+  });
+
+  it('a held message pushed with no origin.messageId gets no channels/acknowledge', async () => {
+    const f = await tunedOut();
+    try {
+      await push(f, {
+        eventId: 'p9', origin: { mcplChannelId: 'noisy', authorId: 'U1', authorName: 'U1' },
+        tags: ['chat:mention'], payload: { content: [{ type: 'text', text: 'agent, build is red' }] },
+      });
+      await settle(f);
+      assert.ok(held(find(f, 'build is red')), 'premise: the message is held');
+      assert.deepEqual(await ackedBefore(f), []);
+    } finally { await f.close(); }
+  });
+
+  it("a coalesced push whose subject names no message is delivered by its event's id, and gets no channels/acknowledge", async () => {
+    const f = await tunedOut();
+    try {
+      await push(f, {
+        eventId: 'st1', coalesce: { key: 'status:U1', channelId: 'noisy' },
+        origin: { mcplChannelId: 'noisy', authorId: 'U1', authorName: 'U1' },
+        tags: ['chat:mention'], payload: { content: [{ type: 'text', text: 'agent, U1 is away' }] },
+      });
+      await settle(f);
+      assert.ok(held(find(f, 'is away')), 'premise: the push is held');
+      assert.deepEqual(await ackedBefore(f), []);
+    } finally { await f.close(); }
+  });
+
+  it("an addressed edit pushed with the edit line's own id, as zulip_mcp pushes one, gets no channels/acknowledge", async () => {
+    const f = await tunedOut();
+    try {
+      await push(f, {
+        eventId: 'zulip_edit_77_1', origin: { mcplChannelId: 'noisy', messageId: 'edit:77:b', targetMessageId: '77', authorId: 'U1', authorName: 'U1' },
+        tags: ['chat:edited', 'chat:mention'], payload: { content: [{ type: 'text', text: '[edited] agent, standup at ten' }] },
+      });
+      await settle(f);
+      assert.ok(held(find(f, 'standup at ten')), 'premise: the edit is held');
       assert.deepEqual(await ackedBefore(f), []);
     } finally { await f.close(); }
   });
