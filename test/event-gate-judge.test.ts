@@ -1830,6 +1830,18 @@ describe('a judge that keeps failing tells the agent one time', () => {
     gate.dispose();
   });
 
+  it('J15c: an agent that is gone is no longer told, so an agent of its name that comes later is told', async () => {
+    const judge = scriptedJudge();
+    const { gate, messages } = makeGate(writeConfig('j15c.json', JUDGED), { judge: judge.fn, agents: ['agent', 'scout'] });
+    await quietly(async () => {
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'ambient', undefined, { recipients: ['scout'] });
+      gate.agentGone('scout');
+      await failFor(gate, judge, 'ambient', undefined, { recipients: ['scout'] });
+    });
+    assert.deepStrictEqual(failingNotices(messages).map((m) => m.audience), [['scout'], ['scout']]);
+    gate.dispose();
+  });
+
   it('J15b: a batch whose events name no agent tells only the agents that have no open notice', async () => {
     const judge = scriptedJudge();
     const { gate, messages } = makeGate(writeConfig('j15b.json', TWO_RULES), { judge: judge.fn, agents: ['agent', 'scout'] });
@@ -1954,6 +1966,23 @@ describe('a judge that keeps failing tells the agent one time', () => {
       await failFor(gate, judge, 'ambient');
       assert.strictEqual(failingNotices(messages).length, 0, 'two failures under the new judge write no notice');
     });
+    gate.dispose();
+  });
+
+  it('J10f: the judge of a second rule that shares a name counts, and its failures are told', async () => {
+    const judge = scriptedJudge();
+    const config: GateConfig = {
+      policies: [
+        { name: 'ambient', match: { scope: ['mcpl:push-event'], channel: 'c1' }, behavior: { judge: { debounceMs: 100, instructions: 'Wake me for questions.' } } },
+        { name: 'ambient', match: { scope: ['mcpl:push-event'], channel: 'c2' }, behavior: { judge: { debounceMs: 100, instructions: 'Wake me for news.' } } },
+      ],
+    };
+    const { gate, messages } = makeGate(writeConfig('j10f.json', config), { judge: judge.fn });
+    await quietly(async () => {
+      for (let i = 0; i < 3; i++) await failFor(gate, judge, 'ambient', undefined, { channelId: 'c2' });
+    });
+    assert.strictEqual(judge.requests[0]!.instructions, 'Wake me for news.', 'premise: the second rule judged');
+    assert.deepStrictEqual(failingNotices(messages).map(ruleOf), ['ambient']);
     gate.dispose();
   });
 
@@ -2118,7 +2147,7 @@ describe('a judge that keeps failing tells the agent one time', () => {
     } finally {
       console.error = original;
     }
-    assert.strictEqual(logged.filter((line) => line.includes('the notice that its reply judge answers again could not be written')).length, 1, logged.join('\n'));
+    assert.strictEqual(logged.filter((line) => line.includes('the notice that its reply judge answers again may not have been written')).length, 1, logged.join('\n'));
     assert.strictEqual(answeringNotices(messages).length, 1);
     gate.dispose();
   });

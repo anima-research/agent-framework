@@ -4386,14 +4386,14 @@ export class EventGate {
   }
 
   /** The rule's judge as it is now, when the rule is still a judge rule; else the one the batch was asked with. */
-  private judgesAsAsked(policyName: string, asked: JudgeConfig): boolean {
-    const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
-    return typeof now === 'object' && 'judge' in now && JSON.stringify(now.judge) === JSON.stringify(asked);
-  }
-
   private currentJudge(policyName: string, asked: JudgeConfig): JudgeConfig {
     const now = this.config.policies.find((p) => p.name === policyName)?.behavior;
     return typeof now === 'object' && 'judge' in now ? now.judge : asked;
+  }
+
+  private judgesAsAsked(policyName: string, asked: JudgeConfig): boolean {
+    const judge = JSON.stringify(asked);
+    return this.config.policies.some((p) => p.name === policyName && typeof p.behavior === 'object' && 'judge' in p.behavior && JSON.stringify(p.behavior.judge) === judge);
   }
 
   /**
@@ -4475,8 +4475,9 @@ export class EventGate {
    * wake starts its turn (answeredWhenJudged). Wait:
    * nothing is delivered, and batches that fired meanwhile go to the judge
    * afresh. A judge that failed, timed out or answered nothing usable decides
-   * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced and
-   * counted for gate_status, and a failure is logged.
+   * by onError: "wake" delivers, "skip" doesn't. Each verdict is traced, and
+   * a failure is logged. A verdict is counted for gate_status only where the
+   * rule still has the judge that gave it.
    */
   private finishJudging(policyName: string, state: JudgingState, verdict: JudgeVerdict | undefined, err?: unknown): void {
     // A verdict for a batch the gate let go of (dispose() clears what the
@@ -4582,7 +4583,7 @@ export class EventGate {
       this.addMessageFn('user', [{ type: 'text', text }], { system: true, kind, policyName }, undefined, undefined, audience);
       return true;
     } catch (err) {
-      console.error(`[gate] Rule ${quotedValue(policyName)}: the notice that its reply judge ${kind === 'gate-judge-failing' ? 'keeps failing' : 'answers again'} could not be written; ${kind === 'gate-judge-failing' ? 'a later failure of the rule that reaches an agent' : "the judge's next answer for the rule"} tries again:`, err);
+      console.error(`[gate] Rule ${quotedValue(policyName)}: the notice that its reply judge ${kind === 'gate-judge-failing' ? 'keeps failing' : 'answers again'} may not have been written; ${kind === 'gate-judge-failing' ? 'a later failure of the rule that reaches an agent' : "the judge's next answer for the rule"} tries again:`, err);
       return false;
     }
   }
@@ -4833,6 +4834,11 @@ export class EventGate {
       this.selfWakeTimers.delete(agentName);
     }
     if (this.sleepAgent === agentName) this.clearSleep();
+    this.judgeNotices = this.judgeNotices.flatMap((n) => {
+      if (!n.agents.has(agentName)) return [n];
+      const agents = new Set([...n.agents].filter((name) => name !== agentName));
+      return agents.size > 0 ? [{ ...n, agents }] : [];
+    });
   }
 
   // =========================================================================
