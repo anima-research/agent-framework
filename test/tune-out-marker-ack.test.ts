@@ -175,6 +175,7 @@ describe('an acknowledgement names a platform message, or none is sent', () => {
       const row = find(f, 'forgot to tag you');
       assert.ok(held(row), 'premise: the edit is held');
       assert.notEqual(row.metadata?.firstView, true, "premise: the edit isn't a first view");
+      assert.equal(wakesScheduled(f), 1);
       assert.deepEqual(await ackedBefore(f), ['1234']);
     } finally { await f.close(); }
   });
@@ -187,6 +188,7 @@ describe('an acknowledgement names a platform message, or none is sent', () => {
       const row = find(f, 'lunch at two');
       assert.ok(held(row), 'premise: the edit is held');
       assert.notEqual(row.metadata?.firstView, true, "premise: the edit isn't a first view");
+      assert.equal(wakesScheduled(f), 1);
       assert.deepEqual(await ackedBefore(f), ['m9']);
     } finally { await f.close(); }
   });
@@ -200,6 +202,7 @@ describe('an acknowledgement names a platform message, or none is sent', () => {
       });
       await settle(f);
       assert.ok(held(find(f, 'standup moved')), 'premise: the message is held');
+      assert.equal(wakesScheduled(f), 1);
       assert.deepEqual(await ackedBefore(f), ['77']);
     } finally { await f.close(); }
   });
@@ -213,6 +216,7 @@ describe('an acknowledgement names a platform message, or none is sent', () => {
       });
       await settle(f);
       assert.ok(held(find(f, 'build is red')), 'premise: the message is held');
+      assert.equal(wakesScheduled(f), 1);
       assert.deepEqual(await ackedBefore(f), []);
     } finally { await f.close(); }
   });
@@ -227,6 +231,7 @@ describe('an acknowledgement names a platform message, or none is sent', () => {
       });
       await settle(f);
       assert.ok(held(find(f, 'is away')), 'premise: the push is held');
+      assert.equal(wakesScheduled(f), 1);
       assert.deepEqual(await ackedBefore(f), []);
     } finally { await f.close(); }
   });
@@ -240,6 +245,7 @@ describe('an acknowledgement names a platform message, or none is sent', () => {
       });
       await settle(f);
       assert.ok(held(find(f, 'standup at ten')), 'premise: the edit is held');
+      assert.equal(wakesScheduled(f), 1);
       assert.deepEqual(await ackedBefore(f), []);
     } finally { await f.close(); }
   });
