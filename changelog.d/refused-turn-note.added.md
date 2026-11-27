@@ -9,7 +9,11 @@
   agent's since, each further refused turn updates that row in place
   (`… The 2 turns after it ended the same way.`) rather than adding one.
   Once a call is answered, a round's or a turn's last, the note stays as
-  written, and the next refused turn starts a new one. The note starts no
-  inference: the agent reads it at its next turn.
+  written, and the next refused turn starts a new one. A turn that ended
+  another way in between (a failure, or a refusal of another category) ends
+  the run too, so the turns a note counts are the ones right after it. The
+  run is kept in memory: after a restart, or once the note has left the
+  agent's window (an undo takes it out), the next refused turn starts a new
+  note. The note starts no inference: the agent reads it at its next turn.
   `SUPPRESS_INFERENCE_FAILED_MARKER=1` leaves it out. A refusal of another
   category writes no note, as before.

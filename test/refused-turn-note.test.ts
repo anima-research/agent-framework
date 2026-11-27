@@ -1,6 +1,7 @@
 import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import type { ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { MembraneError } from '@animalabs/membrane';
 import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, ok, TS } from './helpers/coalescing-fixture.js';
 
@@ -14,6 +15,22 @@ const refused = (category = 'reasoning_extraction', content: ContentBlock[] = []
   raw: { request: {}, response: { stop_details: { category } } },
 }) as unknown as NormalizedResponse;
 const answer = (text: string) => createMockResponse([{ type: 'text', text }]);
+
+/** A call the provider fails with an error that isn't retried: its turn ends failed. */
+class FailedCall implements YieldingStream {
+  isWaitingForTools = false;
+  pendingToolCallIds: string[] = [];
+  toolDepth = 0;
+  isCancelled = false;
+  provideToolResults(): void {}
+  cancel(): void { this.isCancelled = true; }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield {
+      type: 'error',
+      error: new MembraneError({ type: 'invalid_request', retryable: false, httpStatus: 400, message: 'the provider could not process the request', rawError: { status: 400 } }),
+    } as StreamEvent;
+  }
+}
 
 type Internals = {
   logFailure(record: Record<string, unknown>): void;
@@ -34,15 +51,16 @@ async function rig(t: TestContext, opts: { agents?: unknown[]; tools?: unknown[]
   };
   f.framework.start();
   const fw = f.framework as unknown as Internals;
-  t.mock.method(fw, 'logFailure', () => {});
+  const failures: Array<Record<string, unknown>> = [];
+  t.mock.method(fw, 'logFailure', (record: Record<string, unknown>) => { failures.push(record); });
   await f.send('channels/register', { channels: [{ id: ROOM, type: 'discord', label: 'room', initiallyOpen: true }] });
   await eventually(() => fw.channelRegistry.getDesiredState('editor', ROOM) === 'open', 'room is open');
   let sent = 0;
   /** One addressed message, and the turn it wakes, answered by `responses` (one per call). */
-  const turn = async (...responses: NormalizedResponse[]) => {
+  const turn = async (...responses: Array<NormalizedResponse | 'failed'>) => {
     const before = f.membrane.calls.length;
     const messageId = `m-${++sent}`;
-    streams.push(() => new MockYieldingStream(responses));
+    streams.push(() => (responses[0] === 'failed' ? new FailedCall() : new MockYieldingStream(responses as NormalizedResponse[])));
     await f.send('channels/incoming', {
       messages: [{ channelId: ROOM, messageId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ADDRESSED, content: [{ type: 'text', text: `message ${messageId}` }] }],
     });
@@ -53,7 +71,7 @@ async function rig(t: TestContext, opts: { agents?: unknown[]; tools?: unknown[]
     .filter((m) => (m.metadata as { kind?: unknown } | undefined)?.kind === kind);
   const notes = () => rows('inference-refused')
     .map((m) => m.content.map((block) => (block.type === 'text' ? block.text : `<${block.type}>`)).join(''));
-  return { f, turn, rows, notes };
+  return { f, turn, rows, notes, failures };
 }
 
 describe('a turn the provider refused leaves the agent a note, one for a run of such turns', () => {
@@ -111,6 +129,34 @@ describe('a turn the provider refused leaves the agent a note, one for a run of 
     const r = await rig(t);
     await r.turn(refused('cyber'));
     assert.deepEqual(r.notes(), []);
+  });
+
+  it('a turn refused in another category between two told ones: it ends the run, so the second note counts from itself', async (t) => {
+    const r = await rig(t);
+    await r.turn(refused());
+    await r.turn(refused('cyber'));
+    await r.turn(refused());
+    assert.deepEqual(r.notes(), [NOTE, NOTE]);
+  });
+
+  it('a failed turn between two refused ones: it ends the run, so the second note counts from itself', async (t) => {
+    const r = await rig(t);
+    await r.turn(refused());
+    await r.turn('failed');
+    assert.ok(r.failures.some((record) => record.kind === 'inference-exhausted'), 'premise: the turn between failed');
+    await r.turn(refused());
+    assert.deepEqual(r.notes(), [NOTE, NOTE]);
+  });
+
+  it('a note an undo took out of the window: the next refused turn starts a new one there, and the old row is left as written', async (t) => {
+    const r = await rig(t);
+    await r.turn(refused());
+    r.f.framework.undoLastTurn('agent');
+    assert.ok(!r.f.window().includes(NOTE), 'premise: the undo took the note out of the window');
+    assert.deepEqual(r.notes(), [NOTE], 'premise: the record keeps the row');
+    await r.turn(refused());
+    assert.equal(r.f.window().split(NOTE).length - 1, 1, 'the window holds the new note');
+    assert.deepEqual(r.notes(), [NOTE, NOTE]);
   });
 
   it('a refused turn a rewind takes leaves the rewind\'s note only', async (t) => {

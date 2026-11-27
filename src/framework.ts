@@ -15541,8 +15541,12 @@ export class AgentFramework {
    * row to the context, where a note per turn would add a row for every
    * message the agent couldn't answer. Once a call is answered (a round's,
    * or a turn's last) the agent has read the note, so it stays as written
-   * and the next refused turn starts a new one. A note that has left the
-   * record is started anew too.
+   * and the next refused turn starts a new one. So does a turn that ended
+   * another way in between, a failure or a refusal that isn't told, so that
+   * the turns the note counts are the ones right after it. A note that has
+   * left the agent's window (removed from the record, or taken out of the
+   * window by an undo) is started anew too, and so is one from before a
+   * restart: the run is kept in memory.
    *
    * The note opens as a failed turn's does and names no category: it holds
    * the framework's words only, none of the provider's (see failureWords).
@@ -15555,7 +15559,7 @@ export class AgentFramework {
     if (process.env.SUPPRESS_INFERENCE_FAILED_MARKER === '1') return;
     const cm = agent.getContextManager();
     const run = this.refusedTurnsNote.get(agent.name);
-    const row = run && cm.getMessage(run.id) ? run : undefined;
+    const row = run && !this.rowLeftWindow(agent, run.id) ? run : undefined;
     const after = row?.turns ?? 0;
     const text =
       `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: the provider API refused its last call.` +
@@ -31052,6 +31056,8 @@ export class AgentFramework {
                 // reaction never reaches it: one note for a run of such
                 // turns (noteRefusedTurn).
                 if (category === 'reasoning_extraction') this.noteRefusedTurn(agent, category);
+                // A turn refused untold ends the run: the next note counts from itself.
+                else this.refusedTurnsNote.delete(agent.name);
               }
             } else {
               this.endRefusalEpisode(agent.name);
@@ -36812,6 +36818,10 @@ export class AgentFramework {
       excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
+    // A failed turn between two refused ones ends the run of refused turns
+    // (noteRefusedTurn). Optional, as forcedRewind is below: tests call this
+    // on a framework they assembled field by field.
+    this.refusedTurnsNote?.delete(agentName);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
     const agent = this.agents.get(agentName);
     if (agent) this.failedLastTurnAt.set(agent, Date.now());
