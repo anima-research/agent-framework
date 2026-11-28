@@ -711,9 +711,9 @@ export class ApiServer {
     // queues none of the compression its fold plan calls for, at a
     // hypothetical budget least of all (see Agent.compileWithInjections for
     // what a dry run still leaves). Under the autobiographical strategy, a
-    // budget the context can't fit still throws: a dry run skips only
-    // context-manager's post-pick check, and an adaptive fold plan that
-    // doesn't fit then overruns at the middle's emission. Windowed
+    // budget the context can't fit still throws: a dry run meets the plan
+    // check that a committing compile meets, and refuses an adaptive fold
+    // plan that doesn't fit, naming the plan's tokens and the budget. Windowed
     // passthrough's newest message alone is the one window that comes back
     // larger than the budget.
     const { messages } = await contextManager.compile(
