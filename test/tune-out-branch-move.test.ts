@@ -23,7 +23,7 @@ type Coordinator = {
 };
 type Registry = {
   getDesiredState(serverId: string, channelId: string): string | undefined;
-  getTuneOutState(serverId: string, channelId: string): { params: { epochId: string } } | null;
+  getTuneOutState(serverId: string, channelId: string): { params: { epochId: string; startedAtSequence: number } } | null;
   channels: Map<string, { open: boolean }>;
   handleChannelToolCall(tool: string, input: Record<string, unknown>): Promise<{ success: boolean; error?: string }>;
   enterTuneOut(serverId: string, channelId: string, params: TuneOutParams, source: string): void;
@@ -95,8 +95,12 @@ async function arriveDuringMove<T>(f: Fixture, channelId: string, t: string, mov
     sent = send(f, lane, channelId, t);
     const deadline = Date.now() + REPLY_DEADLINE_MS;
     while (keptOf() === undefined) {
-      assert.ok(Date.now() < deadline, 'premise: kept in memory as it arrived during the move');
-      await fw.processNextEvent();
+      const left = deadline - Date.now();
+      assert.ok(left > 0, 'premise: kept in memory as it arrived during the move');
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([fw.processNextEvent(), new Promise<void>((resolve) => { timer = setTimeout(resolve, left); })]);
+      } finally { clearTimeout(timer); }
     }
     keptMark = keptOf()!.metadata?.tuneOut?.epochId;
     onKept?.();
@@ -147,7 +151,7 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
     } finally { await f.close(); }
   });
 
-  it('control: switching back to the branch that holds the tune-out holds it again: the same epoch, its next message held, and its timers armed', async () => {
+  it('switching back to the branch that holds the tune-out holds it again: the same epoch, its next message held, and its timers armed', async () => {
     const f = await withSub();
     try {
       await registerOpen(f, 'work', 'noisy');
@@ -157,6 +161,8 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
       write(f, 'after the tune-out');
       const { sourceBranch } = await moves(f).rollbackToMessage('agent', { messageId: before });
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'premise: the rollback ended it');
+      assert.ok(!coordinatorOf(f).cadenceTimers.has(key('noisy')), 'premise: and stopped its timers');
 
       await moves(f).switchBranch(sourceBranch);
 
@@ -443,7 +449,7 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
     } finally { await f.close(); }
   });
 
-  it("a channel known only from a push gets nothing at a move: no decision, and nothing asked of the server", async () => {
+  it("a channel known only from a push gets its label at a move and nothing else: no decision, and nothing asked of the server", async () => {
     const f = await withSub();
     try {
       await registerOpen(f, 'work');
@@ -459,6 +465,7 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
 
       await moves(f).rollbackToMessage('agent', { messageId: before });
 
+      assert.equal(registry.labelHistory.get('dm-1'), 'Dee', 'its label sighting');
       assert.equal(registry.getDesiredState('editor', 'dm-1'), undefined);
       assert.deepEqual(applied, []);
     } finally { await f.close(); }
@@ -649,7 +656,7 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       assert.equal(registry.getDesiredState('editor', 'noisy'), 'tuned-out', 'premise: the channels kept what they had');
       const left = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
       const anchor = (internals(f) as unknown as { subconsciousAnchor: { pending: Array<{ start: { sequence: number; epochIds: string[] } }> } }).subconsciousAnchor;
-      const start = { sequence: Number.MAX_SAFE_INTEGER, epochIds: [left] };
+      const start = { sequence: registry.getTuneOutState('editor', 'noisy')!.params.startedAtSequence, epochIds: [left] };
       anchor.pending.push({ start, inForce: [start] } as (typeof anchor.pending)[number]);
 
       await moves(f).switchBranch(branchNow(f));
@@ -679,11 +686,13 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       assert.ok(coordinator.cadenceTimers.has(key('noisy')), 'premise: the hold has its cadence');
       const fw = f.framework as unknown as { reinitializeManagers(...a: unknown[]): Promise<unknown> };
       const reinit = fw.reinitializeManagers.bind(fw);
-      fw.reinitializeManagers = (...a: unknown[]) => { coordinator.stopTimers(); return reinit(...a); };
+      let stopped = false;
+      fw.reinitializeManagers = (...a: unknown[]) => { coordinator.stopTimers(); stopped = true; return reinit(...a); };
       try {
         await moves(f).rollbackToMessage('agent', { messageId: point });
       } finally { fw.reinitializeManagers = reinit; }
 
+      assert.ok(stopped, "premise: the stop began while the move waited for the agents' contexts");
       assert.ok(registryOf(f).getTuneOutState('editor', 'noisy') !== null, 'premise: the branch moved to holds it');
       assert.deepEqual([coordinator.cadenceTimers.size, coordinator.expiryTimers.size, coordinator.pendingWakes.size], [0, 0, 0]);
     } finally { await f.close(); }
@@ -706,7 +715,29 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       } finally { coordinator.getAllExcept = scope; }
 
       const said = error.mock.calls.map((c) => String(c.arguments[0]));
-      assert.ok(said.some((s) => s.includes('1 message held as it arrived during the move keeps')), 'told');
+      assert.ok(said.some((s) => s.includes('1 message held as it arrived keeps')), 'told');
+    } finally { error.mock.restore(); await f.close(); }
+  });
+
+  it("an all-except record that the held messages' re-marking can't use is told, and the agents still follow the move", async () => {
+    const f = await withSub();
+    const error = mock.method(console, 'error', () => {});
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const before = write(f, 'before the tune-out');
+      enter(f, 'noisy');
+      write(f, 'after the tune-out');
+      const coordinator = coordinatorOf(f);
+      const scope = coordinator.getAllExcept.bind(coordinator);
+      try {
+        await arriveDuringMove(f, 'noisy', 'arrived during the move', () => moves(f).rollbackToMessage('agent', { messageId: before }), () => {
+          coordinator.getAllExcept = () => ({ params: { epochId: 'e-malformed' } });
+        });
+      } finally { coordinator.getAllExcept = scope; }
+
+      const said = error.mock.calls.map((c) => String(c.arguments[0]));
+      assert.ok(said.some((s) => s.includes('1 message held as it arrived keeps')), 'told');
+      assert.ok(!said.some((s) => s.includes('following a branch move failed')), 'and the move went on past it');
     } finally { error.mock.restore(); await f.close(); }
   });
 

@@ -153,6 +153,8 @@ function world(opts: { subconscious?: boolean; branches?: boolean } = {}) {
     dropStored(): void { stored.splice(0); },
     /** Rows a move back to their branch shows again, at their own sequences. */
     putBack(...rows: StoredMessage[]): void { stored.push(...rows); },
+    /** The next stored row's sequence, as a branch's own sequences go on from its branch point. */
+    sequenceFrom(next: number): void { nextSeq = next; },
     /** The hold's release: what it kept is stored, in arrival order. */
     releaseHold(): void {
       for (const write of kept.splice(0)) {
@@ -281,22 +283,20 @@ describe('reader forks and the messages a tune-out holds', () => {
     w.tuneOut();
     w.coordinator.resumeActiveEpochs();
     errors.mock.resetCalls();
-    const first = w.store('ann', 'S-1');
-    w.wake();
-    assert.deepEqual(bodies(w.invocations[0]!), ['S-1'], 'premise: handed on main');
-    const second = w.store('bo', 'S-2');
+    const rows = [w.store('ann', 'S-1'), w.store('bo', 'S-2'), w.store('cy', 'S-3')];
     w.moveTo('other', { parent: 'main', branchPoint: 0 }, true);
     w.dropStored();
-    w.store('cy', 'O-1');
-    w.store('di', 'O-2');
+    w.sequenceFrom(1);
+    w.store('di', 'O-1');
+    w.store('ed', 'O-2');
     w.wake();
-    assert.deepEqual(bodies(w.invocations[1]!), ['O-1', 'O-2'], 'premise: handed on the other branch');
-    w.moveTo('child', { parent: 'main', branchPoint: 4 });
+    assert.deepEqual(bodies(w.invocations[0]!), ['O-1', 'O-2'], 'premise: handed on the other branch, at its own sequences 1 and 2');
+    w.moveTo('child', { parent: 'main', branchPoint: 3 });
     w.dropStored();
-    w.putBack(first, second);
+    w.putBack(...rows);
     w.followed();
     w.wake();
-    assert.ok(bodies(w.invocations[2]!).includes('S-2'), "main's row that no fork was handed is handed");
+    assert.deepEqual(bodies(w.invocations[1]!), ['S-1', 'S-2', 'S-3'], "main's rows, which no fork was handed, are handed");
     assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
     w.coordinator.stop();
   });
