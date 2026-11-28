@@ -1893,12 +1893,19 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
     const typing: string[] = [];
+    const order: string[] = [];
     registry.startTyping = (channel: { channelId: string }) => { typing.push(`start ${channel.channelId}`); };
-    registry.stopTyping = (channel?: { channelId: string }) => { typing.push(`stop ${channel?.channelId ?? '(all)'}`); };
+    registry.stopTyping = (channel?: { channelId: string }) => {
+      typing.push(`stop ${channel?.channelId ?? '(all)'}`);
+      order.push('stop');
+    };
     const traced = new Set<string | undefined>();
     framework.onTrace((event) => {
       const e = event as { type: string; blockType?: string; channelId?: string };
-      if ((e.type === 'inference:tokens' || e.type === 'inference:content_block') && e.blockType === 'text') traced.add(e.channelId);
+      if ((e.type === 'inference:tokens' || e.type === 'inference:content_block') && e.blockType === 'text') {
+        traced.add(e.channelId);
+        order.push('round 2 traced');
+      }
     });
     const internals = framework as unknown as {
       pendingRequests: InferenceRequest[];
@@ -1915,8 +1922,9 @@ describe('explicit prose routing', () => {
       assert.equal(module.calls.length, 1, 'control: round 1 ran its tool');
       assert.deepEqual(routed, [{ text: 'done', locus: 'chan-alpha' }], 'control: round 2 ran and was delivered');
       assert.ok(typing.includes('start chan-alpha'), `typing showed on the trigger channel: ${JSON.stringify(typing)}`);
-      assert.equal(typing.includes('stop chan-alpha'), false, `and stayed there until the turn ended: ${JSON.stringify(typing)}`);
-      assert.ok(typing.includes('stop (all)'), 'control: the turn\'s end stopped it');
+      assert.deepEqual(typing.filter((x) => x.startsWith('stop ')), ['stop chan-alpha'], `one stop, of its own channel: ${JSON.stringify(typing)}`);
+      assert.equal(typing.at(-1), 'stop chan-alpha', `at the turn's end: ${JSON.stringify(typing)}`);
+      assert.ok(order.indexOf('stop') > order.lastIndexOf('round 2 traced'), `after round 2 is traced: ${JSON.stringify(order)}`);
       assert.deepEqual([...traced], ['chan-alpha'], 'round 2 is traced in the trigger channel');
     } finally {
       await framework.stop();

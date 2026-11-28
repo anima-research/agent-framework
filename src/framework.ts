@@ -1623,9 +1623,9 @@ interface TurnRouting {
   /**
    * The channel the turn's typing indicator was last shown in, by any of its
    * streams (showTurnTyping). A stream that hands the turn to a successor (a
-   * budget restart, a guard retry) leaves its indicator running, so a later
-   * start, or a move, that shows it elsewhere stops this one first, as after
-   * a re-pin.
+   * budget restart, a guard retry, an error policy's retry) leaves its
+   * indicator running, so a later start, or a move, that shows it elsewhere
+   * stops this one first, as after a re-pin.
    */
   typing?: ChannelRef;
   /**
@@ -4833,7 +4833,8 @@ export class AgentFramework {
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
-   * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
+   * outgoing close even after runEphemeralToCompletion deregisters them. The
+   * disposal stops their typing itself. */
   private disposedEphemeralFrames: WeakSet<Agent> = new WeakSet();
   /** Per-agent count of consecutive exhausted inferences, reset when a turn
    *  completes (inference:completed), not when a call answers mid-turn.
@@ -13696,6 +13697,7 @@ export class AgentFramework {
     this.logicalTurnToolCalls.delete(agent);
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== name);
     this.releaseWindowNowOrAfterResume(agent);
+    this.endRemovedTurnTyping(this.openLogical.get(name));
     this.turnRouting.delete(name);
     this.proseSpeechChains.delete(name);
     this.openLogical.delete(name);
@@ -14599,7 +14601,7 @@ export class AgentFramework {
         }
       }
       // Mark before cancellation: an adapter may synchronously settle its
-      // iterator, and this physical frame still owns terminal typing/outgoing
+      // iterator, and this physical frame still owns terminal outgoing
       // closure even though the ephemeral name is about to be deregistered.
       this.disposedEphemeralFrames.add(agent);
       // Cancel before deregistration. Adapters may still yield a queued event;
@@ -14628,6 +14630,7 @@ export class AgentFramework {
         // the same (disposeConversationAgent).
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
+        this.endRemovedTurnTyping(this.openLogical.get(agent.name));
         this.turnRouting.delete(agent.name);
         this.proseSpeechChains.delete(agent.name);
         this.openLogical.delete(agent.name);
@@ -26512,6 +26515,36 @@ export class AgentFramework {
     routing.typing = channel;
   }
 
+  /**
+   * A turn stops the typing that it shows itself, and none that a newer
+   * stream under its agent's name shows at the same address: an error
+   * policy's retry, which continues the turn's routing, or an agent that took
+   * the name, whose routing is its own. `frame` is the stopping frame's agent,
+   * with its stream's id at a stream's teardown.
+   */
+  private stopTurnTyping(routing: TurnRouting | undefined, frame?: { agent: Agent; streamId?: number }): void {
+    const typing = routing?.typing;
+    if (typing === undefined) return;
+    if (frame) {
+      const latest = this.turnRouting?.get(frame.agent.name);
+      const newer = this.agents?.get(frame.agent.name) !== frame.agent ? (latest !== routing ? latest : undefined)
+        : frame.streamId !== undefined && frame.agent.streamId !== frame.streamId ? latest : undefined;
+      if (newer?.typing !== undefined && sameChannel(newer.typing, typing)) return;
+    }
+    this.channelRegistry?.stopTyping(typing);
+  }
+
+  /**
+   * A removal's stop of its agent's open turn: the turn ends with its agent,
+   * so its record of where it types goes too, and the agent's late frame has
+   * nothing left to stop there. No newer stream can hold the name while a
+   * removal runs, so it stops without the check.
+   */
+  private endRemovedTurnTyping(routing: TurnRouting | undefined): void {
+    this.stopTurnTyping(routing);
+    if (routing) delete routing.typing;
+  }
+
   private heardSince(agent: Agent, routing: TurnRouting, read: number): boolean {
     const cm = agent.getContextManager();
     for (const [messageId, heardAt] of routing.heard ?? []) {
@@ -28303,9 +28336,10 @@ export class AgentFramework {
       // waiting out its watchdog. A silent start has no part in an open turn.
       if (!trigger?.suppressProse) {
         const err = error instanceof Error ? error : new Error(String(error));
+        if (this.agents?.get(agent.name) === agent) this.stopTurnTyping(this.openLogical?.get(agent.name), { agent });
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: failureWords(err), cause: err,
-        }, this.openLogical.get(agent.name));
+        }, this.openLogical?.get(agent.name));
       }
       this.endStatedWaitRun(agent.name);
       // The agent's window at the event gate ends here too, while this start
@@ -28421,7 +28455,8 @@ export class AgentFramework {
       const owner = this.activeTurnTokens.get(agentName);
       this.abortDroppedTurn(agentName, owner ?? -1,
         drop.kind === 'dropped' ? (drop.reason ?? CONTINUATION_DROPPED) : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt);
-      this.channelRegistry?.stopTyping();
+      const routing = this.openLogical?.get(agentName) ?? this.turnRouting?.get(agentName);
+      this.stopTurnTyping(routing, agent ? { agent } : undefined);
       if (agent) {
         agent.toolResultGuard.recovering = false;
         if (agent.toolResultGuard.hasPending) {
@@ -28432,7 +28467,6 @@ export class AgentFramework {
           }
         }
       }
-      const routing = this.openLogical.get(agentName) ?? this.turnRouting.get(agentName);
       if (routing) this.endDroppedTurn(agentName, routing);
       this.eventGate?.onInferenceEnded(agentName);
       // A registered ephemeral run's caller waits on the run's settle, which
@@ -28627,7 +28661,7 @@ export class AgentFramework {
     if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
     const sentNothing = opensTurn && !routing.roundsRan && !routing.unflushedRounds;
     console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${sentNothing ? 'sent anything' : 'finished'}; it ends there`);
-    this.channelRegistry?.stopTyping();
+    this.stopTurnTyping(routing, { agent });
     // A start that continues a turn (a budget or guard restart) follows a
     // frame that kept the turn's tool-result batch, and the guard's recovery,
     // for its successor. The terminals below let a pending batch go; a
@@ -29182,7 +29216,7 @@ export class AgentFramework {
         const reason = `a turn assembled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
-        this.channelRegistry?.stopTyping();
+        this.stopTurnTyping(routing, { agent });
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
         return false;
@@ -29270,7 +29304,7 @@ export class AgentFramework {
         // a second time.
         agent.reset();
         this.endDroppedTurn(agent.name, routing);
-        this.channelRegistry?.stopTyping();
+        this.stopTurnTyping(routing, { agent });
         this.eventGate?.onInferenceEnded(agent.name);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt);
         return false;
@@ -29316,7 +29350,7 @@ export class AgentFramework {
               : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
                 : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
           this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing);
-          this.channelRegistry?.stopTyping();
+          this.stopTurnTyping(routing, { agent });
           this.eventGate?.onInferenceEnded(agent.name);
           return false;
         }
@@ -29373,7 +29407,7 @@ export class AgentFramework {
       // The early typing indicator has no driveStream `finally` on this path —
       // a hook/compile/stream-setup failure must not leave "typing…" stuck.
       // (Retries below restart it; stopTyping is idempotent.)
-      this.channelRegistry?.stopTyping();
+      this.stopTurnTyping(routing, { agent });
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
@@ -32128,7 +32162,7 @@ export class AgentFramework {
         this.agents.get(agent.name) === agent && agent.streamId === myStreamId;
       // Ephemeral completion resolves its caller before this finally runs, so
       // runEphemeralToCompletion may already have deregistered the name. The
-      // terminal frame still owns its typing/outgoing completion unless it was
+      // terminal frame still owns its outgoing completion unless it was
       // genuinely superseded or handed EventGate liveness to a budget restart.
       const disposedEphemeralWithoutSuccessor =
         generationLost &&
@@ -32187,9 +32221,11 @@ export class AgentFramework {
       }
       if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
 
-      // Stop the typing indicator on every exit path (complete, error,
-      // exhausted, abort) so it never sticks after the turn ends.
-      if (frameReachedTerminal) this.channelRegistry?.stopTyping();
+      // Stop the turn's own typing indicator on every exit path (complete,
+      // error, exhausted, abort) so it never sticks after the turn ends,
+      // unless this frame handed the turn to a successor. The helper leaves
+      // the indicator to a newer stream under the name at the same address.
+      if (!preserveEventGateForSuccessor) this.stopTurnTyping(streamRouting, { agent, streamId: myStreamId });
 
       // A round of this stream still waiting for its code_execution calls
       // can't be routed now: whether its scripts would have silenced it is
