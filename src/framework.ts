@@ -3230,6 +3230,7 @@ type BudgetHoldOutcome = 'released' | 'stopped' | 'removed';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
 }
+/** `reason` is failureWords' text, which the resident's own failure note shows: never a provider's or an SDK's words. */
 function deadlineRetryLine(agentName: string, ranMs: number, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
   const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
   const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
@@ -31318,7 +31319,7 @@ export class AgentFramework {
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
             if (action.retry) {
-              if (cuts !== undefined) console.error(deadlineRetryLine(agent.name, durationMs, err.message, action, policyAttempt + 2));
+              if (cuts !== undefined) console.error(deadlineRetryLine(agent.name, durationMs, failureWords(err), action, policyAttempt + 2));
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
               // does. Until then, that check is ahead, in a window of its own
