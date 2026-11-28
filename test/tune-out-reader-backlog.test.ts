@@ -275,6 +275,32 @@ describe('reader forks and the messages a tune-out holds', () => {
     w.coordinator.stop();
   });
 
+  it("after a move whose channel decisions couldn't be read, a later move to a branch made from the holds' branch past its hand-offs hands that branch's rows, whatever a fork was handed meanwhile (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    const first = w.store('ann', 'S-1');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[0]!), ['S-1'], 'premise: handed on main');
+    const second = w.store('bo', 'S-2');
+    w.moveTo('other', { parent: 'main', branchPoint: 0 }, true);
+    w.dropStored();
+    w.store('cy', 'O-1');
+    w.store('di', 'O-2');
+    w.wake();
+    assert.deepEqual(bodies(w.invocations[1]!), ['O-1', 'O-2'], 'premise: handed on the other branch');
+    w.moveTo('child', { parent: 'main', branchPoint: 4 });
+    w.dropStored();
+    w.putBack(first, second);
+    w.followed();
+    w.wake();
+    assert.ok(bodies(w.invocations[2]!).includes('S-2'), "main's row that no fork was handed is handed");
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
   it("after a branch move, a hold whose held messages there are all kept in memory is counted from them, though none is stored and no count carried over (AF #619)", (t) => {
     const errors = t.mock.method(console, 'error', () => {});
     const w = world({ branches: true });

@@ -647,12 +647,24 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
         await moves(f).rollbackToMessage('agent', { messageId: before });
       } finally { registry.store.getStateJson = read; }
       assert.equal(registry.getDesiredState('editor', 'noisy'), 'tuned-out', 'premise: the channels kept what they had');
+      const left = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
+      const anchor = (internals(f) as unknown as { subconsciousAnchor: { pending: Array<{ start: { sequence: number; epochIds: string[] } }> } }).subconsciousAnchor;
+      const start = { sequence: Number.MAX_SAFE_INTEGER, epochIds: [left] };
+      anchor.pending.push({ start, inForce: [start] } as (typeof anchor.pending)[number]);
 
       await moves(f).switchBranch(branchNow(f));
 
       assert.equal(registry.getDesiredState('editor', 'noisy'), 'open', "the branch's own decision");
       assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'no hold there');
       assert.equal(coordinator.cadenceTimers.has(key('noisy')), false, "the branch left's hold stops");
+      assert.ok(!anchor.pending.some((p) => p.start.epochIds.includes(left)), "and so does a window start that waited to be fixed for it");
+
+      const reads: string[] = [];
+      registry.store.getStateJson = (id: string) => { reads.push(id); return read(id); };
+      try {
+        await moves(f).switchBranch(branchNow(f));
+      } finally { registry.store.getStateJson = read; }
+      assert.ok(!reads.includes('mcpl/channel-lifecycle'), 'once read, a later switch to the same branch reads the channel logs no more');
     } finally { error.mock.restore(); await f.close(); }
   });
 
