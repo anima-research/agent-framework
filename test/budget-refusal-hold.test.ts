@@ -2714,6 +2714,45 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  it("a merged start routed to its second member's channel, carrying a wait that no member carries, puts the folded request back in its own place, though it shares its first member's identity", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered other'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        const probe = { agentName: 'zz-nobody', reason: 'zz-probe', source: 'test', timestamp: Date.now() };
+        t.internal.pendingRequests.push(probe);
+        await t.internal.processInferenceRequests();
+        const ID = symbolNamed(probe, 'request-id');
+        const MERGED = await mergedBatchMark(t);
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const held = t.internal.budgetHolds.get('prime')!.turn as object;
+        const WAIT = symbolNamed(held, 'budget-wait');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
+        const at = Date.now();
+        const first = { agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: at, [ID]: 1e9 };
+        const second = { agentName: 'prime', reason: 'zz-read', source: 'test', timestamp: at, readsRow: 'zz-a-row-that-is-gone', channelId: 'zz-channel', channelServerId: 'zz', [ID]: 1e9 + 1 };
+        t.internal.pendingRequests.push({
+          ...first,
+          channelId: second.channelId,
+          channelServerId: second.channelServerId,
+          [WAIT]: (held as Record<symbol, unknown>)[WAIT],
+          [MERGED]: [first, second],
+        } as unknown as (typeof t.internal.pendingRequests)[number]);
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        await t.internal.processInferenceRequests();
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'the start carrying the wait was dropped, its row gone');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered other')), 'its first member runs as its own turn');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it("a progress snapshot that can't be serialized reads as none, and the wait still holds", async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2, snapshotBigInt: true }, async () => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });

@@ -1401,6 +1401,19 @@ function sameKeptWrites(a: InferenceRequest | undefined, b: InferenceRequest | u
   return x === y || (x !== undefined && y !== undefined && x.length === y.length && x.every((p, i) => p === y[i]));
 }
 
+/** Whether two requests have the same coalescing marks: a batch wake's
+ *  subject, a batch-only merge's subjects (it has no single subject), the
+ *  rows a wake reads, and the writes kept in memory that it is for. A wake
+ *  with any of them can be withdrawn or dropped on its own, and must not
+ *  stand for one without. (coalescingBatch is set only beside one of the
+ *  first two.) */
+function sameCoalescingMarks(a: InferenceRequest, b: InferenceRequest): boolean {
+  const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
+  return a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
+    a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
+    sameKeptWrites(a, b);
+}
+
 function isRearmed(request: InferenceRequest | undefined): boolean {
   return request !== undefined && (request as MarkedRequest)[REARMED] === true;
 }
@@ -7534,36 +7547,35 @@ export class AgentFramework {
     }
     return { delayMs: ownMs, ownMs, stated: false };
   }
-  /** Whether two requests are one wake, for a provider hold's dedup: the
+  /** Whether two requests are one wake by their fields: the
    *  same agent, reason, source, time and channel, on the same server (two
-   *  servers' channels can share an id), and the same coalescing
-   *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
-   *  single subject), and the rows a wake reads. A wake with any of them
-   *  can be withdrawn or dropped on its own, and must not stand for one
-   *  without. (coalescingBatch is set only beside one of the first two.)
-   *  It also compares `marker`. A marker's wake ranks below a message's
-   *  when a turn's channel is picked, so one can't stand for the other.
-   *  Requests that a scheduler pass has taken carry their wake's identity
-   *  (REQUEST_ID), which every copy of a wake keeps, its merged start and
-   *  its retry included. Two of them are one when their identity is, and
-   *  their coalescing marks match. */
+   *  servers' channels can share an id), and the same coalescing marks
+   *  (sameCoalescingMarks). It also compares `marker`. A marker's wake
+   *  ranks below a message's when a turn's channel is picked, so one can't
+   *  stand for the other. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
-    const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
-    const sameMarks = a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
-      sameKeptWrites(a, b);
-    const ida = (a as MarkedRequest)[REQUEST_ID];
-    const idb = (b as MarkedRequest)[REQUEST_ID];
-    if (ida !== undefined && idb !== undefined) return ida === idb && sameMarks;
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
-      a.marker === b.marker && sameMarks;
+      a.marker === b.marker && sameCoalescingMarks(a, b);
+  }
+  /** Whether a hold already holds `b` as `a`, for a provider hold's dedup.
+   *  Requests that a scheduler pass has taken carry their wake's identity
+   *  (REQUEST_ID), which every copy of a wake keeps, its merged start and
+   *  its retry included, whatever fields the merge rewrote. Two of them are
+   *  one when their identity is, and their coalescing marks match. Two
+   *  different wakes of one moment stay two. Others are one by
+   *  sameInferenceRequest. */
+  private heldAs(a: InferenceRequest, b: InferenceRequest): boolean {
+    const ida = (a as MarkedRequest)[REQUEST_ID];
+    const idb = (b as MarkedRequest)[REQUEST_ID];
+    if (ida !== undefined && idb !== undefined) return ida === idb && sameCoalescingMarks(a, b);
+    return this.sameInferenceRequest(a, b);
   }
   /** Keep `request` among a hold's `held` requests, once by
-   *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
+   *  heldAs. A held turn's retry (TURN_RETRY) whose equal is
    *  already held marks that one, so the hold still keeps the turn alive. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
-    const same = held.find((r) => this.sameInferenceRequest(r, request));
+    const same = held.find((r) => this.heldAs(r, request));
     if (!same) {
       held.push(request);
       return;
