@@ -899,7 +899,8 @@ describe('a stop before the turn has a stream', () => {
       await waitFor('the turn to end', () => traces.some((t) => t.type === 'inference:aborted' || t.type === 'inference:exhausted'));
       if (stopping) await within('stop() to finish', stopping);
       const why = how === 'stopping' ? 'the framework was stopping' : 'the agent was replaced or removed';
-      assert.ok(traces.some((t) => t.type === 'inference:failed'), "the compile's failure was reported");
+      if (how === 'stopping') assert.ok(traces.some((t) => t.type === 'inference:failed'), "the compile's failure was reported");
+      else assert.ok(!traces.some((t) => t.type === 'inference:failed'), "a replaced agent's failure isn't reported: the drop's reason says why the turn ended");
       assert.equal(compiles, 1, 'no retry compiled');
       assert.equal(requests.length, 0, 'nothing was sent');
       assert.deepEqual(abortReasons(traces), [`a turn whose request couldn't be built while ${why} is dropped before it sends anything`], 'the turn was dropped');

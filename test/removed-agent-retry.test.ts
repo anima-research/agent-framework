@@ -11,6 +11,13 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/
 
 const GONE = 'a retry waiting while the agent was replaced or removed is dropped before it sends anything';
 const STOPPING = 'a retry waiting while the framework was stopping is dropped before it sends anything';
+const REMOVED = "the agent was removed in its wait to retry; the retry wasn't sent";
+/** The removal's [turn] lines on stderr from here on, for one name. */
+function removalLines(t: TestContext): (name: string) => string[] {
+  const lines: string[] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+  return (name) => lines.filter((line) => line.startsWith(`[turn] ${name}: ${REMOVED}`));
+}
 
 type Internals = {
   agents: Map<string, unknown>;
@@ -167,7 +174,8 @@ class ResumeMembrane extends CountingMembrane {
 }
 
 describe("driveStream's wait to retry, when the agent goes before it ends", () => {
-  it('an ephemeral run that ends during the wait retries nothing, and the turn ends with one inference:aborted that says why', async (t) => {
+  it('an ephemeral run that ends during the wait retries nothing, and the turn ends with one inference:aborted that says why, and one line on stderr', async (t) => {
+    const removed = removalLines(t);
     const h = await boot(t, 800, ['resident']);
     const worker = await h.fw.createEphemeralAgent({ name: 'worker', model: 'zz-model', systemPrompt: 'Do it.' });
     worker.contextManager.addMessage('user', [{ type: 'text', text: 'Do the task.' }]);
@@ -180,9 +188,11 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     await until("the turn's end", () => reasons(of(h.traces, 'worker', from)).length > 0);
     nothingRanFor(h, 'worker', from);
     assert.deepEqual(reasons(of(h.traces, 'worker', from)), [GONE]);
+    assert.equal(removed('worker').length, 1, 'one [turn] line says that the retry was not sent');
   });
 
-  it('stopAgent during the wait: no retry, and one inference:aborted that says why', async (t) => {
+  it('stopAgent during the wait: no retry, one inference:aborted that says why, and one line on stderr', async (t) => {
+    const removed = removalLines(t);
     const h = await boot(t, 500);
     wake(h.fw, 'helper');
     await until('the wait to retry', () => of(h.traces, 'helper').some((e) => e.type === 'inference:waiting'));
@@ -192,9 +202,11 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     await until("the turn's end", () => reasons(of(h.traces, 'helper', from)).length > 0);
     nothingRanFor(h, 'helper', from);
     assert.deepEqual(reasons(of(h.traces, 'helper', from)), [GONE]);
+    assert.deepEqual(removed('helper'), [`[turn] helper: ${REMOVED}`]);
   });
 
-  it('a job resumed under its name during the wait, in its turn: no retry, and no inference:aborted under the name', async (t) => {
+  it('a job resumed under its name during the wait, in its turn: no retry, and no inference:aborted or removal line under the name', async (t) => {
+    const removed = removalLines(t);
     const h = await boot(t, 1500, ['resident']);
     const config = { model: 'zz-model', systemPrompt: 'Do it.' };
     const worker = await h.fw.createEphemeralAgent({ name: 'worker', ...config });
@@ -214,6 +226,7 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     const from = h.traces.length;
     await oldWaitEnded(h);
     assert.deepEqual(reasons(of(h.traces, 'worker', from)), [], 'no inference:aborted under the name the resumed job holds');
+    assert.deepEqual(removed('worker'), [], 'no removal line under the name the resumed job holds');
     assert.equal(h.membrane.sent.filter((n) => n === 'worker').length, 2, "no request from the old turn's retry");
     assert.equal(h.i.activeTurnTokens.get('worker'), token, "the resumed turn's token is untouched");
     assert.equal(h.i.consecutiveInferenceFailures.get('worker'), failures, "the resumed job's failure count is untouched");
@@ -286,7 +299,8 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     assert.equal(h.membrane.sent.filter((n) => n === 'worker').length, 2, "no request from the old turn's retry");
   });
 
-  it('stop() during the wait, after the agent went, ends the turn as a stop: the reason is the stopping one', async (t) => {
+  it('stop() during the wait, after the agent went, ends the turn as a stop: the reason is the stopping one, and no removal line', async (t) => {
+    const removed = removalLines(t);
     const h = await boot(t, 60_000);
     wake(h.fw, 'helper');
     await until('the wait to retry', () => of(h.traces, 'helper').some((e) => e.type === 'inference:waiting'));
@@ -294,6 +308,7 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     h.fw.stopAgent('helper', { reason: 'zz-released' });
     await h.fw.stop();
     assert.deepEqual(reasons(of(h.traces, 'helper', from)), [STOPPING]);
+    assert.deepEqual(removed('helper'), []);
     assert.equal(h.membrane.sent.filter((sent) => sent === 'helper').length, 1, 'no retry');
   });
 
@@ -311,7 +326,8 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     assert.equal(h.membrane.sent.filter((sent) => sent === 'helper').length, 1, 'no retry');
   });
 
-  it("a conversation fork disposed during the wait: no retry, and one inference:aborted that says why", async (t) => {
+  it("a conversation fork disposed during the wait: no retry, one inference:aborted that says why, and one line on stderr", async (t) => {
+    const removed = removalLines(t);
     const h = await boot(t, 500, ['resident'], true);
     await h.i.createConversationAgent('fork-1', { serverId: 'zz', channelId: 'room' });
     wake(h.fw, 'fork-1');
@@ -323,6 +339,7 @@ describe("driveStream's wait to retry, when the agent goes before it ends", () =
     await until("the turn's end", () => reasons(of(h.traces, 'fork-1', from)).length > 0);
     nothingRanFor(h, 'fork-1', from);
     assert.deepEqual(reasons(of(h.traces, 'fork-1', from)), [GONE]);
+    assert.equal(removed('fork-1').length, 1);
   });
 
   it('control: an agent that stays retries as before', async (t) => {

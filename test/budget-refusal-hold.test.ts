@@ -185,7 +185,7 @@ interface Internal {
   cancelCoalescedWakes(subject: string): void;
   holdProviderAcceleration(agent: unknown, error: Error): boolean;
   processInferenceRequests(): Promise<void>;
-  startAgentStream(agent: unknown, trigger: Record<string, unknown>): Promise<void>;
+  startAgentStream(agent: unknown, trigger: Record<string, unknown>, ...rest: unknown[]): Promise<void>;
   releaseAgentRuntime(agent: unknown, home?: unknown, why?: string): void;
   providerAccelerationCooldowns: Map<string, { until: number; heldRequests: unknown[] }>;
   releaseProviderAccelerationCooldown(agentName: string): void;
@@ -216,9 +216,9 @@ const providerLimit = () => new MembraneError({
 async function mergedBatchMark(t: { internal: Internal; cm(): { addMessage(p: string, c: unknown): unknown } }): Promise<symbol> {
   const orig = t.internal.startAgentStream;
   let merged: Record<string, unknown> | undefined;
-  t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>) {
+  t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>, ...rest: unknown[]) {
     if (!merged && Object.getOwnPropertySymbols(trigger).some((x) => x.description === 'merged-batch')) merged = trigger;
-    return orig.call(this, agent, trigger);
+    return orig.call(this, agent, trigger, ...rest);
   };
   try {
     t.cm().addMessage('user', [text('hello')]);
@@ -696,9 +696,9 @@ describe('a turn refused for budget while compression is pending waits idle, and
         };
         const starts: object[] = [];
         const start = t.internal.startAgentStream;
-        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>) {
+        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>, ...rest: unknown[]) {
           starts.push(trigger);
-          return start.call(this, agent, trigger);
+          return start.call(this, agent, trigger, ...rest);
         };
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
@@ -1340,10 +1340,10 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.stored().includes('Hi')));
         const orig = t.internal.startAgentStream;
         const merged: number[] = [];
-        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>) {
+        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>, ...rest: unknown[]) {
           const mark = Object.getOwnPropertySymbols(trigger ?? {}).find((x) => x.description === 'merged-batch');
           if (mark) merged.push((trigger as Record<symbol, unknown[]>)[mark]!.length);
-          return orig.call(this, agent, trigger);
+          return orig.call(this, agent, trigger, ...rest);
         };
         t.sendForPrime('alpha');
         t.sendForPrime('beta');

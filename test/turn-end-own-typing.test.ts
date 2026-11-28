@@ -568,6 +568,33 @@ test("a turn whose compile throws stops its own channel, and not the host's", as
   assert.equal(w.stopsAt(bGeneral), 0, w.typing.join(', '));
 });
 
+test("a compile that throws after its agent was replaced stops its own channel, and not the replacement's at the same address or the host's", async (t) => {
+  for (const replacementAt of [aGeneral, bLounge]) {
+    const w = await world(t, { errorPolicy: noRetry });
+    w.framework.channels!.startTyping(bGeneral);
+    const agent = w.framework.getAgent('scout')!;
+    agent.startStreamWithInjections = (async () => {
+      const replacement = { ...w.i.turnRouting.get('scout'), typing: replacementAt };
+      w.i.agents.set('scout', Object.create(agent));
+      w.i.turnRouting.set('scout', replacement);
+      w.framework.channels!.startTyping(replacementAt);
+      throw new Error('zz compile failed');
+    }) as typeof agent.startStreamWithInjections;
+    w.wake('scout', aGeneral);
+    await until('the drop', () => w.traces.some((e) => e.type === 'inference:aborted'));
+    await afterTeardown();
+    assert.equal(w.stopsAt(bGeneral), 0, `the host's indicator is left: ${w.typing.join(', ')}`);
+    if (replacementAt === aGeneral) {
+      assert.equal(w.stopsAt(aGeneral), 0, `the replacement's indicator at the same address is left: ${w.typing.join(', ')}`);
+    } else {
+      assert.equal(w.stopsAt(aGeneral), 1, `the old turn stops its own channel: ${w.typing.join(', ')}`);
+      assert.equal(w.stopsAt(bLounge), 0, `the replacement's indicator elsewhere is left: ${w.typing.join(', ')}`);
+    }
+    w.i.agents.set('scout', agent);
+    w.i.turnRouting.delete('scout');
+  }
+});
+
 test("staged at the teardown's own condition: a newer stream of the agent typing at another server's channel of the same id leaves the old frame to stop its own; one typing at the same address keeps it", async (t) => {
   for (const newerAt of [bGeneral, aGeneral]) {
     const w = await world(t);
