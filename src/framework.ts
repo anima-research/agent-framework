@@ -3199,7 +3199,7 @@ function unbatchedStoreRefusal(store: JsStore): string | undefined {
   return 'agent-framework needs a store handle with JsStore.appendManyToStateJsonWithIdentity, the identity-stamped batched append ' +
     'with which context-manager writes each agent\'s window, several rows as one record. The store handle has none ' +
     `(this package loads @animalabs/chronicle ${chronicleVersion() ?? 'of a version it does not say'}). ` +
-    'Install @animalabs/chronicle ^0.6.0 || ^0.7.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
+    'Install @animalabs/chronicle ^0.6.0 || ^0.7.0 || ^0.8.0, which this package declares (0.5.0 and earlier have no batched append), and open the store with it';
 }
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
@@ -5533,7 +5533,7 @@ export class AgentFramework {
       throw new Error(
         'agent-framework needs @animalabs/context-manager with ContextManager.presentRows and ContextManager.noteThinkingDropped: ' +
           "a context-manager that keeps a window index per agent and can be told which stored replies' thinking the provider dropped. " +
-          'Install @animalabs/context-manager ^0.28.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
+          'Install @animalabs/context-manager ^0.29.0, which this package declares (0.23.x and 0.24.x have no window index, and 0.25.0 has no noteThinkingDropped)',
       );
     }
 
@@ -11528,11 +11528,11 @@ export class AgentFramework {
    * bookkeeping of its own, such as handing the context manager the
    * compression tool definitions, as every activation request does.
    * Under the autobiographical strategy, a budget the context can't fit
-   * still throws, as for a committing compile: a dry run skips only
-   * context-manager's post-pick check, and an adaptive fold plan that
-   * doesn't fit then overruns at the middle's emission, with a refusal that
-   * names the tokens and the limit. Windowed passthrough's newest message
-   * alone is the one window that comes back larger than the budget. For a
+   * still throws, as for a committing compile: a dry run meets the same
+   * plan check, and refuses an adaptive fold plan that doesn't fit, with a
+   * refusal that names the plan's tokens and the budget. Windowed
+   * passthrough's newest message alone is the one window that comes back
+   * larger than the budget. For a
    * verdict instead of the refusal, `previewContextSettings` returns
    * context-manager's own at a budget, with the agent's `maxTokens` reserved
    * for the response.
@@ -21380,8 +21380,8 @@ export class AgentFramework {
       // flight keeps its calibration estimate.
       // The template's compile runs at context-manager's default budget (none
       // is passed), and a dry run still refuses a budget it can't fit: it
-      // skips only the post-pick check, and an adaptive fold plan that
-      // doesn't fit then overruns at the middle's emission. So a template
+      // meets the plan check that a committing compile meets, and refuses an
+      // adaptive fold plan that doesn't fit. So a template
       // whose fold plan doesn't fit that budget fails the spawn with
       // context-manager's refusal, which names the tokens and the limit, as
       // a committing compile failed it. Only a windowed-passthrough template
