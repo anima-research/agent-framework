@@ -17,7 +17,8 @@ import { MembraneError } from '@animalabs/membrane';
 import { createMockResponse, HeldStream, MockYieldingStream } from './helpers/mock-membrane.js';
 import { fixture, eventually, settles, crash, ok, TS } from './helpers/coalescing-fixture.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
-import { PushCoalescer, coalescingReceiptKey, coalescingSubjectKey, type CoalescerHost, type CoalescedOccurrence, type CoalescingChange, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
+import { PushCoalescer, coalescingReceiptKey, coalescingSubjectKey, type CoalescerHost, type CoalescedOccurrence, type CoalescingChange, type CoalescingPlacement, type CoalescingReceiptRecord, type CoalescingSnapshot } from '../src/mcpl/push-coalescer.js';
+import type { TraceEvent } from '../src/index.js';
 import { journaledTable, type CoalescingJournalItem, type StoredCoalescingTable } from '../src/mcpl/coalescing-store.js';
 import { JOURNALED, numbered } from './helpers/coalescing-journal.js';
 import { coverTest, readMarkForTest, type ReadMark } from '../src/read-marks.js';
@@ -123,6 +124,423 @@ for (const shape of ['an update', 'a retraction with a notice', 'a retraction wi
     else assert.equal(cm.getMessageCount(), before, 'nothing is appended');
   });
 }
+
+function bounded<T>(work: Promise<T>, what: string): Promise<T> {
+  return Promise.race([
+    work,
+    new Promise<never>((_, reject) => { setTimeout(() => reject(new Error(`${what} didn't come within 10 s`)), 10_000).unref(); }),
+  ]);
+}
+
+function gatedSwitch(f: Fixture, { fail = false } = {}) {
+  const strategy = f.framework.getAgent('agent')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
+  const own = Object.hasOwn(strategy, 'initialize');
+  const initialize = strategy.initialize;
+  let entered!: () => void;
+  const reached = new Promise<void>((resolve) => { entered = resolve; });
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => { open = resolve; });
+  strategy.initialize = async (...args: unknown[]) => {
+    if (own) strategy.initialize = initialize;
+    else delete strategy.initialize;
+    entered();
+    await gate;
+    if (fail) throw new Error('injected initialization failure');
+    await initialize?.apply(strategy, args);
+  };
+  const switched = f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+  return { reached, open, switched };
+}
+
+async function whileHeld(f: Fixture, work: () => Promise<void>, options: { fail?: boolean } = {}): Promise<void> {
+  const hold = gatedSwitch(f, options);
+  try {
+    await bounded(hold.reached, "the switch's re-initialization");
+    await work();
+  } finally {
+    hold.open();
+  }
+  await hold.switched;
+}
+
+const storeHeldLost = (traces: TraceEvent[]) => traces.filter((t) => t.type === 'ops:alert' && t.kind === 'store-held-lost');
+
+for (const notice of ['deletion_notice', ''] as const) {
+  test(`while a branch switch holds the store, a retraction ${notice ? 'with' : 'with no'} notice withdraws a coalesced push that the hold keeps, and nothing of either lands`, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    const cm = f.framework.getAgent('agent')!.getContextManager();
+    const before = cm.getMessageCount();
+    await whileHeld(f, async () => {
+      const first = await bounded(f.send('push/event', f.params('1', 'held_original', { initial: true })), "the push's reply");
+      assert.equal(first.result.coalesce.outcome, 'first');
+      const retraction = await bounded(f.send('push/event', f.params('2', notice, { retract: true })), "the retraction's reply");
+      assert.equal(retraction.result.coalesce.outcome, 'retracted');
+      assert.equal(f.framework.getHostModeStatus().deferredWrites, 0, 'the hold keeps nothing of the push');
+    });
+    assert(!f.context().includes('held_original'), 'the push never lands');
+    if (notice) assert(!f.context().includes(notice), 'nor does the notice');
+    assert.equal(cm.getMessageCount(), before);
+  });
+}
+
+test('while a branch switch holds the store, an update replaces a coalesced push that the hold keeps, and only the update lands', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const before = cm.getMessageCount();
+  await whileHeld(f, async () => {
+    await bounded(f.send('push/event', f.params('1', 'held_original', { initial: true })), "the push's reply");
+    const update = await bounded(f.send('push/event', f.params('2', 'held_update')), "the update's reply");
+    assert.deepEqual(update.result.coalesce, { outcome: 'replaced', priorEventId: '1' });
+  });
+  assert(!f.context().includes('held_original'), 'the replaced push never lands');
+  assert(f.context().includes('held_update'), 'the update lands at the release');
+  assert.equal(cm.getMessageCount(), before + 1);
+});
+
+test('a retraction after the release withdraws a coalesced push that the hold kept and the release stored, while no request has read it', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const before = cm.getMessageCount();
+  await whileHeld(f, async () => {
+    await bounded(f.send('push/event', f.params('1', 'held_original', { initial: true })), "the push's reply");
+  });
+  assert(f.context().includes('held_original'), 'the release stores the push');
+  const retraction = await f.send('push/event', f.params('2', 'deletion_notice', { retract: true }));
+  assert.equal(retraction.result.coalesce.outcome, 'retracted');
+  assert(!f.context().includes('held_original') && !f.context().includes('deletion_notice'));
+  assert.equal(cm.getMessageCount(), before);
+});
+
+test('a retraction withdraws a coalesced push kept in memory while its agent\'s context manager refuses its work, and the recovery stores nothing of it', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const traces: TraceEvent[] = [];
+  f.framework.onTrace((event) => { traces.push(event); });
+  const cm = f.framework.getAgent('agent')!.getContextManager();
+  const before = cm.getMessageCount();
+  await whileHeld(f, async () => {}, { fail: true });
+  const first = await f.send('push/event', f.params('1', 'kept_original', { initial: true }));
+  assert.equal(first.result.coalesce.outcome, 'first');
+  assert.equal(f.framework.getHostModeStatus().deferredWrites, 1, 'setup: the push waits for the recovery');
+  const retraction = await f.send('push/event', f.params('2', '', { retract: true }));
+  assert.equal(retraction.result.coalesce.outcome, 'retracted');
+  assert.equal(f.framework.getHostModeStatus().deferredWrites, 0);
+  const logged: string[] = [];
+  const quiet = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    await f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+  } finally {
+    console.error = quiet;
+  }
+  assert(!f.context().includes('kept_original'));
+  assert.equal(cm.getMessageCount(), before);
+  assert.deepEqual(storeHeldLost(traces), []);
+  assert.deepEqual(logged.filter((line) => line.includes('kept in memory for it')), [], 'the recovery finds no writes kept for the agent');
+});
+
+test("a retraction withdraws a coalesced push that a hold kept, whose release kept it again for its agent's recovery, and the recovery stores the write beside it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const traces: TraceEvent[] = [];
+  f.framework.onTrace((event) => { traces.push(event); });
+  await whileHeld(f, async () => {
+    await bounded(f.send('push/event', f.params('1', 'kept_original', { initial: true })), "the push's reply");
+    await bounded(f.send('push/event', f.params('n', 'neighbour_note', { key: 'neighbour', initial: true })), "the neighbour's reply");
+  }, { fail: true });
+  assert.equal(f.framework.getHostModeStatus().deferredWrites, 2, 'setup: the release kept both for the recovery');
+  const retraction = await f.send('push/event', f.params('2', '', { retract: true }));
+  assert.equal(retraction.result.coalesce.outcome, 'retracted');
+  assert.equal(f.framework.getHostModeStatus().deferredWrites, 1);
+  await f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+  assert(!f.context().includes('kept_original'), 'the withdrawn push never lands');
+  assert(f.context().includes('neighbour_note'), 'the write beside it lands at the recovery');
+  assert.deepEqual(storeHeldLost(traces), []);
+});
+
+test('while a branch switch holds the store, an update replaces a conversation fork\'s coalesced channel message kept in memory, and a retraction withdraws the update', async (t) => {
+  const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('w', 'fork_warmup', { initial: true }, 'chat', 'w')] });
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): { agentName: string } | undefined } }).conversationRouter;
+  const fork = router.getBinding({ serverId: 'editor', channelId: 'chat' })!.agentName;
+  await whileHeld(f, async () => {
+    const first = await bounded(f.send('channels/incoming', { messages: [f.channel('c1', 'fork_original', { initial: true })] }), "the message's reply");
+    assert.equal(first.result.results[0].coalesce.outcome, 'first');
+    const update = await bounded(f.send('channels/incoming', { messages: [f.channel('c2', 'fork_update')] }), "the update's reply");
+    assert.equal(update.result.results[0].coalesce.outcome, 'replaced');
+    const retraction = await bounded(f.send('channels/incoming', { messages: [f.channel('c3', '', { retract: true })] }), "the retraction's reply");
+    assert.equal(retraction.result.results[0].coalesce.outcome, 'retracted');
+  });
+  const forkContext = f.context(fork);
+  assert(forkContext.includes('fork_warmup'), 'setup: the fork holds the message before the hold');
+  assert(!forkContext.includes('fork_original') && !forkContext.includes('fork_update'), 'nothing of the withdrawn message lands in the fork');
+});
+
+test("a retraction after the release withdraws a conversation fork's coalesced channel message that the hold kept, while no request has read it", async (t) => {
+  const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close); await f.register();
+  await f.send('channels/incoming', { messages: [f.channel('w', 'fork_warmup', { initial: true }, 'chat', 'w')] });
+  const router = (f.framework as unknown as { conversationRouter: { getBinding(channel: { serverId: string; channelId: string }): { agentName: string } | undefined } }).conversationRouter;
+  const fork = router.getBinding({ serverId: 'editor', channelId: 'chat' })!.agentName;
+  await whileHeld(f, async () => {
+    await bounded(f.send('channels/incoming', { messages: [f.channel('c1', 'fork_original', { initial: true })] }), "the message's reply");
+  });
+  assert(f.context(fork).includes('fork_original'), 'the release stores the message in the fork');
+  const retraction = await f.send('channels/incoming', { messages: [f.channel('c2', '', { retract: true })] });
+  assert.equal(retraction.result.results[0].coalesce.outcome, 'retracted');
+  assert(!f.context(fork).includes('fork_original'));
+});
+
+test("while its agent's context manager refuses its work, a retraction that withdraws the one write kept for it leaves the wait in place, and the next write waits behind it", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  await whileHeld(f, async () => {}, { fail: true });
+  await f.send('push/event', f.params('1', 'kept_original', { initial: true }));
+  const retraction = await f.send('push/event', f.params('2', '', { retract: true }));
+  assert.equal(retraction.result.coalesce.outcome, 'retracted');
+  const cm = f.framework.getAgent('agent')!.getContextManager() as unknown as { addMessage: (...args: unknown[]) => unknown };
+  const addMessage = cm.addMessage;
+  let tried = 0;
+  cm.addMessage = (...args: unknown[]) => { tried++; return addMessage.apply(cm, args); };
+  try {
+    await f.send('push/event', f.params('n', 'kept_later', { key: 'later', initial: true }));
+  } finally {
+    cm.addMessage = addMessage;
+  }
+  assert.equal(f.framework.getHostModeStatus().deferredWrites, 1, 'the later write waits in memory');
+  assert.equal(tried, 0, 'the later write joins the wait without trying the store');
+  await f.framework.switchBranch(f.framework.getStore().currentBranch().name);
+  assert(f.context().includes('kept_later') && !f.context().includes('kept_original'));
+});
+
+type DebounceGate = {
+  debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>;
+  fireDebounce(name: string): void;
+  upcomingWakes(agentNames: string[]): Array<{ kind: string; certain: boolean }>;
+};
+const debounceGate = (f: Fixture) => (f.framework as unknown as { eventGate: DebounceGate }).eventGate;
+const debounced = (f: Fixture) => [...debounceGate(f).debounceTimers.values()].reduce((n, s) => n + s.events.length, 0);
+function fireDebounces(f: Fixture): void {
+  for (const [name, state] of [...debounceGate(f).debounceTimers]) { clearTimeout(state.timer); debounceGate(f).fireDebounce(name); }
+}
+const debounceRule = { gate: { config: { policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 60_000 } }], default: 'skip' }, onboarding: false } } as never;
+const pendingFor = (f: Fixture, agent: string) => (f.framework as unknown as { pendingRequests: Array<{ agentName: string }> }).pendingRequests
+  .filter((r) => r.agentName === agent).length;
+
+for (const fires of ['after the release', 'during the hold, before the retraction'] as const) {
+  test(`a debounced batch of a coalesced message that a hold kept and a retraction withdrew starts no turn, when the debounce fires ${fires}`, async (t) => {
+    const f = await fixture({ framework: debounceRule }); t.after(f.close); await f.register();
+    f.alwaysRespond();
+    await whileHeld(f, async () => {
+      await bounded(f.send('channels/incoming', { messages: [f.channel('c1', 'kept_question', { initial: true })] }), "the message's reply");
+      await eventually(() => debounced(f) === 1, 'the message in the batch');
+      if (fires !== 'after the release') {
+        fireDebounces(f);
+        assert.equal(pendingFor(f, 'agent'), 1, "premise: the batch's wake waits for the hold to end");
+      }
+      const retraction = await bounded(f.send('channels/incoming', { messages: [f.channel('c2', '', { retract: true })] }), "the retraction's reply");
+      assert.equal(retraction.result.results[0].coalesce.outcome, 'retracted');
+    });
+    if (fires === 'after the release') {
+      assert.deepEqual(debounceGate(f).upcomingWakes(['agent']).filter((w) => w.kind === 'debounce').map((w) => w.certain), [false],
+        'the batch is no certain wake');
+      fireDebounces(f);
+    }
+    await f.framework.runUntilIdle();
+    assert(!f.context().includes('kept_question'), 'premise: the message never lands');
+    assert.equal(f.membrane.calls.length, 0, 'no turn starts for a message withdrawn before it was stored');
+  });
+}
+
+test('a coalesced channel message that a hold kept and a retraction withdrew starts no turn after the release', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  f.alwaysRespond();
+  await whileHeld(f, async () => {
+    await bounded(f.send('channels/incoming', { messages: [f.channel('c1', 'kept_question', { initial: true })] }), "the message's reply");
+    assert.equal(pendingFor(f, 'agent'), 1, "premise: the message's wake waits for the hold to end");
+    const retraction = await bounded(f.send('channels/incoming', { messages: [f.channel('c2', '', { retract: true })] }), "the retraction's reply");
+    assert.equal(retraction.result.results[0].coalesce.outcome, 'retracted');
+  });
+  await f.framework.runUntilIdle();
+  assert(!f.context().includes('kept_question'), 'premise: the message never lands');
+  assert.equal(f.membrane.calls.length, 0, 'no turn starts for a message withdrawn before it was stored');
+});
+
+test('a debounced batch of two coalesced messages that a hold kept, one of them withdrawn, still wakes the agent for the other, which its turn reads', async (t) => {
+  const f = await fixture({ framework: debounceRule }); t.after(f.close); await f.register();
+  f.alwaysRespond();
+  await whileHeld(f, async () => {
+    await bounded(f.send('channels/incoming', { messages: [f.channel('c1', 'withdrawn_question', { initial: true })] }), "the first message's reply");
+    await bounded(f.send('channels/incoming', { messages: [f.channel('d1', 'kept_question', { initial: true }, 'chat', 'm2')] }), "the second message's reply");
+    await eventually(() => debounced(f) === 2, 'both messages in the batch');
+    const retraction = await bounded(f.send('channels/incoming', { messages: [f.channel('c2', '', { retract: true })] }), "the retraction's reply");
+    assert.equal(retraction.result.results[0].coalesce.outcome, 'retracted');
+  });
+  fireDebounces(f);
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1, 'the batch wakes the agent');
+  assert(f.lastRequest().includes('kept_question') && !f.lastRequest().includes('withdrawn_question'));
+});
+
+type KeptRenderInternals = {
+  addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+  removePlacement(placement: CoalescingPlacement): boolean;
+  pushCoalescer: { host: CoalescerHost<unknown> };
+  upcomingWakesFor(agentName: string): Array<{ kind: string; certain: boolean }>;
+};
+
+/** A plain push's occurrence, as the coalescer gave it to the host to deliver. */
+async function deliveredOccurrence(f: Fixture): Promise<CoalescedOccurrence<unknown>> {
+  const host = (f.framework as unknown as KeptRenderInternals).pushCoalescer.host;
+  const deliver = host.deliver;
+  let delivered: CoalescedOccurrence<unknown> | undefined;
+  host.deliver = (occurrence, ...rest) => { delivered = occurrence; host.deliver = deliver; return deliver.call(host, occurrence, ...rest); };
+  await f.send('push/event', f.params('1', 'read_first', { initial: true }));
+  await f.framework.runUntilIdle();
+  assert(delivered, 'premise: the push was delivered');
+  return delivered;
+}
+
+for (const withdrawn of [true, false]) {
+  test(`a wake to read a render that a hold kept ${withdrawn ? 'starts no turn once a retraction withdraws its write' : 'starts its turn once the release stores the write'}`, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    f.alwaysRespond();
+    const internals = f.framework as unknown as KeptRenderInternals;
+    const occurrence = await deliveredOccurrence(f);
+    const calls = f.membrane.calls.length;
+    const kept: CoalescingPlacement = { agent: '' };
+    await whileHeld(f, async () => {
+      internals.addMessage('user', [{ type: 'text', text: 'kept_render' }], {}, { placement: kept });
+      await internals.pushCoalescer.host.wakeToRead(occurrence, kept, false);
+      assert.equal(pendingFor(f, 'agent'), 1, "premise: the render's wake waits for the hold to end");
+      assert.deepEqual(internals.upcomingWakesFor('agent').filter((w) => w.kind === 'queued').map((w) => w.certain), [false],
+        'a wake that a withdrawal can drop is no certain wake');
+      if (withdrawn) assert.equal(internals.removePlacement(kept), true, 'the write is withdrawn');
+    });
+    await f.framework.runUntilIdle();
+    assert.equal(f.context().includes('kept_render'), !withdrawn);
+    assert.equal(f.membrane.calls.length, calls + (withdrawn ? 0 : 1));
+  });
+}
+
+test("a provider hold keeps apart the wakes to read two renders that a hold kept, though they share a millisecond", async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as KeptRenderInternals & TurnInternals;
+  const occurrence = await deliveredOccurrence(f);
+  const timer = setTimeout(() => {}, 60_000);
+  t.after(() => clearTimeout(timer));
+  internals.providerAccelerationCooldowns.set('agent', { startedAt: Date.now(), until: Date.now() + 60_000, timer, heldRequests: [], reason: 'held', failures: 1 });
+  const first: CoalescingPlacement = { agent: '' };
+  const second: CoalescingPlacement = { agent: '' };
+  await whileHeld(f, async () => {
+    internals.addMessage('user', [{ type: 'text', text: 'first_render' }], {}, { placement: first });
+    internals.addMessage('user', [{ type: 'text', text: 'second_render' }], {}, { placement: second });
+    const now = Date.now;
+    const at = now();
+    Date.now = () => at;
+    try {
+      await internals.pushCoalescer.host.wakeToRead(occurrence, first, false);
+      await internals.pushCoalescer.host.wakeToRead(occurrence, second, false);
+    } finally {
+      Date.now = now;
+    }
+  });
+  await settles(internals.processInferenceRequests(), 'the held pass');
+  const held = internals.providerAccelerationCooldowns.get('agent')?.heldRequests ?? [];
+  assert.equal(held.filter((r) => r.reason === 'mcpl:push-event').length, 2, 'each wake is held: neither stands for the other, which a withdrawal could take with it');
+});
+
+/** The next occurrence's answer, after a batch that a suppress rule renders
+ *  at once was stored while a hold kept the store (`held`) or unheld, its
+ *  delivery waiting on the modules until the hold was released. */
+async function nextAfterSuppressedRender(t: TestContext, held: boolean): Promise<unknown> {
+  const f = await fixture({ framework: { gate: { config: {
+    policies: [{ name: 'quiet-doc', match: { scope: ['mcpl:push-event'] }, behavior: 'defer', suppress: { description: 'the doc pushes' } }],
+    default: 'always',
+  }, onboarding: false } } as never });
+  t.after(f.close);
+  f.alwaysRespond();
+  let rendered!: () => void;
+  const rendering = new Promise<void>((resolve) => { rendered = resolve; });
+  f.renderer(async () => { await rendering; return { content: [{ type: 'text', text: 'document_diff' }] }; });
+  await f.send('push/event', f.params('e1', 'notice_fallback', { deferred: true, initial: true }));
+  await eventually(() => f.renders.length === 1, 'premise: the suppress rule has the batch render now');
+  await f.framework.runUntilIdle();
+  const internals = f.framework as unknown as { dispatchProcessEventToModules(event: unknown): Promise<void> };
+  const dispatch = internals.dispatchProcessEventToModules;
+  let reached!: () => void;
+  const delivered = new Promise<void>((resolve) => { reached = resolve; });
+  let returns!: () => void;
+  const delivery = new Promise<void>((resolve) => { returns = resolve; });
+  internals.dispatchProcessEventToModules = async (event: unknown) => {
+    if ((event as { coalescingSubject?: unknown }).coalescingSubject !== undefined) {
+      internals.dispatchProcessEventToModules = dispatch;
+      reached();
+      await delivery;
+    }
+    return dispatch.call(f.framework, event);
+  };
+  if (held) {
+    const hold = gatedSwitch(f);
+    await bounded(hold.reached, "the switch's re-initialization");
+    rendered();
+    await bounded(delivered, "the render's delivery");
+    hold.open();
+    await hold.switched;
+  } else {
+    rendered();
+    await bounded(delivered, "the render's delivery");
+  }
+  returns();
+  const next = await bounded(f.send('push/event', f.params('e2', 'next_fallback', { deferred: true })), "the next occurrence's reply");
+  return next.result.coalesce;
+}
+
+test("a render stored while a hold keeps the store, and released before its delivery returns, leaves its subject as a render stored unheld does", async (t) => {
+  assert.deepEqual(await nextAfterSuppressedRender(t, true), await nextAfterSuppressedRender(t, false));
+});
+
+test('the release fills a held write\'s placement as a store outside a hold fills it: the row it landed as, and no mark of a row left unpresented', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as {
+    addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+    storeInFork(target: unknown, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+  };
+  const added: CoalescingPlacement = { agent: '' };
+  const forked: CoalescingPlacement = { agent: '' };
+  await whileHeld(f, async () => {
+    internals.addMessage('user', [{ type: 'text', text: 'added_while_held' }], {}, { placement: added });
+    internals.storeInFork(f.framework.getAgent('agent'), [{ type: 'text', text: 'forked_while_held' }], {}, { placement: forked });
+    assert.deepEqual([added, forked], [{ agent: 'agent', presented: false }, { agent: 'agent', presented: false }]);
+  });
+  for (const [placement, text] of [[added, 'added_while_held'], [forked, 'forked_while_held']] as const) {
+    const row = f.framework.getAgent('agent')!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
+    assert.deepEqual(placement, { agent: 'agent', messageId: row?.id }, `${text}: the agent is at rest, so the release presents the row`);
+  }
+});
+
+test('a write kept in memory that an earlier try may have stored isn\'t withdrawn while it is kept, and lands at the release', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  const internals = f.framework as unknown as {
+    addMessage(participant: string, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+    storeInFork(target: unknown, content: ContentBlock[], metadata: Record<string, unknown>, opts: Record<string, unknown>): string;
+    isUnreadPlacement(placement: CoalescingPlacement): boolean;
+    removePlacement(placement: CoalescingPlacement): boolean;
+  };
+  const unsure: CoalescingPlacement = { agent: '' };
+  const unsureInFork: CoalescingPlacement = { agent: '' };
+  const sure: CoalescingPlacement = { agent: '' };
+  await whileHeld(f, async () => {
+    assert.equal(internals.addMessage('user', [{ type: 'text', text: 'maybe_stored' }], {}, { placement: unsure, mayBeStored: true }), '');
+    assert.equal(internals.storeInFork(f.framework.getAgent('agent'), [{ type: 'text', text: 'maybe_stored_in_fork' }], {}, { placement: unsureInFork, mayBeStored: true }), '');
+    assert.equal(internals.addMessage('user', [{ type: 'text', text: 'surely_held' }], {}, { placement: sure }), '');
+    for (const placement of [unsure, unsureInFork]) {
+      assert.equal(internals.isUnreadPlacement(placement), false);
+      assert.equal(internals.removePlacement(placement), false);
+    }
+    assert.equal(internals.isUnreadPlacement(sure), true);
+    assert.equal(internals.removePlacement(sure), true);
+  });
+  assert(f.context().includes('maybe_stored') && f.context().includes('maybe_stored_in_fork'), 'the writes that may be stored land at the release');
+  assert(!f.context().includes('surely_held'), 'the withdrawn write never lands');
+  assert.equal(typeof unsure.messageId, 'string', 'its placement names the row it landed as');
+});
 
 test('vectors 29/34: read original → unread edit → delete keeps the original and appends only the notice', async (t) => {
   const f = await fixture(); t.after(f.close);

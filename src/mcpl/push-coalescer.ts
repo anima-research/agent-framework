@@ -71,7 +71,7 @@ export interface CoalescingPlacement {
   agent: string;
   /** Stored message id in that agent's context manager. Absent for a write
    *  kept in memory (a surgery's hold, or the wait for its agent's
-   *  recovery), which counts as read and can't be removed. */
+   *  recovery). */
   messageId?: string;
   /** Set on a placement that wasn't presented to `agent` at its write: a
    *  write kept in memory (no `messageId` yet), or one stored while a turn
@@ -185,6 +185,7 @@ interface Rendering<E> {
   done: Promise<void>;
   /** Set once the render (or its fallback) was delivered as content. */
   materialized?: boolean;
+  materializedRow?: { agent: string; id: string };
 }
 
 /** What an assembly did, per subject, for the turn being assembled. */
@@ -205,6 +206,7 @@ export interface AssemblyResult {
    *  a cause whose batch was withdrawn, displaced or consumed by another
    *  request. */
   materialized: Set<string>;
+  materializedRows: Map<string, string>;
 }
 
 /** What holds a subject's single slot (§3.2). A render describes what changed
@@ -348,7 +350,8 @@ export interface CoalescerHost<E> {
    *  no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
   /** True iff nothing may have shown the placement to the agent: it is
-   *  stored where no committing compile has begun to assemble it and no tool
+   *  kept in memory, where no earlier try may have stored it, or stored
+   *  where no committing compile has begun to assemble it and no tool
    *  boundary has injected past it. Unlike
    *  isUnread, a compile counts from its start: a doubt counts as shown. */
   isUnshown(placement: CoalescingPlacement): boolean;
@@ -1025,7 +1028,7 @@ export class PushCoalescer<E = unknown> {
    * taking it as its own.
    */
   async assemble(agentName: string, causes: readonly string[] = []): Promise<AssemblyResult> {
-    const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
+    const result: AssemblyResult = { settled: new Set(), materialized: new Set(), materializedRows: new Map() };
     if (this.suspended) return result;
     const work: Promise<void>[] = [];
     const wanted = new Set(causes);
@@ -1039,7 +1042,11 @@ export class PushCoalescer<E = unknown> {
         work.push(started.done.then(() => {
           result.settled.add(subject);
           // A render another assembly froze is that request's to read.
-          if (started.rendering.materialized && !started.joined) result.materialized.add(subject);
+          if (started.rendering.materialized && !started.joined) {
+            result.materialized.add(subject);
+            const row = started.rendering.materializedRow;
+            if (row !== undefined && row.agent === agentName) result.materializedRows.set(subject, row.id);
+          }
         }));
       }
     }
@@ -1283,10 +1290,7 @@ export class PushCoalescer<E = unknown> {
           // Not presented to its agent: stored for another agent, whose
           // turn is alive, or for the assembling agent after its assembly
           // ended, as any write during its turn; or kept in memory (no id)
-          // until its hold's release stores it, which the host counts as
-          // read and can't remove, so of what follows only the wake applies
-          // to it. A stored one is still unread there, so it stays
-          // replaceable and withdrawable. The turn being assembled
+          // until its hold's release stores it. The turn being assembled
           // doesn't read it, so it isn't materialized for that turn, and no
           // request has consumed it. The freeze withdrew the placement's
           // agent's wake for this batch; give it an ordinary wake, as any
@@ -1314,6 +1318,7 @@ export class PushCoalescer<E = unknown> {
         // The materialized occurrence is consumed by the request being
         // assembled, and becomes history with the run placed ahead of it.
         rendering.materialized = true;
+        if (placement?.messageId !== undefined) rendering.materializedRow = { agent: placement.agent, id: placement.messageId };
         state.history = 'some';
         state.consumedEventId = occurrence.eventId;
         state.occupant = undefined;

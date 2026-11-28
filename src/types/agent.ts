@@ -319,6 +319,9 @@ export interface AgentConfig {
    * giving up. This keeps the agent
    * on its own model (no fallback-model substitution) while self-healing around
    * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
+   * A `reasoning_extraction` refusal no rewind takes also leaves the agent a
+   * note that its turn did not complete, one for a run of such turns (see
+   * AgentFramework.noteRefusedTurn).
    */
   refusalHandling?: {
     /**
@@ -797,7 +800,9 @@ export interface InferenceRequest {
    * which copies its trigger), and on a merged batch whose causes include a
    * heartbeat's wake and name no channel; false on a merged batch with none,
    * so the batch's first request doesn't decide it. Unset, a wake is a
-   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it.
+   * heartbeat's when its `source` is `heartbeat`. Hosts don't set it. In such a
+   * merged batch, a marker's wake that doesn't address the agent (`marker`)
+   * names no channel.
    */
   heartbeatTurn?: boolean;
   /**
@@ -805,7 +810,9 @@ export interface InferenceRequest {
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient
    * chatter for the turn's frozen speech locus: overheard conversation must
-   * not capture the agent's voice just by being newest.
+   * not capture the agent's voice just by being newest. A resident's wake
+   * from `channels/incoming` or `push/event` for a deletion or a removed
+   * reaction is never addressed, whatever its tags, since it asks nothing.
    */
   addressed?: boolean;
   /**
@@ -828,6 +835,23 @@ export interface InferenceRequest {
    * set on a coalesced render's wake, which may fold messages too.
    */
   systemNotice?: true;
+  /**
+   * Host-owned: true when the triggering message is a marker by its tags
+   * (isMarkerTagged). A marker is a reaction added or removed, an edit or a
+   * deletion of an existing message, or a `chat:system` notice. An edit
+   * isn't a marker when the host delivers it as the first version of its
+   * message that the agent sees. The mark says only what the message is,
+   * not whom it addresses. A marked wake that doesn't address the agent
+   * ranks last in its batch. It names the turn's channel only if no other
+   * request names one. If the batch holds a heartbeat's wake, the turn then
+   * has no channel. The wake keeps its `channelId` in every case. Only a
+   * wake from `channels/incoming` or `push/event` carries the mark. A
+   * conversation fork's wake from `channels/incoming`, a deferred batch's
+   * wake and the wake-onboarding wake carry none. A merged start carries the
+   * mark of the request that named its channel. A `chat:system` notice's
+   * wake from those two lanes names no channel (`systemNotice`).
+   */
+  marker?: true;
   /**
    * Who spoke the message that triggered this inference, as an adapter-
    * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display

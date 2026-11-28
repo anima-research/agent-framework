@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, PassthroughStrategy, WindowedPassthroughStrategy } from '@animalabs/context-manager';
@@ -8,6 +8,8 @@ import { MembraneError, type ContentBlock, type NormalizedRequest, type Normaliz
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
+import { jsonLines } from './helpers/json-lines.js';
+import { fixture as coalescingFixture } from './helpers/coalescing-fixture.js';
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t } as ContentBlock);
 const NOTE = /\[budget-hold\] Your context didn't fit its budget \(100,201 tokens against 48,568\) when a turn came to start\. That turn waited \d+ (s|min)\./;
@@ -163,6 +165,7 @@ class SequentialStreamMembrane extends MockMembrane {
 }
 
 interface Internal {
+  openLogical: Map<string, unknown>;
   budgetHoldRecheckMs: number;
   budgetHolds: Map<string, { turn?: unknown; startedAt: number; wait: { since: number }; wakes: Array<{ reason?: string }> }>;
   quiesced: boolean;
@@ -265,8 +268,12 @@ async function resident(options: {
   secondAgent?: boolean;
   policy?: { shouldInfer(agentName: string, requests: Array<Record<string, unknown>>): boolean };
   strategy?: unknown;
+  channels?: boolean;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'budget-hold-'));
+  const commandPath = join(dir, 'commands.jsonl');
+  const statusPath = join(dir, 'status.jsonl');
+  writeFileSync(commandPath, '');
   const inbox = new InboxModule(options.context);
   const membrane = new SequentialStreamMembrane();
   if (options.restart) {
@@ -287,6 +294,12 @@ async function resident(options: {
       ...(options.strategy ? { strategy: options.strategy } : {}),
     }, ...(options.secondAgent ? [{ name: 'second', model: 'test-model', systemPrompt: 'You are second.' }] : [])],
     modules: [options.restart ? new BlobToolModule() : inbox, ...(options.modules ?? [])],
+    ...(options.channels ? {
+      mcplServers: [{
+        id: 'discord', command: process.execPath, args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
+        env: { STATUS_PATH: statusPath, COMMAND_PATH: commandPath },
+      }],
+    } : {}),
     syncIntervalMs: 0,
     maintenanceIntervalMs: options.maintenanceIntervalMs ?? 50,
     errorPolicy: {
@@ -305,7 +318,20 @@ async function resident(options: {
   const send = (body: string) => framework.pushEvent({
     type: 'external-message', source: 'test', content: [text(body)], metadata: {}, triggerInference: true,
   } as unknown as ProcessEvent);
-  framework.start();
+  let ready = false;
+  try {
+    framework.start();
+    if (options.channels) {
+      const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
+      assert.ok(await pollUntil(() => registry.listChannelsRaw().length >= 2), 'the stand-in server registered its channels');
+    }
+    ready = true;
+  } finally {
+    if (!ready) {
+      await framework.stop().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
   const cm = () => framework.getAgent('prime')!.getContextManager();
   const rows = () => cm().getAllMessages() as unknown as Array<{ id: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> }>;
   const bodyOf = (row: { content: Array<{ type: string; text?: string }> }) => row.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
@@ -322,6 +348,10 @@ async function resident(options: {
       internal.pendingRequests.push({ agentName: 'prime', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsRows: ids.map((row) => ({ row })) });
       return ids;
     },
+    incoming: (channelId: string, messageId: string, body: string) =>
+      appendFileSync(commandPath, JSON.stringify({ op: 'incoming', channelId, messageId, mode: 'addressed', text: body }) + '\n'),
+    publishes: (): Array<[string, string]> => jsonLines<{ event: string; channelId: string; text: string }>(statusPath)
+      .filter((e) => e.event === 'publish').map((e) => [e.channelId, e.text]),
     stored: () => rows().map(bodyOf).join('\n'),
     rowWith: (body: string) => rows().find((r) => bodyOf(r) === body)!,
     windowText: () => (cm().getPresentedMessages() as unknown as Array<{ content: Array<{ type: string; text?: string }> }>).map(bodyOf).join('\n'),
@@ -691,6 +721,58 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  it("a released start that fits, then meets a provider wait recorded during its compile, leaves its wait behind: refused for budget, its retry waits in a hold of its own", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const waits = t.internal.providerWaits as unknown as {
+        set(agentName: string, model: string, ms: number, reason: string): unknown;
+        release(agentName: string, model: string | undefined, by: string): unknown;
+      };
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const hold = t.internal.budgetHolds.get('prime')!;
+        hold.wait.since -= 180_000;
+        const agent = t.framework.getAgent('prime')! as unknown as { startStreamWithInjections: (...a: unknown[]) => Promise<unknown> };
+        const compile = agent.startStreamWithInjections.bind(agent);
+        let recorded = false;
+        agent.startStreamWithInjections = async (...args: unknown[]) => {
+          const made = await compile(...args);
+          if (!recorded) {
+            recorded = true;
+            c.fitAt = Infinity;
+            c.readyAt = Infinity;
+            waits.set('prime', 'test-model', 60_000, 'zz wait during the compile');
+          }
+          return made;
+        };
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-newer', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => (t.internal.providerAccelerationCooldowns.get('prime')?.heldRequests.length ?? 0) > 0),
+          'the start fit, and the wait recorded during its compile holds its retry');
+        const marks = (o: object) => Object.getOwnPropertySymbols(o).map((x) => x.description);
+        const kept = t.internal.providerAccelerationCooldowns.get('prime')!.heldRequests[0] as Record<symbol, unknown>;
+        const batch = Object.getOwnPropertySymbols(kept).filter((x) => x.description === 'merged-batch').map((x) => kept[x] as object[])[0] ?? [];
+        assert.deepEqual(batch.flatMap(marks).filter((m) => m === 'budget-wait'), [], 'nothing in the retry carries the wait');
+        waits.release('prime', undefined, 'zz');
+        t.internal.providerAccelerationCooldowns.get('prime')!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2), 'the retry was refused for budget, and waits');
+        assert.ok(t.internal.budgetHolds.get('prime')!.wait.since > hold.wait.since + 120_000, 'in a wait of its own');
+        assert.equal(t.alerts('context-refusal').length, 2, 'with its own open alert');
+        const standsOn = (t.internal.budgetHolds.get('prime') as unknown as { standsOn: string[] }).standsOn;
+        assert.ok(standsOn.includes(String(t.rowWith('go').id)), `and the turn still stands on go's row: ${standsOn}`);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('when compression has nothing left and the context still does not fit, releases the wait, and the refusal takes the error policy\'s path with the note in place', async () => {
     await withWebhook(async (posts) => {
       await withCompression({ fitAt: Infinity, readyAt: 2 }, async () => {
@@ -751,6 +833,530 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
         assert.match(String(t.alerts('context-refusal-clear')[0]?.message), /was stopped after .*, so its waiting start doesn't run/);
         assert.ok(await pollUntil(() => t.stored().includes('Answered the second')), 'the wake that joined runs as its own turn');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  async function reheldWithSecond(replies: Reply[]) {
+    const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', ...replies] });
+    try {
+      t.internal.budgetHoldRecheckMs = 60_000;
+      t.send('hello');
+      assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+      t.sendForPrime('go');
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+      t.send('second');
+      assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+      t.internal.releaseBudgetHold('prime');
+      assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+        'released while compression still refuses, its start merged with that wake is refused and waits again');
+      return t;
+    } catch (error) {
+      await t.close();
+      throw error;
+    }
+  }
+
+  it('a released turn refused again keeps the wakes merged into it at its release: a surgery that drops it puts them back in the queue, and they run', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await reheldWithSecond(['Answered second']);
+      try {
+        const gated = t.framework.getHostModeStatus().gatedRequests;
+        const health = t.hold()?.heldRequests;
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed']);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        assert.ok(requestText(t.turnCalls()[1]).includes('second'), 'which read it');
+        assert.equal(t.of('inference:held')[1]?.heldRequests, 2, 'the wait held again counted that wake among the requests it held as it started');
+        assert.equal(gated, 2, 'and the host mode status counted the waiting turn and that wake as gated requests');
+        assert.equal(health, 2, "and the agent's health counted them the same way");
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('abortInference() of a released turn refused again puts the wakes merged into it at its release back in the queue, and they run', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await reheldWithSecond(['Answered second']);
+      try {
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        const wakes = [...t.internal.budgetHolds.get('prime')!.wakes];
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.ok(wakes.length === 1 && t.internal.pendingRequests.length === 1 && t.internal.pendingRequests[0] === wakes[0], "the queue holds second's wake, not the turn");
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'stopped']);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a released turn refused again twice keeps the wakes merged into it at both releases, and a drop puts them all back', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await reheldWithSecond(['Answered both']);
+      try {
+        const before = t.hold()?.heldRequests as number;
+        t.send('third');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === before + 1), "third's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 3 && t.internal.budgetHolds.has('prime')), 'refused and waiting a third time');
+        assert.equal(t.hold()?.heldRequests, 3, 'with both wakes beside the turn');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.equal(t.of('inference:hold_ended').at(-1)?.outcome, 'removed');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered both')), 'the wakes ran');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        const read = requestText(t.turnCalls()[1]);
+        assert.ok(read.includes('second') && read.includes('third'), 'which read both');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a joined wake that a surgery removes from a released turn refused again leaves no trace: the silent turn stays silent, and the next message is answered where it came from', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, channels: true, replies: ['Hi', 'Quiet thoughts', 'Answered third'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const ROOM = 'discord:g1:room';
+      const GENERAL = 'discord:g1:general';
+      const rowOf = (body: string) => t.rows().find((r) => JSON.stringify(r.content).includes(body));
+      try {
+        t.incoming(ROOM, 'in-1', 'hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-silent', source: 'test', timestamp: Date.now(), suppressProse: true });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the silent turn waits');
+        t.incoming(GENERAL, 'in-2', 'second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'released, merged with that wake, refused and waiting again');
+        await t.framework.suppressMessages('prime', { messageIds: [String(rowOf('second')!.id)] });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 3 && t.internal.budgetHolds.has('prime')),
+          'once the surgery removed second, the silent turn tried again, alone, and waits again');
+        assert.equal(t.hold()?.heldRequests, 1, 'with no wake beside it');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Quiet thoughts')), 'the silent turn ran once there was room');
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        t.incoming(ROOM, 'in-3', 'third');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered third')), "third's wake ran");
+        await pollUntil(() => t.publishes().some(([, said]) => said === 'Answered third'));
+        assert.deepEqual(t.publishes(), [[ROOM, 'Hi'], [ROOM, 'Answered third']], 'the silent turn posted nothing, and third was answered in its own channel');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  async function deferredBatchReheld() {
+    const f = await coalescingFixture({ framework: { maintenanceIntervalMs: 0 } });
+    try {
+      f.framework.start();
+      const internal = f.framework as unknown as Internal;
+      internal.budgetHoldRecheckMs = 60_000;
+      const traces: TraceEvent[] = [];
+      f.framework.onTrace((e) => traces.push(e));
+      const held = () => traces.filter((e) => e.type === 'inference:held').length;
+      const goRow = String(internal.addMessage('User', [text('go')]));
+      internal.pendingRequests.push({ agentName: 'agent', reason: 'external-message', source: 'test', timestamp: Date.now(), readsRow: goRow });
+      assert.ok(await pollUntil(() => held() === 1), 'go waits');
+      const pushed = await f.send('push/event', f.params('d1', 'zz batch', { deferred: true, key: 'docA' }));
+      assert.equal(pushed.result.coalesce.outcome, 'first');
+      const hold = () => (f.framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { heldRequests?: number } | null }> })
+        .agents.find((a) => a.name === 'agent')?.budgetHold ?? null;
+      assert.ok(await pollUntil(() => hold()?.heldRequests === 2), "the deferred batch's wake joined the wait");
+      internal.releaseBudgetHold('agent');
+      assert.ok(await pollUntil(() => held() === 2 && internal.budgetHolds.has('agent')), 'released, merged with that wake, refused and waiting again');
+      assert.equal(f.renders.length, 1, "the released start's assembly rendered the batch");
+      assert.equal(hold()?.heldRequests, 2, "and the batch's wake waits again beside the turn");
+      const renderRow = (f.framework.getAgent('agent')!.getContextManager().getAllMessages() as unknown as Array<{ id: string; content: unknown }>)
+        .find((r) => JSON.stringify(r.content).includes('document_diff'));
+      assert.ok(renderRow, 'and stored its render');
+      return { f, goRow, renderRow: String(renderRow.id), traces };
+    } catch (error) {
+      await f.close();
+      throw error;
+    }
+  }
+
+  it("a deferred batch rendered by a released start that is refused again still runs when a surgery drops the turn, and reads its render", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 1 }, async (c) => {
+      const { f, goRow } = await deferredBatchReheld();
+      try {
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await f.framework.suppressMessages('agent', { messageIds: [goRow] });
+        assert.ok(await pollUntil(() => f.membrane.calls.length === 1), "the batch's wake ran");
+        assert.ok(f.lastRequest().includes('document_diff'), 'and read the render');
+      } finally {
+        await f.close();
+      }
+    });
+  });
+
+  it('a deferred batch rendered by a released start that is refused again ends when a surgery takes both the turn and the render', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 1 }, async (c) => {
+      const { f, goRow, renderRow, traces } = await deferredBatchReheld();
+      try {
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        const ended = traces.filter((e) => e.type === 'inference:hold_ended').length;
+        await f.framework.suppressMessages('agent', { messageIds: [goRow, renderRow] });
+        assert.ok(await pollUntil(() => traces.filter((e) => e.type === 'inference:hold_ended').length > ended), 'the surgery ended the hold');
+        await f.framework.runUntilIdle();
+        assert.equal(f.membrane.calls.length, 0, 'nothing ran: no row of either is left to read');
+      } finally {
+        await f.close();
+      }
+    });
+  });
+
+  it("a prose turn that came from a channel, released and refused again beside a wake from another, waits with its own channels", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, channels: true, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const room = { serverId: 'discord', channelId: 'discord:g1:room' };
+      const general = { serverId: 'discord', channelId: 'discord:g1:general' };
+      const wakeFrom = (body: string, channel: typeof room) => {
+        const row = String(t.internal.addMessage('User', [text(body)]));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'gate:debounce', source: 'gate', timestamp: Date.now(), readsRow: row, wakeChannels: [channel] });
+      };
+      const channelsOf = () => ((t.internal.openLogical.get('prime') as { wakeChannels?: Array<{ channelId: string }> } | undefined)?.wakeChannels ?? [])
+        .map((c) => c.channelId);
+      try {
+        t.incoming(room.channelId, 'in-1', 'hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        wakeFrom('go', room);
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'go waits');
+        assert.deepEqual(channelsOf(), [room.channelId], "premise: go's waiting turn came from the room");
+        wakeFrom('second', general);
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'released, merged with that wake, refused and waiting again');
+        assert.deepEqual(channelsOf(), [room.channelId], "the turn that waits again came from go's channel alone");
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('a withdrawal takes a wake out of a released turn refused again, and the turn still waits', async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const row = String(t.internal.addMessage('User', [text('second')]));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-coalesced', source: 'test', timestamp: Date.now(), readsRow: row, coalescingSubject: 'zz-subject' });
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'released, merged with that wake, refused and waiting again');
+        assert.equal(t.hold()?.heldRequests, 2, "second's wake waits beside the turn again");
+        t.internal.cancelCoalescedWakes('zz-subject');
+        assert.equal(t.hold()?.heldRequests, 1, 'the withdrawal took it out');
+        assert.ok(t.internal.budgetHolds.has('prime'), 'and the held turn still waits');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered go')), 'the turn ran once there was room');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a released turn whose start fails once, and whose retry is refused again, keeps the wakes merged into it: abortInference() puts them back, and they run", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = new Error('zz store unavailable');
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+          "the released start failed, and the error policy's retry was refused and waits again");
+        assert.equal(c.failNext, undefined, 'the released start met the failure');
+        assert.deepEqual((t.internal.budgetHolds.get('prime')!.wait as { rows?: string[] }).rows, [String(t.rowWith('go').id)],
+          "the turn that waits again still stands on go's row");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        const wakes = [...t.internal.budgetHolds.get('prime')!.wakes];
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.ok(wakes.length === 1 && t.internal.pendingRequests.length === 1 && t.internal.pendingRequests[0] === wakes[0], "the queue holds second's wake, not the turn");
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a released turn with no rows to stand on, whose start fails once and whose retry is refused again, waits again as the fresh turn it was", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-rowless', source: 'test', timestamp: Date.now() });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'the turn with no rows waits');
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = new Error('zz store unavailable');
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+          "the released start failed, and the error policy's retry was refused and waits again");
+        assert.equal(c.failNext, undefined, 'the released start met the failure');
+        const marks = Object.getOwnPropertySymbols(t.internal.budgetHolds.get('prime')!.turn as object).map((x) => x.description);
+        assert.ok(!marks.includes('turn-retry'), `the turn waits again as the fresh turn it was, not as the retry of one: ${marks}`);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a surgery that removes a silent released turn's row, once its failed start's retry is refused, drops the turn and puts the wakes merged into it back", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Quiet thoughts'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const silentWake = (body: string) => {
+        const row = String(t.internal.addMessage('User', [text(body)]));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-silent', source: 'test', timestamp: Date.now(), readsRow: row, suppressProse: true });
+        return row;
+      };
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        const goRow = silentWake('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'go waits');
+        silentWake('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = new Error('zz store unavailable');
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')),
+          "the released start failed, and the error policy's retry was refused and waits again");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [goRow] });
+        assert.ok(await pollUntil(() => t.stored().includes('Quiet thoughts')), "second's wake ran");
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed'],
+          'the surgery dropped the waiting turn rather than releasing it');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("abortInference() that reaches a released start before it sends anything puts the wakes merged into it back in the queue, and they run", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        let stopped: boolean | undefined;
+        c.onRefusal = () => {
+          c.onRefusal = undefined;
+          c.fitAt = c.ticks;
+          c.readyAt = c.ticks;
+          stopped = t.framework.abortInference('prime', 'zz-stop');
+        };
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => stopped !== undefined), "the released start's compile ran");
+        assert.equal(stopped, true, 'the stop reached it');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        assert.ok(!t.internal.budgetHolds.has('prime'), 'and nothing waits');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("abortInference() of a released start's retry that a provider hold keeps puts the wakes merged into it back in the queue, and they run", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const cooldown = () => t.internal.providerAccelerationCooldowns.get('prime');
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = providerLimit();
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "the released start met a provider hold, and its retry waits there");
+        assert.equal(t.framework.getHostModeStatus().gatedRequests, 1, "second's wake counts as gated; the turn's retry, which a quiesce lets through, doesn't");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        cooldown()!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a wake that joins a released start's retry while a provider hold keeps it is kept too: refused for budget, then dropped, the retry gives back both wakes", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered both'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const cooldown = () => t.internal.providerAccelerationCooldowns.get('prime');
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = providerLimit();
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "the released start met a provider hold, and its retry waits there");
+        t.send('third');
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 1), "third's wake waits in the provider hold too");
+        cooldown()!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'the retry, merged with third, was refused for budget and waits');
+        assert.equal(t.hold()?.heldRequests, 3, "second's and third's wakes wait beside the turn");
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        assert.ok(await pollUntil(() => t.stored().includes('Answered both')), 'the wakes ran');
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+        assert.match(requestText(t.turnCalls().at(-1)), /second[\s\S]*third/, 'reading both');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a silent continuation released with a wake that opens a turn, and refused again, still stands on its own rows: a surgery that removes them drops it and gives the wake back", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const cooldown = () => t.internal.providerAccelerationCooldowns.get('prime');
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')));
+        c.failNext = providerLimit();
+        const goRow = String(t.internal.addMessage('User', [text('go')]));
+        t.internal.pendingRequests.push({ agentName: 'prime', reason: 'zz-silent', source: 'test', timestamp: Date.now(), readsRow: goRow, suppressProse: true });
+        assert.ok(await pollUntil(() => (cooldown()?.heldRequests.length ?? 0) > 0), "go's silent start met a provider hold, and its retry waits there");
+        cooldown()!.until = Date.now();
+        t.internal.releaseProviderAccelerationCooldown('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), "go's retry was refused for budget, and waits");
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 2 && t.internal.budgetHolds.has('prime')), 'released, merged with that wake, refused and waiting again');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        await t.framework.suppressMessages('prime', { messageIds: [goRow] });
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['released', 'removed'],
+          'the surgery dropped the waiting turn rather than releasing it');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("abortInference() while a released turn's failed start waits for its retry puts the wakes merged into it back in the queue, and they run", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered second'], policyDelayMs: 60_000 });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        t.send('second');
+        assert.ok(await pollUntil(() => t.hold()?.heldRequests === 2), "second's wake joined the wait");
+        c.failNext = new Error('zz store unavailable');
+        t.internal.releaseBudgetHold('prime');
+        assert.ok(await pollUntil(() => t.of('inference:failed').some((e) => String(e.error).includes('zz store unavailable'))), 'the released start failed, and its retry waits out the delay');
+        assert.ok(!t.internal.budgetHolds.has('prime'), 'no hold: the retry has not started');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.ok(await pollUntil(() => t.stored().includes('Answered second')), "second's wake ran");
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 2, 'as one turn after the hello');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("abortInference() of a held start merged from wakes, none of them a released turn, ends them with it, since they are the waiting turn's own", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered the merge'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        const orig = t.internal.startAgentStream;
+        const merged: number[] = [];
+        t.internal.startAgentStream = async function (this: unknown, agent: unknown, trigger: Record<string, unknown>) {
+          const mark = Object.getOwnPropertySymbols(trigger ?? {}).find((x) => x.description === 'merged-batch');
+          if (mark) merged.push((trigger as Record<symbol, unknown[]>)[mark]!.length);
+          return orig.call(this, agent, trigger);
+        };
+        t.sendForPrime('alpha');
+        t.sendForPrime('beta');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), 'one start, merged from both, waits');
+        t.internal.startAgentStream = orig;
+        assert.deepEqual(merged, [2], 'the held start was merged from both wakes');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        assert.equal(t.framework.abortInference('prime', 'zz-stop'), true);
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['stopped']);
+        await t.framework.runUntilIdle();
+        assert.equal(t.turnCalls().length, 1, 'no turn after the hello');
+        assert.ok(!t.stored().includes('Answered the merge'));
       } finally {
         await t.close();
       }
@@ -1496,6 +2102,35 @@ describe('a turn refused for budget while compression is pending waits idle, and
       } finally {
         internal.acquirePrimaryProviderGate = acquire;
         internal.releasePrimaryProviderGate = release;
+        await t.close();
+      }
+    });
+  });
+
+  it("a policy retry refused for budget leaves no stream reported live, keeps its hold and the window, and an undo takes the held turn out", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const stream = t.membrane.streamYielding.bind(t.membrane);
+      let failed = false;
+      t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
+        if (failed) return stream(request, options);
+        failed = true;
+        t.membrane.calls.push(request);
+        return errorStream(new Error('zz the stream failed'));
+      };
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), "the stream failed, and its policy retry's compile was refused and waits");
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')), 'the start unwound');
+        assert.deepEqual((t.framework.healthSnapshot() as { activeStreams: string[] }).activeStreams, [], 'no stream is reported live');
+        assert.notEqual(t.hold(), null, 'the hold stands');
+        t.internal.addMessage('User', [text('zz arrived while held')]);
+        assert.ok(t.stored().includes('zz arrived while held'));
+        assert.ok(!t.windowText().includes('zz arrived while held'), 'what arrives stays out of the held turn');
+        t.framework.undoLastTurn('prime');
+        assert.equal(t.hold(), null, 'the undo took the held turn out');
+      } finally {
         await t.close();
       }
     });
