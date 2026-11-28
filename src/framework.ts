@@ -15254,27 +15254,29 @@ export class AgentFramework {
    * message, and that reached a request, out of what the agent is sent,
    * whoever wrote it, with the rest of its exchange (the tool_use turn
    * paired with a tool result, and the whole of a body stored in shards).
-   * With `carried` (the stored bodies a refused request's compile carried,
-   * by each body's first message id), only a message that request carried
-   * counts, or the stored result of a call it carried, which goes with that
-   * call as one exchange when that pair is found or proven (below; if not,
-   * the call goes alone and the result stays); a row that carries nothing a request sends
-   * (asNextRequestCarries) is passed over and left in place. It adds no
-   * marker; the caller keeps one consolidated marker for the episode
-   * (updateRewindMarker). The returned record's descriptor says what was
-   * set aside and its size, never the content. Returns null when nothing
-   * that counts is left.
+   * With `carried`, only a message that the refused or failed request carried
+   * counts. `carried` holds the stored bodies that the request's compile
+   * carried, by each body's first message id, and the rows that its stream
+   * added since. The stored result of a call that the request carried counts
+   * too. It goes with that call as one exchange when the pair is found or
+   * proven (below). If not, the call goes alone and the result stays. A row
+   * that carries nothing a request sends (asNextRequestCarries) is passed
+   * over and left in place. It adds no marker; the caller keeps one
+   * consolidated marker for the episode (updateRewindMarker). The returned
+   * record's descriptor says what was set aside and its size, never the
+   * content. Returns null when nothing that counts is left.
    *
    * On a presented window (#291) the shed is the window's: the newest rows
    * of the agent's own window, in its order, leave it as an undone turn's
    * do (retractRows with `undone`), so no presentation point brings them
    * back, and the record keeps them, as the marker says. No other agent's
-   * window, nor its cache prefix or signed thinking, changes. A row the
-   * agent is never sent is passed over: a system_change row, a row a
-   * tune-out holds from residents (for an agent whose window leaves them
-   * out), and another agent's stored context injection. On a window that is
-   * still the record, the rows are removed from it, as before the index,
-   * and leave every other window that held them.
+   * window, nor its cache prefix or signed thinking, changes. On a window
+   * that is still the record, the shed removes the rows from the record, as
+   * before the index, and they leave every other window that held them. In
+   * either mode, the shed passes over a system_change row, which is the
+   * host's, and a row that the agent is never sent: a row that a tune-out
+   * holds from residents (for an agent whose view leaves them out), and
+   * another agent's stored context injection.
    *
    * A tool result is paired with the tool_use body right before it. On a
    * presented window, and only there, system notices between a result body
@@ -15294,14 +15296,14 @@ export class AgentFramework {
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
-    // In the window, the rows the agent is sent: a held row is in a
-    // resident's written-down window and left out by its view, as another
-    // agent's injection is (agentSees, the one rule main's #853 asks
-    // everywhere), and a system_change row is the host's.
+    // A row the shed passes over: a system row or a system_change row, which
+    // are the host's, and a row the agent isn't sent. Its compile reads its
+    // window, or in legacy mode the record, through one view: a resident's
+    // view leaves out a held row, as it leaves out another agent's injection
+    // (agentSees, the one rule main's #853 asks everywhere).
     const passedOver = (m: StoredMessage): boolean => {
       const meta = (m.metadata ?? {}) as Record<string, unknown>;
       if (meta.system) return true;
-      if (!windowed) return false;
       return hasBlock(m, 'system_change') || !this.agentSees(agent, m.metadata);
     };
     // The tool_use body a result body starting at `start` is paired with:
@@ -15338,21 +15340,35 @@ export class AgentFramework {
     // add a marker here; the caller keeps one consolidated marker
     // (updateRewindMarker).
     const wasCarried = (from: number, to: number) => !carried || all.slice(from, to + 1).some((m) => carried.has(m.id));
-    const callCarried = (start: number) => {
+    // A result body answers a carried call when any tool_result in it names,
+    // by its toolUseId, a tool_use of the call body before it. The body then
+    // goes with the call, so no result is left without its call.
+    const answersCarriedCall = (start: number, body: readonly StoredMessage[]) => {
+      const blocks = (rows: readonly StoredMessage[], t: string) => rows
+        .flatMap((m) => (Array.isArray(m.content) ? m.content : []) as unknown[])
+        .filter((blk) => typeOf(blk) === t);
+      const answers = blocks(body, 'tool_result').map((blk) => (blk as { toolUseId?: unknown }).toolUseId);
+      if (answers.length === 0) return false;
       const turn = callBefore(start);
-      return turn !== null && wasCarried(turn.from, turn.to);
+      if (turn === null || !wasCarried(turn.from, turn.to)) return false;
+      const calls = new Set(blocks(all.slice(turn.from, turn.to + 1), 'tool_use').map((blk) => (blk as { id?: unknown }).id));
+      return answers.some((id) => typeof id === 'string' && calls.has(id));
     };
     let idx = -1;
     for (let i = all.length - 1; i >= 0; i--) {
-      const { from: start } = bodyRangeIn(all, i);
+      const { from: start, to: end } = bodyRangeIn(all, i);
       const body = all.slice(start, i + 1);
-      const resultOfCarriedCall = body.some((m) => hasBlock(m, 'tool_result')) && callCarried(start);
-      // A row the agent is never sent is passed over, unless it is the
-      // stored result of a call the request carried: the exchange goes whole.
+      const resultOfCarriedCall = carried !== undefined && answersCarriedCall(start, body);
+      // A row that passedOver names is passed over, unless it is the stored
+      // result of a call the request carried: the exchange goes whole.
+      // With no record of what the request carried, no call counts as carried here.
       if (passedOver(all[i]!) && !resultOfCarriedCall) continue;
       if (!body.every((m) => !Array.isArray(m.content) || asNextRequestCarries(m.content) === null)
         && (wasCarried(start, i) || resultOfCarriedCall)) {
-        idx = i; break;
+        // A later shard can be passed over while this one is taken. The body
+        // still goes whole, to its last shard: a removal that ended inside it
+        // would split it, and context-manager refuses that.
+        idx = end; break;
       }
       i = start;
     }
@@ -31372,7 +31388,7 @@ export class AgentFramework {
                 // request's content or size, which a shed of the newest
                 // exchange may fix.
                 ...this.classifyInferenceError(err),
-              });
+              }, { carried: this.streamCarried.get(stream) ?? new Set() });
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
                 this.pushEvent(action.emit);
@@ -31764,7 +31780,7 @@ export class AgentFramework {
         error: err.message,
         ...shownReasonOf(err),
         ...this.classifyInferenceError(err),
-      });
+      }, { carried: this.streamCarried.get(stream) ?? new Set() });
       this.rearmExhaustedTurn(agent, err, trigger, ownsProviderGate, streamRouting, asTransient);
       // Postmortem 2026-05-28 P2 #7: catch-path failures (stream itself
       // threw) were previously only visible via in-memory trace listeners.
@@ -36095,7 +36111,12 @@ export class AgentFramework {
     };
   }
 
-  private emitTrace(event: TraceEventInput): void {
+  /**
+   * `exhausted.carried`: for an `inference:exhausted` from a stream, the rows
+   * that the stream carried, which the poison-history breaker's shed may
+   * take. Listeners never get it with the event.
+   */
+  private emitTrace(event: TraceEventInput, exhausted?: { carried: ReadonlySet<MessageId> }): void {
     // Centralized inference-health observability. Every terminal failure path
     // funnels through an `inference:exhausted` trace and every successful model
     // response through `inference:completed`, so intercepting here is the one
@@ -36114,6 +36135,7 @@ export class AgentFramework {
           providerErrorCode: event.providerErrorCode as string | undefined,
           shownReason: event.shownReason as string | undefined,
         },
+        exhausted?.carried,
       );
     } else if (event.type === 'inference:completed') {
       // A completed turn, a tool-ended one included, shows the agent can
@@ -36624,6 +36646,8 @@ export class AgentFramework {
     retryable?: boolean,
     rawErrorType?: string,
     detail?: { httpStatus?: number; providerErrorCode?: string; shownReason?: string },
+    /** The rows that the failing stream carried. A failure with no stream gives none. */
+    carried?: ReadonlySet<MessageId>,
   ): void {
     const ended = this.exhaustedTurns?.get(agentName);
     this.exhaustedTurns?.delete(agentName);
@@ -36812,7 +36836,7 @@ export class AgentFramework {
       // `retryable` is kept only for the trace.
       void retryable;
       if (agent && shedMayHelp(errorType, httpStatus)) {
-        this.quarantinePoisonedHistory(agent, wholeReason);
+        this.quarantinePoisonedHistory(agent, wholeReason, carried);
       }
     }
   }
@@ -36831,7 +36855,7 @@ export class AgentFramework {
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
-  private quarantinePoisonedHistory(agent: Agent, wholeReason: string): void {
+  private quarantinePoisonedHistory(agent: Agent, wholeReason: string, carried?: ReadonlySet<MessageId>): void {
     const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
     const used = this.exhaustionRewinds.get(agent.name) ?? 0;
     if (used >= cap) {
@@ -36842,12 +36866,14 @@ export class AgentFramework {
       return;
     }
 
-    const rec = this.shedNewestTurn(agent);
+    // After a stream fails, the shed may take only a row that the stream carried.
+    const rec = this.shedNewestTurn(agent, carried);
     if (!rec) {
-      console.error(
-        `[inference-rewind] agent=${agent.name} has nothing left to shed — ` +
-        `history holds only system markers and rows a request leaves empty. Manual repair needed.`,
-      );
+      console.error(carried
+        ? `[inference-rewind] agent=${agent.name} has no eligible exchange to shed for this failure — manual repair needed.`
+        : `[inference-rewind] agent=${agent.name} has nothing left to shed — history holds only rows a shed ` +
+          `passes over: system markers, system changes, rows the agent's view leaves out, and rows a request leaves empty. ` +
+          `Manual repair needed.`);
       return;
     }
 
