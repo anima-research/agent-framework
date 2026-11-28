@@ -3343,13 +3343,17 @@ export function carryQuietSinceForTests(request: InferenceRequest, since: number
 }
 
 /** Test-only: marks `request` as the scheduler marks a turn's retry
- *  (TURN_RETRY), a re-armed turn (REARMED) or a turn a budget hold released
- *  (BUDGET_WAIT), whose symbols a test can't name. */
-export function markRequestForTests(request: InferenceRequest, mark: 'retry' | 'rearmed' | 'budget-wait'): void {
+ *  (TURN_RETRY), a re-armed turn (REARMED), a turn a budget hold released
+ *  (BUDGET_WAIT) or one whose release wrote its routing and whose request
+ *  was sent (RELEASED_ROUTING alone), whose symbols a test can't name. */
+export function markRequestForTests(request: InferenceRequest, mark: 'retry' | 'rearmed' | 'budget-wait' | 'released'): void {
   const r = request as MarkedRequest;
   if (mark === 'retry') r[TURN_RETRY] = true;
   else if (mark === 'rearmed') r[REARMED] = true;
-  else r[BUDGET_WAIT] = { since: request.timestamp };
+  else if (mark === 'budget-wait') r[BUDGET_WAIT] = { since: request.timestamp };
+  // A released turn once its request is sent: rebuilt without BUDGET_WAIT,
+  // keeping RELEASED_ROUTING (an object rest copies symbol keys).
+  else r[RELEASED_ROUTING] = { wasRetry: false, opened: true };
 }
 
 /**

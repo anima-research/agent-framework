@@ -115,8 +115,9 @@ describe('quietSplit', () => {
     assert.equal(remaining([auto], T0 + 100), 0);
     // The marks the scheduler sets, which keep the message reason and the
     // first wake's age: a retry (TURN_RETRY, R6-13), a re-arm, which drops
-    // the retry mark, and a turn a budget hold released (R6-1).
-    for (const mark of ['retry', 'rearmed', 'budget-wait'] as const) {
+    // the retry mark, a turn a budget hold released (R6-1), and one whose
+    // request was sent, left with RELEASED_ROUTING alone (Weft's plant).
+    for (const mark of ['retry', 'rearmed', 'budget-wait', 'released'] as const) {
       const marked = message(T0);
       markRequestForTests(marked, mark);
       assert.equal(remaining([marked], T0 + 100), 0, `a ${mark} turn is not held`);
