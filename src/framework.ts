@@ -14607,9 +14607,9 @@ export class AgentFramework {
         // act on, goes on to the primary, now or, while quiesced, at resume.
         // The run's store keeps its namespace for investigation.
         // Exact-generation disposal owns these name-keyed entries. Remove them
-        // before deregistration; the late driveStream finally will see the
-        // generation mismatch and leave any future owner untouched. A fork's
-        // end does the same (disposeConversationAgent).
+        // before deregistration. The late driveStream finally leaves a future
+        // owner's entries alone, since they aren't its own. A fork's end does
+        // the same (disposeConversationAgent).
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
         this.turnRouting.delete(agent.name);
@@ -29253,13 +29253,6 @@ export class AgentFramework {
         // The agent lets go of the stream, which cancelStream() would cancel
         // a second time.
         agent.reset();
-        if (this.agents.get(agent.name) === agent) {
-          // The compile took the agent's stream id, so a frame that started
-          // this one (a guard or budget restart) no longer owns the entries
-          // it left, and its teardown leaves them to this frame.
-          this.activeStreams.delete(agent.name);
-          this.pendingAssistantBlocks.delete(agent.name);
-        }
         this.endDroppedTurn(agent.name, routing);
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
@@ -29271,10 +29264,6 @@ export class AgentFramework {
       const stopAfterCompile = this.takeStartStop(agent, checkWindow);
       if (stopAfterCompile) {
         this.cancelUnsentStream(agent, stream, 'stopped after its compile');
-        // As above: the compile took the agent's stream id from any frame
-        // that started this one.
-        this.activeStreams.delete(agent.name);
-        this.pendingAssistantBlocks.delete(agent.name);
         this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn, released);
         return false;
       }
@@ -29311,8 +29300,6 @@ export class AgentFramework {
               : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
                 : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
           this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing);
-          this.activeStreams.delete(agent.name);
-          this.pendingAssistantBlocks.delete(agent.name);
           this.channelRegistry?.stopTyping();
           this.eventGate?.onInferenceEnded(agent.name);
           return false;
@@ -29338,6 +29325,7 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      const streamRef: { handle?: Promise<void> } = {};
       const handle = this.driveStream(
         agent,
         stream,
@@ -29358,7 +29346,9 @@ export class AgentFramework {
             }
           : undefined,
         streamCarry,
+        streamRef,
       );
+      streamRef.handle = handle;
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
       // its finally now owns clearing it. The caller's finally must not.
@@ -29481,6 +29471,17 @@ export class AgentFramework {
       } else {
         if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         this.noteFailedTurnEnd(agent, routing);
+        // A start that continues a turn (a budget or guard restart) follows a
+        // frame that kept the turn's batch and the guard's recovery for it. No
+        // successor follows this failure, so they end here, as at a stop.
+        agent.toolResultGuard.recovering = false;
+        if (agent.toolResultGuard.hasPending) {
+          try {
+            agent.toolResultGuard.abandon('aborted');
+          } catch (error) {
+            console.error(`[tool-result-guard] agent=${agent.name} failed to record aborted batch:`, error);
+          }
+        }
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame
         // can never clear a successor turn's marker. A leaked token would
@@ -29544,6 +29545,8 @@ export class AgentFramework {
      *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
+    /** The caller puts this stream's handle here as it registers the stream. */
+    streamRef: { handle?: Promise<void> } = {},
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     const startTime = Date.now();
@@ -29554,6 +29557,8 @@ export class AgentFramework {
     // so the latest is everything the stream has been billed for so far:
     // the measure of a stream that ends without a final response.
     let latestUsage: DetailedUsage | undefined;
+    // The blocks that this stream's latest round put in pendingAssistantBlocks.
+    let myPendingBlocks: ContentBlock[] | undefined;
     const tokenUsageOf = (usage: DetailedUsage | undefined): InferenceLogEntry['tokenUsage'] => usage
       ? {
           input: usage.inputTokens,
@@ -30249,6 +30254,7 @@ export class AgentFramework {
             assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
+            myPendingBlocks = assistantBlocks;
             this.pendingRoundSent.set(assistantBlocks, roundContent && roundContent.length > 0
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
@@ -32098,7 +32104,9 @@ export class AgentFramework {
       }
       // A framework retry/budget restart can overlap physical streams on the
       // same Agent object. Name + Agent identity is not enough: only the
-      // current stream generation may mutate name-keyed teardown state.
+      // current stream generation may mutate the name-keyed teardown state
+      // below. This stream's own activeStreams and pendingAssistantBlocks
+      // entries go by identity instead.
       const ownsPhysicalStream =
         this.agents.get(agent.name) === agent && agent.streamId === myStreamId;
       // Ephemeral completion resolves its caller before this finally runs, so
@@ -32186,8 +32194,13 @@ export class AgentFramework {
       // since stopping closes the connections a queued delivery waits on.
       void turnSpeechChain.then(completeOutgoing);
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
-      if (ownsPhysicalStream) {
+      // When this frame ends, clear the entries that are still this stream's
+      // own. Do so even if this frame no longer holds the stream id. A later
+      // stream's entries are not this stream's, so they stay.
+      if (streamRef.handle !== undefined && this.activeStreams.get(agent.name) === streamRef.handle) {
         this.activeStreams.delete(agent.name);
+      }
+      if (myPendingBlocks !== undefined && this.pendingAssistantBlocks.get(agent.name) === myPendingBlocks) {
         this.pendingAssistantBlocks.delete(agent.name);
       }
 
