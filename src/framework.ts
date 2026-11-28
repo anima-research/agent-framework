@@ -1978,8 +1978,17 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
 }
 
 const CALLS_CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
-const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
-const LIVE_SPEECH_UNRECEIPTED = `Plain speech its rounds routed live was handed on for delivery as written, and no [${NOTICE_TAG.delivered}] line was written for it.`;
+const SPEECH_STILL_ROUTING = "Some of that turn's plain speech was still being routed when the turn ended, so it may yet be posted; check the channel before sending it again.";
+
+function distinctDestinations(list: readonly ChannelRef[]): ChannelRef[] {
+  const seen = new Set<string>();
+  return list.filter((channel) => {
+    const key = destinationKey(channel);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 /** The reason on the inference:aborted that ends a turn whose retry stop()
  *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
@@ -4589,7 +4598,7 @@ export class AgentFramework {
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
-  private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
+  private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; deliveries: ChannelRef[]; speechRouting: boolean }>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -9268,7 +9277,7 @@ export class AgentFramework {
     const ownsAgent = args.stream === undefined || closes !== undefined;
     const handedOn = before === 'sending' ? ''
       : `${(stream?.unflushedRounds ?? 0) > 0 ? ` ${CALLS_CUT_OFF}` : ''}` +
-        `${stream?.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
+        `${stream?.liveSpeech ? this.confirmedSpeech(agent.name, stream.deliveries) : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
     try {
       storeOwnRow(
         agent,
@@ -25026,16 +25035,9 @@ export class AgentFramework {
     if (list.length === 0 && suppressed === 0 && drafts.length === 0 && kept === 0 && !notHeld) return;
     routing.deliveries = [];
     routing.suppressed = 0;
-    const seen = new Set<string>();
-    const shown: string[] = [];
-    const landed: ChannelRef[] = [];
-    for (const channel of list ?? []) {
-      const key = destinationKey(channel);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      shown.push(this.channelShown(channel));
-      landed.push(channel);
-    }
+    const landed = distinctDestinations(list);
+    const seen = new Set(landed.map((channel) => destinationKey(channel)));
+    const shown = landed.map((channel) => this.channelShown(channel));
     const notes: string[] = [];
     // Each of the turn's drafts as it stands now: a mid-turn notice lets the
     // resident resend or dismiss one before the turn ends, so "not sent" is
@@ -25178,12 +25180,23 @@ export class AgentFramework {
     }
   }
 
+  private confirmedSpeech(agentName: string, deliveries: readonly ChannelRef[]): string {
+    const landed = distinctDestinations(deliveries);
+    if (landed.length === 0) return '';
+    // What a [delivered] line adds for the same list: speech that stayed in a
+    // channel the agent closed or declined says so.
+    const closedNotes = this.closedChannelNotes(agentName, landed);
+    return ` Confirmed delivered before that turn ended: plain speech → ${landed.map((channel) => this.channelShown(channel)).join(' · ')}.` +
+      ` No [${NOTICE_TAG.delivered}] line was written for this speech, so this note is its receipt.` +
+      (closedNotes.length > 0 ? ` ${closedNotes.join(' ')}${this.closedChannelNoteOff(agentName)}` : '');
+  }
+
   private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
     const callsCutOff = (routing.unflushedRounds ?? 0) > 0;
     if (gotPartway(routing)) {
       this.exhaustedTurns?.set(agent.name, {
         roundsRan: routing.roundsRan === true, callsCutOff, liveSpeech: routing.liveSpeech === true,
-        speechRouting: (routing.speechRouting ?? 0) > 0,
+        deliveries: [...routing.deliveries], speechRouting: (routing.speechRouting ?? 0) > 0,
       });
     }
   }
@@ -25199,13 +25212,7 @@ export class AgentFramework {
    * agent once. No-op otherwise.
    */
   private appendClosedChannelNoteAlone(agent: Agent, routing: TurnRouting): void {
-    const seen = new Set<string>();
-    const landed = routing.deliveries.filter((channel) => {
-      const key = destinationKey(channel);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const landed = distinctDestinations(routing.deliveries);
     routing.deliveries = [];
     const notes = this.closedChannelNotes(agent.name, landed);
     if (notes.length === 0) return;
@@ -36958,7 +36965,7 @@ export class AgentFramework {
               `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
               `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
               `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
-              `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
+              `${ended.liveSpeech ? this.confirmedSpeech(agentName, ended.deliveries) : ''}` +
               `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}` +
               `${shown}${timedOut ? ` ${TIMEOUT_ADVICE}` : ''}`,
           }],
