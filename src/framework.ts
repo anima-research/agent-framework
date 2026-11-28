@@ -41737,23 +41737,27 @@ export class AgentFramework {
       return !!metadata?.tuneOut && typeof metadata.serverId === 'string' && typeof metadata.channelId === 'string';
     });
     if (marked.length === 0) return;
+    const holds: Array<{ epochId: string } | null> = [];
     try {
-      coordinator.getAllExcept();
+      for (const write of marked) {
+        const metadata = write.metadata as { serverId: string; channelId: string };
+        holds.push(coordinator.holdFor(metadata.serverId, metadata.channelId));
+      }
     } catch (error) {
-      const kept = marked.length === 1 ? '1 message held as it arrived during the move keeps' : `${marked.length} messages held as they arrived during the move keep`;
-      console.error(`[tune-out] the all-except hold of the branch moved to could not be read, so ${kept} the branch left's tune-out, and a message whose tune-out the branch moved to doesn't hold never reaches the resident:`, error);
+      const kept = marked.length === 1 ? '1 message held as it arrived keeps' : `${marked.length} messages held as they arrived keep`;
+      console.error(`[tune-out] the all-except hold of the branch moved to could not be read, so ${kept} the tune-out it was held under, and one that the branch moved to doesn't hold reaches the resident only if a later move gives it that branch's mark:`, error);
       return;
     }
-    for (const write of marked) {
-      const metadata = write.metadata as { tuneOut?: unknown; serverId: string; channelId: string };
-      const hold = coordinator.holdFor(metadata.serverId, metadata.channelId);
+    marked.forEach((write, i) => {
+      const metadata = write.metadata as { tuneOut?: unknown };
+      const hold = holds[i];
       if (hold) {
         metadata.tuneOut = { epochId: hold.epochId };
       } else {
         delete metadata.tuneOut;
         if (write.opts?.heldFrom) write.opts = { ...write.opts, audience: [...write.opts.heldFrom] };
       }
-    }
+    });
   }
 
   private tuneOutsOnRecordHere(): boolean {

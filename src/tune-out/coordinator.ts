@@ -1347,7 +1347,7 @@ export class TuneOutCoordinator {
 
   private resumeHolds(occasion: ResumeOccasion): void {
     const moved = occasion === 'branch-move';
-    const meanwhile = moved ? 'before the branch move' : 'while the process was down';
+    const meanwhile = moved ? 'by the end of the branch move' : 'while the process was down';
     for (const { serverId, channelId, params } of this.listActive()) {
       const key = this.key(serverId, channelId);
       const kept = moved && (this.cadenceTimers.has(key) || this.expiryTimers.has(key));
@@ -3347,7 +3347,7 @@ export class TuneOutCoordinator {
     try {
       this.resumeHolds('branch-move');
     } catch (err) {
-      console.error(`[tune-out] the holds on the branch moved to could not all be resumed: ${thrownReason(err)}`);
+      console.error(`[tune-out] the holds on the branch moved to could not all be resumed, so a hold after the one that failed may have no timers until a later move or a start: ${thrownReason(err)}`);
     }
   }
 

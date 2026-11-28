@@ -1767,16 +1767,18 @@ export class ChannelRegistry {
 
   /**
    * The store moved to another branch (the framework's followBranchMove, for
-   * any move but one to the branch it was on). The desired lifecycle states
+   * any move but one to the branch it was on, unless the move before
+   * couldn't read these logs). The desired lifecycle states
    * and the label history are read again from the destination, as a start on
    * that branch reads them. Both logs are read before either replaces what
    * memory holds, so a read that throws leaves memory as it was, and the
    * error goes to the caller. Then each registered channel gets what a
-   * registration on the destination would give it, and a push's placeholder
-   * gets nothing. It gets its label sightings, and the legacy policy's
-   * migration where the destination hasn't had it. For a server whose
-   * lifecycle this host directs, each channel also gets its first decision.
-   * The agent is told of a channel that the policy opened, as at
+   * registration on the destination would give it: its label sightings, and
+   * the legacy policy's migration where the destination hasn't had it. A
+   * push's placeholder gets only its label sighting, where it has a real
+   * label. For a server whose lifecycle this host directs, each channel also
+   * gets its first decision, unless that server's migration failed, as at
+   * registration. The agent is told of a channel that the policy opened, as at
    * registration. Where a channel's transport isn't confirmed as that
    * decision has it, an open or a close is sent, without waiting for the
    * server. A failure there is traced as a registration's is
@@ -1795,7 +1797,16 @@ export class ChannelRegistry {
     this.dmClassified = labels.dmClassified;
     const byServer = new Map<string, ChannelEntry[]>();
     for (const entry of this.channels.values()) {
-      if (this.untargetedPushEntries.has(entry)) continue;
+      if (this.untargetedPushEntries.has(entry)) {
+        if (entry.descriptor.label !== entry.descriptor.id) {
+          try {
+            this.appendLabelSighting(entry.descriptor.id, entry.descriptor.label, extractDmMeta(entry.descriptor.metadata));
+          } catch (err) {
+            this.reconcileFailed(entry.serverId, entry.descriptor.id, err);
+          }
+        }
+        continue;
+      }
       const entries = byServer.get(entry.serverId);
       if (entries) entries.push(entry);
       else byServer.set(entry.serverId, [entry]);
@@ -1811,7 +1822,7 @@ export class ChannelRegistry {
       try {
         this.migrateLegacyPolicy(serverId, entries.map((entry) => entry.descriptor));
       } catch (err) {
-        console.error(`[mcpl] the "${serverId}" server's legacy recipe policy couldn't be migrated on the branch moved to, so its channels get no decision on this move, as at a registration whose migration fails; a later move or a start migrates it:`, err);
+        console.error(`[mcpl] the "${serverId}" server's legacy recipe policy couldn't be migrated on the branch moved to, so the channels it didn't reach get no decision on this move, and none of its channels is opened or closed at the server, as at a registration whose migration fails; a later move or a start migrates it:`, err);
         continue;
       }
       if (!this.directsLifecycle(serverId)) continue;
