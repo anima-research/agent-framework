@@ -445,7 +445,7 @@ const OWN_ROW_WRITERS: Record<string, { count: number; when: 'turn' | 'end' | 'u
   'framework.ts AgentFramework.placeBatchLine': { count: 1, when: 'turn', what: "a batched wake's line, at its start" },
   'framework.ts AgentFramework.runPuppetToolCall': { count: 2, when: 'held-back', what: "the puppet's pair: under its own reservation, or held back once a turn replaced it" },
   'framework.ts AgentFramework.appendProseDeliveryReceipt': { count: 1, when: 'end', what: "a stream's delivery receipt, after its last request" },
-  'framework.ts AgentFramework.driveStream': { count: 3, when: 'end', what: "the contained tool-wrapper prose marker, main's cut-off tool-block notice, and the output-limit note after a cut plain-prose reply" },
+  'framework.ts AgentFramework.driveStream': { count: 4, when: 'end', what: "the contained tool-wrapper prose marker, main's cut-off tool-block notice, the output-limit note after a cut plain-prose reply, and a named cut's held-words row (#640 R3-3)" },
   'framework.ts AgentFramework.updateRewindMarker': { count: 1, when: 'end', what: "a refusal rewind's marker" },
   'framework.ts AgentFramework.noteInferenceExhausted': { count: 1, when: 'end', what: "an exhausted turn's [inference-failed] marker" },
   // Written where the rewind marker is, in the refused stream's completion,
