@@ -9,4 +9,6 @@
   copy of that wake. Two different wakes at the same moment both stay
   held, and the turn that starts when the hold ends handles both. A
   quiesce now keeps a waiting wake for each channel, and not one for all
-  of them.
+  of them. One case changes the other way. A quiesce may park wakes on #a,
+  then #b, then #a again, with the last two in the same millisecond. The
+  resumed turn then speaks in #b, where before it spoke in #a.
