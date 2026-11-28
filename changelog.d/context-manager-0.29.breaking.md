@@ -6,28 +6,33 @@
   agent-framework and context-manager.
   - **Who needs to act:** a host that depends on context-manager itself; a
     host that previews a context, reads one through the API, runs a gate reply
-    judge or spawns conversation forks, under the autobiographical strategy;
-    and a host that subclasses `AutobiographicalStrategy`.
+    judge or spawns conversation forks, under the autobiographical strategy; a
+    host that subclasses `AutobiographicalStrategy`; and a host with no
+    chronicle of its own, or one whose framework opens its store by path.
   - **Migration:** take context-manager `^0.29.0` too. Beside a 0.28.x of its
     own, an install holds two copies of context-manager. Then a check of a
     class fails for what the other copy made. The framework refuses a
-    `PassthroughStrategy` with `subconscious.reader: 'forks'`. And
-    `previewContextSettings` throws for a non-adaptive
+    `PassthroughStrategy` with `subconscious.reader: 'forks'` and no
+    `strategyFactory`. And `previewContextSettings` throws for a non-adaptive
     `AutobiographicalStrategy` whose select fits the budget, where it would
     give null. A host that declares chronicle may stay on 0.6 or 0.7, or move
-    to 0.8. A lockfile's 0.6 or 0.7 is still admitted. A caller of a preview
-    below catches context-manager's `OverBudgetError`, by its class or, across
-    two copies, by `error.name === 'OverBudgetError'`, or asks
-    `previewContextSettings` whether a budget fits.
+    to 0.8. A lockfile's 0.6 or 0.7 is still admitted. A caller of
+    `previewActivation` in the same process catches context-manager's
+    `OverBudgetError`, by its class or, across two copies, by
+    `error.name === 'OverBudgetError'`, or asks `previewContextSettings`
+    whether the agent's budget fits. An API or MCP client gets the refusal's
+    message as an error, and `lastVisible` gives null.
   - **When the framework's chronicle becomes 0.8.0:** on a fresh install, a
     host with no chronicle of its own gets 0.8.0, where it got 0.7. Where the
     framework opens the store by its path (`storePath`,
-    `agent-framework-recover`), a host on chronicle 0.8.0 now opens it with
-    0.8.0. Before, the framework used its nested 0.7. chronicle 0.8.0 opens
-    and reads a store that 0.6 or 0.7 wrote. On disk it adds only saved length
-    checks in `state.bin`, which 0.6 and 0.7 don't read, so they still open a
-    store that 0.8.0 wrote. chronicle 0.8.0's breaking changes reach a host
-    through this package: an open fsyncs the log before it returns, and
+    `agent-framework-recover`), a host on chronicle 0.8.0 whose install shares
+    that chronicle now opens it with 0.8.0. Before, the framework used its
+    nested 0.7. Where a lockfile keeps that nested 0.7, the framework still
+    opens with it. chronicle 0.8.0
+    opens and reads a store that 0.6 or 0.7 wrote. On disk it adds only saved
+    length checks in `state.bin`, which 0.6 and 0.7 don't read, so they still
+    open a store that 0.8.0 wrote. chronicle 0.8.0's breaking changes reach a
+    host through this package: an open fsyncs the log before it returns, and
     refuses a used store that has lost its log; a write first retries a failed
     fsync of the log; and a branch call whose checkpoint fails undoes its
     change. This package matches two chronicle messages,
