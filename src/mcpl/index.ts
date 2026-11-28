@@ -112,7 +112,7 @@ export {
 
 // Server connection and registry
 export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './server-connection.js';
-export type { McplConnectionCloseInfo } from './server-connection.js';
+export type { McplConnectionCloseInfo, McplNoGrantEnd, McplNoGrantRefusal } from './server-connection.js';
 export type { TransportCloseInfo } from './transport.js';
 export { ModernMcpConnection } from './modern-connection.js';
 export type { ModernToolCallResult } from './modern-connection.js';

@@ -9,6 +9,7 @@ import { AnthropicAdapter, AnthropicXmlFormatter, Membrane } from '@animalabs/me
 
 import { AgentFramework } from '../src/index.js';
 import { TOOL_RESULT_GUARD_AUDIT_STATE } from '../src/tool-result-guard.js';
+import { draftState, type Draft } from '../src/prose-drafts.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 
 type Block = { text: string } | { thinking: string } | { call: string; json: string[]; whole: boolean };
@@ -81,7 +82,7 @@ interface Run {
   failedTraces: Array<{ callId?: string; tool?: string; error?: string }>;
   audit: Array<Record<string, any>>;
   drafts: Array<{ text: string; reason: string }>;
-  /** The open drafts with their ids and notes. */
+  /** The drafts the run held and didn't deliver, with their ids and notes. */
   held: Array<{ id: string; text: string; reason: string; note?: string }>;
 }
 
@@ -171,6 +172,11 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'And next?', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     const cm = framework.getAgent('resident')!.getContextManager() as unknown as { getAllMessages(): Run['rows'] };
+    // Every draft the run held and didn't deliver, newest first, open or not:
+    // the "And next?" turn leaves the first turn's drafts alone, which sets
+    // them aside at its end.
+    const undelivered = [...((framework as unknown as { proseDrafts: { drafts: Map<string, Map<string, Draft>> } }).proseDrafts.drafts.get('resident')?.values() ?? [])]
+      .filter((d) => draftState(d) !== 'delivered').reverse();
     return {
       mode,
       moves: robot.moves,
@@ -182,10 +188,8 @@ async function turn(mode: 'native' | 'xml', replies: Reply[], settings: Record<s
       boundaryLines: lines.filter((line) => line.startsWith('[tool-boundary]')),
       failedTraces,
       audit: settings.toolResultGuard ? framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, any>> : [],
-      drafts: (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string }> } })
-        .proseDrafts.open('resident').map((d) => ({ text: d.text, reason: d.reason })),
-      held: (framework as unknown as { proseDrafts: { open(agent: string): Array<{ id: string; text: string; reason: string; note?: string }> } })
-        .proseDrafts.open('resident').map((d) => ({ id: d.id, text: d.text, reason: d.reason, ...(d.note ? { note: d.note } : {}) })),
+      drafts: undelivered.map((d) => ({ text: d.text, reason: d.reason })),
+      held: undelivered.map((d) => ({ id: d.id, text: d.text, reason: d.reason, ...(d.note ? { note: d.note } : {}) })),
     };
   } finally {
     console.error = error;
@@ -625,7 +629,7 @@ describe("sameRoundSkipReplyTextPolicy 'ask' on the XML tool path: what a skip_r
     ({ xml: `${text}\n\n<function_calls>\n<invoke name="skip_reply">\n${input}</invoke>\n`, stop: 'stop_sequence' });
   const refusedWake = (text: string): Reply => skipRound(text, '<parameter name="wake_in_seconds">60</parameter>\n');
   const SECOND = 'Second words for the room.';
-  /** The texts of the run's open 'skip-reply' drafts, trimmed (the parse decides a run's whitespace), sorted (the store lists the newest first). */
+  /** The texts of the run's 'skip-reply' drafts, trimmed (the parse decides a run's whitespace), sorted (the store lists the newest first). */
   const skipHeld = (run: Run): string[] => run.held.filter((d) => d.reason === 'skip-reply').map((d) => d.text.trim()).sort();
   const receipts = (run: Run) => run.rows.flatMap((row) => row.content.filter((block) => block.type === 'text').map((block) => block.text as string))
     .filter((t) => t.startsWith('[delivered]'));

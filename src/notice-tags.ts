@@ -45,6 +45,7 @@ export const NOTICE_TAG = {
   channelInvitation: 'Channel invitation',
   system: 'system',
   toolsets: 'toolsets',
+  noGrant: 'no-grant',
   wakeOnboarding: 'wake onboarding',
   suppressionReview: 'suppression review',
   heartbeat: 'heartbeat',

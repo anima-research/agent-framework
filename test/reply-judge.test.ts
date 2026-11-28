@@ -361,3 +361,143 @@ describe('reply judge: the document', () => {
     assert.deepStrictEqual(asked, ['Scout']);
   });
 });
+
+describe('reply judge: surrogate pairs', () => {
+  const FLOWER = '\u{1F33C}';
+  const NOTE = / \[…(\d+) characters cut…\] /;
+
+  function parts(result: string): { head: string; count: number; tail: string } {
+    const m = NOTE.exec(result);
+    assert.ok(m, `a cut note in ${JSON.stringify(result.slice(0, 60))}`);
+    return { head: result.slice(0, m.index), count: Number(m[1]), tail: result.slice(m.index + m[0].length) };
+  }
+
+  function requestTexts(request: NormalizedRequest): string[] {
+    const texts: string[] = typeof request.system === 'string' ? [request.system] : [];
+    for (const m of request.messages) for (const b of m.content) if (b.type === 'text') texts.push(b.text);
+    return texts;
+  }
+
+  async function bothAlignments(context: (pad: string) => { system?: string; messages: NormalizedMessage[] }): Promise<NormalizedRequest[]> {
+    const { membrane, requests } = fakeMembrane();
+    for (const pad of ['', 'a']) {
+      const judge = new ReplyJudge({
+        membraneFor: () => membrane, chooseAgent: (n) => n[0],
+        preview: async () => ({ ...context(pad), config: { model: 'x', maxTokens: 1 } }),
+      });
+      await judge.judge(judgeRequest());
+    }
+    return requests;
+  }
+
+  function assertEmojiWhole(requests: NormalizedRequest[]): void {
+    assert.strictEqual(requests.length, 2);
+    for (const request of requests) {
+      for (const text of requestTexts(request)) {
+        assert.ok(text.isWellFormed(), `well formed: ${JSON.stringify(text.slice(0, 40))}`);
+        assert.ok(!text.includes('\uFFFD'), `no emoji replaced: ${JSON.stringify(text.slice(0, 40))}`);
+      }
+      const all = requestTexts(request).join('\n');
+      assert.match(all, NOTE, 'the cut text reaches the request');
+      assert.ok(all.includes(FLOWER), 'its emoji reach the request');
+    }
+  }
+
+  it('ends the head before a pair that its cut point falls inside', () => {
+    const keep = Math.floor((600 - 40) / 2);
+    const text = 'x'.repeat(keep - 1) + FLOWER + 'y'.repeat(500);
+    const result = cut(text, 600);
+    assert.ok(result.isWellFormed());
+    const { head, count, tail } = parts(result);
+    assert.strictEqual(head, 'x'.repeat(keep - 1));
+    assert.strictEqual(count, text.length - head.length - tail.length);
+  });
+
+  it('starts the tail after a pair that its cut point falls inside', () => {
+    const keep = Math.floor((600 - 40) / 2);
+    const text = 'x'.repeat(500) + FLOWER + 'y'.repeat(keep - 1);
+    const result = cut(text, 600);
+    assert.ok(result.isWellFormed());
+    const { head, count, tail } = parts(result);
+    assert.strictEqual(tail, 'y'.repeat(keep - 1));
+    assert.strictEqual(count, text.length - head.length - tail.length);
+  });
+
+  it('keeps a text of emoji alone well formed, within its limit, with the cut counted', () => {
+    for (const text of [FLOWER.repeat(400), 'a' + FLOWER.repeat(400)]) {
+      const result = cut(text, 600);
+      assert.ok(result.isWellFormed(), `well formed from ${text.length} units`);
+      assert.ok(result.length <= 600, String(result.length));
+      const { head, count, tail } = parts(result);
+      assert.strictEqual(count, text.length - head.length - tail.length);
+    }
+  });
+
+  it('cuts a text with no surrogate at a cut point as before, to the character, emoji elsewhere included', () => {
+    const keep = Math.floor((600 - 40) / 2);
+    const letters = Array.from({ length: 700 }, (_, i) => String.fromCharCode(97 + (i % 26))).join('');
+    const emoji = FLOWER + 'x'.repeat(300) + FLOWER.repeat(50) + 'y'.repeat(300) + FLOWER;
+    for (const text of [letters, emoji]) {
+      assert.strictEqual(cut(text, 600), `${text.slice(0, keep)} […${text.length - 2 * keep} characters cut…] ${text.slice(-keep)}`);
+    }
+  });
+
+  it('sends a long text block with emoji at its cut points, each emoji whole', async () => {
+    assertEmojiWhole(await bothAlignments((pad) => ({ messages: [msg('user1', pad + FLOWER.repeat(3_100))] })));
+  });
+
+  it("sends a long tool call's input with emoji at its cut points, each emoji whole", async () => {
+    assertEmojiWhole(await bothAlignments((pad) => ({
+      messages: [{ participant: 'Scout', content: [{ type: 'tool_use', id: 't1', name: 'weather', input: { q: pad + FLOWER.repeat(400) } }] }],
+    })));
+  });
+
+  it('sends a long tool result with emoji at its cut points, each emoji whole', async () => {
+    assertEmojiWhole(await bothAlignments((pad) => ({
+      messages: [{ participant: 'user', content: [{ type: 'tool_result', toolUseId: 't1', toolName: 'weather', content: pad + FLOWER.repeat(400), isError: false }] }],
+    })));
+  });
+
+  it('sends a long message of several blocks with emoji at its cut points, each emoji whole', async () => {
+    const block = (pad: string) => ({ type: 'text' as const, text: pad + FLOWER.repeat(2_500) });
+    assertEmojiWhole(await bothAlignments((pad) => ({ messages: [{ participant: 'user1', content: [block(pad), block(pad), block(pad)] }] })));
+  });
+
+  it("sends a long system prompt of the agent's with emoji at its cut points, each emoji whole", async () => {
+    assertEmojiWhole(await bothAlignments((pad) => ({ system: pad + FLOWER.repeat(15_000), messages: conversation(2) })));
+  });
+
+  it('sends U+FFFD for a lone half that no cut made, wherever the request carries it', async () => {
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({
+        system: 'You are a \uDF3C scout.',
+        messages: [msg('user1', 'an early \uDF3C flower'), ...conversation(60), msg('user1', 'a broken \uD83C flower')],
+        config: { model: 'x', maxTokens: 1 },
+      }),
+    });
+    await judge.judge(judgeRequest({ agentNames: ['Sc\uD83Cout'], instructions: 'wake me for \uDF3C only' }));
+    const request = requests[0]!;
+    assert.ok(requestTexts(request).every((t) => t.isWellFormed()));
+    const text = (m: NormalizedMessage | undefined): string => (m?.content[0] as { text: string } | undefined)?.text ?? '';
+    assert.ok(typeof request.system === 'string' && request.system.includes('Sc\uFFFDout'), "the judge's own system prompt");
+    assert.ok(text(request.messages.find((m) => m.cacheBreakpoint)).includes('an early \uFFFD flower'), 'a closed chunk');
+    assert.ok(text(request.messages.at(-3)).includes('a broken \uFFFD flower'), 'the open chunk');
+    assert.ok(text(request.messages.at(-2)).includes('You are a \uFFFD scout.'), "the agent's system prompt");
+    assert.ok(text(request.messages.at(-1)).includes('wake me for \uFFFD only'), "the rule's instructions");
+  });
+
+  it('sends a whole emoji that no cut reaches as itself', async () => {
+    const { membrane, requests } = fakeMembrane();
+    const judge = new ReplyJudge({
+      membraneFor: () => membrane, chooseAgent: (n) => n[0],
+      preview: async () => ({ system: `You are Scout ${FLOWER}.`, messages: [msg('user1', `the tomatoes ${FLOWER} are ripe`)], config: { model: 'x', maxTokens: 1 } }),
+    });
+    await judge.judge(judgeRequest());
+    const all = requestTexts(requests[0]!).join('\n');
+    assert.ok(all.includes(`the tomatoes ${FLOWER} are ripe`));
+    assert.ok(all.includes(`You are Scout ${FLOWER}.`));
+    assert.ok(!all.includes('\uFFFD'));
+  });
+});

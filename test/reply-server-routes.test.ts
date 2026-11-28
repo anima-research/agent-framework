@@ -560,9 +560,12 @@ describe('in explicit and hybrid mode, a reply goes out through no server but th
   }
   const traces: Array<{ type: string; tool?: string }> = [];
   // Where a reply's words ended: published through a server, held as a
-  // draft by a bounce, or refused at their route.
+  // draft by a bounce, or refused at their route. A draft counts whether it
+  // is still open or not: the bounce's own wake is a whole turn that leaves
+  // the other held words alone, and its end sets them aside.
   const ended = (text: string) => (): boolean => published(text).length > 0
-    || (framework as unknown as { proseDrafts: { open(agent: string): unknown[] } }).proseDrafts.open('scout').some((d) => JSON.stringify(d).includes(text))
+    || [...((framework as unknown as { proseDrafts: { drafts: Map<string, Map<string, unknown>> } }).proseDrafts.drafts.get('scout')?.values() ?? [])]
+      .some((d) => JSON.stringify(d).includes(text))
     || traces.some((e) => e.type === 'mcpl:speech-route-failed');
   // A tool call of the turn's answered.
   const answered = (tool: string) => (): boolean => traces.some((e) => e.tool === tool && e.type !== 'tool:started');

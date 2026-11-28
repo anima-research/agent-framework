@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { MembraneError, type ContentBlock, type NormalizedRequest, type NormalizedResponse, type StreamEvent, type YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
-import type { Module } from '../src/index.js';
+import type { Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { ProseDraftStore, draftState, PROSE_DRAFT_RECORD_TYPE } from '../src/prose-drafts.js';
 import { destinationKey } from '../src/mcpl/channel-registry.js';
 import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
@@ -542,6 +542,10 @@ async function harness(opts: {
       await framework.runUntilIdle();
     },
     drafts: (agent = 'scout') => (framework as unknown as { proseDrafts: ProseDraftStore }).proseDrafts.open(agent),
+    /** Every draft the store keeps, whatever became of it, newest first: a
+     *  held draft left alone for a whole turn is set aside, and is open no more. */
+    kept: (agent = 'scout') => [...((framework as unknown as { proseDrafts: { drafts: Map<string, Map<string, ReturnType<ProseDraftStore['open']>[number]>> } })
+      .proseDrafts.drafts.get(agent)?.values() ?? [])].reverse(),
     store: () => (framework as unknown as { proseDrafts: ProseDraftStore }).proseDrafts,
     texts: (agent = 'scout') => framework.getAgent(agent)!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text),
@@ -614,7 +618,7 @@ describe('held prose drafts, end to end', () => {
         .flatMap((o) => o?.injectedMessages ?? []).map((m) => JSON.stringify(m.content));
       assert.ok(injected.some((t) => t.includes(ids[0]!)), 'the resident heard about the first draft mid-turn');
       const receipt = h.texts().find((t) => t.startsWith('[delivered]'))!;
-      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`);
+      assert.equal(receipt, `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${ids.join(', ')} (not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends)`);
 
       // A publish into a channel is noted on the agent with what it had read
       // when it made the call (a wake for a message there that it read first
@@ -688,7 +692,7 @@ describe('held prose drafts, end to end', () => {
       assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'no mid-turn notice: a stream that doesn\'t say is taken as one that carries no injections');
       assert.equal(
         h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged, or dismiss them)`,
+        `[delivered] nothing — 3 plain-speech segment(s) held as drafts ${held.map((d) => d.id).join(', ')} (not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends)`,
       );
     } finally {
       await h.close();
@@ -773,7 +777,7 @@ describe('held prose drafts, end to end', () => {
       const held = h.drafts();
       assert.deepEqual(held.map((d) => d.text), ['Beside the send.'], "only the send's own round is held");
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged, or dismiss them) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
+        `[delivered] nothing — 1 plain-speech segment(s) held as draft ${held[0]!.id} (not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends) · 2 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)`,
         'the refused round and the round after it stay private');
     } finally {
       await h.close();
@@ -1641,9 +1645,10 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       assert.deepEqual(h.publishes(), []);
-      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Checking my drafts.', 'no-destination'], ['lost words', 'bounced']],
+      // (Kept, not open: the bounce's own wake is a whole turn that leaves the line alone, and so sets it aside.)
+      assert.deepEqual(h.kept().map((d) => [d.text, d.reason]), [['Checking my drafts.', 'no-destination'], ['lost words', 'bounced']],
         'the refused target still bounces; the line after it is held as no-destination');
-      assert.ok(!h.texts().some((t) => !t.startsWith('[delivered]') && t.includes(h.drafts()[0]!.id)), 'no notice names the line before the turn ends');
+      assert.ok(!h.texts().some((t) => !t.startsWith('[delivered]') && t.includes(h.kept()[0]!.id)), 'no notice names the line before the turn ends');
     } finally {
       await h.close();
     }
@@ -1678,7 +1683,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       await h.until(() => h.membrane.calls.length >= before + 2, "its ' !' starts a continuation turn: the model is asked again");
-      assert.deepEqual(h.drafts().map((d) => d.text), ['Kept words.'], 'its words are held');
+      assert.deepEqual(h.kept().map((d) => d.text), ['Kept words.'], 'its words are held');
     } finally {
       await h.close();
     }
@@ -1884,12 +1889,13 @@ describe('held prose drafts, end to end', () => {
   it('a dismissal in the same round as its draft\'s resend is refused until that result is in: it can\'t call back words on their way', async () => {
     const h = await harness();
     try {
-      await h.turn([
-        createMockResponse([text('words that land'), explicitSend('s1'), text('words in doubt'), call('l1', 'channel_list', {})], 'tool_use'),
-        createMockResponse([]),
-      ]);
-      const sure = h.drafts().find((d) => d.text === 'words that land')!;
-      const unsure = h.drafts().find((d) => d.text === 'words in doubt')!;
+      // Each draft is held in the turn before the one that races it: a held
+      // draft left alone for a whole turn is set aside at that turn's end.
+      const hold = async (words: string, id: string) => {
+        await h.turn([createMockResponse([text(words), explicitSend(id)], 'tool_use'), createMockResponse([])]);
+        return h.drafts().find((d) => d.text === words)!;
+      };
+      const sure = await hold('words that land', 's1');
       // The resend is dispatched first, so its attempt is out when the dismissal runs.
       const raced = (id: string) => [
         drafts(`r-${id}`, { action: 'resend', draftIds: [id], destination: ROOM }),
@@ -1904,6 +1910,7 @@ describe('held prose drafts, end to end', () => {
       assert.match(dismissal!, waits(sure.id), 'no "dismissed" reply over words that went out');
       assert.equal(draftState(h.store().get('scout', sure.id)!), 'delivered');
 
+      const unsure = await hold('words in doubt', 's2');
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse(raced(unsure.id), 'tool_use'), createMockResponse([])]);
       [resent, dismissal] = h.toolResults();
@@ -1929,6 +1936,8 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       const [draft] = h.drafts();
+      // One turn, the one after the draft was held: a held draft left alone
+      // for a whole turn is set aside at its end.
       await h.turn([
         createMockResponse([
           // A caller whose provider presents every property as required, filling
@@ -1939,19 +1948,7 @@ describe('held prose drafts, end to end', () => {
           drafts('c', { action: 'list', offset: ' 0 ' }),
           drafts('d', { action: 'list', offset: ' ' }),
         ], 'tool_use'),
-        createMockResponse([]),
-      ]);
-      const [listed, oneEmpty, read, padded, blank] = h.toolResults();
-      // The call a review named: one empty field, the rest null.
-      assert.match(oneEmpty!, /^1 open draft, newest first:/);
-      assert.ok(oneEmpty!.includes(draft!.id), oneEmpty);
-      assert.equal(listed, oneEmpty, 'every unused field empty lists the same');
-      assert.match(read!, /words/);
-      assert.equal(padded, listed, 'a padded offset reads as its digits');
-      assert.match(blank!, /offset must be a whole number of drafts to skip/, 'whitespace alone is a value, and not a number');
-
-      // A value in use is still checked, by the guards the rule now feeds.
-      await h.turn([
+        // A value in use is still checked, by the guards the rule now feeds.
         createMockResponse([
           drafts('f', { action: 'read', draftIds: '' }),
           drafts('g', { action: 'list', destination: '#elsewhere' }),
@@ -1964,9 +1961,27 @@ describe('held prose drafts, end to end', () => {
           // false is "don't confirm", what list already does: it lists.
           drafts('l', { action: 'list', confirmDuplicate: false }),
         ], 'tool_use'),
+        // resend: an empty destination is unused (and this resident has no home to
+        // fall back to), and an empty confirmDuplicate is unused, so the send goes.
+        createMockResponse([
+          drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '', confirmDuplicate: '' }),
+          drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM, confirmDuplicate: '' }),
+        ], 'tool_use'),
         createMockResponse([]),
       ]);
-      const [noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse] = h.toolResults();
+      const [
+        listed, oneEmpty, read, padded, blank,
+        noIds, destUsed, confirmUsed, offsetUsed, pastOne, negative, unsafe, confirmFalse,
+        noDest, resent,
+      ] = h.toolResults();
+      // The call a review named: one empty field, the rest null.
+      assert.match(oneEmpty!, /^1 open draft, newest first:/);
+      assert.ok(oneEmpty!.includes(draft!.id), oneEmpty);
+      assert.equal(listed, oneEmpty, 'every unused field empty lists the same');
+      assert.match(read!, /words/);
+      assert.equal(padded, listed, 'a padded offset reads as its digits');
+      assert.match(blank!, /offset must be a whole number of drafts to skip/, 'whitespace alone is a value, and not a number');
+
       assert.match(noIds!, /action "read" needs draftIds/);
       assert.match(destUsed!, /destination is not used by action "list"/);
       assert.match(confirmUsed!, /confirmDuplicate is not used by action "list"/);
@@ -1976,16 +1991,6 @@ describe('held prose drafts, end to end', () => {
       assert.match(unsafe!, /offset must be a whole number of drafts to skip/);
       assert.equal(confirmFalse, listed, 'confirmDuplicate: false lists, as an omitted one does');
 
-      // resend: an empty destination is unused (and this resident has no home to
-      // fall back to), and an empty confirmDuplicate is unused, so the send goes.
-      await h.turn([
-        createMockResponse([
-          drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '', confirmDuplicate: '' }),
-          drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM, confirmDuplicate: '' }),
-        ], 'tool_use'),
-        createMockResponse([]),
-      ]);
-      const [noDest, resent] = h.toolResults();
       assert.match(noDest!, /resend needs a destination/);
       assert.match(resent!, new RegExp(`${draft!.id}: delivered to`));
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'words']);
@@ -2209,6 +2214,173 @@ describe('draft notices and turn-end settlement', () => {
   });
 });
 
+describe('a held draft left alone for a whole turn is set aside', () => {
+  const heldBack = [createMockResponse([text('words a send held back'), explicitSend('s1')], 'tool_use'), createMockResponse([])];
+  const stateOf = (h: Awaited<ReturnType<typeof harness>>, id: string) => draftState(h.store().get('scout', id)!);
+  const setAsides = (h: Awaited<ReturnType<typeof harness>>): Array<{ draftIds: string[]; auto?: true }> => {
+    const seen: Array<{ draftIds: string[]; auto?: true }> = [];
+    h.framework.onTrace((ev) => { if (ev.type === 'prose:drafts-dismissed') seen.push({ draftIds: ev.draftIds, ...(ev.auto ? { auto: true as const } : {}) }); });
+    return seen;
+  };
+
+  it("the turn that holds it leaves it open and says so; the next turn's end sets it aside, with no row of its own", async () => {
+    const h = await harness();
+    try {
+      const traced = setAsides(h);
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      assert.equal(draft?.text, 'words a send held back', 'open at the end of its own turn');
+      const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
+      assert.ok(notice.endsWith(
+        `drafts(action: "resend", draftIds: ["${draft!.id}"], destination: "#room") delivers it unchanged; ` +
+        'left alone for a whole turn, it is set aside when that turn ends.'), notice);
+      assert.ok(!notice.includes('dismiss'), 'the notice asks for no call');
+
+      const rows = h.messages().length;
+      await h.turn([createMockResponse([text('about something else')])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed');
+      assert.deepEqual(h.drafts(), [], 'nothing is left open');
+      assert.deepEqual(traced, [{ draftIds: [draft!.id], auto: true }]);
+      assert.ok(!h.messages().slice(rows).some((m) => JSON.stringify(m.content).includes(draft!.id)), 'nothing tells the resident again');
+
+      // As after its own dismissal: the words stay readable, and are not resent.
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'read', draftIds: [draft!.id] }), drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [read, resend] = h.toolResults();
+      assert.ok(read!.startsWith(`${draft!.id} — dismissed;`) && read!.endsWith('words a send held back'), read);
+      assert.equal(resend, `${draft!.id} was dismissed, so it can't be resent. Nothing was sent.`);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("closing words, named only by their turn's receipt, are open through the next turn and resend in it", async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([explicitSend('s1')], 'tool_use'), createMockResponse([text('closing words')])]);
+      const [draft] = h.drafts();
+      assert.ok(h.texts().some((t) => t.startsWith('[delivered]') && t.includes(draft!.id)), 'premise: the receipt names it');
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'delivered');
+      assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'closing words']);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("closing words left alone through the next turn are set aside: their turn's receipt is the notice that names them", async () => {
+    const h = await harness();
+    try {
+      await h.turn([createMockResponse([explicitSend('s1')], 'tool_use'), createMockResponse([text('closing words')])]);
+      const [draft] = h.drafts();
+      assert.ok(!h.texts().some((t) => t.startsWith('[drafts]')), 'premise: no mid-turn notice named it');
+      await h.turn([createMockResponse([text('about something else')])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('naming a draft in a drafts call is something done with it: a resend refused before any attempt, or a read, keeps it through that turn', async () => {
+    const h = await harness();
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: '#nowhere' })], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(h.store().get('scout', draft!.id)!.attempts, [], `premise: the resend was refused before an attempt was journaled: ${h.toolResults()[0]}`);
+      assert.equal(stateOf(h, draft!.id), 'held', 'the turn that tried to send it does not set it aside');
+      await h.turn([createMockResponse([drafts('r2', { action: 'read', draftIds: [draft!.id] })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'nor does one that read it');
+      await h.turn([createMockResponse([drafts('r3', { action: 'read', draftIds: [draft!.id, 'd-nosuch1'] })], 'tool_use'), createMockResponse([])]);
+      assert.match(h.toolResults()[0]!, /No draft of yours with id d-nosuch1/, 'premise: the whole call was refused');
+      assert.equal(stateOf(h, draft!.id), 'held', 'nor one whose call was refused whole for another id');
+      await h.turn([createMockResponse([drafts('l1', { action: 'list' })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed', 'a listing names no draft');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a turn a tool ends sets it aside too', async () => {
+    const h = await harness();
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      let toolEnded = 0;
+      h.framework.onTrace((ev) => { if (ev.type === 'inference:turn_ended') toolEnded++; });
+      const streams = h.membrane.calls.length;
+      await h.turn([createMockResponse([call('k1', 'skip_reply', {})], 'tool_use')]);
+      assert.equal(toolEnded, 1, 'premise: the skip_reply ended the turn');
+      assert.equal(h.membrane.calls.length, streams + 1, 'premise: no further response was asked for');
+      assert.equal(stateOf(h, draft!.id), 'dismissed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a turn that is refused, cut off, or fails, and a silent one, set nothing aside: the resident may not have read the notice', async () => {
+    const h = await harness({ retries: 0 });
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      const refusal = { ...createMockResponse([text('discarded')], 'refusal'), raw: { request: {}, response: { stop_details: { category: 'test' } } } } as NormalizedResponse;
+      await h.turn([refusal]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'a refused turn leaves it open');
+      await h.turn([createMockResponse([text('cut off mid-')], 'max_tokens')]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'a turn cut off at the output limit leaves it open');
+      failWhileToolsRun(h.membrane);
+      await h.turn([createMockResponse([call('l1', 'channel_list', {})], 'tool_use')]);
+      assert.equal(stateOf(h, draft!.id), 'held', 'a failed turn leaves it open');
+      await h.turn([createMockResponse([])], 'scout', 'silent');
+      assert.equal(stateOf(h, draft!.id), 'held', 'a silent turn leaves it open');
+      await h.turn([createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'dismissed', 'the next turn that ends as its own does not');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a resend that fails counts as something done with it: the draft is open through the turn after', async () => {
+    const h = await harness();
+    try {
+      await h.turn(heldBack);
+      const [draft] = h.drafts();
+      h.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(h.store().get('scout', draft!.id)!.attempts.map((a) => a.outcome?.status), ['failed'], 'premise: the attempt was made, and failed');
+      assert.equal(stateOf(h, draft!.id), 'held', 'a failed resend leaves it held, and its turn does not set it aside');
+      h.command({ op: 'publish-mode', mode: 'delivered' });
+      await h.turn([createMockResponse([drafts('r2', { action: 'resend', draftIds: [draft!.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, draft!.id), 'delivered', 'so the next turn can still send it');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a bounce, and a draft that may already have been posted, stay open however long they are left', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'hybrid' }] });
+    try {
+      await h.turn([createMockResponse([text('>>>#nowhere lost words')])]);
+      const [bounce] = h.drafts();
+      assert.equal(bounce?.reason, 'bounced');
+      // Held by a send, then resent with no receipt: it may have been posted.
+      await h.turn(heldBack);
+      const doubted = h.drafts().find((d) => d.reason === 'explicit-send')!;
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [doubted.id], destination: ROOM })], 'tool_use'), createMockResponse([])]);
+      assert.equal(stateOf(h, doubted.id), 'unconfirmed');
+      await h.turn([createMockResponse([])]);
+      await h.turn([createMockResponse([])]);
+      assert.equal(stateOf(h, bounce!.id), 'held', 'the bounce is still open');
+      assert.equal(stateOf(h, doubted.id), 'unconfirmed', 'and so is the one in doubt');
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 describe('a draft whose notice an undo takes out of the window', () => {
   type Harness = Awaited<ReturnType<typeof harness>>;
   const undo = async (h: Harness): Promise<void> => {
@@ -2236,9 +2408,9 @@ describe('a draft whose notice an undo takes out of the window', () => {
       assert.ok(!windowNames(h, draft!.id), 'the undo took the receipt out of the window');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'the next start names it');
+      assert.ok(h.drafts().some((d) => d.id === draft!.id), 'it is still open: the turn that names it again is not one that left it alone');
       await h.turn([createMockResponse([])]);
       assert.equal(catchUpsNaming(h, draft!.id).length, 1, 'a later start does not name it again');
-      assert.ok(h.drafts().some((d) => d.id === draft!.id), 'it is still open');
     } finally {
       await h.close();
     }
@@ -2925,12 +3097,12 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply, a drafts call or a private think\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.
-      const before = h.drafts().length;
+      const before = h.kept().length;
       await h.turn(rounds(
         [text('>>>skip_reply thinking aloud'), call('l4', 'channel_list', {})],
         [text('still thinking'), explicitSend('s2')],
       ));
-      assert.equal(h.drafts().length, before, 'nothing private was drafted');
+      assert.equal(h.kept().length, before, 'nothing private was drafted');
       // "still thinking" is the one kept private (live routing does not count
       // the `>>>skip_reply` envelope itself).
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1), '[delivered] nothing — 1 plain-speech segment(s) kept private (skip_reply, a drafts call or a private think)');
@@ -2950,9 +3122,9 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const copy = h.drafts().find((d) => d.text.endsWith('a postscript'))!;
       assert.deepEqual([copy.text, copy.note, copy.reason, copy.inheritedRisk], ['lost words and a postscript', `written for >>>${ROOM}`, 'explicit-send', undefined]);
 
-      const count = h.drafts().length;
+      const count = h.kept().length;
       await h.turn(rounds([text(`>>>${ROOM} {{unsent}}`), explicitSend('s2')]));
-      assert.equal(h.drafts().length, count, 'a bare {{unsent}} mints no copy');
+      assert.equal(h.kept().length, count, 'a bare {{unsent}} mints no copy');
       assert.equal(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1),
         `[delivered] nothing — 1 plain-speech segment(s) held as draft ${bounce!.id} (not sent — drafts can resend them unchanged, or dismiss them)`);
 
@@ -3003,7 +3175,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note', 'resend me']);
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
         `[delivered] plain speech → #room (Guild One) (${ROOM}) (draft ${ids[0]}, by your resend) · ` +
-        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged, or dismiss them) · ` +
+        `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends) · ` +
         `draft ${ids[1]} dismissed by you`);
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -4766,10 +4938,10 @@ describe('a heartbeat turn holds its plain speech as drafts', () => {
       // answer is queued as its stream opens.
       onSecondStream(h.membrane, createMockResponse([text('continued heartbeat words')]));
       await h.turn([createMockResponse([text('first heartbeat words')])], 'scout', 'heartbeat');
-      await h.until(() => h.drafts().length >= 2, 'the continuation');
+      await h.until(() => h.kept().length >= 2, 'the continuation');
       await h.framework.runUntilIdle();
       assert.deepEqual(h.publishes(), [], 'neither the turn nor its continuation posted');
-      assert.deepEqual(h.drafts().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
+      assert.deepEqual(h.kept().map((d) => d.text).reverse(), ['first heartbeat words', 'continued heartbeat words']);
       assert.equal(h.texts().filter((t) => t.startsWith('[routing] This turn came from your heartbeat')).length, 1,
         'the continuation is not told again');
       assert.ok(h.texts().some((t) => t.startsWith('[continue]') && t.includes('are held as drafts, as on the heartbeat')),
@@ -4986,7 +5158,7 @@ describe('sameRoundSkipReplyTextPolicy', () => {
   const asksWhere = (result: string, id: string): void => {
     assert.ok(result.startsWith(opening(id)), result);
     assert.ok(result.includes(`drafts(action: "resend", draftIds: ["${id}"], destination: "#room") delivers it unchanged`), result);
-    assert.ok(result.includes(`drafts(action: "dismiss", draftIds: ["${id}"]) sets it aside.`), result);
+    assert.ok(result.includes("left alone for a whole turn, it is set aside when that turn ends."), result);
     assert.match(result, /call skip_reply again/);
     assert.match(result, /wake_in_seconds/);
     assert.match(result, /\breason\b/);
@@ -5650,5 +5822,616 @@ describe('sameRoundSkipReplyTextPolicy', () => {
         rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe('a skip_reply beside a call of its step that failed', () => {
+  class LabModule implements Module {
+    readonly name = 'lab';
+    private readonly gates = new Map<string, () => void>();
+    async start(_ctx: ModuleContext): Promise<void> {}
+    async stop(): Promise<void> {}
+    getTools(): ToolDefinition[] {
+      const inputSchema: ToolDefinition['inputSchema'] = { type: 'object', properties: { fail: { type: 'boolean' }, delayMs: { type: 'number' }, hold: { type: 'string' } } };
+      return [
+        { name: 'lookup', description: 'Look something up.', inputSchema },
+        { name: 'send_file', description: 'Send a file.', inputSchema },
+      ];
+    }
+    async handleToolCall(call: ToolCall): Promise<ToolResult> {
+      const input = (call.input ?? {}) as { fail?: boolean; delayMs?: number; hold?: string };
+      if (input.delayMs) await new Promise((r) => setTimeout(r, input.delayMs));
+      if (input.hold) await new Promise<void>((r) => this.gates.set(input.hold!, r));
+      return input.fail ? { success: false, error: 'nothing found', isError: true } : { success: true, data: { found: 'it' } };
+    }
+    async onProcess(): Promise<Record<string, never>> { return {}; }
+    release(key: string): void { this.gates.get(key)?.(); }
+    releaseAll(): void { for (const open of this.gates.values()) open(); }
+    holding(key: string): boolean { return this.gates.has(key); }
+  }
+  const lab = () => new LabModule();
+  const lookup = (id: string, input: Record<string, unknown> = {}) => call(id, 'lab--lookup', input);
+  const sendFile = (id: string, input: Record<string, unknown> = {}) => call(id, 'lab--send_file', input);
+  const failed = (id: string) => sendFile(id, { fail: true });
+  const skip = (id: string, input: Record<string, unknown> = {}) => call(id, 'skip_reply', input);
+  const result = (id: string, content: string) => ({ type: 'tool_result', toolUseId: id, content }) as ContentBlock;
+  const endings = (h: Awaited<ReturnType<typeof harness>>): (() => number) => {
+    let ended = 0;
+    h.framework.onTrace((event) => { if (event.type === 'inference:turn_ended') ended++; });
+    return () => ended;
+  };
+  const refusal = (...tools: string[]) => {
+    const named = tools.length === 1 ? tools[0]! : `${tools.slice(0, -1).join(', ')} and ${tools.at(-1)!}`;
+    return `This skip_reply didn't run: ${named} failed in the same step, and ${tools.length === 1 ? 'its answer says' : 'their answers say'} why. ` +
+      'To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.';
+  };
+  const roundTaken = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean =>
+    h.messages().some((m) => m.content.some((b) => b.type === 'tool_use' && (b as { id?: string }).id === id));
+  const answerOf = (h: Awaited<ReturnType<typeof harness>>, id: string): string | undefined => {
+    const block = h.messages().flatMap((m) => m.content)
+      .filter((b) => b.type === 'tool_result' && (b as { toolUseId?: string }).toolUseId === id).at(-1);
+    if (!block) return undefined;
+    const content = (block as { content?: unknown }).content;
+    return typeof content === 'string' ? content
+      : Array.isArray(content) ? content.map((b) => (b as { text?: string }).text ?? '').join('') : undefined;
+  };
+  const gateOf = (h: Awaited<ReturnType<typeof harness>>) => (h.framework as unknown as {
+    eventGate: { selfWakeTimers: Map<string, unknown>; getSleepState(): { until: number } | null };
+  }).eventGate;
+  const waitsOf = (h: Awaited<ReturnType<typeof harness>>) => h.framework as unknown as {
+    stepWaits: Map<string, unknown>;
+    releaseAgentRuntime(agent: unknown): void;
+  };
+  const answeredBeforeTheTurnEnds = (h: Awaited<ReturnType<typeof harness>>, id: string): boolean => {
+    const state = h.framework.getAgent('scout')!.state;
+    return state.status === 'waiting_for_tools' && state.completed.some((c) => c.id === id);
+  };
+  const lifecycle = (h: Awaited<ReturnType<typeof harness>>): (() => string[]) => {
+    const sent: ToolLifecycleParams[] = [];
+    const observer = {
+      id: 'observer', grant: new CapabilityGrant(new Set(['toolLifecycle.observe']), []), toolObserveFilter: null, transportEpoch: 0,
+      sendToolLifecycle: (p: ToolLifecycleParams) => { sent.push(p); },
+    };
+    (h.framework as unknown as { toolLifecycleEmitter: ToolLifecycleEmitter }).toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => [observer as never], configFor: () => undefined, describe: () => ({ class: [] }),
+    });
+    return () => sent.map((p) => `${p.toolCallId.split('~')[0]}:${p.phase}`);
+  };
+
+  it("a send that fails beside skip_reply: skip_reply doesn't run, the model reads both answers, and a skip_reply alone then ends the turn", async () => {
+    const h = await harness({ sendTool: true });
+    await h.sendMode('error');
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([unplacedSend('s1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.ok(roundTaken(h, 'k2'), 'the model was called again, with both answers');
+      const [send, skipped] = h.toolResults();
+      assert.match(send!, /Discord refused/, 'the send\'s own answer reached the model');
+      assert.equal(skipped, refusal('discord--send_message'));
+      assert.equal(ended(), 1, 'the second skip_reply ended the turn');
+      assert.deepEqual(h.publishes(), []);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a failed call that is no send changes nothing: skip_reply runs at once, and the turn ends', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    const ended = endings(h);
+    const phases = lifecycle(h);
+    try {
+      const before = h.membrane.calls.length;
+      const turn = h.turn([createMockResponse([lookup('q1', { fail: true, hold: 'h1' }), skip('k1')], 'tool_use')]);
+      await h.until(() => module.holding('h1') && phases().includes('k1:started'), 'skip_reply runs while the lookup still runs');
+      module.release('h1');
+      await turn;
+      assert.equal(h.membrane.calls.length - before, 1, 'one model call');
+      assert.equal(ended(), 1);
+      assert.ok(!(answerOf(h, 'k1') ?? '').startsWith("This skip_reply didn't run"), answerOf(h, 'k1'));
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('a send that the host refuses counts as failed; a refused call that is no send changes nothing', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([{ ...sendFile('l1'), unparseableInput: '{"fail": tr' } as ContentBlock, skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k2'));
+      const before = h.membrane.calls.length;
+      await h.turn([
+        createMockResponse([{ ...lookup('q1'), unparseableInput: '{"fail": tr' } as ContentBlock, skip('k3')], 'tool_use'),
+        createMockResponse([skip('k4')], 'tool_use'),
+      ]);
+      assert.equal(h.membrane.calls.length - before, 1, 'the refused lookup beside skip_reply: one model call, as today');
+      assert.ok(!(answerOf(h, 'k3') ?? '').startsWith("This skip_reply didn't run"), answerOf(h, 'k3'));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a drafts resend that fails is a send: skip_reply beside it is refused; a drafts list is no send", async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([drafts('r1', { action: 'resend', draftIds: ['d-none'], destination: ROOM }), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('drafts'));
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([drafts('r2', { action: 'list' }), skip('k3')], 'tool_use')]);
+      assert.equal(h.membrane.calls.length - before, 1, 'a drafts list beside skip_reply: one model call, as today');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('beside a send that takes a while, skip_reply runs after it and ends the turn, with no added model call', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    const ended = endings(h);
+    const phases = lifecycle(h);
+    try {
+      const before = h.membrane.calls.length;
+      const turn = h.turn([createMockResponse([skip('k1'), sendFile('l1', { hold: 'h1' })], 'tool_use')]);
+      await h.until(() => module.holding('h1'), 'the send waits');
+      assert.ok(!phases().includes('k1:started'), `skip_reply waits while the send runs: ${phases().join(' ')}`);
+      module.release('h1');
+      await turn;
+      assert.equal(h.membrane.calls.length - before, 1, 'one model call');
+      assert.equal(ended(), 1);
+      const order = phases();
+      assert.ok(order.includes('l1:completed') && order.indexOf('k1:started') > order.indexOf('l1:completed'),
+        `skip_reply ran after the send it was called before: ${order.join(' ')}`);
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('beside a send that succeeds, the send goes out and skip_reply ends the turn, with no added model call', async () => {
+    const h = await harness({ sendTool: true });
+    const ended = endings(h);
+    try {
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([unplacedSend('s1'), skip('k1')], 'tool_use')]);
+      assert.equal(h.membrane.calls.length - before, 1, 'one model call');
+      assert.deepEqual(h.sends().map((s) => s.channelId), [GENERAL], 'the send went out');
+      assert.equal(ended(), 1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('skip_reply alone ends the turn as it does today', async () => {
+    const h = await harness({ modules: [lab()] });
+    const ended = endings(h);
+    try {
+      const before = h.membrane.calls.length;
+      await h.turn([createMockResponse([skip('k1', { reason: 'nothing to add' })], 'tool_use')]);
+      assert.equal(h.membrane.calls.length - before, 1);
+      assert.equal(ended(), 1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a refused skip_reply arms no wake and doesn't keep the turn's end private: the next round's text is posted", async () => {
+    const h = await harness({ modules: [lab()], gate: true });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1', { wake_in_seconds: 60 })], 'tool_use'),
+        createMockResponse([text('Posted after all.')]),
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'Posted after all.']]);
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no self-wake is armed');
+    } finally {
+      await h.close();
+    }
+  });
+
+  for (const order of [['k1', 'l1', 'k2'], ['l1', 'k1', 'k2'], ['k1', 'k2', 'l1']]) {
+    it(`two skip_reply calls beside a failed call (${order.join(', ')}) both get the refusal, and the model is called again`, async () => {
+      const h = await harness({ modules: [lab()] });
+      const ended = endings(h);
+      try {
+        await h.turn([
+          createMockResponse(order.map((id) => (id === 'l1' ? failed(id) : skip(id))), 'tool_use'),
+          createMockResponse([skip('k3')], 'tool_use'),
+        ]);
+        const results = h.toolResults();
+        for (const id of ['k1', 'k2']) assert.equal(results[order.indexOf(id)], refusal('lab--send_file'), id);
+        assert.ok(roundTaken(h, 'k3'), 'the model was called again');
+        assert.equal(ended(), 1);
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  for (const order of [['l1', 'k1', 'z1'], ['z1', 'k1', 'l1'], ['k1', 'z1', 'l1']]) {
+    it(`beside a failed call and a sleep (${order.join(', ')}), skip_reply is refused and the sleep runs and ends the turn`, async () => {
+      const h = await harness({ modules: [lab()], gate: true });
+      const ended = endings(h);
+      try {
+        const before = h.membrane.calls.length;
+        await h.turn([
+          createMockResponse(order.map((id) => (id === 'l1' ? failed(id) : id === 'k1' ? skip(id) : call(id, 'sleep', { seconds: 60 }))), 'tool_use'),
+          createMockResponse([text('Never asked for.')]),
+        ]);
+        assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+        assert.ok(gateOf(h).getSleepState() !== null, 'the sleep ran');
+        assert.equal(ended(), 1);
+        assert.equal(h.membrane.calls.length - before, 1, 'the sleep ended the turn: the model was not called again');
+      } finally {
+        await h.close();
+      }
+    });
+  }
+
+  it('it refuses one time in a turn: a second skip_reply beside a second failed call runs and ends the turn', async () => {
+    const h = await harness({ modules: [lab()] });
+    const ended = endings(h);
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
+        createMockResponse([skip('k3')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k2'), 'the model was called again');
+      const second = answerOf(h, 'k2');
+      assert.ok(second !== undefined && !second.startsWith("This skip_reply didn't run"), second);
+      assert.ok(!roundTaken(h, 'k3'), 'the second skip_reply ended the turn');
+      assert.equal(ended(), 1);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('several failed calls are each named one time', async () => {
+    const h = await harness({ modules: [lab()], sendTool: true });
+    await h.sendMode('error');
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), unplacedSend('s1'), failed('l2'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(h.toolResults()[3], refusal('lab--send_file', 'discord--send_message'), 'each named one time, in the order of the calls');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('two failed calls of one tool: the tool is named one time, and the words speak of both answers', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), failed('l2'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), "This skip_reply didn't run: lab--send_file failed in the same step, and their answers say why. " +
+        'To end your turn, call skip_reply again, with wake_in_seconds again if you set a wake.');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a skip_reply waits for every send of its step, not only the first to answer', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    try {
+      const turn = h.turn([
+        createMockResponse([failed('l1'), sendFile('l2', { hold: 'h2' }), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      await h.until(() => module.holding('h2') && answeredBeforeTheTurnEnds(h, 'l1'), 'l1 has answered, and l2 still runs');
+      assert.ok(!answeredBeforeTheTurnEnds(h, 'k1'), 'k1 waits while l2 runs');
+      module.release('h2');
+      await turn;
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it("beside a send that succeeds, a skip_reply's wake is armed once the send answers", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], gate: true });
+    try {
+      const turn = h.turn([createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use')]);
+      await h.until(() => module.holding('h1'), 'the send waits');
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'no wake while the send runs');
+      module.release('h1');
+      await turn;
+      assert.ok(gateOf(h).selfWakeTimers.has('scout'), 'the wake is armed once the send has answered');
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('the one refusal is per turn: the next turn refuses again', async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      await h.turn([
+        createMockResponse([failed('l2'), skip('k3')], 'tool_use'),
+        createMockResponse([skip('k4')], 'tool_use'),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.equal(answerOf(h, 'k3'), refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k4'), 'the model was called again in the second turn');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a turn stopped while skip_reply waits runs nothing later: no wake is armed', async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], gate: true });
+    let dropped = false;
+    h.framework.onTrace((event) => { if (event.type === 'tool:result_dropped' && event.callId === 'l1') dropped = true; });
+    try {
+      h.membrane.pushResponse(createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use'));
+      const before = h.membrane.calls.length;
+      h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-stop', mode: 'addressed', text: 'message' });
+      await h.until(() => h.membrane.calls.length > before && module.holding('h1'), 'the send waits');
+      assert.ok(h.framework.abortInference('scout', 'test stop'), 'premise: the turn was stopped');
+      module.release('h1');
+      await h.until(() => dropped, "the send's late answer is dropped");
+      await h.framework.runUntilIdle();
+      assert.ok(!gateOf(h).selfWakeTimers.has('scout'), 'the skip_reply never ran: no self-wake is armed');
+      assert.ok(!waitsOf(h).stepWaits.has('scout'), "the stream's end dropped its step wait");
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it("deregistering an agent while its skip_reply waits drops the agent's step wait", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    try {
+      h.membrane.pushResponse(createMockResponse([sendFile('l1', { hold: 'h1' }), skip('k1')], 'tool_use'));
+      h.command({ op: 'incoming', channelId: ROOM, messageId: 'in-release', mode: 'addressed', text: 'message' });
+      await h.until(() => module.holding('h1') && waitsOf(h).stepWaits.has('scout'), 'the skip_reply waits');
+      waitsOf(h).releaseAgentRuntime(h.framework.getAgent('scout'));
+      assert.ok(!waitsOf(h).stepWaits.has('scout'), 'no step wait is left');
+      module.release('h1');
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it('a retried silent turn keeps the refusal it already used', async () => {
+    const h = await harness({ modules: [lab()], retries: 1 });
+    try {
+      breakAfterToolRound(h.membrane, 'error', {
+        beforeFailure: () => {
+          h.membrane.pushResponse(createMockResponse([failed('l2'), skip('k2')], 'tool_use'));
+          h.membrane.pushResponse(createMockResponse([skip('k3')], 'tool_use'));
+        },
+      });
+      await h.turn([createMockResponse([failed('l1'), skip('k1')], 'tool_use')], 'scout', 'silent');
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'), 'premise: the first step used the refusal');
+      assert.ok(roundTaken(h, 'k2'), 'premise: the retry ran');
+      const second = answerOf(h, 'k2');
+      assert.ok(second !== undefined && !second.startsWith("This skip_reply didn't run"), second);
+      assert.ok(!roundTaken(h, 'k3'), "the retry's skip_reply ended the turn");
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a script's skip_reply runs at once: the rule holds only the model's own calls", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module], codeExecution: true });
+    const ended = endings(h);
+    try {
+      const turn = h.turn([
+        createMockResponse([sendFile('l1', { fail: true, hold: 'h1' }), call('ce1', 'code_execution', { code: 'await tools.skip_reply({});' })], 'tool_use'),
+        createMockResponse([text('Never asked for.')]),
+      ]);
+      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'ce1'), "the script ends while the send still runs: its skip_reply didn't wait");
+      module.release('h1');
+      await turn;
+      assert.equal(ended(), 1);
+      assert.ok(!h.toolResults().some((r) => r.includes("This skip_reply didn't run")));
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  it("a skip_reply the host refuses for its arguments is answered at once and leaves the rule its refusal", async () => {
+    const module = lab();
+    const h = await harness({ modules: [module] });
+    const ended = endings(h);
+    try {
+      const turn = h.turn([
+        createMockResponse([sendFile('l1', { fail: true, hold: 'h1' }), skip('k1', { wake_in_seconds: 60 })], 'tool_use'),
+        createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
+        createMockResponse([skip('k3')], 'tool_use'),
+      ]);
+      await h.until(() => module.holding('h1') && answeredBeforeTheTurnEnds(h, 'k1'), 'k1 is answered while the send still runs');
+      module.release('h1');
+      await turn;
+      const results = h.toolResults();
+      assert.match(results[1]!, /wake/, 'the wake refusal, as today');
+      assert.ok(!results[1]!.startsWith("This skip_reply didn't run"), results[1]);
+      assert.equal(results[3], refusal('lab--send_file'));
+      assert.ok(roundTaken(h, 'k3'));
+      assert.equal(ended(), 1);
+    } finally {
+      module.releaseAll();
+      await h.close();
+    }
+  });
+
+  describe("with sameRoundSkipReplyTextPolicy 'ask'", () => {
+    const asking = { agents: [{ name: 'scout', sameRoundSkipReplyTextPolicy: 'ask' as const }] };
+    it("held text and a failed call in one step give one refusal: the policy's words whole, and one sentence added", async () => {
+      const alone = await harness({ ...asking, modules: [lab()] });
+      let policyWords = '';
+      let aloneDraft = '';
+      try {
+        await alone.turn([
+          createMockResponse([text('Hello there.'), skip('k1')], 'tool_use'),
+          createMockResponse([skip('k2')], 'tool_use'),
+        ]);
+        policyWords = alone.toolResults()[0]!;
+        aloneDraft = alone.drafts().find((d) => d.text === 'Hello there.')!.id;
+      } finally {
+        await alone.close();
+      }
+      assert.ok(policyWords.startsWith('[drafts]') && policyWords.includes(aloneDraft), `premise: the policy alone refused: ${policyWords}`);
+      const h = await harness({ ...asking, modules: [lab()] });
+      const ended = endings(h);
+      try {
+        await h.turn([
+          createMockResponse([text('Hello there.'), failed('l1'), skip('k1')], 'tool_use'),
+          createMockResponse([text('Another note.'), failed('l2'), skip('k2')], 'tool_use'),
+          createMockResponse([skip('k3')], 'tool_use'),
+        ]);
+        const results = h.toolResults();
+        const held = h.drafts().find((d) => d.text === 'Hello there.')!;
+        assert.equal(results[1], `${policyWords.replaceAll(aloneDraft, held.id)} lab--send_file also failed in the same step, and its answer says why.`);
+        assert.ok(roundTaken(h, 'k2'), 'the model was called again');
+        const later = answerOf(h, 'k2');
+        assert.ok(later !== undefined && !later.includes("didn't run"), `no later skip_reply is refused: ${later}`);
+        assert.ok(!roundTaken(h, 'k3'));
+        assert.equal(ended(), 1);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("the policy's refusal in one step, then a failed call beside skip_reply in the next: the rule's refusal, and a third skip_reply runs", async () => {
+      const h = await harness({ ...asking, modules: [lab()] });
+      const ended = endings(h);
+      try {
+        await h.turn([
+          createMockResponse([text('Hello there.'), skip('k1')], 'tool_use'),
+          createMockResponse([failed('l2'), skip('k2')], 'tool_use'),
+          createMockResponse([skip('k3')], 'tool_use'),
+        ]);
+        const results = h.toolResults();
+        assert.ok(results[0]!.startsWith('[drafts]'), 'premise: the policy refused k1');
+        assert.equal(results[2], refusal('lab--send_file'));
+        assert.ok(roundTaken(h, 'k3'));
+        assert.equal(ended(), 1);
+      } finally {
+        await h.close();
+      }
+    });
+  });
+
+  it("native tool mode: text in the refused call's step stays private, and a later step's text is posted", async () => {
+    const h = await harness({ modules: [lab()] });
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([text('After it, posted.')]),
+      ]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a failed call beside skip_reply refuses it, and plain text after the refusal is posted as in a turn without it", async () => {
+    const h = await harness({ modules: [lab()], xml: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
+        { ...createMockResponse([text('Beside the refused skip.'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--send_file')), text('After it, posted.')]), toolCalls: [] },
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  const sendToRoom = (id: string) => call(id, 'discord--send_message', { channelId: ROOM, text: 'an explicit note' });
+
+  it("native tool mode: a refusal gives back the silence from before it, so a send's silence still holds a later step's text", async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: true }], modules: [lab()], sendTool: true });
+    try {
+      await h.turn([
+        createMockResponse([sendToRoom('s1')], 'tool_use'),
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([text('Held by the send.')]),
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.deepEqual(h.sends().map((s) => s.channelId), [ROOM], 'premise: the send went out');
+      assert.deepEqual(h.publishes(), []);
+      assert.ok(h.drafts().some((d) => d.text === 'Held by the send.'), 'the send kept the text back as a draft');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode: a refusal gives back the silence from before it, so a send's silence still holds the trailing text", async () => {
+    const h = await harness({ agents: [{ name: 'scout', sendSilencing: true }], modules: [lab()], sendTool: true, xml: true });
+    try {
+      await h.turn([
+        createMockResponse([sendToRoom('s1')], 'tool_use'),
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        { ...createMockResponse([sendToRoom('s1-reparsed'), result('s1-reparsed', 'sent'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--send_file')), text('Held by the send.')]), toolCalls: [] },
+      ]);
+      assert.equal(answerOf(h, 'k1'), refusal('lab--send_file'));
+      assert.deepEqual(h.publishes(), []);
+      assert.ok(h.drafts().some((d) => d.text === 'Held by the send.'), 'the send kept the text back as a draft');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("XML tool mode with sameRoundSkipReplyTextPolicy 'ask': the refused call's round's text is held at the turn's end, and later text is posted", async () => {
+    const h = await harness({ agents: [{ name: 'scout', sameRoundSkipReplyTextPolicy: 'ask' }], modules: [lab()], xml: true });
+    try {
+      await h.turn([
+        createMockResponse([text('Beside the refused skip.'), failed('l1'), skip('k1')], 'tool_use'),
+        { ...createMockResponse([text('Beside the refused skip.'), failed('l1-reparsed'), skip('k1-reparsed'), result('l1-reparsed', 'nothing found'), result('k1-reparsed', refusal('lab--send_file')), text('After it, posted.')]), toolCalls: [] },
+      ]);
+      assert.equal(h.toolResults()[1], refusal('lab--send_file'));
+      assert.deepEqual(h.drafts().map((d) => [d.text, d.reason]), [['Beside the refused skip.', 'skip-reply']]);
+      assert.deepEqual(h.publishes().map((p) => [p.channelId, p.text]), [[ROOM, 'After it, posted.']]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('the refused call reports nothing to a tool-lifecycle observer, and the skip_reply that then runs reports started and completed', async () => {
+    const h = await harness({ modules: [lab()] });
+    const phases = lifecycle(h);
+    try {
+      await h.turn([
+        createMockResponse([failed('l1'), skip('k1')], 'tool_use'),
+        createMockResponse([skip('k2')], 'tool_use'),
+      ]);
+      const of = (id: string) => phases().filter((p) => p.startsWith(`${id}:`));
+      assert.deepEqual(of('k1'), [], 'the refused call reports nothing');
+      assert.deepEqual(of('k2'), ['k2:started', 'k2:completed']);
+    } finally {
+      await h.close();
+    }
   });
 });

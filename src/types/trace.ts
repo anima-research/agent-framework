@@ -211,7 +211,10 @@ export type TraceEvent =
        *  release starts a new hold; its `context-refusal` alert and the note
        *  count from the wait's first hold. */
       since: number;
-      /** Requests the hold holds as it starts: the refused start's own. */
+      /** Requests the hold holds as it starts: the refused start's own, and,
+       *  when that start merged one released turn with other wakes, those
+       *  wakes, which the hold takes back. A wake that a
+       *  quiesce lets through isn't counted, as in `gatedRequests`. */
       heldRequests: number;
     })
   | (TraceEventBase & {
@@ -1626,6 +1629,8 @@ export type TraceEvent =
       type: 'prose:drafts-dismissed';
       agentName: string;
       draftIds: string[];
+      /** Set aside at a turn's end, having been left alone all through it, rather than by the resident's own dismissal. */
+      auto?: true;
     });
 
 /** Why rows left an agent's window (`presentation:retracted`). */

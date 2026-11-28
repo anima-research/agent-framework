@@ -185,6 +185,7 @@ interface Rendering<E> {
   done: Promise<void>;
   /** Set once the render (or its fallback) was delivered as content. */
   materialized?: boolean;
+  materializedRow?: { agent: string; id: string };
 }
 
 /** What an assembly did, per subject, for the turn being assembled. */
@@ -205,6 +206,7 @@ export interface AssemblyResult {
    *  a cause whose batch was withdrawn, displaced or consumed by another
    *  request. */
   materialized: Set<string>;
+  materializedRows: Map<string, string>;
 }
 
 /** What holds a subject's single slot (§3.2). A render describes what changed
@@ -1025,7 +1027,7 @@ export class PushCoalescer<E = unknown> {
    * taking it as its own.
    */
   async assemble(agentName: string, causes: readonly string[] = []): Promise<AssemblyResult> {
-    const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
+    const result: AssemblyResult = { settled: new Set(), materialized: new Set(), materializedRows: new Map() };
     if (this.suspended) return result;
     const work: Promise<void>[] = [];
     const wanted = new Set(causes);
@@ -1039,7 +1041,11 @@ export class PushCoalescer<E = unknown> {
         work.push(started.done.then(() => {
           result.settled.add(subject);
           // A render another assembly froze is that request's to read.
-          if (started.rendering.materialized && !started.joined) result.materialized.add(subject);
+          if (started.rendering.materialized && !started.joined) {
+            result.materialized.add(subject);
+            const row = started.rendering.materializedRow;
+            if (row !== undefined && row.agent === agentName) result.materializedRows.set(subject, row.id);
+          }
         }));
       }
     }
@@ -1314,6 +1320,7 @@ export class PushCoalescer<E = unknown> {
         // The materialized occurrence is consumed by the request being
         // assembled, and becomes history with the run placed ahead of it.
         rendering.materialized = true;
+        if (placement?.messageId !== undefined) rendering.materializedRow = { agent: placement.agent, id: placement.messageId };
         state.history = 'some';
         state.consumedEventId = occurrence.eventId;
         state.occupant = undefined;

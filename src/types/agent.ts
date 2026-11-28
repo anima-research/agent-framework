@@ -165,14 +165,15 @@ export interface AgentConfig {
    * the first such `skip_reply` of a turn, called by the model in a round
    * with verbatim content, is refused once with a result that names the
    * round's drafts and asks where they should go. Where the text would only
-   * have been held, the `skip_reply` runs. The refusal acts only on rounds
+   * have been held, the policy doesn't refuse the `skip_reply`. The refusal acts only on rounds
    * with verbatim content (membrane's `roundContent`). On the XML tool path,
    * which gives none, the policy refuses no `skip_reply`, and what a
    * `skip_reply` leaves unsent is held at the turn's end, from membrane's
    * parse of the turn: where a `skip_reply` ends the turn, the text of every
    * round of the stream it cancels (after a budget restart, the
    * continuation's); at a natural end, the text of a round whose `skip_reply`
-   * was refused for its wake or cut off. A derived agent and the
+   * was refused for its wake, refused because a send of its step failed,
+   * or cut off. A derived agent and the
    * subconscious don't take it from this agent. The agent can change it for
    * itself with `agent_settings` (`same_round_skip_reply_text_policy`); its
    * choice persists.
@@ -302,14 +303,27 @@ export interface AgentConfig {
   /**
    * How to handle a model content-policy refusal (`stop_reason: refusal`).
    * When `autoRewind` is on, a refused turn triggers an automatic rewind: the
-   * framework redacts the triggering turn (the tool result or message that
-   * tripped the classifier), injects a metadata-only marker in its place (which
-   * carries none of the offending content, so it cannot itself re-trip), and
-   * re-runs — up to `maxRewinds` times before giving up. This keeps the agent
+   * framework sets aside the newest turn the refused request carried (or the
+   * stored result of a call it carried), a tool result with the call it is
+   * paired with where a pair is found (the call body right before it, or,
+   * on a presented window, one before a run of system notices when the pair
+   * is proven); otherwise the result goes alone and its call can stay, or,
+   * when the carried row is the call, the call goes alone and its result
+   * stays. On a presented window the originals stay in the raw record; a
+   * window that is still the record (legacy mode) removes them, and the
+   * notice says which. That isn't necessarily the content that tripped the
+   * classifier. The first rewind of an episode appends one notice at the tail
+   * of the context saying that earlier content was set aside, and later ones
+   * update that notice in place; it carries none of that content, so it cannot
+   * itself re-trip. The turn then re-runs, up to `maxRewinds` times before
+   * giving up. This keeps the agent
    * on its own model (no fallback-model substitution) while self-healing around
    * a poison turn. Default: off (a refusal surfaces a marker and a built-in
    * reaction unless a host has taken ownership through `getMainRefusalBridge()`;
    * the marker is unaffected by ownership).
+   * A `reasoning_extraction` refusal no rewind takes also leaves the agent a
+   * note that its turn did not complete, one for a run of such turns (see
+   * AgentFramework.noteRefusedTurn), regardless of reaction ownership.
    */
   refusalHandling?: {
     /**
@@ -338,7 +352,7 @@ export interface AgentConfig {
      * Native tool mode only — see the XML-mode warning in Membrane.
      */
     retries?: number;
-    /** Auto-rewind the triggering turn on refusal and retry. Default false. */
+    /** On refusal, set aside the newest turn the refused request carried (or the stored result of a call it carried, with that call, when that pair is found or proven; otherwise the call goes alone and the result stays) and retry. Default false. */
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
     maxRewinds?: number;

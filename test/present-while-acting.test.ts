@@ -2046,7 +2046,7 @@ describe('present while acting', () => {
       assemble: async () => {
         entered();
         await released;
-        return { settled: new Set<string>(), materialized: new Set<string>() };
+        return { settled: new Set<string>(), materialized: new Set<string>(), materializedRows: new Map<string, string>() };
       },
       suspend: () => {},
       isRendering: () => false,
@@ -2493,7 +2493,7 @@ describe('present while acting', () => {
     assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
       `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
-        '(not sent — drafts can resend them unchanged, or dismiss them)',
+        '(not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends)',
     ]);
 
     await framework.stop();
@@ -2538,7 +2538,7 @@ describe('present while acting', () => {
       assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
         `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
-          '(not sent — drafts can resend them unchanged, or dismiss them)',
+          '(not sent — drafts can resend them unchanged; left alone for a whole turn, they are set aside when that turn ends)',
       ], `${verb}: suppression is visible in the receipt`);
 
       await framework.stop();
@@ -2636,7 +2636,8 @@ describe('present while acting', () => {
 
     const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
     assert.ok(results.includes('backscroll line 0'), 'control: the result reached the model');
-    assert.equal(results.includes('backscroll line 399'), false, 'control: the result was cut for its length');
+    assert.match(results, /\[truncated — chars \d+ to \d+ of \d+ elided here/, 'control: the result was cut for its length');
+    assert.equal(results.includes('backscroll line 200 '), false, 'control: its middle was elided');
     assert.ok(results.includes('plain speech now lands in this channel'), 'the routing word survived the cut');
 
     await framework.stop();

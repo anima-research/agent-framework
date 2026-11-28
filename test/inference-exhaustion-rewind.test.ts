@@ -7,9 +7,11 @@
  * Now, at the hard-down threshold, when the failure suggests the provider
  * refused the request's content or size (shedMayHelp: an invalid_request at
  * HTTP 400, 413 or 422 or with no status, or a context_length at 413), the
- * breaker auto-quarantines: sheds the newest complete exchange (the same
- * shedNewestTurn primitive the refusal auto-rewind and /unstick use — never
- * orphaning a tool_use/thinking block), drops ONE consolidated marker, and
+ * breaker auto-quarantines: sheds the newest turn (the same shedNewestTurn
+ * primitive the refusal auto-rewind and /unstick use, which takes a tool
+ * result with its call where it finds or proves the pair, and otherwise
+ * sheds the result alone, which can leave its tool_use), drops ONE
+ * consolidated marker, and
  * queues a retry — bounded by the refusalHandling.maxRewinds cap so it can
  * never eat the whole history.
  */
@@ -95,7 +97,7 @@ test('at the threshold, an invalid_request with no status (shedMayHelp) triggers
 
   const marker = added.find(isRewindMarker);
   assert.ok(marker, 'rewind marker added');
-  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 most recent turn\(s\) were set aside because the requests that carried them couldn't be completed\. Their content isn't shown here, and the originals remain in the raw record\. You are clear to continue/);
+  assert.match(marker!.content[0].text, /^\[[^\]]+\] The 1 earlier turn\(s\) were set aside after requests couldn't be completed\. Their content isn't shown here\. The originals were removed\. You are clear to continue/);
   assert.doesNotMatch(marker!.content[0].text, /tool_use ids|refus|filter|rejecting the conversation/i, "the marker carries none of the provider's words");
   assert.ok(String(marker!.meta.category).includes('tool_use ids must have a corresponding tool_result'), 'the record keeps them');
 
@@ -177,7 +179,7 @@ test('at the threshold, a row that carries nothing is passed over, uncounted, an
   assert.deepEqual(messages.filter((m) => !m.metadata?.system).map((m) => m.id), ['u0', 'a0', 'a1'],
     'the newest message is gone, and the empty row after it stays with what came before');
   const marker = added.find(isRewindMarker);
-  assert.match(marker!.content[0].text, /The 1 most recent turn\(s\) were set aside/);
+  assert.match(marker!.content[0].text, /1 earlier turn\(s\) were set aside/);
 });
 
 test('retryable / unknown-retryability failures NEVER shed history (outages cost nothing)', () => {

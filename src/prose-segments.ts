@@ -84,6 +84,28 @@ export function withoutRoundsProse(
   });
 }
 
+/** The `tool_use` blocks of the given rounds, the rounds counted as withoutRoundsProse counts them. */
+export function toolUsesOfRounds(
+  content: readonly ContentBlock[],
+  rounds: ReadonlySet<number>,
+): Set<ContentBlock> {
+  const found = new Set<ContentBlock>();
+  let round = 0;
+  let afterResults = false;
+  for (const block of content) {
+    if (block.type === 'tool_result') {
+      afterResults = true;
+      continue;
+    }
+    if (afterResults) {
+      round++;
+      afterResults = false;
+    }
+    if (block.type === 'tool_use' && rounds.has(round)) found.add(block);
+  }
+  return found;
+}
+
 /**
  * A turn's prose runs (splitProseRuns) in order, in groups whose rounds are
  * all in `held` or all outside it, the rounds counted as withoutRoundsProse
