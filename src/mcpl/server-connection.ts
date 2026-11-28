@@ -1473,18 +1473,26 @@ export class McplServerConnection extends EventEmitter {
           }
           cleanup();
           if (msg.error) {
-            // describeCause rather than the template's own conversion: the
-            // server's `message` can be any JSON value, and one that has no
-            // primitive form, such as {"toString":1}, would throw out of this
-            // listener after cleanup() has cleared the timeout: an uncaught
-            // exception, which ends a host that doesn't catch them, and a
-            // handshake left to wait forever. It's the server's text in an
-            // error the host gets, so it's redacted, then bounded as
-            // errors.ts says: a cut or a replaced character first would
-            // leave part of a credential the redactor can't match.
-            reject(msg.error.code === UNSUPPORTED_PROTOCOL_VERSION_CODE
-              ? protocolVersionRejection(config, msg.error)
-              : new Error(`MCPL server "${config.id}" initialize error: ${boundedForLog(redactServerText(describeCause(msg.error.message), config))}`));
+            // Only a string is words, as for an error answer to a request
+            // after the handshake: a message of any other JSON value, or a
+            // blank one, reads as none, with the code when it's a number
+            // (#750). So no template converts the server's `message`: one
+            // that has no primitive form, such as {"toString":1}, would throw
+            // out of this listener after cleanup() has cleared the timeout:
+            // an uncaught exception, which ends a host that doesn't catch
+            // them, and a handshake left to wait forever. It's the server's
+            // text in an error the host gets, so it's redacted, then trimmed
+            // and bounded as errors.ts says: a cut or a replaced character
+            // first would leave part of a credential the redactor can't match.
+            if (msg.error.code === UNSUPPORTED_PROTOCOL_VERSION_CODE) {
+              reject(protocolVersionRejection(config, msg.error));
+              return;
+            }
+            const message: unknown = msg.error.message;
+            const said = typeof message === 'string' ? boundedForLog(redactServerText(message, config).trim()) : '';
+            const code: unknown = msg.error.code;
+            const saidNothing = `the server answered without saying what went wrong${typeof code === 'number' ? ` (code ${code})` : ''}`;
+            reject(new Error(`MCPL server "${config.id}" initialize error: ${said || saidNothing}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;
