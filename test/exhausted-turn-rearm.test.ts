@@ -1490,6 +1490,49 @@ test("a job's turn aborted from outside ends its run without clearing its failur
   assert.deepEqual(failed.map((line) => line.match(/consecutive=(\d+)/)![1]), ['1', '2'], 'the abort is neither an end from outside nor a failure');
 });
 
+test("a quiesce that folds a wake and a re-arm with one key keeps the fold re-armed only if both were, as the scheduler's merge does", async (t) => {
+  const membrane = new ScriptedMembrane(() => serverError, 'event');
+  const r = await resident(t, membrane);
+  const internal = r.fw as unknown as {
+    providerAccelerationCooldowns: Map<string, { heldRequests: Array<Record<string | symbol, unknown>>; timer: ReturnType<typeof setTimeout> }>;
+    pendingRequests: Array<Record<string | symbol, unknown>>;
+    processInferenceRequests(): Promise<void>;
+    quiesced: boolean;
+  };
+  const rearmedKey = (request: Record<string | symbol, unknown>) =>
+    Object.getOwnPropertySymbols(request).find((key) => key.description === 'rearmed' && request[key] === true);
+  const held = () => internal.providerAccelerationCooldowns.get('resident')?.heldRequests ?? [];
+  r.say('zz-question');
+  await waitFor(() => held().some((request) => rearmedKey(request) !== undefined), 'a re-arm to be held');
+  const rearm = held().find((request) => rearmedKey(request) !== undefined)!;
+  const key = rearmedKey(rearm)!;
+  const cooldown = internal.providerAccelerationCooldowns.get('resident')!;
+  clearTimeout(cooldown.timer);
+  internal.providerAccelerationCooldowns.delete('resident');
+  const at = (timestamp: number, rearmed: boolean): Record<string | symbol, unknown> => {
+    const wake: Record<string | symbol, unknown> = { ...rearm, timestamp, wakeAt: undefined };
+    if (rearmed) wake[key] = true;
+    else delete wake[key];
+    return wake;
+  };
+  const park = async (...wakes: Array<Record<string | symbol, unknown>>) => {
+    internal.quiesced = true;
+    internal.pendingRequests.length = 0;
+    internal.pendingRequests.push(...wakes);
+    await internal.processInferenceRequests();
+    const parked = internal.pendingRequests.filter((request) => request.agentName === 'resident');
+    internal.pendingRequests.length = 0;
+    internal.quiesced = false;
+    return parked;
+  };
+  const mixed = await park(at(1, false), at(2, true));
+  assert.equal(mixed.length, 1, 'premise: the wake and the re-arm share a key');
+  assert.equal(mixed[0]![key], undefined, "not re-armed, since the wake folded with it wasn't");
+  const both = await park(at(1, true), at(2, true));
+  assert.equal(both.length, 1, 'premise: the two re-arms share a key');
+  assert.equal(both[0]![key], true, 'still re-armed, since both were');
+});
+
 test("a provider hold that folds a wake into an equal re-arm keeps it re-armed only if both were, as the scheduler's merge does", async (t) => {
   const membrane = new ScriptedMembrane(() => serverError, 'event');
   const r = await resident(t, membrane);

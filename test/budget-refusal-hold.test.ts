@@ -2649,7 +2649,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it("a provider hold that already keeps an equal request without the wait takes the wait onto it, so a surgery that removes its row drops it", async () => {
+  it("a provider hold that already keeps a copy of the request without the wait takes the wait onto it, so a surgery that removes its row drops it", async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
       t.internal.budgetHoldRecheckMs = 60_000;
@@ -2660,7 +2660,9 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const held = t.internal.budgetHolds.get('prime')!.turn as Record<string, unknown>;
         assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), providerLimit()), 'a provider hold parks the agent');
-        t.internal.pendingRequests.push(stringKeys(held));
+        const copy: Record<string | symbol, unknown> = { ...held };
+        delete copy[symbolNamed(held, 'budget-wait')];
+        t.internal.pendingRequests.push(copy);
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');

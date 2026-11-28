@@ -273,7 +273,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("three pushes parked with one key for an agent their messages aren't written to, a plain one, a silent heartbeat's and another plain one, name both plain pushes' channels at resume, the first's carried on by the silent push the park kept between them", async () => {
+  it("three pushes parked for an agent their messages aren't written to, a plain one, a silent heartbeat's and another plain one, name both plain pushes' channels at resume, and the silent push parks apart from them", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -297,7 +297,7 @@ describe('Turn trigger provenance', () => {
     );
     await i.processInferenceRequests();
     assert.equal(membrane.calls.length, 0, 'premise: parked while quiesced');
-    assert.equal(i.pendingRequests.length, 1, 'premise: coalesced into one');
+    assert.equal(i.pendingRequests.length, 2, 'premise: the plain pushes coalesced into one, and the silent push parked apart');
     await framework.resume();
     await framework.runUntilIdle();
     assert.ok(captured.exposed, 'the turn started at resume');
@@ -354,7 +354,7 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
-  it("a provider hold that keeps a silent push carrying channels and folds an equal plain push into it keeps both pushes' channels", async () => {
+  it("a provider hold that folds a copy of a held push into it keeps both copies' channels, and holds apart two pushes of one moment, a silent one among them", async () => {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'held.chronicle'),
       membrane: membrane.asMembrane(),
@@ -374,12 +374,17 @@ describe('Turn trigger provenance', () => {
         ...(silent ? { suppressProse: true, silentHeartbeat: { eventId: 'zz-tick', serverId: 'discord' } } : {}),
         wakeChannels: [{ serverId: 'discord', channelId }],
       });
-      i.pendingRequests.push(push('discord:g:a', true), push('discord:g:b', false));
+      i.pendingRequests.push(push('discord:g:a', false));
       await framework.runUntilIdle();
-      const held = i.providerAccelerationCooldowns.get('scout')!.heldRequests as Array<{ wakeChannels?: unknown; suppressProse?: unknown }>;
-      assert.equal(held.length, 1, 'premise: the hold keeps one of the two equal pushes');
-      assert.equal(held[0]!.suppressProse, true, 'premise: the hold keeps the silent push it held first');
-      assert.deepEqual(held[0]!.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:a' }, { serverId: 'discord', channelId: 'discord:g:b' }]);
+      const held = () => i.providerAccelerationCooldowns.get('scout')!.heldRequests as Array<{ wakeChannels?: unknown; suppressProse?: unknown }>;
+      assert.equal(held().length, 1, 'premise: the hold keeps the push');
+      i.pendingRequests.push({ ...held()[0]!, wakeChannels: [{ serverId: 'discord', channelId: 'discord:g:b' }] } as Record<string, unknown>);
+      await framework.runUntilIdle();
+      assert.equal(held().length, 1, 'the copy folds into the held push');
+      assert.deepEqual(held()[0]!.wakeChannels, [{ serverId: 'discord', channelId: 'discord:g:a' }, { serverId: 'discord', channelId: 'discord:g:b' }]);
+      i.pendingRequests.push(push('discord:g:c', false), push('discord:g:d', true));
+      await framework.runUntilIdle();
+      assert.deepEqual(held().map((r) => r.suppressProse === true), [false, false, true], 'two pushes of one moment are two wakes, the silent one among them');
     } finally {
       clearTimeout(timer);
       await framework.stop();

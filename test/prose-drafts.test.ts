@@ -6660,3 +6660,240 @@ describe('a skip_reply beside a call of its step that failed', () => {
     }
   });
 });
+
+describe('wakes that wait out a quiesce or a provider hold keep apart what the batch merge reads', () => {
+  type H = Awaited<ReturnType<typeof harness>>;
+  type Wake = {
+    agentName: string; reason: string; source: string; timestamp: number; wakeAt?: number; ambient?: true; addressed?: boolean;
+    channelId?: string; channelServerId?: string; suppressProse?: boolean; heartbeatTurn?: boolean; systemNotice?: boolean;
+    counterparty?: { authorId: string }; wakeChannels?: Array<{ serverId: string; channelId: string }>;
+  };
+  type Started = { channelId?: string; serverId?: string; silent?: boolean };
+  type Internals = {
+    pendingRequests: Wake[];
+    processInferenceRequests(): Promise<void>;
+    quiesced: boolean;
+    providerAccelerationCooldowns: Map<string, { startedAt: number; until: number; timer: ReturnType<typeof setTimeout>; heldRequests: Wake[]; reason: string; failures: number }>;
+    releaseProviderAccelerationCooldown(agentName: string): void;
+    rewindRetry(agentName: string, reason: string, answering: unknown, wakes: unknown): Wake;
+  };
+  const internalsOf = (h: H) => h.framework as unknown as Internals;
+  const t = 1_000_000;
+  const push = (timestamp: number, more: Partial<Wake> = {}): Wake =>
+    ({ agentName: 'scout', reason: 'mcpl:push-event', source: 'discord', timestamp, ...more });
+  const inRoom = { channelId: ROOM, channelServerId: 'discord' };
+  const inGeneral = { channelId: GENERAL, channelServerId: 'discord' };
+  const silentTick = (timestamp: number): Wake => push(timestamp, { source: 'heartbeat', suppressProse: true });
+  const startedOf = (h: H): Started[] => {
+    const started: Started[] = [];
+    h.framework.onTrace((e) => {
+      if (e.type !== 'inference:started') return;
+      const s = e as unknown as Started;
+      started.push({ channelId: s.channelId, serverId: s.serverId, silent: s.silent });
+    });
+    return started;
+  };
+  /** The one turn that the wakes start, after the host's quiesce parks them and its resume, or with no quiesce. */
+  const turnFrom = async (wakes: Wake[], quiesce: boolean): Promise<Started> => {
+    const h = await harness();
+    const internals = internalsOf(h);
+    try {
+      const started = startedOf(h);
+      h.membrane.pushResponse(createMockResponse([]));
+      if (quiesce) await h.framework.quiesce({ reason: 'test window' });
+      internals.pendingRequests.push(...wakes);
+      await internals.processInferenceRequests();
+      if (quiesce) {
+        assert.equal(started.length, 0, 'premise: nothing starts while the host is quiesced');
+        await h.framework.resume();
+      }
+      await h.until(() => started.length > 0, 'the turn the wakes start');
+      await h.framework.runUntilIdle();
+      assert.equal(started.length, 1, 'the wakes start one turn');
+      return started[0]!;
+    } finally {
+      await h.close();
+    }
+  };
+  /** Which of the wakes a quiesce keeps parked, by each wake's position in the list. */
+  const parkedOf = async (wakes: Wake[], h?: H): Promise<Wake[]> => {
+    const own = h ?? await harness();
+    const internals = internalsOf(own);
+    try {
+      internals.quiesced = true;
+      internals.pendingRequests.push(...wakes);
+      await internals.processInferenceRequests();
+      return internals.pendingRequests.filter((r) => r.agentName === 'scout');
+    } finally {
+      internals.quiesced = false;
+      internals.pendingRequests.length = 0;
+      if (!h) await own.close();
+    }
+  };
+  const positions = (wakes: Wake[], parked: Wake[]) => parked.map((r) => wakes.indexOf(r)).sort();
+
+  it('a silent tick parked after an ordinary wake on a channel leaves the resumed turn speaking, in that channel', async () => {
+    assert.deepEqual(await turnFrom([push(t, inRoom), silentTick(t + 1)], true), { channelId: ROOM, serverId: 'discord', silent: undefined });
+  });
+
+  it('a silent tick parked after an ordinary channel-less wake leaves the resumed turn speaking', async () => {
+    assert.equal((await turnFrom([push(t, { source: 'notes' }), silentTick(t + 1)], true)).silent, undefined);
+  });
+
+  it('a channel-less wake parked after a wake on a channel leaves the resumed turn in that channel', async () => {
+    assert.deepEqual(await turnFrom([push(t, inRoom), push(t + 1, { source: 'notes' })], true), { channelId: ROOM, serverId: 'discord', silent: undefined });
+  });
+
+  it('a system notice parked after an ordinary wake on the same channel leaves the resumed turn in that channel', async () => {
+    assert.deepEqual(await turnFrom([push(t, inRoom), push(t + 1, { ...inRoom, systemNotice: true })], true), { channelId: ROOM, serverId: 'discord', silent: undefined });
+  });
+
+  it('a wake whose event is newer, though it was queued first, resumes the turn to its channel, as with no quiesce', async () => {
+    const wakes = () => [push(t, { ...inRoom, wakeAt: t + 10 }), push(t + 1, inGeneral)];
+    const uninterrupted = await turnFrom(wakes(), false);
+    assert.equal(uninterrupted.channelId, ROOM, 'premise: with no quiesce, the turn is in #room');
+    assert.deepEqual(await turnFrom(wakes(), true), uninterrupted);
+  });
+
+  it('a quiesce keeps, of two wakes on one channel, the one whose event is newer, in the first wake\'s place', async () => {
+    const byEvent = [push(t, { ...inRoom, wakeAt: t + 10 }), push(t + 1, inRoom), push(t + 2, inGeneral)];
+    assert.deepEqual((await parkedOf(byEvent)).map((r) => byEvent.indexOf(r)), [0, 2]);
+    const later = [push(t, inRoom), push(t + 1, inGeneral), push(t + 2, inRoom)];
+    assert.deepEqual((await parkedOf(later)).map((r) => later.indexOf(r)), [2, 1], "the newer #room wake stands in the first #room wake's place, before #general");
+  });
+
+  it('a quiesce keeps an ambient wake, and a ranked retry, apart from an ordinary wake on the same channel', async () => {
+    const ambient = [push(t, inRoom), push(t + 1, { ...inRoom, ambient: true })];
+    assert.deepEqual(positions(ambient, await parkedOf(ambient)), [0, 1]);
+    const h = await harness();
+    try {
+      const retry = internalsOf(h).rewindRetry('scout', 'unstick', { answers: { channel: { serverId: 'discord', channelId: ROOM } } }, undefined);
+      const rank = Object.getOwnPropertySymbols(retry).find((key) => key.description === 'retry-rank');
+      assert.ok(rank, 'premise: a rewind retry that answers a channel carries its rank');
+      const ranked = [{ ...retry, timestamp: t }, { ...retry, timestamp: t + 1, [rank]: undefined } as Wake];
+      assert.deepEqual(positions(ranked, await parkedOf(ranked, h)), [0, 1]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a quiesce that folds a wake with a counterparty into a newer one without keeps the counterparty, unless the newer one is addressed', async () => {
+    const parked = await parkedOf([push(t, { source: 'notes', counterparty: { authorId: 'u1' } }), push(t + 1, { source: 'notes' })]);
+    assert.equal(parked.length, 1, 'premise: the two wakes share a key');
+    assert.deepEqual(parked[0]!.counterparty, { authorId: 'u1' });
+    const addressed = await parkedOf([
+      push(t, { ...inRoom, addressed: true, counterparty: { authorId: 'u1' } }),
+      push(t + 1, { ...inRoom, addressed: true }),
+    ]);
+    assert.equal(addressed.length, 1, 'premise: the two addressed wakes share a key');
+    assert.equal(addressed[0]!.counterparty, undefined, 'an addressed wake is its own provenance, as in the batch merge');
+  });
+
+  it("a heartbeat wake parked beside a push on a channel and a channel-less push leaves the resumed turn speaking in that channel, not a heartbeat's turn", async () => {
+    const h = await harness();
+    try {
+      h.membrane.pushResponse(createMockResponse([text('the answer')]));
+      await h.framework.quiesce({ reason: 'test window' });
+      internalsOf(h).pendingRequests.push(push(t, inRoom), push(t + 1, { source: 'heartbeat' }), push(t + 2, { source: 'notes' }));
+      await internalsOf(h).processInferenceRequests();
+      await h.framework.resume();
+      await h.until(() => h.publishes().some((p) => p.text === 'the answer'), 'the answer');
+      assert.deepEqual(h.publishes().filter((p) => p.text === 'the answer').map((p) => p.channelId), [ROOM]);
+      assert.equal(h.texts().filter((x) => x.startsWith('[routing] This turn came from your heartbeat')).length, 0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('a quiesce still coalesces repeated wakes, and keeps apart one channel id on two servers and ids that hold "|"', async () => {
+    const repeated = [push(t, inRoom), push(t + 1, inRoom), push(t + 2, inRoom)];
+    assert.deepEqual(positions(repeated, await parkedOf(repeated)), [2]);
+    const ticks = [silentTick(t), silentTick(t + 1)];
+    assert.deepEqual(positions(ticks, await parkedOf(ticks)), [1]);
+    const servers = [push(t, { channelId: 'general', channelServerId: 'a' }), push(t + 1, { channelId: 'general', channelServerId: 'b' })];
+    assert.deepEqual(positions(servers, await parkedOf(servers)), [0, 1]);
+    const pipes = [push(t, { channelId: 'c', channelServerId: 's|t' }), push(t + 1, { channelId: 't|c', channelServerId: 's' })];
+    assert.deepEqual(positions(pipes, await parkedOf(pipes)), [0, 1]);
+  });
+
+  describe('a provider hold', () => {
+    /** Hold the wakes in a provider hold on scout, and answer with the held list. */
+    const holding = async (h: H, wakes: Wake[]): Promise<Wake[]> => {
+      const internals = internalsOf(h);
+      if (!internals.providerAccelerationCooldowns.has('scout')) {
+        const now = Date.now();
+        const timer = setTimeout(() => {}, 60_000);
+        internals.providerAccelerationCooldowns.set('scout', { startedAt: now, until: now + 60_000, timer, heldRequests: [], reason: 'test hold', failures: 1 });
+      }
+      internals.pendingRequests.push(...wakes);
+      await internals.processInferenceRequests();
+      return internals.providerAccelerationCooldowns.get('scout')!.heldRequests;
+    };
+    const release = async (h: H) => {
+      const internals = internalsOf(h);
+      internals.providerAccelerationCooldowns.get('scout')!.until = Date.now() - 1;
+      internals.releaseProviderAccelerationCooldown('scout');
+      await internals.processInferenceRequests();
+    };
+
+    it("keeps a silent tick and a heartbeat push of one moment apart, and the turn its release starts speaks", async () => {
+      const h = await harness();
+      try {
+        const started = startedOf(h);
+        h.membrane.pushResponse(createMockResponse([]));
+        assert.equal((await holding(h, [silentTick(t), push(t, { source: 'heartbeat' })])).length, 2);
+        await release(h);
+        await h.until(() => started.length > 0, 'the released turn');
+        await h.framework.runUntilIdle();
+        assert.deepEqual(started.map((s) => s.silent), [undefined]);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it("keeps a merged heartbeat retry and a heartbeat push of one moment apart, and the turn its release starts is a heartbeat's", async () => {
+      const h = await harness();
+      try {
+        h.membrane.pushResponse(createMockResponse([text('a thought')]));
+        assert.equal((await holding(h, [push(t, { source: 'heartbeat', heartbeatTurn: false }), push(t, { source: 'heartbeat' })])).length, 2);
+        await release(h);
+        await h.until(() => h.drafts().some((d) => d.text === 'a thought'), 'the words, held');
+        assert.equal(h.texts().filter((x) => x.startsWith('[routing] This turn came from your heartbeat')).length, 1);
+        assert.deepEqual(h.publishes().filter((p) => p.text === 'a thought'), []);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('keeps apart two wakes of one moment that differ only in heartbeatTurn, or in being a system notice', async () => {
+      const h = await harness();
+      try {
+        const held = await holding(h, [
+          push(t, { source: 'heartbeat', heartbeatTurn: false }), push(t, { source: 'heartbeat' }),
+          push(t, inRoom), push(t, { ...inRoom, systemNotice: true }),
+        ]);
+        assert.equal(held.length, 4);
+      } finally {
+        await h.close();
+      }
+    });
+
+    it('folds a copy of a held wake into it, though the copy names another channel, or a merge rewrote its silence, heartbeat or notice, and keeps apart a copy with other coalescing marks', async () => {
+      const h = await harness();
+      try {
+        const held = await holding(h, [silentTick(t), push(t + 1, { ...inRoom, systemNotice: true })]);
+        assert.equal(held.length, 2, 'premise: the tick and the notice are held');
+        const holdAgain = (copy: Wake) => (h.framework as unknown as { holdRequest(held: Wake[], request: Wake): void }).holdRequest(held, copy);
+        holdAgain({ ...held[0]!, wakeChannels: [{ serverId: 'discord', channelId: GENERAL }] });
+        holdAgain({ ...held[0]!, suppressProse: undefined, heartbeatTurn: false });
+        holdAgain({ ...held[1]!, systemNotice: undefined });
+        assert.equal(held.length, 2);
+        assert.deepEqual(held[0]!.wakeChannels, [{ serverId: 'discord', channelId: GENERAL }]);
+        holdAgain({ ...held[0]!, coalescingSubject: 'zz-subject' } as Wake);
+        assert.equal(held.length, 3, 'a copy that a subject could withdraw on its own stays apart');
+      } finally {
+        await h.close();
+      }
+    });
+  });
+});
