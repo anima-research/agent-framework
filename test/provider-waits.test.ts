@@ -697,9 +697,7 @@ test('a primary 429 with retry-after holds the turn, without a failure marker, a
       // loaded host; the clock stays inside it, and so the hold stands.
       await clock.outlast(wait);
       assert.ok(internal.providerAccelerationCooldowns.has('resident'), 'the hold stands while the clock is inside the wait');
-      // A real clock stamps the arrival after the failed turn. Under the held
-      // one they would share a timestamp, and the hold would keep them as one
-      // request (sameInferenceRequest compares timestamps).
+      // A real clock stamps the arrival after the failed turn.
       clock.advance(1);
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-arrived while waiting', metadata: {} });
       await fw.runUntilIdle();

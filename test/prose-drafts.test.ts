@@ -6905,7 +6905,7 @@ describe('wakes that wait out a quiesce or a provider hold keep apart what the b
       }
     });
 
-    it("keeps a merged heartbeat retry and a heartbeat push of one moment apart, and the turn its release starts is a heartbeat's", async () => {
+    it("keeps a heartbeat wake with heartbeatTurn false, as a merged heartbeat retry has, and a heartbeat push of one moment apart, and the turn its release starts is a heartbeat's", async () => {
       const h = await harness();
       try {
         h.membrane.pushResponse(createMockResponse([text('a thought')]));

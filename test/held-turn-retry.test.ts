@@ -407,8 +407,7 @@ test("a quiesced host's scheduler lets a released retry through, counts only the
       // once the turn has, or at the stop.
       const quiesce = fw.quiesce({ timeoutMs: 1_000 });
       await waitFor(fw, () => fw.getHostModeStatus().quiesced, 'the quiesce');
-      // A real clock stamps the arrival after the failed turn; under the held
-      // one the hold would keep the two as one request (sameInferenceRequest).
+      // A real clock stamps the arrival after the failed turn.
       clock.advance(1);
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-third', metadata: {} });
       await fw.runUntilIdle();
