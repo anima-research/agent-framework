@@ -3230,7 +3230,7 @@ type BudgetHoldOutcome = 'released' | 'stopped' | 'removed';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
 }
-/** `reason` is failureWords' text, which the resident's own failure note shows: never a provider's or an SDK's words. */
+/** `reason` is failureWords' text, which the resident's own failure note shows, so the line adds no text that the note doesn't. */
 function deadlineRetryLine(agentName: string, ranMs: number, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
   const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
   const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
