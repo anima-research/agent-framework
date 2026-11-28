@@ -71,7 +71,7 @@ export interface CoalescingPlacement {
   agent: string;
   /** Stored message id in that agent's context manager. Absent for a write
    *  kept in memory (a surgery's hold, or the wait for its agent's
-   *  recovery), which counts as read and can't be removed. */
+   *  recovery). */
   messageId?: string;
   /** Set on a placement that wasn't presented to `agent` at its write: a
    *  write kept in memory (no `messageId` yet), or one stored while a turn
@@ -350,7 +350,8 @@ export interface CoalescerHost<E> {
    *  no model request has included it. */
   isUnread(placement: CoalescingPlacement): boolean;
   /** True iff nothing may have shown the placement to the agent: it is
-   *  stored where no committing compile has begun to assemble it and no tool
+   *  kept in memory, where no earlier try may have stored it, or stored
+   *  where no committing compile has begun to assemble it and no tool
    *  boundary has injected past it. Unlike
    *  isUnread, a compile counts from its start: a doubt counts as shown. */
   isUnshown(placement: CoalescingPlacement): boolean;
@@ -1289,10 +1290,7 @@ export class PushCoalescer<E = unknown> {
           // Not presented to its agent: stored for another agent, whose
           // turn is alive, or for the assembling agent after its assembly
           // ended, as any write during its turn; or kept in memory (no id)
-          // until its hold's release stores it, which the host counts as
-          // read and can't remove, so of what follows only the wake applies
-          // to it. A stored one is still unread there, so it stays
-          // replaceable and withdrawable. The turn being assembled
+          // until its hold's release stores it. The turn being assembled
           // doesn't read it, so it isn't materialized for that turn, and no
           // request has consumed it. The freeze withdrew the placement's
           // agent's wake for this batch; give it an ordinary wake, as any

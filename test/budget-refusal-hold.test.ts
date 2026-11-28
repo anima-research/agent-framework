@@ -2107,6 +2107,35 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
+  it("a policy retry refused for budget leaves no stream reported live, keeps its hold and the window, and an undo takes the held turn out", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async () => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      const stream = t.membrane.streamYielding.bind(t.membrane);
+      let failed = false;
+      t.membrane.streamYielding = (request: NormalizedRequest, options?: unknown) => {
+        if (failed) return stream(request, options);
+        failed = true;
+        t.membrane.calls.push(request);
+        return errorStream(new Error('zz the stream failed'));
+      };
+      try {
+        t.send('hello');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1), "the stream failed, and its policy retry's compile was refused and waits");
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime')), 'the start unwound');
+        assert.deepEqual((t.framework.healthSnapshot() as { activeStreams: string[] }).activeStreams, [], 'no stream is reported live');
+        assert.notEqual(t.hold(), null, 'the hold stands');
+        t.internal.addMessage('User', [text('zz arrived while held')]);
+        assert.ok(t.stored().includes('zz arrived while held'));
+        assert.ok(!t.windowText().includes('zz arrived while held'), 'what arrives stays out of the held turn');
+        t.framework.undoLastTurn('prime');
+        assert.equal(t.hold(), null, 'the undo took the held turn out');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it("a silent start's provider-held retry that waits for budget stands on the start's row, so a rollback that removes it drops the retry", async () => {
     await withCompression({ fitAt: 0, refuseFrom: 1 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered quietly'] });

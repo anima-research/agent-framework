@@ -2813,16 +2813,11 @@ export class ChannelRegistry {
   }
 
   /**
-   * Stop all typing intervals and clear all channel registrations.
+   * Stop all typing indicators, each with its channel's explicit stop as
+   * stopTyping() sends it, and clear all channel registrations.
    */
   stopAll(): void {
-    // Clear all typing intervals, and their metadata, which a channel
-    // registered again later would otherwise send
-    for (const { interval } of this.typingIntervals.values()) {
-      clearInterval(interval);
-    }
-    this.typingIntervals.clear();
-    this.typingMetadata.clear();
+    this.stopTyping();
 
     // Clear channels map
     this.channels.clear();

@@ -40,6 +40,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   const renders: Array<Record<string, unknown>> = [];
   const hostCaps: Array<Record<string, unknown>> = [];
   const published: Array<Record<string, unknown>> = [];
+  const acknowledged: Array<Record<string, unknown>> = [];
   let renderer: (params: Record<string, unknown>) => Promise<unknown> = async () => ({ content: [{ type: 'text', text: 'document_diff' }] });
   wss.on('connection', (ws) => {
     if (!online) { ws.close(); return; }
@@ -60,6 +61,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
       else if (m.method === 'tools/list') reply({ tools: options.tools ?? [] });
       else if (m.method === 'tools/call' && options.toolsCall) reply(options.toolsCall(m.params));
       else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
+      else if (m.method === 'channels/acknowledge' && m.id !== undefined) { acknowledged.push(m.params); reply({ acknowledged: true }); }
       else if (m.method === 'channels/close') reply({ closed: true });
       else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
       else if (m.method === 'push/render') {
@@ -95,7 +97,7 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
   });
   await create();
   return {
-    get framework() { return framework; }, membrane, renders, hostCaps, published, create, send, dir,
+    get framework() { return framework; }, membrane, renders, hostCaps, published, acknowledged, create, send, dir,
     port: (wss.address() as AddressInfo).port,
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },

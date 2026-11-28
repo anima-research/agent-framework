@@ -25,6 +25,7 @@ export const NOTICE_TAG = {
   continue: 'continue',
   proseRouting: 'prose-routing',
   toolBoundary: 'tool-boundary',
+  outputLimit: 'output-limit',
   gate: 'Gate',
   selfWake: 'self-wake',
   discordSendFailed: 'discord-send-failed',
@@ -79,9 +80,9 @@ export const NOTICE_TAG = {
 export const FORMER_NOTICE_TAGS = ['refusal-rewind'] as const;
 
 /**
- * The bracket openings context-manager 0.28.0 writes into an agent's context
+ * The bracket openings context-manager 0.29.0 writes into an agent's context
  * outside a tool result or read back from it, the same as 0.23.1, 0.25.0,
- * 0.25.1 and 0.27.0 write, marked as the framework's own are. Its
+ * 0.25.1, 0.27.0 and 0.28.0 write, marked as the framework's own are. Its
  * `[truncated — original was` isn't here: NOTICE_TAG.truncated marks it. Check
  * them against each context-manager release the framework takes.
  */

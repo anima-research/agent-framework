@@ -12,6 +12,284 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.36.0 — 2026-11-28
+
+### Breaking
+
+- **Hosts:** agent-framework now depends on `@animalabs/context-manager`
+  `^0.29.0` (was `^0.28.0`), and accepts `@animalabs/chronicle`
+  `^0.6.0 || ^0.7.0 || ^0.8.0` (was `^0.6.0 || ^0.7.0`), the range that
+  context-manager 0.29.0 declares. So an install beside a host's own chronicle
+  0.8.0 holds that one chronicle. Before, it nested a 0.7 under
+  agent-framework and context-manager.
+  - **Who needs to act:** a host that depends on context-manager itself; a
+    host that previews a context, reads one through the API, runs a gate reply
+    judge or spawns conversation forks, under the autobiographical strategy; a
+    host that subclasses `AutobiographicalStrategy`; and a host with no
+    chronicle of its own, or one whose framework opens its store by path.
+  - **Migration:** take context-manager `^0.29.0` too. Beside a 0.28.x of its
+    own, an install holds two copies of context-manager. Then a check of a
+    class fails for what the other copy made. The framework refuses a
+    `PassthroughStrategy` with `subconscious.reader: 'forks'` and no
+    `strategyFactory`. And `previewContextSettings` throws for a non-adaptive
+    `AutobiographicalStrategy` whose select fits the budget, where it would
+    give null. A host that declares chronicle may stay on 0.6 or 0.7, or move
+    to 0.8. A lockfile's 0.6 or 0.7 is still admitted. A caller of
+    `previewActivation` in the same process catches context-manager's
+    `OverBudgetError`, by its class or, across two copies, by
+    `error.name === 'OverBudgetError'`, or asks `previewContextSettings`
+    whether the agent's budget fits. An API or MCP client gets the refusal's
+    message as an error, and `lastVisible` gives null.
+  - **When the framework's chronicle becomes 0.8.0:** on a fresh install, a
+    host with no chronicle of its own gets 0.8.0, where it got 0.7. Where the
+    framework opens the store by its path (`storePath`,
+    `agent-framework-recover`), a host on chronicle 0.8.0 whose install shares
+    that chronicle now opens it with 0.8.0. Before, the framework used its
+    nested 0.7. Where a lockfile keeps that nested 0.7, the framework still
+    opens with it. chronicle 0.8.0
+    opens and reads a store that 0.6 or 0.7 wrote. On disk it adds only saved
+    length checks in `state.bin`, which 0.6 and 0.7 don't read, so they still
+    open a store that 0.8.0 wrote. chronicle 0.8.0's breaking changes reach a
+    host through this package: an open fsyncs the log before it returns, and
+    refuses a used store that has lost its log; a write first retries a failed
+    fsync of the log; and a branch call whose checkpoint fails undoes its
+    change. This package matches two chronicle messages,
+    `State already exists` and the OS error at the end of an `IO error: `
+    message, and chronicle 0.8.0 changes neither.
+  - **What changes for a preview:** in context-manager 0.29.0, a dry compile
+    meets the adaptive plan check that a committing compile meets. So under
+    the autobiographical strategy, a preview refuses a fold plan that doesn't
+    fit, with `OverBudgetError`. The refusal names the plan's tokens and the
+    budget. Before, such a plan passed when the context that it emitted fit.
+    These meet that refusal now:
+    - `previewActivation`;
+    - the API's `message.list` and `agent.context`, and the MCP tools
+      `agent_list_messages` and `agent_context`, which answer with the
+      refusal's message as an error;
+    - the seed of a conversation fork from its template, so the fork isn't
+      made;
+    - a gate's reply judge, which counts it as a failure of the judge and then
+      acts as its `onError` says;
+    - the preview after `hide`, `undo`, `rollbackToMessage` and
+      `suppressMessages`, which then gives `lastVisible` as null;
+    - `previewContextSettings` with `render`, which on a final refusal gives
+      `fits: false` with no `entries` or `stats`.
+  - **A refused preview doesn't show that a turn fails:** a turn's compile can
+    unpin its inputs, or fall back after a boot, and a preview does neither.
+  - **context-manager's other changes that reach a host:** its adaptive
+    plan-check refusal now opens with `Adaptive plan check (`, where it said
+    "Adaptive picker exhausted" or "still exceed". `AutobiographicalStrategy`,
+    which this package exports, reserves two protected hook names,
+    `getCompressionOpening` and `getSourceMergeInstruction`. context-manager's
+    changelog for 0.29.0 lists the rest.
+
+### Added
+
+- **Two stderr lines for a headless host.** A deadline expiry can cut a call that the error policy then retries. The expiry can be a progress bound's cut, or a deadline that membrane reports. Before the wait, the cut now writes `[inference-timeout] agent=NAME stream cut after 150212ms; retry scheduled in 1000ms (2 of 2): REASON`. The reason stays on one line, and it holds the words of the resident's own failure note. The line says that a retry is scheduled, not that it was sent. A caller's stop during that wait writes `[turn] NAME: a stop ended the turn in its wait to retry; the retry wasn't sent: REASON`, and one during the tool-result guard's wait writes a line of the same kind. A caller's stop can cancel a live stream, through `abortInference()` or `Agent.cancelStream()`. Such a stop now writes `[turn] NAME: a stop cancelled the turn's stream after 12034ms; the turn ends there: REASON`. The caller's reason ends the line, in quotes when it is more than one plain word, and it isn't redacted. Traces, notes, the inference log, `failures.log` and the retry rules don't change. A host that prints these traces itself may show two messages for one event. connectome-host's piped mode is such a host.
+
+- A turn whose last call the provider refused as `reasoning_extraction`,
+  and which no rewind took, now leaves the agent a note in its own context:
+  `[inference-failed] Your previous turn did not complete: the provider API
+  refused its last call.` Until now such a turn left the agent nothing: the
+  reaction on the message it answered never reaches its context. The note
+  names no category and carries none of the provider's text; the category
+  is in the row's metadata (`kind: 'inference-refused'`). A run of such
+  turns shares one note: while the provider has answered no call of the
+  agent's since, each further refused turn updates that row in place
+  (`… The 2 turns after it ended the same way.`) rather than adding one.
+  Once a call is answered, a round's or a turn's last, the note stays as
+  written, and the next refused turn starts a new one. A turn that ended
+  another way in between (a failure, a stop, or a refusal of another
+  category) ends the run too, so the turns a note counts are the ones right after it. The
+  run is kept in memory: after a restart, or once the note has left the
+  agent's window (an undo takes it out), the next refused turn starts a new
+  note. The note starts no inference: the agent reads it at its next turn.
+  `SUPPRESS_INFERENCE_FAILED_MARKER=1` leaves it out. A refusal of another
+  category writes no note, as before.
+
+### Changed
+
+- The rewind marker now reads "The N earlier turn(s) were set aside after
+  requests couldn't be completed", where it read "The N most recent
+  turn(s) were set aside because the requests that carried them couldn't
+  be completed": the shed passes over notices and rows a request didn't
+  carry, so what it set aside isn't always the newest, nor always all on
+  the failed request. It still opens "[turns-set-aside] The ", so a reader
+  matching that prefix still finds it. It also no longer says the
+  originals always remain in the raw record: it says they remain there
+  after a rewind on a presented window (the default), and that they were
+  removed from it after one on a window that is still the record (legacy
+  mode), as it did before. The tag and the metadata are unchanged.
+
+- When a turn fails or a caller stops it, the turn now reports where its
+  live speech went. Its note lists each channel that received that speech.
+  These notes are `[inference-failed]` and `[turn-interrupted]`. The list
+  takes the same form as a `[delivered]` line. Some listed channels may be
+  ones that the agent closed or declined. For each of those, the note also
+  says that the channel stays closed, as a `[delivered]` line does. Before,
+  these notes said only that the speech was handed on for delivery (#841).
+  The list holds only deliveries confirmed before the turn ended, so speech
+  that was held, refused or still being routed is not in it. A host can
+  turn off the failure note, which removes this list too.
+
+- `history--extract` still returns structured text, tool arguments and results in raw mode, but leaves out private thinking blocks, including in older extracts recognized by name or stored call ID even across page boundaries or duplicate IDs. If an older extract was cut inside a nested result string, the body is withheld when both the nested result's origin and a private block marker remain recognizable. The stored conversation is unchanged.
+  Its updated tool description changes prompt bytes and can cause a prompt-cache miss on upgrade for agents offered the tool, even if they never call it.
+  Raw extracts check the body shape (or private markers in a malformed body) and current page before reading stored call provenance. If still needed, the lookup searches backwards from the page first, then forwards on a miss, stopping once it finds the call and sharing progress with nested extracts. Missing or distant calls may still require a long scan.
+  In a cut extract, any block-level payload key after a private block type is a marker, regardless of its value. A cut in `data` before the block's `redacted_thinking` type is visible remains undetectable.
+
+- `inference:held`'s `heldRequests` now counts the wakes that a hold takes
+  back, so it can be more than 1. `healthSnapshot()`'s
+  `budgetHold.heldRequests` and `getHostModeStatus().gatedRequests` count
+  those wakes too.
+
+- An over-long tool result now keeps its tail as well as its head: 60% of the inline cap at the start and the rest at the end, an end that splits a line moved to a line break that lies within half its share, with the truncation notice between them naming the characters it elides (`chars H to E of M elided here`). Where a spill file holds the whole result, the notice's `workspace--read` starts at H, and reading on with `nextOffsetChars` until it is null or at least E returns the elided characters, the last page possibly running on into the tail; where the spill write fails or no mount can hold the file, the notice says the middle was not retained. The same cut applies to the live copy of a text block beside an image, whose notice names the elided characters by their offsets in the result's text, to the copies made with no file (`truncateForHistory`), and to the fields a withheld result keeps (`[cut: chars H to E of these fields' N elided here; …]`). Under a reader's bound, head and tail shrink together. A script's wake message past the cap is cut the same way. Results stored before this keep the shape they were stored in.
+- Image slots the live copy showed in the elided middle are re-appended after the notice, before the tail, under a note that now says they were in the elided middle; slots in the head or tail stay where they are, so `save_recent_image` counts what the resident saw. The notices' old wording (`showing H of M chars`, `original was N chars`, `fell past the cut`) is gone.
+
+### Fixed
+
+- One agent's failed start no longer drops the requests of the agents behind it
+  (#620). A scheduler pass takes up agents one at a time. When one agent's start
+  threw, the pass dropped the requests of the agents it hadn't reached yet, and
+  traced nothing. Those agents then lost their wakes and turn continuations until
+  something new woke them. Now those requests go back to the front of the queue,
+  and the next pass takes them up. The caller still gets the error, so a direct
+  `runUntilIdle()` rejects, and the requests wait for its next call. The requests
+  that were merged into the failed start aren't queued again. If a stop drops a
+  continuation during the pass, it stays dropped. If the fault is shared, such as
+  a full disk, each of the next starts can fail the same way, with its own error.
+
+- A rewind on a presented window (the default) no longer leaves a tool call
+  without its result when system notices sit between them (#737), when the
+  pair is proven. The refusal rewind, `/unstick` and the inference-failure
+  quarantine took the result alone, and membrane answered the left call
+  with a synthesized `[pending]` result on the next request. The shed now
+  takes the call body with the result body in one retraction, as an undone
+  turn's, and leaves the notices in the window, when: only system notices
+  sit between them (none of them a rewind marker, a host
+  change (`system_change`) or a tool block); the call body holds no results and
+  the result body no calls (either can also hold text or thinking); their
+  tool IDs are the same set, each a nonblank string that appears once in
+  its body; both bodies are in the agent's own record, not only presented
+  from another slot's (a persistent subconscious's view of its primary,
+  whose record isn't checked); no other call or result in the agent's
+  record or window uses any of those IDs; and every row of both carries the same owner stamp and
+  the same audience stamp. A row with no owner stamp (one stored before
+  stamps, or a module's write, which is stamped with an audience only) has
+  an unknown writer and proves no pair. A result body right after a call
+  body pairs with it as before, whatever its IDs or stamps. Any other
+  shape across notices sheds as before: the result alone, which can
+  still leave its call, or, when the request carried the call and not
+  its result, the call alone, which leaves the result.
+  On a presented window the record keeps every row, as before. A window
+  that is still the record (legacy mode: after a failed write-down, or
+  when a strategy couldn't follow a branch move) sheds as before, does
+  not look across notices, and removes the shed rows from the record.
+
+- **Hosts whose MCPL servers send coalesced events or channel messages:** on
+  chronicle 0.8.0, a producer's retry of an acceptance can succeed on the same
+  open store after a failed fsync of the store's log. Before the acceptance's
+  write or its commit (`store.sync()`) goes on, chronicle 0.8.0 writes the
+  records since the last good fsync again, and fsyncs. On chronicle 0.6 and
+  0.7, each later commit on that store fails until the store is opened again,
+  so the retry can't succeed.
+
+- A failed turn could leave its agent counted as streaming. This happened when a stream failed and its retry ended before it had a stream, for a policy retry or a tool-result guard retry. The retry ended that way in four cases: its compile failed, its compile was refused for budget, it was held for budget, or its call failed before its stream started. `runUntilIdle()` did not settle until a later turn ended. `healthSnapshot()` listed the agent as streaming, and a closing conversation agent was not disposed. `undoLastTurn()` treated a retry held for budget as a live turn and refused to undo it. After a retry gave up, a new message stayed out of the agent's window until the agent's next turn. A stream's frame now clears its entries when it ends.
+- A guard retry or a budget restart can give up before it has a stream. The tool-result guard then stayed in recovery, and the turn's held batch stayed pending. The next turn's tokens were held back until it completed, and a refusal in that turn counted as the guard's own. Now the guard's recovery and the held batch end with the turn.
+
+- Reactions, edits and deletions that don't address the agent no longer
+  move a turn's plain speech away from a message in another channel
+  (#189). Before, such a marker could choose the turn's channel when it
+  was the newest request and nothing in the batch addressed the agent.
+  Now the other requests in the batch come first, an autoContinue wake's
+  channel included. Such a marker chooses the channel only if no other
+  request names one and the batch holds no heartbeat's wake. With a
+  heartbeat's wake, the turn is a heartbeat's turn and has no channel,
+  so its plain words stay a draft and aren't published in the marker's
+  channel. When a marker is the only request, it still chooses the
+  channel. A deletion or a removed reaction never addresses the agent
+  here, even when its server gives it an addressing tag, as zulip_mcp
+  gives a deletion its message's. An edit that addresses the agent still
+  ranks as an addressed message. An edit still counts as a message when
+  the host knows that it is the first version of that message that the
+  agent sees. The wake of a deferred batch, and the one-time
+  wake-onboarding wake, take no part: they name their channel as before.
+  `InferenceRequest` gains an optional `marker` field.
+
+- In a tuned-out channel, a held line's `channels/acknowledge` request
+  now names the id that the server gave as the message's, and the host
+  sends none where it has no such id (#476). A held reaction, deletion
+  or `chat:system` notice gets none. On the push lane the request names
+  `origin.messageId`, where before it named the event's id, and a push
+  without one gets none. On the channel lane, the host sometimes knows a
+  message only by its event's id, and such a message gets none. An edit
+  gets a request only when its id is its message's id. On the channel
+  lane that holds for an edit that the server sends with `coalesce`
+  (MCPL SPEC §20.3.1). On either lane it holds for an edit that the host
+  delivers as the agent's first view of its message. Other edits get
+  none, such as zulip_mcp's `edit:77:…` lines. A held message still gets
+  its request. The reader's wake is unchanged, and #476 stays open for
+  it.
+
+- A turn that waits for compression can be released and then refused again.
+  It now keeps the wakes that joined its wait, and any other wakes that its
+  released start took in. Before, its start held those wakes as its own, so
+  a surgery that dropped the turn, or `abortInference()`, ended them too,
+  and they never ran. Now they go back to the queue, as 0.34.0 promised. The
+  same holds when a stop reaches the released start before it sends
+  anything, when that start fails and its retry is refused, and when a
+  provider hold keeps its retry. The turn that waits again is the released
+  one. A wake that a surgery removes takes its channel with it. A withdrawal
+  reaches a joined wake while it waits beside the turn, unless the released
+  start rendered its batch. If the released start rendered all of a joined
+  wake's deferred batch for this agent, that wake reads the stored render
+  once the turn is dropped, unless a surgery removed the render too. A start
+  that merged two released turns, or a released turn and a continuation,
+  still ends its joined wakes with the turn. If the released start moved
+  where the turn's speech lands, the move and its notice stay.
+
+- When the output limit (`max_tokens`) cuts a reply in plain prose, the
+  agent now gets a note after the reply: "[output-limit] The output limit
+  was reached in the response just before this note. The rest was not
+  generated." Only a turn that the framework drives writes the note. The
+  agent reads the note at its next turn. Before, nothing set such a reply
+  apart. A cut tool call still gets its own notice instead. The reply is
+  stored and routed as before (part of #135). The caller of an ephemeral
+  run still gets the cut text as `speech`, with no mark, since the note
+  stays in the run's own context. `Agent.runInferenceWithInjections()`
+  writes no note, and its caller gets the stop reason. Supplied text that
+  opens with `[output-limit` is now marked, as for any other notice tag.
+
+- **A turn whose agent ends while the turn waits to retry no longer retries under the agent's name.** This covers an ephemeral run that ends, `stopAgent`, and a fork's disposal, during `driveStream`'s wait. Before, each retry emitted `inference:started`, and `inference:failed` with `Unknown agent: <name>`. It asked the error policy again with that error, and it ended in `inference:exhausted` and an `[inference-failed]` line, for an agent that was gone. Now the turn ends when its wait runs out, with one `inference:aborted` whose reason is "a retry waiting while the agent was replaced or removed is dropped before it sends anything". A `stop()` during the wait still ends it at once, with the reason that the framework was stopping. The event isn't sent if another agent has taken the name since the turn started. That agent may hold the name now. It may also have ended again, as a job that `resumeAgent` brought back can. A host's state for that agent is then left alone. As for any dropped turn, none is sent while another turn holds the agent's name.
+
+- **Event coalescing:** during a store surgery, or while an agent's context
+  manager refuses its work, the host keeps new writes in memory. It now
+  counts a coalesced occurrence in memory as unread. A later occurrence of
+  its subject replaces it, and a retraction withdraws it. The host then
+  takes it out of memory, and stores nothing of it. Before, the host counted
+  such an occurrence as read. So an update was appended after it. And a
+  retraction didn't withdraw it: the release stored it, and then the
+  retraction's notice. An earlier try may have stored a write already. Such
+  a write still counts as read while it is in memory.
+- **Writes kept in memory:** the release now fills each write's placement,
+  as a store outside a hold does. The placement names the row of the write,
+  and says if that row is out of its agent's window. So after the release, a
+  retraction or a replacement reaches the stored occurrence while no request
+  has read it, as for any stored occurrence. The event gate's batched
+  wakes use the same placements. After the release, a reply judge can count
+  such a write as answered. And `upcomingWakes` no longer says that a
+  debounced batch will certainly wake its agent where each of its events is
+  such a write placed for that agent.
+- **Wakes of a withdrawn write:** a wake whose only cause is a write kept
+  in memory now starts no turn once that write is withdrawn. Such a wake is
+  a debounced gate batch whose every message is kept, or a wake to read a
+  render that is kept. Before, the wake started a turn after the release,
+  and that turn read nothing of the write. A batch with a message still to
+  read wakes for it. Where each event of a debounced batch is such a
+  withdrawn write, `upcomingWakes` no longer says that the batch will
+  certainly wake its agent.
+
+- **A turn's end stops typing at its own server and channel, and no longer everywhere.** The end of a turn used to stop the typing indicator in every channel of the process, whether the turn completed, failed, was stopped or was dropped. So it ended another agent's indicator, a resident's indicator during a subagent's run, and an indicator that a host started through `framework.channels`. Now an indicator at another address keeps typing. A failed stream that the error policy retries no longer stops the retry's indicator, and the retry's own end stops it. Some ends stopped no indicator, and the next turn's end, anywhere in the process, stopped it instead. Each of these now stops the turn's own indicator. They are a continuation that fails to start, such as at its checkpoint write, and an agent's removal or an ephemeral run's end while its turn is open. That holds also when the turn's stream never answers its cancel. An agent that takes over a name keeps its indicator at the same address when the old agent's last stream ends, or when the old agent's start is dropped. When a removed agent's stream ends late, it sends no second stop. A host that starts typing through `framework.channels` stops that typing itself. The framework's `stop()` now sends a stop to each indicator that is still running, where its server still holds the typing grant. It used to clear them without one. A turn that types at the same address as a host still stops that indicator at the turn's end. The registry keeps one indicator per address, with no owner, so two typers at one address still share it, and the first stop ends it for both. `ChannelRegistry.stopTyping()` with no channel still stops every channel. A host's own module can still stop an indicator at any agent's stream end, as connectome-host's activity module does. An address that its server removes and registers again is the same address, so an old turn's stop still reaches a new indicator there.
+
 ## 0.35.4 — 2026-11-24
 
 ### Added
