@@ -148,6 +148,7 @@ describe('a model-path call whose dispatch throws, and a sleep beyond the host\'
       assert.equal(traced.length, 1);
       assert.equal(traced[0]!.module, 'framework');
       assert.equal(traced[0]!.error, 'Invalid time value');
+      assert.match(String(traced[0]!.stack), /^RangeError: Invalid time value\n\s+at /);
       assert.ok(
         got.lines.some((l) => l.includes('agent') && l.includes('test--echo') && l.includes(thrower.id) && l.includes('Invalid time value')),
         `a stderr line names the agent, the tool, the call and the throw:\n${got.lines.join('\n')}`,
@@ -225,6 +226,14 @@ describe('a model-path call whose dispatch throws, and a sleep beyond the host\'
     const untilLocal = String((result.data as { untilLocal?: unknown }).untilLocal);
     assert.match(untilLocal, /^\+?\d+-\d\d-\d\dT/);
     assert.ok(!untilLocal.includes('NaN'), untilLocal);
+    assert.ok(internals().eventGate.getSleepState() !== null, 'the gate sleeps');
+  });
+
+  it("a sleep whose end falls on the day before the host's last day still sleeps", async () => {
+    const seconds = (LAST_DATE_MS - DAY_MS * 1.5 - Date.now()) / 1000;
+    const result = await sleep({ seconds, announce: false });
+    assert.equal(result.success, true, String(result.error));
+    assert.ok(!String((result.data as { untilLocal?: unknown }).untilLocal).includes('NaN'));
     assert.ok(internals().eventGate.getSleepState() !== null, 'the gate sleeps');
   });
 
