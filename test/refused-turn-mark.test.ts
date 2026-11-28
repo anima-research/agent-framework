@@ -422,7 +422,7 @@ describe('a refused turn is marked on the message it answers, and its failure na
     assert.deepEqual(r.marked(), [['add_reaction', 'room', 'm-1'], ['add_reaction', 'room', 'm-1']], 'neither resumed turn for m-2 and m-3 marks a message');
   });
 
-  it('a second resident\'s wakes for two messages that its provider\'s stated wait holds as one answer neither: its refusal marks nothing; for one message, it marks it', async (t) => {
+  it('a second resident\'s wakes for two messages of one moment, which its provider\'s stated wait holds apart, answer neither: its refusal marks nothing; for one message, it marks it', async (t) => {
     const r = await rig(t, { agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }, { name: 'second', model: 'test', systemPrompt: 'test' }] });
     for (let i = 0; i < 4; i++) r.streams.push(() => new MockYieldingStream([refusal()]));
     const waits = (r.fw as unknown as { providerWaits: { set(agent: string, model: string, ms: number, why: string): unknown } }).providerWaits;
@@ -441,8 +441,8 @@ describe('a refused turn is marked on the message it answers, and its failure na
     const now = Date.now();
     const clock = t.mock.method(Date, 'now', () => now);
     await r.f.send('channels/incoming', { messages: [message('m-2'), message('m-3')] });
-    await eventually(() => held('second') === 1 && held('agent') === 2,
-      'premise: the second resident\'s hold keeps its two wakes as one, the first resident\'s apart');
+    await eventually(() => held('second') === 2 && held('agent') === 2,
+      'premise: each resident\'s hold keeps its two wakes apart');
     clock.mock.restore();
     r.f.framework.releaseProviderWait('agent', 'test', 'test');
     r.f.framework.releaseProviderWait('second', 'test', 'test');

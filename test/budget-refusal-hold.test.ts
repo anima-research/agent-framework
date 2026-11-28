@@ -2649,7 +2649,7 @@ describe('a turn refused for budget while compression is pending waits idle, and
     });
   });
 
-  it("a provider hold that already keeps an equal request without the wait takes the wait onto it, so a surgery that removes its row drops it", async () => {
+  it("a provider hold that already keeps a copy of the request without the wait takes the wait onto it, so a surgery that removes its row drops it", async () => {
     await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
       const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered go'] });
       t.internal.budgetHoldRecheckMs = 60_000;
@@ -2660,7 +2660,9 @@ describe('a turn refused for budget while compression is pending waits idle, and
         assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
         const held = t.internal.budgetHolds.get('prime')!.turn as Record<string, unknown>;
         assert.ok(t.internal.holdProviderAcceleration(t.framework.getAgent('prime'), providerLimit()), 'a provider hold parks the agent');
-        t.internal.pendingRequests.push(stringKeys(held));
+        const copy: Record<string | symbol, unknown> = { ...held };
+        delete copy[symbolNamed(held, 'budget-wait')];
+        t.internal.pendingRequests.push(copy);
         c.fitAt = c.ticks;
         c.readyAt = c.ticks;
         t.internal.releaseBudgetHold('prime');
@@ -2706,6 +2708,45 @@ describe('a turn refused for budget while compression is pending waits idle, and
         await t.internal.processInferenceRequests();
         assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'the start carrying the wait was dropped, its row gone');
         assert.ok(await pollUntil(() => t.stored().includes('Answered other')), 'the wake merged with it runs as its own turn');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it("a merged start routed to its second member's channel, carrying a wait that no member carries, puts the folded request back in its own place, though it shares its first member's identity", async () => {
+    await withCompression({ fitAt: Infinity, refuseFrom: 2 }, async (c) => {
+      const t = await resident({ maintenanceIntervalMs: 0, replies: ['Hi', 'Answered other'] });
+      t.internal.budgetHoldRecheckMs = 60_000;
+      try {
+        const probe = { agentName: 'zz-nobody', reason: 'zz-probe', source: 'test', timestamp: Date.now() };
+        t.internal.pendingRequests.push(probe);
+        await t.internal.processInferenceRequests();
+        const ID = symbolNamed(probe, 'request-id');
+        const MERGED = await mergedBatchMark(t);
+        assert.ok(await pollUntil(() => t.stored().includes('Hi')));
+        t.sendForPrime('go');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1));
+        const held = t.internal.budgetHolds.get('prime')!.turn as object;
+        const WAIT = symbolNamed(held, 'budget-wait');
+        c.fitAt = c.ticks;
+        c.readyAt = c.ticks;
+        t.internal.releaseBudgetHold('prime');
+        t.internal.pendingRequests.splice(0, t.internal.pendingRequests.length);
+        const at = Date.now();
+        const first = { agentName: 'prime', reason: 'zz-other', source: 'test', timestamp: at, [ID]: 1e9 };
+        const second = { agentName: 'prime', reason: 'zz-read', source: 'test', timestamp: at, readsRow: 'zz-a-row-that-is-gone', channelId: 'zz-channel', channelServerId: 'zz', [ID]: 1e9 + 1 };
+        t.internal.pendingRequests.push({
+          ...first,
+          channelId: second.channelId,
+          channelServerId: second.channelServerId,
+          [WAIT]: (held as Record<symbol, unknown>)[WAIT],
+          [MERGED]: [first, second],
+        } as unknown as (typeof t.internal.pendingRequests)[number]);
+        await t.framework.suppressMessages('prime', { messageIds: [t.rowWith('go').id] });
+        await t.internal.processInferenceRequests();
+        assert.ok(await pollUntil(() => t.of('inference:aborted').length === 1), 'the start carrying the wait was dropped, its row gone');
+        assert.ok(await pollUntil(() => t.stored().includes('Answered other')), 'its first member runs as its own turn');
       } finally {
         await t.close();
       }

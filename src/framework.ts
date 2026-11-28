@@ -796,6 +796,10 @@ function isHeartbeatWake(
   return trigger.heartbeatTurn ?? trigger.source === 'heartbeat';
 }
 
+function eventAt(r: InferenceRequest): number {
+  return r.wakeAt ?? r.timestamp;
+}
+
 // parseProsePrefix lives in ./mcpl/prose-grammar.ts. The outgoing stream
 // (Spec 14.3) needs no grammar of its own: it carries what delivery
 // published.
@@ -1354,6 +1358,8 @@ const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
 const KEPT_WRITES: unique symbol = Symbol('kept-writes');
+const REQUEST_ID: unique symbol = Symbol('request-id');
+let nextRequestId = 0;
 /**
  * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
  * the wake of every agent the batch wakes: a fresh start of the turn it
@@ -1379,7 +1385,7 @@ interface TurnCarry {
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
 type ReleasedRouting = { wasRetry: boolean; rows?: string[] } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside'; [KEPT_WRITES]?: readonly WritePlacement[] };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside'; [KEPT_WRITES]?: readonly WritePlacement[]; [REQUEST_ID]?: number };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
@@ -1393,6 +1399,19 @@ function sameKeptWrites(a: InferenceRequest | undefined, b: InferenceRequest | u
   const x = keptWritesOf(a);
   const y = keptWritesOf(b);
   return x === y || (x !== undefined && y !== undefined && x.length === y.length && x.every((p, i) => p === y[i]));
+}
+
+/** Whether two requests have the same coalescing marks: a batch wake's
+ *  subject, a batch-only merge's subjects (it has no single subject), the
+ *  rows a wake reads, and the writes kept in memory that it is for. A wake
+ *  with any of them can be withdrawn or dropped on its own, and must not
+ *  stand for one without. (coalescingBatch is set only beside one of the
+ *  first two.) */
+function sameCoalescingMarks(a: InferenceRequest, b: InferenceRequest): boolean {
+  const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
+  return a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
+    a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
+    sameKeptWrites(a, b);
 }
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
@@ -7528,29 +7547,35 @@ export class AgentFramework {
     }
     return { delayMs: ownMs, ownMs, stated: false };
   }
-  /** Whether two requests are one wake, for a provider hold's dedup: the
+  /** Whether two requests are one wake by their fields: the
    *  same agent, reason, source, time and channel, on the same server (two
-   *  servers' channels can share an id), and the same coalescing
-   *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
-   *  single subject), and the rows a wake reads. A wake with any of them
-   *  can be withdrawn or dropped on its own, and must not stand for one
-   *  without. (coalescingBatch is set only beside one of the first two.)
-   *  It also compares `marker`. A marker's wake ranks below a message's
-   *  when a turn's channel is picked, so one can't stand for the other. */
+   *  servers' channels can share an id), and the same coalescing marks
+   *  (sameCoalescingMarks). It also compares `marker`. A marker's wake
+   *  ranks below a message's when a turn's channel is picked, so one can't
+   *  stand for the other. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
-    const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
-      a.marker === b.marker &&
-      a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
-      sameKeptWrites(a, b);
+      a.marker === b.marker && sameCoalescingMarks(a, b);
+  }
+  /** Whether a hold already holds `b` as `a`, for a provider hold's dedup.
+   *  Requests that a scheduler pass has taken carry their wake's identity
+   *  (REQUEST_ID), which every copy of a wake keeps, its merged start and
+   *  its retry included, whatever fields the merge rewrote. Two of them are
+   *  one when their identity is, and their coalescing marks match. Two
+   *  different wakes of one moment stay two. Others are one by
+   *  sameInferenceRequest. */
+  private heldAs(a: InferenceRequest, b: InferenceRequest): boolean {
+    const ida = (a as MarkedRequest)[REQUEST_ID];
+    const idb = (b as MarkedRequest)[REQUEST_ID];
+    if (ida !== undefined && idb !== undefined) return ida === idb && sameCoalescingMarks(a, b);
+    return this.sameInferenceRequest(a, b);
   }
   /** Keep `request` among a hold's `held` requests, once by
-   *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
+   *  heldAs. A held turn's retry (TURN_RETRY) whose equal is
    *  already held marks that one, so the hold still keeps the turn alive. */
   private holdRequest(held: InferenceRequest[], request: InferenceRequest): void {
-    const same = held.find((r) => this.sameInferenceRequest(r, request));
+    const same = held.find((r) => this.heldAs(r, request));
     if (!same) {
       held.push(request);
       return;
@@ -23362,6 +23387,7 @@ export class AgentFramework {
 
     // Group requests by agent
     for (const req of this.pendingRequests) {
+      (req as MarkedRequest)[REQUEST_ID] ??= ++nextRequestId;
       const existing = requestsByAgent.get(req.agentName) ?? [];
       existing.push(req);
       requestsByAgent.set(req.agentName, existing);
@@ -23518,13 +23544,39 @@ export class AgentFramework {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
           // and a wake that reads rows is its rows' (readsRow, readsRows):
           // neither may absorb an unrelated wake that would vanish with it.
+          // Nor may a wake for writes kept in memory (KEPT_WRITES), which
+          // goes when they are withdrawn: it keys by its own identity.
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
-          // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : request.marker ? 'm' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${readsRowsKey(request)}|${budgetWaitOf(request) ? 'waited' : ''}`;
+          // (heartbeatTurn), as they would have without the quiesce. So do a
+          // silent tick (silentOnly), a system notice (channelReq skips one),
+          // an ambient wake (the read check), a ranked retry (channelReq),
+          // a wake that names its author or wake channel (provReq) and each
+          // channel on its server (channelReq). The newer wake by eventAt
+          // wins a key, in the key's first place.
+          const key = JSON.stringify([
+            request.reason,
+            request.addressed ? 'a' : request.marker ? 'r' : 'n',
+            isHeartbeatWake(request) ? 'h' : '',
+            request.suppressProse === true ? 's' : '',
+            isUnprompted(request) ? 'u' : '',
+            request.systemNotice ? 'y' : '',
+            request.ambient === true ? 'm' : '',
+            (request as MarkedRequest)[RETRY_RANK] ?? '',
+            request.counterparty || request.wakeChannelId ? 'p' : '',
+            request.channelServerId ?? '',
+            request.channelId ?? '',
+            request.coalescingSubject ?? '',
+            request.readsRow ?? '',
+            readsRowsKey(request),
+            keptWritesOf(request) ? (request as MarkedRequest)[REQUEST_ID] ?? '' : '',
+            budgetWaitOf(request) ? 'waited' : '',
+          ]);
           const prev = newestByKey.get(key);
-          const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
+          const replace = !prev || eventAt(request) >= eventAt(prev);
+          const kept = replace || !prev ? request : prev;
           if (prev && !answersSameMessage(prev, request)) kept.answersMessageId = undefined;
+          if (prev && !(isRearmed(prev) && isRearmed(request))) delete (kept as MarkedRequest)[REARMED];
           const pair = prev ? [prev, request] : undefined;
           const channels = pair ? wakeChannelsOf(pair) : undefined;
           if (channels) kept.wakeChannels = channels;
@@ -23762,7 +23814,6 @@ export class AgentFramework {
       // held in the gate while the agent was busy lands BEHIND a newer
       // addressed message's direct wake, and queue order would hand the turn
       // to the older one. Ties keep the later-queued request, as before.
-      const eventAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
       // An autoContinue wake names the finished turn's locus. It speaks for

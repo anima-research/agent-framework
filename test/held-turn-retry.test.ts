@@ -379,15 +379,15 @@ test('a wake a recorded wait holds at admission, with no turn of its own begun, 
       await fw.runUntilIdle();
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the wait', metadata: {} });
       await fw.runUntilIdle();
-      // Its duplicate (the clock is held, so the two are equal) merges with it.
+      // A second event at the held clock is a wake of its own, though its fields are equal.
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-during the wait', metadata: {} });
       await fw.runUntilIdle();
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the wake, its duplicate merged');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'the hold has both wakes');
       const status = fw.getHostModeStatus();
       assert.equal(status.drained, true, 'a held wake is no turn');
       assert.deepEqual(status.activeTurnAgents, []);
       assert.equal(fw.abortInference('resident', 'zz-stop'), false, 'abortInference has no turn to stop');
-      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'and the wake stays held');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 2, 'and the wakes stay held');
       clock.pass(wait);
       await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
     } finally { await fw.stop(); log.restore(); }
@@ -407,8 +407,7 @@ test("a quiesced host's scheduler lets a released retry through, counts only the
       // once the turn has, or at the stop.
       const quiesce = fw.quiesce({ timeoutMs: 1_000 });
       await waitFor(fw, () => fw.getHostModeStatus().quiesced, 'the quiesce');
-      // A real clock stamps the arrival after the failed turn; under the held
-      // one the hold would keep the two as one request (sameInferenceRequest).
+      // A real clock stamps the arrival after the failed turn.
       clock.advance(1);
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-third', metadata: {} });
       await fw.runUntilIdle();
@@ -1612,11 +1611,13 @@ test("a merged start held where an equal request is already held keeps its wakes
     const { fw, internal } = await framework(path, membrane);
     try {
       await mergedStartWaiting(fw, internal, membrane, clock, wait, 'parked');
-      // A wait is recorded, and an unmarked request equal to the parked start
-      // (a JSON copy drops its symbols) is held at admission by it.
+      // A wait is recorded, and an unmarked copy of the parked start (the
+      // same wake, without its batch or other marks) is held at admission by it.
       internal.providerWaits.set('resident', 'zz-model', 60_000, 'zz later wait');
       const parked = [...internal.parkedContinuations][0];
-      internal.pendingRequests.push(JSON.parse(JSON.stringify(parked)));
+      const copy: Record<string | symbol, unknown> = { ...(parked as Record<string | symbol, unknown>) };
+      for (const key of Object.getOwnPropertySymbols(copy)) if (key.description !== 'request-id') delete copy[key];
+      internal.pendingRequests.push(copy as unknown as Request);
       await fw.runUntilIdle();
       assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the equal request is held');
       // The park ends: the merged start is held where its equal is.
