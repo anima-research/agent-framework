@@ -151,6 +151,8 @@ function world(opts: { subconscious?: boolean; branches?: boolean } = {}) {
       kept.push({ participant: 'user', content: [text(body)], metadata: meta(author, where) } as Pick<StoredMessage, 'participant' | 'content' | 'metadata'>);
     },
     dropStored(): void { stored.splice(0); },
+    /** Rows a move back to their branch shows again, at their own sequences. */
+    putBack(...rows: StoredMessage[]): void { stored.push(...rows); },
     /** The hold's release: what it kept is stored, in arrival order. */
     releaseHold(): void {
       for (const write of kept.splice(0)) {
@@ -215,7 +217,7 @@ describe('reader forks and the messages a tune-out holds', () => {
     w.coordinator.stop();
   });
 
-  it("after a move whose channel decisions couldn't be read, a later move that reads them drops what the holds kept, though the store is on the same branch (AF #619)", (t) => {
+  it("after a move whose channel decisions couldn't be read, a switch to the branch the store is on that reads them drops what the holds kept (AF #619)", (t) => {
     const errors = t.mock.method(console, 'error', () => {});
     const w = world({ branches: true });
     w.tuneOut();
@@ -227,7 +229,7 @@ describe('reader forks and the messages a tune-out holds', () => {
     assert.ok(cadence(), 'premise: kept, as the channel decisions were');
     const before = w.coordinator.heldEpochs();
     w.endHolds();
-    w.coordinator.branchMoved(false, before);
+    w.coordinator.branchMoved(true, before);
     w.followed();
     assert.equal(cadence(), false, "the branch left's hold stops");
     assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
@@ -250,21 +252,55 @@ describe('reader forks and the messages a tune-out holds', () => {
     w.coordinator.stop();
   });
 
-  it("a move back to the branch the coordinator is on keeps what reader forks were handed (AF #619)", (t) => {
+  it("a move back to the branch whose holds stayed in memory through a move that couldn't read the channel decisions hands a reader fork that branch's rows, whatever a fork was handed meanwhile (AF #619)", (t) => {
     const errors = t.mock.method(console, 'error', () => {});
     const w = world({ branches: true });
     w.tuneOut();
     w.coordinator.resumeActiveEpochs();
     errors.mock.resetCalls();
-    w.store('ann', 'S-1');
+    const first = w.store('ann', 'S-1');
+    w.moveTo('other', { parent: 'main', branchPoint: 0 }, true);
+    w.dropStored();
+    w.store('bo', 'O-1');
+    w.store('cy', 'O-2');
     w.wake();
-    assert.deepEqual(bodies(w.invocations[0]!), ['S-1'], 'premise: handed');
+    assert.deepEqual(bodies(w.invocations[0]!), ['O-1', 'O-2'], 'premise: handed on the other branch');
     w.moveTo('main');
+    w.dropStored();
+    w.putBack(first);
     w.followed();
-    w.store('bo', 'S-2');
     w.wake();
-    assert.deepEqual(bodies(w.invocations[1]!), ['S-2'], 'S-1 is not handed again');
+    assert.deepEqual(bodies(w.invocations[1]!), ['S-1'], "main's row is handed");
     assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("after a branch move, a hold whose held messages there are all kept in memory is counted from them, though none is stored and no count carried over (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.tuneOut();
+    w.coordinator.resumeActiveEpochs();
+    errors.mock.resetCalls();
+    const count = () => w.internals.divertedSinceInvocation.get(JSON.stringify([SERVER, NOISY]));
+    w.moveTo('elsewhere', undefined, false, () => { w.endHolds(); w.tuneOut(200, { epochId: 'e-noisy-0002' }); });
+    assert.equal(count(), undefined, "premise: the branch left's count went with its hold");
+    w.keep('ann', 'K-1', { epochId: 'e-noisy-0002' });
+    w.followed();
+    assert.equal(count(), 1);
+    assert.deepEqual(errors.mock.calls.map((c) => String(c.arguments[0])), [], 'nothing went wrong on the way');
+    w.coordinator.stop();
+  });
+
+  it("a hold whose record can't be read at a branch move is told, with what the move drops for it (AF #619)", (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    const w = world({ branches: true });
+    w.coordinator.resumeActiveEpochs();
+    assert.ok(w.coordinator.enterAllExcept({ serverId: SERVER, channelId: 'disc:guild:work' }, { durationSeconds: 600 }, 'agent-tool').ok, 'premise: the hold');
+    errors.mock.resetCalls();
+    w.moveTo('elsewhere', undefined, false, () => w.unreadable.add('all-except'));
+    const said = errors.mock.calls.map((c) => String(c.arguments[0]));
+    assert.ok(said.some((s) => s.includes("whether the all-except hold still holds couldn't be read at the branch move")), 'told');
+    w.unreadable.delete('all-except');
     w.coordinator.stop();
   });
 

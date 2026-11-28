@@ -1,7 +1,7 @@
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { fixture, eventually } from './helpers/coalescing-fixture.js';
+import { fixture, eventually, REPLY_DEADLINE_MS, TS } from './helpers/coalescing-fixture.js';
 import type { FrameworkConfig } from '../src/types/framework.js';
 import type { TuneOutParams } from '../src/mcpl/channel-registry.js';
 import { SUB, internals, incoming, registerOpen, enter, stored, find, held, inWindow, textOf, type Fixture } from './helpers/admission.js';
@@ -65,8 +65,49 @@ function appliedChannels(registry: Registry): string[] {
 async function settlesSoon<T>(move: Promise<T>, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([move, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} waited`)), 5000); })]);
+    return await Promise.race([move, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} waited`)), REPLY_DEADLINE_MS); })]);
   } finally { clearTimeout(timer); }
+}
+
+type Lane = 'channels/incoming' | 'push/event';
+
+function send(f: Fixture, lane: Lane, channelId: string, t: string): Promise<unknown> {
+  return lane === 'channels/incoming'
+    ? incoming(f, channelId, `m-${channelId}-during`, t)
+    : f.send('push/event', {
+      featureSet: 'doc', eventId: `p-${channelId}-during`, timestamp: TS, payload: { content: [text(t)] },
+      origin: { mcplChannelId: channelId, messageId: `m-${channelId}-during`, authorId: 'U1', authorName: 'ann' }, tags: ['chat:mention'],
+    });
+}
+
+async function arriveDuringMove<T>(f: Fixture, channelId: string, t: string, move: () => Promise<T>, onKept?: () => void, lane: Lane = 'channels/incoming'): Promise<{ moved: T; keptMark: string | undefined }> {
+  const fw = f.framework as unknown as {
+    followBranchMove(...a: unknown[]): Promise<unknown>;
+    processNextEvent(): Promise<void>;
+    surgeryHeldWrites: Array<{ content: ContentBlock[]; metadata?: { tuneOut?: { epochId?: string } } }>;
+  };
+  const keptOf = () => fw.surgeryHeldWrites.find((w) => w.content.some((b) => (b as { text?: string }).text?.includes(t)));
+  const follow = fw.followBranchMove.bind(fw);
+  let sent: Promise<unknown> | undefined;
+  let keptMark: string | undefined;
+  fw.followBranchMove = async (...a: unknown[]) => {
+    f.alwaysRespond();
+    sent = send(f, lane, channelId, t);
+    const deadline = Date.now() + REPLY_DEADLINE_MS;
+    while (keptOf() === undefined) {
+      assert.ok(Date.now() < deadline, 'premise: kept in memory as it arrived during the move');
+      await fw.processNextEvent();
+    }
+    keptMark = keptOf()!.metadata?.tuneOut?.epochId;
+    onKept?.();
+    return follow(...a);
+  };
+  try {
+    const moved = await move();
+    await sent;
+    await f.framework.runUntilIdle();
+    return { moved, keptMark };
+  } finally { fw.followBranchMove = follow; }
 }
 
 async function arrive(f: Fixture, channelId: string, messageId: string, t: string): Promise<void> {
@@ -275,9 +316,10 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       write(f, 'after the close');
 
       f.holdReplies('channels/open');
+      const sent = f.requests.length;
       const { sourceBranch } = await settlesSoon(moves(f).rollbackToMessage('agent', { messageId: before }), 'the rollback');
       assert.equal(registry.getDesiredState('editor', 'noisy'), 'open', 'decided open on the branch moved to');
-      await eventually(() => f.requests.includes('channels/open'), 'the server is asked to open it');
+      await eventually(() => f.requests.slice(sent).includes('channels/open'), 'the server is asked to open it');
       assert.equal(registry.channels.get(key('noisy'))?.open, false, 'its answer not in yet');
       f.releaseReplies();
       await eventually(() => registry.channels.get(key('noisy'))?.open === true, 'opened at the server');
@@ -323,8 +365,9 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       await eventually(() => registry.channels.get(key('noisy'))?.open === false, 'premise: closed at the server');
       write(f, 'after the close');
       f.holdReplies('channels/open');
+      const sent = f.requests.length;
       const { sourceBranch } = await moves(f).rollbackToMessage('agent', { messageId: before });
-      await eventually(() => f.requests.includes('channels/open'), "premise: the rollback's open is out");
+      await eventually(() => f.requests.slice(sent).includes('channels/open'), "premise: the rollback's open is out");
 
       await moves(f).switchBranch(sourceBranch);
       assert.equal(registry.getDesiredState('editor', 'noisy'), 'closed', 'premise: decided closed on the branch moved back to');
@@ -421,31 +464,25 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
     } finally { await f.close(); }
   });
 
-  it("a message held under the branch left's tune-out while the move is under way reaches the resident on a branch that doesn't hold it", async () => {
-    const f = await withSub();
-    try {
-      await registerOpen(f, 'work', 'noisy');
-      const before = write(f, 'before the tune-out');
-      f.present();
-      enter(f, 'noisy');
-      const registry = registryOf(f);
-      const epochId = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
-      write(f, 'after the tune-out');
-      const keep = (f.framework as unknown as { addMessage(p: string, c: ContentBlock[], m: Record<string, unknown>): unknown }).addMessage.bind(f.framework);
-      const reload = registry.branchMoved.bind(registry);
-      registry.branchMoved = () => {
-        keep('user', [text('arrived during the move')], { tuneOut: { epochId }, channelId: 'noisy', serverId: 'editor' });
-        reload();
-      };
+  for (const lane of ['channels/incoming', 'push/event'] as const) {
+    it(`a message (${lane}) held under the branch left's tune-out as it arrived while the move was under way reaches the resident on a branch that doesn't hold it`, async () => {
+      const f = await withSub();
       try {
-        await moves(f).rollbackToMessage('agent', { messageId: before });
-      } finally { registry.branchMoved = reload; }
+        await registerOpen(f, 'work', 'noisy');
+        const before = write(f, 'before the tune-out');
+        f.present();
+        enter(f, 'noisy');
+        const epochId = registryOf(f).getTuneOutState('editor', 'noisy')!.params.epochId;
+        write(f, 'after the tune-out');
+        const { keptMark } = await arriveDuringMove(f, 'noisy', 'arrived during the move', () => moves(f).rollbackToMessage('agent', { messageId: before }), undefined, lane);
+        assert.equal(keptMark, epochId, "premise: held under the branch left's tune-out as it arrived");
 
-      assert.equal(held(find(f, 'arrived during the move')), false, 'stored unheld');
-      f.present();
-      assert.ok(inWindow(f, 'arrived during the move'), "in the resident's window");
-    } finally { await f.close(); }
-  });
+        assert.equal(held(find(f, 'arrived during the move')), false, 'stored unheld');
+        f.present();
+        assert.ok(inWindow(f, 'arrived during the move'), "in the resident's window");
+      } finally { await f.close(); }
+    });
+  }
 
   it("under an all-except hold that both branches hold, a channel's own hold that the branch moved to doesn't hold leaves no count for the scope's cadence to read while the agents follow", async () => {
     const f = await withSub();
@@ -486,15 +523,8 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
       const second = registry.getTuneOutState('editor', 'noisy')!.params.epochId;
       assert.notEqual(second, first, 'premise: a second tune-out');
       write(f, 'after the second tune-out');
-      const keep = (f.framework as unknown as { addMessage(p: string, c: ContentBlock[], m: Record<string, unknown>): unknown }).addMessage.bind(f.framework);
-      const reload = registry.branchMoved.bind(registry);
-      registry.branchMoved = () => {
-        keep('user', [text('arrived during the move')], { tuneOut: { epochId: second }, channelId: 'noisy', serverId: 'editor' });
-        reload();
-      };
-      try {
-        await moves(f).rollbackToMessage('agent', { messageId: point });
-      } finally { registry.branchMoved = reload; }
+      const { keptMark } = await arriveDuringMove(f, 'noisy', 'arrived during the move', () => moves(f).rollbackToMessage('agent', { messageId: point }));
+      assert.equal(keptMark, second, 'premise: held under the second tune-out as it arrived');
 
       assert.equal(registry.getTuneOutState('editor', 'noisy')?.params.epochId, first, 'premise: the branch moved to holds the first');
       const row = find(f, 'arrived during the move');
@@ -595,6 +625,116 @@ describe('a branch move takes the channels and holds of the branch moved to', ()
 
       assert.equal(coordinator.getAllExcept()?.params.epochId, epochId, 'the hold stays');
       assert.equal(coordinator.cadenceTimers.get(SCOPE), cadence, 'and so does its timer');
+    } finally { error.mock.restore(); await f.close(); }
+  });
+
+  it("after a move whose channel logs couldn't be read, a switch to the branch the store is on reads them, and the channels and holds follow", async () => {
+    const f = await withSub();
+    const error = mock.method(console, 'error', () => {});
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const before = write(f, 'before the tune-out');
+      enter(f, 'noisy');
+      write(f, 'cut by the rollback');
+      const registry = registryOf(f);
+      const coordinator = coordinatorOf(f);
+      const read = registry.store.getStateJson.bind(registry.store);
+      registry.store.getStateJson = (id: string) => {
+        if (id === 'mcpl/channel-lifecycle') throw new Error('injected read failure');
+        return read(id);
+      };
+      try {
+        await moves(f).rollbackToMessage('agent', { messageId: before });
+      } finally { registry.store.getStateJson = read; }
+      assert.equal(registry.getDesiredState('editor', 'noisy'), 'tuned-out', 'premise: the channels kept what they had');
+
+      await moves(f).switchBranch(branchNow(f));
+
+      assert.equal(registry.getDesiredState('editor', 'noisy'), 'open', "the branch's own decision");
+      assert.equal(registry.getTuneOutState('editor', 'noisy'), null, 'no hold there');
+      assert.equal(coordinator.cadenceTimers.has(key('noisy')), false, "the branch left's hold stops");
+    } finally { error.mock.restore(); await f.close(); }
+  });
+
+  it("a move that ends after the host's stop began arms no timer for the holds of the branch moved to", async () => {
+    const f = await withSub();
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      enter(f, 'noisy');
+      const point = write(f, 'after the tune-out');
+      write(f, 'cut by the rollback');
+      const coordinator = coordinatorOf(f) as Coordinator & { stopTimers(): void };
+      assert.ok(coordinator.cadenceTimers.has(key('noisy')), 'premise: the hold has its cadence');
+      const fw = f.framework as unknown as { reinitializeManagers(...a: unknown[]): Promise<unknown> };
+      const reinit = fw.reinitializeManagers.bind(fw);
+      fw.reinitializeManagers = (...a: unknown[]) => { coordinator.stopTimers(); return reinit(...a); };
+      try {
+        await moves(f).rollbackToMessage('agent', { messageId: point });
+      } finally { fw.reinitializeManagers = reinit; }
+
+      assert.ok(registryOf(f).getTuneOutState('editor', 'noisy') !== null, 'premise: the branch moved to holds it');
+      assert.deepEqual([coordinator.cadenceTimers.size, coordinator.expiryTimers.size, coordinator.pendingWakes.size], [0, 0, 0]);
+    } finally { await f.close(); }
+  });
+
+  it("an all-except record that can't be read as the move gives each held message the mark of the branch moved to is told, with what that leaves", async () => {
+    const f = await withSub();
+    const error = mock.method(console, 'error', () => {});
+    try {
+      await registerOpen(f, 'work', 'noisy');
+      const before = write(f, 'before the tune-out');
+      enter(f, 'noisy');
+      write(f, 'after the tune-out');
+      const coordinator = coordinatorOf(f);
+      const scope = coordinator.getAllExcept.bind(coordinator);
+      try {
+        await arriveDuringMove(f, 'noisy', 'arrived during the move', () => moves(f).rollbackToMessage('agent', { messageId: before }), () => {
+          coordinator.getAllExcept = () => { throw new Error('injected read failure'); };
+        });
+      } finally { coordinator.getAllExcept = scope; }
+
+      const said = error.mock.calls.map((c) => String(c.arguments[0]));
+      assert.ok(said.some((s) => s.includes('1 message held as it arrived during the move keeps')), 'told');
+    } finally { error.mock.restore(); await f.close(); }
+  });
+
+  it("a channel a server registered with a descriptor that says lazyRegistered gets, on a rollback past its registration, the decision its registration made", async () => {
+    const f = await withSub();
+    try {
+      await registerOpen(f, 'work');
+      const before = write(f, 'before the channel came');
+      await f.send('channels/register', { channels: [{ id: 'late', type: 'discord', label: 'late', metadata: { channelType: 'guild_text', lazyRegistered: true } }] });
+      const registry = registryOf(f);
+      await eventually(() => registry.getDesiredState('editor', 'late') === 'closed', 'premise: registered closed by default');
+      assert.ok((await registry.handleChannelToolCall('channel_open', { channelId: 'late' })).success, 'premise: the agent opened it');
+      write(f, 'after the channel came');
+
+      await moves(f).rollbackToMessage('agent', { messageId: before });
+
+      assert.equal(registry.getDesiredState('editor', 'late'), 'closed', "its registration's decision");
+    } finally { await f.close(); }
+  });
+
+  it("a server whose legacy policy's migration fails on the branch moved to gets no decision for its channels there, as a registration whose migration fails gets none", async () => {
+    const f = await withSub();
+    const error = mock.method(console, 'error', () => {});
+    try {
+      const before = write(f, 'before the server registered');
+      await f.register('work');
+      const registry = registryOf(f) as Registry & { setDesiredState(serverId: string, channelId: string, desired: string, source: string): void };
+      await eventually(() => registry.getDesiredState('editor', 'work') === 'closed', 'premise: decided at its registration');
+      write(f, 'after the server registered');
+      const set = registry.setDesiredState.bind(registry);
+      registry.setDesiredState = (serverId: string, channelId: string, desired: string, source: string) => {
+        if (source === 'legacy-recipe-migration') throw new Error('injected write failure');
+        return set(serverId, channelId, desired, source);
+      };
+      try {
+        await moves(f).rollbackToMessage('agent', { messageId: before });
+      } finally { registry.setDesiredState = set; }
+
+      assert.ok(error.mock.calls.some((c) => String(c.arguments[0]).includes("legacy recipe policy couldn't be migrated")), 'premise: the migration failed');
+      assert.equal(registry.getDesiredState('editor', 'work'), undefined);
     } finally { error.mock.restore(); await f.close(); }
   });
 

@@ -938,7 +938,7 @@ test("65 follow-up (Isaac-3593, round 3): a kept notice of a cancel dropped for 
     mock.timers.tick(60_000);
     assert.deepEqual(h.lossNotices().map((m) => textOf(m.content)), [
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. That tune-out ended '
-      + 'without your cancel while it waited, so your cancel was dropped, and the note with it. A later tune-out of '
+      + 'without your cancel while it waited, so your cancel was dropped, and the note with it. Another tune-out of '
       + 'disc:guild:a, which your cancel was not for, was in force when your cancel was dropped, and has ended since.]',
     ], 'the later hold as it is when the notice is written');
   } finally {
@@ -1002,7 +1002,7 @@ test("65 follow-up (Isaac-3593): a queued cancel whose hold ended without it tel
     assert.equal(typeof told[0]!.metadata?.lossNoticeId, 'string', 'the row names the notice it is (review 3, #64)');
     assert.equal(textOf(told[0]!.content),
       '[Tune-out: the note you left with your cancel of disc:guild:a was not delivered to scout. That tune-out ended '
-      + 'without your cancel while it waited, so your cancel was dropped, and the note with it. A later tune-out of '
+      + 'without your cancel while it waited, so your cancel was dropped, and the note with it. Another tune-out of '
       + 'disc:guild:a is in force now, which your cancel was not for.]');
     assert.deepEqual(h.wakes, [['Subconscious', 'tune-out note not delivered: disc:guild:a']], 'a turn to read it, as nothing else gives one');
     assert.deepEqual(h.dropped().map((t) => [t.reason, t.noteAuthor]), [['hold-ended', 'Subconscious']]);
