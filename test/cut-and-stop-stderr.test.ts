@@ -181,13 +181,14 @@ describe('a deadline expiry whose call the error policy retries writes one stder
     oneTimeoutLine(stderr, timeoutLine(`No provider event within 150s ${HOST_SETTING}`));
   });
 
-  it("a deadline that membrane reports with its mark writes the line too, with membrane's reason", async (t) => {
+  it("a deadline that membrane reports with its mark writes the line too, with the words of the resident's own note and not membrane's or the SDK's", async (t) => {
     const stderr = stderrOf(t);
     const { fw, membrane } = await boot(t, [markedDeadline('Request timed out.')]);
     hello(fw);
     await within('the turn', fw.runUntilIdle());
     assert.equal(membrane.calls.length, 2, 'one fresh call');
-    oneTimeoutLine(stderr, timeoutLine('Request timed out.'));
+    oneTimeoutLine(stderr, timeoutLine('the model call timed out'));
+    assert.ok(!stderr.some((text) => text.includes('Request timed out.')), "the SDK's words are on no line");
   });
 
   it('a second cut ends the turn: the first cut wrote the one [inference-timeout] line, and the end has its [inference-failed] line', async (t) => {
