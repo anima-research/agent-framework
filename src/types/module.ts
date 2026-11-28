@@ -474,13 +474,29 @@ export interface ModuleContext {
    * row. For one release it also takes the `held:` handle a release before
    * #291 answered for a write it held, and edits the row that write landed
    * as.
+   *
+   * While an operator's move (switchBranch, rollbackToMessage or
+   * suppressMessages) holds the store, an edit of a stored row waits in
+   * memory with the writes, in the order they came. The move's release
+   * applies it on the branch that the store is on then. An edit waits in
+   * the same way while the delivery agent's context manager refuses its
+   * work, and the recovery applies it. A malformed edit throws at once, and
+   * so does an edit of a row that the store doesn't hold. The release skips
+   * an edit of a row that the move cut away. If the move failed, the edit
+   * waits for the recovery instead. If the store refuses the edit at the
+   * release because the move left its context manager uninitialized, the
+   * edit waits for the recovery too. If the store throws for another
+   * reason, a `store-held-lost` alert tells the operator.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
   /**
-   * Remove a stored message, by its id. For one release it also takes the
-   * `held:` handle a release before #291 answered for a write it held, and
-   * removes the row that write landed as.
+   * Remove a stored message, by its id, with the rest of its body when it
+   * is one shard of a body. For one release it also takes the `held:`
+   * handle a release before #291 answered for a write it held, and removes
+   * the row that write landed as.
+   *
+   * A removal waits, and throws at once, as an edit does (editMessage).
    */
   removeMessage(id: MessageId): void;
 
@@ -504,6 +520,10 @@ export interface ModuleContext {
    * tune-out or a suppress rule holds it from the residents. For one release
    * it also takes the `held:` handle a release before #291 answered, and
    * gives the row that write landed as.
+   *
+   * While edits and removals wait in memory (editMessage), it shows them.
+   * A removed row reads as null, and so does each row of its body. An
+   * edited row has its new content.
    */
   getMessage(id: MessageId): ModuleMessage | null;
 
@@ -525,6 +545,10 @@ export interface ModuleContext {
    * in. A name that isn't a registered agent, or the empty name, throws,
    * naming the registered ones, so a typo is heard rather than read as an
    * empty window.
+   *
+   * While edits and removals for the agent that it reads wait in memory
+   * (editMessage), the rows show them, as getMessage does. The count leaves
+   * out the rows that a removal takes.
    */
   queryMessages(filter: MessageQuery, opts?: { forAgent?: string }): MessageQueryResult;
 
@@ -793,8 +817,10 @@ export interface EventResponse {
 
   /**
    * Module state update. The framework calls setState() with this value
-   * after applying the response's message changes, and not when one of
-   * them threw.
+   * after it applies the response's message changes. While the store is
+   * held, it calls it after it keeps them in memory
+   * (ModuleContext.editMessage). It doesn't call it when one of the changes
+   * threw.
    */
   stateUpdate?: unknown;
 }

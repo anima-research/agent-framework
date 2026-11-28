@@ -180,7 +180,7 @@ async function within<T>(promise: Promise<T>, what: string, ms = 10_000): Promis
 async function withKeptCreate(
   hold: Hold,
   run: (s: { framework: AgentFramework; discord: FakeDiscord; processed: (type: string, id: string) => Promise<void>; kept: () => number; texts: (id: string) => string[] }) => Promise<void>,
-  options: { triggerOn?: 'all'; modules?: Module[]; membrane?: MockMembrane } = {},
+  options: { triggerOn?: 'all'; modules?: Module[]; membrane?: MockMembrane; before?: (s: { discord: FakeDiscord; processed: (type: string, id: string) => Promise<void>; texts: (id: string) => string[] }) => Promise<void> } = {},
 ): Promise<{ framework: AgentFramework; texts: (id: string) => string[]; cleanup: () => Promise<void> }> {
   const dir = mkdtempSync(join(tmpdir(), 'discord-kept-create-'));
   const discord = new FakeDiscord();
@@ -209,6 +209,7 @@ async function withKeptCreate(
     .map(textOf);
   const kept = () => framework.getHostModeStatus().deferredWrites;
   framework.start();
+  await options.before?.({ discord, processed, texts });
   const branch = framework.getStore().currentBranch().name;
   const strategy = framework.getAgent('Sol')!.getContextManager().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
   const initialize = strategy.initialize;
@@ -289,6 +290,37 @@ for (const hold of ['a branch move holding the store', "the primary's recovery w
     try {
       await drained(s.framework);
       assert.deepEqual(s.texts('k2'), ['after'], 'the store holds the edited text');
+    } finally {
+      await s.cleanup();
+    }
+  });
+}
+
+for (const hold of ['a branch move holding the store', "the primary's recovery wait"] as const) {
+  test(`a stored message edited and then edited back while ${hold} keeps the edits in memory has its first text once they are applied`, async () => {
+    const s = await withKeptCreate(hold, async ({ discord, processed, kept, texts }) => {
+      const created = processed('discord:message', 'r2');
+      await discord.onMessageHandler!(live('r2', 'a create, whose store the release traces'));
+      await created;
+      const edited = processed('discord:edit', 'r1');
+      discord.onEditHandler!('r1', 'B');
+      await edited;
+      assert.deepEqual([kept(), texts('r1')], [2, ['A']], 'the edit is kept in memory, and the row keeps its text');
+      const reverted = processed('discord:edit', 'r1');
+      discord.onEditHandler!('r1', 'A');
+      await reverted;
+      assert.equal(kept(), 3, 'the revert is kept in memory too, since the module reads the edit kept before it');
+    }, {
+      before: async ({ discord, processed, texts }) => {
+        const created = processed('discord:message', 'r1');
+        await discord.onMessageHandler!(live('r1', 'A'));
+        await created;
+        assert.deepEqual(texts('r1'), ['A'], 'setup: the message is stored before the hold');
+      },
+    });
+    try {
+      await drained(s.framework);
+      assert.deepEqual(s.texts('r1'), ['A']);
     } finally {
       await s.cleanup();
     }

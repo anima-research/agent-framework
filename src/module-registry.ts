@@ -160,6 +160,7 @@ export class ModuleRegistry {
   readonly observesFn?: (observer: string, observed: string) => boolean;
   readonly viewKeepsFn?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
   readonly agentNameOfFn?: (contextManager: ContextManager) => string | undefined;
+  readonly storeHeldFn?: () => boolean;
 
   constructor(
     store: JsStore,
@@ -188,6 +189,9 @@ export class ModuleRegistry {
       viewKeeps?: (row: StoredMessage, opts?: { forAgent?: string }) => boolean;
       /** The live agent whose context a context manager is (ModuleContext.agentNameOf). */
       agentNameOf?: (contextManager: ContextManager) => string | undefined;
+      /** Whether the framework keeps a module's edits and removals in memory now, to apply them later: while a
+       *  surgery holds the store, while its release replays, or while the delivery agent waits for its recovery. */
+      storeHeld?: () => boolean;
     }
   ) {
     this.store = store;
@@ -206,6 +210,7 @@ export class ModuleRegistry {
     this.observesFn = options.observes;
     this.viewKeepsFn = options.viewKeeps;
     this.agentNameOfFn = options.agentNameOf;
+    this.storeHeldFn = options.storeHeld;
     this.dropRetiredPushFn = options.dropRetiredPush;
   }
 
@@ -1031,6 +1036,7 @@ class ModuleContextImpl implements ModuleContext {
   removeMessage(id: MessageId): void {
     if (this.refused('removeMessage')) return;
     this.removeMessageFn(id);
+    if (this.registry.storeHeldFn?.()) return;
     // Clean up external ID mapping
     for (const [key, msgId] of this.externalIdMap) {
       if (msgId === id) {
@@ -1059,7 +1065,7 @@ class ModuleContextImpl implements ModuleContext {
     // later finds its entry.
     if (entry !== '') {
       if (this.getMessageFn(entry)) return entry;
-      if (!this.retired) {
+      if (!this.retired && !this.registry.storeHeldFn?.()) {
         this.externalIdMap.delete(key);
         this.persistExternalIdMap();
       }
@@ -1067,7 +1073,7 @@ class ModuleContextImpl implements ModuleContext {
     }
     const row = this.queryMessagesFn({ source, externalIds: [externalId] }).messages[0];
     if (!row) return null;
-    if (!this.retired) {
+    if (!this.retired && !this.registry.storeHeldFn?.()) {
       this.externalIdMap.set(key, row.id);
       this.persistExternalIdMap();
     }

@@ -118,7 +118,7 @@ interface Module {
 }
 ```
 
-An `EventResponse` can add/edit/remove messages, update module state, request inference, and signal tool changes. The framework applies its message changes, then its state update, then its inference request; when one of these throws, what came before it stays applied, that step may have taken effect in part, and the rest of that response isn't:
+An `EventResponse` can add/edit/remove messages, update module state, request inference, and signal tool changes. The framework applies its message changes, then its state update, then its inference request; when one of these throws, what came before it stays applied, that step may have taken effect in part, and the rest of that response isn't. While a branch move holds the store, or while the agent's context manager refuses its work, the edits and removals wait in memory, so the state update comes before they reach the store:
 
 ```typescript
 return {

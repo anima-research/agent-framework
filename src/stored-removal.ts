@@ -98,21 +98,27 @@ export function removeStoredMessages(cm: Removals, first: StoredLike, last: Stor
  * them (#291).
  */
 export function removeStoredMessage(cm: ContextManager, id: MessageId): MessageId[] {
-  const message = cm.getMessage(id) as StoredLike | null;
-  if (!message?.bodyGroupId) {
+  const run = bodyRunOf(cm, id);
+  if (!run) {
     cm.removeMessage(id);
     return [id];
   }
+  cm.removeMessages(run.fromId as MessageId, run.toId as MessageId);
+  return run.ids;
+}
+
+/** The ids of the rows that removeStoredMessage removes for `id`, in store order. */
+export function storedRowsRemovedWith(cm: ContextManager, id: MessageId): MessageId[] {
+  return bodyRunOf(cm, id)?.ids ?? [id];
+}
+
+function bodyRunOf(cm: ContextManager, id: MessageId): ReturnType<typeof bodyGroupRun> | undefined {
+  const message = cm.getMessage(id) as StoredLike | null;
+  if (!message?.bodyGroupId) return undefined;
   // Found in blob-free windows: a full read of the branch would inflate every
   // attachment on it, once for each message a sweep removes.
   const index = locateMessageIndex(cm, String(id));
-  if (index < 0) {
-    cm.removeMessage(id);
-    return [id];
-  }
-  const run = bodyGroupRun(cm, index);
-  cm.removeMessages(run.fromId as MessageId, run.toId as MessageId);
-  return run.ids;
+  return index < 0 ? undefined : bodyGroupRun(cm, index);
 }
 
 /**
