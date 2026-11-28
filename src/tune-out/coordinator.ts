@@ -3347,7 +3347,7 @@ export class TuneOutCoordinator {
     try {
       this.resumeHolds('branch-move');
     } catch (err) {
-      console.error(`[tune-out] the holds on the branch moved to could not all be resumed, so a hold after the one that failed may have no timers until a later move or a start: ${thrownReason(err)}`);
+      console.error(`[tune-out] the holds on the branch moved to could not all be resumed, so a hold may run without its timers or its count until a later move or a start: ${thrownReason(err)}`);
     }
   }
 

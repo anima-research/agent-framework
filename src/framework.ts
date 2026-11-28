@@ -16772,7 +16772,10 @@ export class AgentFramework {
       }
       if (holdsFollow) {
         this.tuneOutCoordinator?.branchFollowed();
-        if (!this.tuneOutCoordinator && this.tuneOutsOnRecordHere()) this.releaseTuneOutsWithoutReader();
+        if (!this.tuneOutCoordinator && this.tuneOutsOnRecordHere()) {
+          if (this.tuneOutOffered) this.endTuneOutsWithoutCoordinator();
+          else this.releaseTuneOutsWithoutReader();
+        }
       }
       return failures;
     } catch (error) {
@@ -41745,7 +41748,7 @@ export class AgentFramework {
       }
     } catch (error) {
       const kept = marked.length === 1 ? '1 message held as it arrived keeps' : `${marked.length} messages held as they arrived keep`;
-      console.error(`[tune-out] the all-except hold of the branch moved to could not be read, so ${kept} the tune-out it was held under, and one that the branch moved to doesn't hold reaches the resident only if a later move gives it that branch's mark:`, error);
+      console.error(`[tune-out] the all-except hold of the branch moved to could not be read, so ${kept} the tune-out it was held under, and one that the branch moved to doesn't hold won't reach the resident, unless it waits for an agent's recovery and a later move re-marks it:`, error);
       return;
     }
     marked.forEach((write, i) => {
