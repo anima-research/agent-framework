@@ -16745,7 +16745,7 @@ export class AgentFramework {
       } catch (error) {
         console.error("[operator] the tune-outs of the branch moved to could not be read, so the subconscious's window keeps every start it waits to fix:", error);
       }
-      this.subconsciousAnchor?.branchMoved(active, sameBranch);
+      this.subconsciousAnchor?.branchMoved(active, sameBranch && !holdsFollow);
       if (!sameBranch) {
         this.redoStacks.clear();
         this.coalescingStore?.branchMoved(this.storedCoalescing());

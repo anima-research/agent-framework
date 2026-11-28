@@ -3309,7 +3309,7 @@ export class TuneOutCoordinator {
     for (const key of [...this.divertedSinceInvocation.keys()]) if (!survives(key)) this.divertedSinceInvocation.delete(key);
     let highest = -1;
     for (const cursor of this.readerCursor.values()) if (cursor > highest) highest = cursor;
-    if (!fromSource || origin!.branchPoint < highest) {
+    if (this.runBranch !== source || !fromSource || origin!.branchPoint < highest) {
       this.readerCursor.clear();
       this.readerReturned.clear();
     }
