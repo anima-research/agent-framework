@@ -54,6 +54,9 @@ function makeAgentHarness(messages: any[]) {
     },
   };
   const fw = Object.create(AgentFramework.prototype) as any;
+  // No view is recorded for its manager, so agentSees reads it as seeing
+  // every row but a reasoning-loss row, as for a manager opened with no view.
+  fw.storeSees = new WeakMap();
   fw.rewindEpisode = new Map();
   const agent = { name: 'labclaude', getContextManager: () => cm };
   return { fw, agent, removed, added, edited, messages };
