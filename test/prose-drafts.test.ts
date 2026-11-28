@@ -6777,6 +6777,31 @@ describe('wakes that wait out a quiesce or a provider hold keep apart what the b
     }
   });
 
+  it('a quiesce keeps a wake for a write kept in memory apart from an ordinary wake, so withdrawing the write takes only its own wake', async () => {
+    const h = await harness();
+    const internals = h.framework as unknown as Internals & {
+      readsRowsFor(writes: Array<{ after: { agent: string } }>, agentName: string): object;
+      withdrawnPlacements: WeakSet<object>;
+    };
+    try {
+      const started = startedOf(h);
+      h.membrane.pushResponse(createMockResponse([]));
+      const placement = { agent: 'scout' };
+      const kept = internals.readsRowsFor([{ after: placement }], 'scout');
+      assert.deepEqual(Object.getOwnPropertySymbols(kept).map((x) => x.description), ['kept-writes'], 'premise: the wake for the kept write carries its mark');
+      await h.framework.quiesce({ reason: 'test window' });
+      internals.pendingRequests.push(push(t, inRoom), { ...push(t + 1, inRoom), ...kept });
+      await internals.processInferenceRequests();
+      internals.withdrawnPlacements.add(placement);
+      await h.framework.resume();
+      await h.until(() => started.length > 0, "the ordinary wake's turn");
+      await h.framework.runUntilIdle();
+      assert.deepEqual(started.map((s) => s.channelId), [ROOM]);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('a quiesce that folds a wake with a counterparty into a newer one without keeps the counterparty, unless the newer one is addressed', async () => {
     const parked = await parkedOf([push(t, { source: 'notes', counterparty: { authorId: 'u1' } }), push(t + 1, { source: 'notes' })]);
     assert.equal(parked.length, 1, 'premise: the two wakes share a key');

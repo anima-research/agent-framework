@@ -23544,6 +23544,8 @@ export class AgentFramework {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
           // and a wake that reads rows is its rows' (readsRow, readsRows):
           // neither may absorb an unrelated wake that would vanish with it.
+          // Nor may a wake for writes kept in memory (KEPT_WRITES), which
+          // goes when they are withdrawn: it keys by its own identity.
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce. So do a
@@ -23565,6 +23567,7 @@ export class AgentFramework {
             request.coalescingSubject ?? '',
             request.readsRow ?? '',
             readsRowsKey(request),
+            keptWritesOf(request) ? (request as MarkedRequest)[REQUEST_ID] ?? '' : '',
             budgetWaitOf(request) ? 'waited' : '',
           ]);
           const prev = newestByKey.get(key);
