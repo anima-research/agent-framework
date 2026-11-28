@@ -23550,9 +23550,10 @@ export class AgentFramework {
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce. So do a
           // silent tick (silentOnly), a system notice (channelReq skips one),
-          // an ambient wake (the read check), a ranked retry (channelReq)
-          // and each channel on its server (channelReq). The newer wake by
-          // eventAt wins a key, in the key's first place.
+          // an ambient wake (the read check), a ranked retry (channelReq),
+          // a wake that names its author or wake channel (provReq) and each
+          // channel on its server (channelReq). The newer wake by eventAt
+          // wins a key, in the key's first place.
           const key = JSON.stringify([
             request.reason,
             request.addressed ? 'a' : request.marker ? 'r' : 'n',
@@ -23562,6 +23563,7 @@ export class AgentFramework {
             request.systemNotice ? 'y' : '',
             request.ambient === true ? 'm' : '',
             (request as MarkedRequest)[RETRY_RANK] ?? '',
+            request.counterparty || request.wakeChannelId ? 'p' : '',
             request.channelServerId ?? '',
             request.channelId ?? '',
             request.coalescingSubject ?? '',
@@ -23575,11 +23577,6 @@ export class AgentFramework {
           const kept = replace || !prev ? request : prev;
           if (prev && !answersSameMessage(prev, request)) kept.answersMessageId = undefined;
           if (prev && !(isRearmed(prev) && isRearmed(request))) delete (kept as MarkedRequest)[REARMED];
-          const dropped = prev && (kept === prev ? request : prev);
-          if (dropped && !kept.addressed && (kept as MarkedRequest)[RETRY_RANK] === undefined && !kept.counterparty && !kept.wakeChannelId && (dropped.counterparty || dropped.wakeChannelId)) {
-            kept.counterparty = dropped.counterparty;
-            kept.wakeChannelId = dropped.wakeChannelId;
-          }
           const pair = prev ? [prev, request] : undefined;
           const channels = pair ? wakeChannelsOf(pair) : undefined;
           if (channels) kept.wakeChannels = channels;

@@ -6715,6 +6715,30 @@ describe('wakes that wait out a quiesce or a provider hold keep apart what the b
       await h.close();
     }
   };
+  /** The author that the one turn the wakes start names, after the host's quiesce parks them and its resume, or with no quiesce. */
+  const authorFrom = async (wakes: Wake[], quiesce: boolean): Promise<unknown> => {
+    const h = await harness();
+    const internals = h.framework as unknown as Internals & { startAgentStream(agent: unknown, trigger: Wake): Promise<void> };
+    const triggers: Wake[] = [];
+    const start = internals.startAgentStream;
+    internals.startAgentStream = async function (this: unknown, agent: unknown, trigger: Wake) {
+      triggers.push(trigger);
+      return start.call(this, agent, trigger);
+    };
+    try {
+      h.membrane.pushResponse(createMockResponse([]));
+      if (quiesce) await h.framework.quiesce({ reason: 'test window' });
+      internals.pendingRequests.push(...wakes);
+      await internals.processInferenceRequests();
+      if (quiesce) await h.framework.resume();
+      await h.until(() => triggers.length > 0, 'the turn the wakes start');
+      await h.framework.runUntilIdle();
+      assert.equal(triggers.length, 1, 'the wakes start one turn');
+      return triggers[0]!.counterparty;
+    } finally {
+      await h.close();
+    }
+  };
   /** Which of the wakes a quiesce keeps parked, by each wake's position in the list. */
   const parkedOf = async (wakes: Wake[], h?: H): Promise<Wake[]> => {
     const own = h ?? await harness();
@@ -6802,16 +6826,21 @@ describe('wakes that wait out a quiesce or a provider hold keep apart what the b
     }
   });
 
-  it('a quiesce that folds a wake with a counterparty into a newer one without keeps the counterparty, unless the newer one is addressed', async () => {
-    const parked = await parkedOf([push(t, { source: 'notes', counterparty: { authorId: 'u1' } }), push(t + 1, { source: 'notes' })]);
-    assert.equal(parked.length, 1, 'premise: the two wakes share a key');
-    assert.deepEqual(parked[0]!.counterparty, { authorId: 'u1' });
-    const addressed = await parkedOf([
-      push(t, { ...inRoom, addressed: true, counterparty: { authorId: 'u1' } }),
-      push(t + 1, { ...inRoom, addressed: true }),
-    ]);
-    assert.equal(addressed.length, 1, 'premise: the two addressed wakes share a key');
-    assert.equal(addressed[0]!.counterparty, undefined, 'an addressed wake is its own provenance, as in the batch merge');
+  it('a quiesce leaves the turn naming the author that it names with no quiesce', async () => {
+    const parked = await parkedOf([push(t, { ...inRoom, counterparty: { authorId: 'alice' } }), push(t + 1, inRoom)]);
+    assert.equal(parked.length, 2, 'a wake that names its author keeps apart from one that names none');
+    const two = await parkedOf([push(t, { ...inRoom, counterparty: { authorId: 'alice' } }), push(t + 1, { ...inRoom, counterparty: { authorId: 'bob' } })]);
+    assert.deepEqual(two.map((r) => r.counterparty), [{ authorId: 'bob' }], 'two wakes that name their authors fold to the newer');
+    const across = () => [
+      push(t, { ...inRoom, counterparty: { authorId: 'alice' } }),
+      push(t + 1, { ...inGeneral, counterparty: { authorId: 'bob' } }),
+      push(t + 2, inRoom),
+    ];
+    const unpaused = await authorFrom(across(), false);
+    assert.deepEqual(unpaused, { authorId: 'bob' }, 'premise: with no quiesce, the newest author in the batch');
+    assert.deepEqual(await authorFrom(across(), true), unpaused);
+    const one = () => [push(t, { ...inRoom, counterparty: { authorId: 'alice' } }), push(t + 1, inRoom)];
+    assert.deepEqual(await authorFrom(one(), true), await authorFrom(one(), false));
   });
 
   it("a heartbeat wake parked beside a push on a channel and a channel-less push leaves the resumed turn speaking in that channel, not a heartbeat's turn", async () => {
