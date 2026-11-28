@@ -36,7 +36,7 @@ import {
   type ForkReaderConfig,
   type TuneOutReader,
 } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, type ReaderInvocation } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, heldAcknowledgementId, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
 import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
@@ -493,8 +493,10 @@ const HOST_METADATA_KEYS = [
  * without having been shown gets no mark. A reaction or deletion so marked
  * is still a notice about that message and stays a marker. An edit of a
  * message the host never received looks like any other edit and stays a
- * marker too. A marker that wakes the agent can still set that turn's speech
- * channel (agent-framework#189); a `chat:system` notice can't (systemNotice).
+ * marker too. A marker that doesn't address the agent ranks last when a
+ * turn's speech channel is chosen (InferenceRequest.marker). A `chat:system`
+ * notice's wake from `channels/incoming` or `push/event` names no channel
+ * (systemNotice).
  */
 const isOwnScheduleWrite = (metadata?: MessageMetadata): boolean => {
   const m = metadata as { serverId?: unknown; source?: unknown; tags?: unknown } | undefined;
@@ -769,6 +771,16 @@ const ambientMark = (tags?: string[]): { ambient?: true } =>
  *  speech goes. */
 const systemNoticeMark = (tags?: string[]): { systemNotice?: true } =>
   isSystemNotice(tags) ? { systemNotice: true } : {};
+
+const markerMark = (tags: string[] | undefined, firstView: boolean): { marker?: true } =>
+  isMarkerTagged(tags, firstView) ? { marker: true } : {};
+
+/** A resident's wake claims its channel as addressed only when its message
+ *  asks something. A server may give a deletion or a removed reaction an
+ *  addressing tag, as zulip_mcp gives a deletion its message's, and neither
+ *  asks the agent anything. */
+const claimsAddressed = (tags: string[] | undefined): boolean =>
+  isAddressedMessage(tags) && !tags?.some((t) => t === 'chat:deleted' || t === 'chat:reaction-remove');
 
 /**
  * A wake from the heartbeat: a tick or a reminder, from the framework's own
@@ -1341,6 +1353,7 @@ const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
+const KEPT_WRITES: unique symbol = Symbol('kept-writes');
 /**
  * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
  * the wake of every agent the batch wakes: a fresh start of the turn it
@@ -1366,10 +1379,20 @@ interface TurnCarry {
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
 type ReleasedRouting = { wasRetry: boolean; rows?: string[] } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside'; [KEPT_WRITES]?: readonly WritePlacement[] };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
+}
+
+function keptWritesOf(request: InferenceRequest | undefined): readonly WritePlacement[] | undefined {
+  return request === undefined ? undefined : (request as MarkedRequest)[KEPT_WRITES];
+}
+
+function sameKeptWrites(a: InferenceRequest | undefined, b: InferenceRequest | undefined): boolean {
+  const x = keptWritesOf(a);
+  const y = keptWritesOf(b);
+  return x === y || (x !== undefined && y !== undefined && x.length === y.length && x.every((p, i) => p === y[i]));
 }
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
@@ -1600,9 +1623,9 @@ interface TurnRouting {
   /**
    * The channel the turn's typing indicator was last shown in, by any of its
    * streams (showTurnTyping). A stream that hands the turn to a successor (a
-   * budget restart, a guard retry) leaves its indicator running, so a later
-   * start, or a move, that shows it elsewhere stops this one first, as after
-   * a re-pin.
+   * budget restart, a guard retry, an error policy's retry) leaves its
+   * indicator running, so a later start, or a move, that shows it elsewhere
+   * stops this one first, as after a re-pin.
    */
   typing?: ChannelRef;
   /**
@@ -1967,8 +1990,17 @@ function ephemeralRunStopped(name: string, observed?: string): Error {
 }
 
 const CALLS_CUT_OFF = "A round's tool calls were started, but its stream ended before their results came back, so that round isn't in your context; those calls may have taken effect.";
-const SPEECH_STILL_ROUTING = 'Some of its plain speech was still being routed when it ended, so it may yet be posted; check the channel before sending it again.';
-const LIVE_SPEECH_UNRECEIPTED = `Plain speech its rounds routed live was handed on for delivery as written, and no [${NOTICE_TAG.delivered}] line was written for it.`;
+const SPEECH_STILL_ROUTING = "Some of that turn's plain speech was still being routed when the turn ended, so it may yet be posted; check the channel before sending it again.";
+
+function distinctDestinations(list: readonly ChannelRef[]): ChannelRef[] {
+  const seen = new Set<string>();
+  return list.filter((channel) => {
+    const key = destinationKey(channel);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 /** The reason on the inference:aborted that ends a turn whose retry stop()
  *  cancelled, whichever frame was waiting to retry: beginAgentTurn's, when
@@ -2124,6 +2156,7 @@ interface SurgeryHeldWrite {
   opts?: FrameworkWriteOptions;
   /** `mayBeStored`: storeInFork's, as FrameworkWriteOptions.mayBeStored. */
   direct?: { agentName: string; mayBeStored?: true };
+  placement?: WritePlacement;
   /** The agent the write was kept for, as registered then: the incarnation
    *  its name meant. Another agent registered under that name since isn't
    *  the write's (heldWriteTargetGone). */
@@ -2782,7 +2815,9 @@ interface FrameworkWriteOptions {
    *  stored while a turn of the agent's was alive, outside its start's
    *  assembly, or at rest with a presentation that failed. A write kept
    *  in memory (a surgery's hold, or its agent's recovery) names only its
-   *  agent, with no id, and is not presented. */
+   *  agent, with no id, and is not presented, until a release stores it:
+   *  that release fills this placement as a store outside a hold does
+   *  (its agent, its id, and `presented` set anew). */
   placement?: WritePlacement;
   /**
    * Who the message is for, when that is decided before it gets here:
@@ -3251,6 +3286,12 @@ const BUDGET_HOLD_NOTE_NAMESPACE = 'framework:budget-hold';
 type BudgetHoldOutcome = 'released' | 'stopped' | 'removed';
 function describeWait(ms: number): string {
   return ms < 60_000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60_000)} min`;
+}
+/** `reason` is failureWords' text, which the resident's own failure note shows, so the line adds no text that the note doesn't. */
+function deadlineRetryLine(agentName: string, ranMs: number, reason: string, action: Extract<ErrorAction, { retry: true }>, nextTry: number): string {
+  const delay = Number.isFinite(action.delayMs) && action.delayMs > 0 ? ` in ${action.delayMs}ms` : '';
+  const of = Number.isSafeInteger(action.maxTries) && (action.maxTries ?? 0) > 0 ? ` of ${action.maxTries}` : '';
+  return `[inference-timeout] agent=${agentName} stream cut after ${ranMs}ms; retry scheduled${delay} (${nextTry}${of}): ${boundFailureText(reason.replace(/[\s\u0085]+/g, ' ').trim())}`;
 }
 interface BudgetHoldBaseline {
   progress: string | undefined;
@@ -4462,7 +4503,7 @@ function answersSameMessage(a: InferenceRequest, b: InferenceRequest | undefined
 function droppableAsRead(request: InferenceRequest): boolean {
   const batch = mergedBatch(request);
   if (batch?.length) return batch.every(droppableAsRead);
-  return request.readsRow !== undefined || request.readsRows !== undefined;
+  return request.readsRow !== undefined || request.readsRows !== undefined || keptWritesOf(request) !== undefined;
 }
 
 /** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
@@ -4582,7 +4623,7 @@ export class AgentFramework {
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
-  private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; speechRouting: boolean }>();
+  private readonly exhaustedTurns = new Map<string, { roundsRan: boolean; callsCutOff: boolean; liveSpeech: boolean; deliveries: ChannelRef[]; speechRouting: boolean }>();
   private readonly roundTurns = new WeakMap<ContentBlock[], TurnRouting>();
   private running = false;
   private loopPromise: Promise<void> | null = null;
@@ -4625,6 +4666,7 @@ export class AgentFramework {
   private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   /** Run records whose failure repeated one already reported, and whose report was suppressed. */
   private maintenanceRepeats = new WeakSet<ContextMaintenanceAgentRun>();
+  private readonly withdrawnPlacements = new WeakSet<WritePlacement>();
   /** An operator's maintain (maintenanceTick) asked for the pass running or about to run: the run it records is kept in the history whatever it met. A pass with nothing to run records none. */
   private maintenancePassRequested = false;
   private providerGates: Map<string, LocalProviderGate> = new Map();
@@ -4796,7 +4838,8 @@ export class AgentFramework {
   private ephemeralAgents: WeakSet<Agent> = new WeakSet();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
-   * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
+   * outgoing close even after runEphemeralToCompletion deregisters them. The
+   * disposal stops their typing itself. */
   private disposedEphemeralFrames: WeakSet<Agent> = new WeakSet();
   /** Per-agent count of consecutive exhausted inferences, reset when a turn
    *  completes (inference:completed), not when a call answers mid-turn.
@@ -4845,6 +4888,11 @@ export class AgentFramework {
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
   private rewindEpisode: Map<string, { markerId: MessageId; count: number; category: string }> = new Map();
+  /** Per-agent note of the current run of refused turns: its row, and how
+   *  many turns it tells of. One note per run, updated in place (see
+   *  noteRefusedTurn); cleared once the provider answers a call of the
+   *  agent's, which has then read it. */
+  private refusedTurnsNote: Map<string, { id: MessageId; turns: number }> = new Map();
   /** Active `/unstick` sessions: an admin-forced rewind-until-clean loop that
    *  runs even when the agent's autoRewind toggle is off. Tracks the remaining
    *  budget, what was shed (for the report), and where to post the outcome. */
@@ -6008,6 +6056,7 @@ export class AgentFramework {
         // names it back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId),
         isAnswered: (after) => framework.answeredWrite(after),
+        isWithdrawn: (after) => framework.withdrawnPlacements.has(after),
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
         // module's events carry a source of the module's own, such as "cli"
@@ -7494,13 +7543,17 @@ export class AgentFramework {
    *  marks: a batch wake's subject, a batch-only merge's subjects (it has no
    *  single subject), and the rows a wake reads. A wake with any of them
    *  can be withdrawn or dropped on its own, and must not stand for one
-   *  without. (coalescingBatch is set only beside one of the first two.) */
+   *  without. (coalescingBatch is set only beside one of the first two.)
+   *  It also compares `marker`. A marker's wake ranks below a message's
+   *  when a turn's channel is picked, so one can't stand for the other. */
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     const batchSubjects = (r: InferenceRequest) => (r.coalescingBatchSubjects ?? []).join('\n');
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
+      a.marker === b.marker &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b);
+      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
+      sameKeptWrites(a, b);
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
@@ -9179,8 +9232,10 @@ export class AgentFramework {
    * for implementations that report cancel() that way — see
    * host-quiesce.test.ts), so the two cannot drift: settle the turn, ONE
    * inference:aborted carrying the caller's reason, the neutral
-   * [turn-interrupted] marker, an attributable inference-log terminal, gate
-   * release. Deliberately none of the failure accounting: inference:failed /
+   * [turn-interrupted] marker, an attributable inference-log terminal, a
+   * [turn] line on stderr when a live stream was cancelled or a wait was
+   * stopped (inWait), gate release. Deliberately
+   * none of the failure accounting: inference:failed /
    * inference:exhausted feed the consecutive-failure streak, hard-down ops
    * alerts, the poison-history breaker and the "[inference-failed]" marker,
    * and errorPolicy would relaunch the very inference someone just stopped.
@@ -9206,10 +9261,15 @@ export class AgentFramework {
      *  'finishing' for a start that continues a turn and for the guard's
      *  wait. The note says which, instead of a cut-off stream. */
     before?: 'sending' | 'finishing';
+    /** The wait that the stop ended, where no other line on stderr says so:
+     *  the error policy's wait to retry, or the tool-result guard's. */
+    inWait?: 'retry' | 'guard';
   }): void {
-    const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before } = args;
+    const { agent, myStreamId, startTime, compiledRequest, reason, closes, log, before, inWait } = args;
     const stream = args.stream ?? closes;
     const durationMs = Date.now() - startTime;
+    // A stopped turn between two refused ones ends the run of refused turns (noteRefusedTurn).
+    this.refusedTurnsNote.delete(agent.name);
     if (closes && this.answeredTurns.get(agent) === closes) this.answeredTurns.delete(agent);
     if (stream) this.abandonAgentScripts(agent.name, 'stream cancelled', stream);
     agent.reset();
@@ -9243,6 +9303,11 @@ export class AgentFramework {
       reason,
       durationMs,
     });
+    const stopped = before === undefined ? `a stop cancelled the turn's stream after ${durationMs}ms; the turn ends there`
+      : inWait === 'retry' ? "a stop ended the turn in its wait to retry; the retry wasn't sent"
+      : inWait === 'guard' ? "a stop ended the turn in the tool-result guard's wait; its retry wasn't sent"
+      : undefined;
+    if (stopped !== undefined) console.error(`[turn] ${agent.name}: ${stopped}: ${logDetail(reason)}`);
     // Agent-facing marker in the same system envelope as the failure marker
     // so surfaces render it the same way. The text names the act and not an
     // actor (the wire reason names the call, not who made it). Of delivery
@@ -9258,7 +9323,7 @@ export class AgentFramework {
     const ownsAgent = args.stream === undefined || closes !== undefined;
     const handedOn = before === 'sending' ? ''
       : `${(stream?.unflushedRounds ?? 0) > 0 ? ` ${CALLS_CUT_OFF}` : ''}` +
-        `${stream?.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
+        `${stream?.liveSpeech ? this.confirmedSpeech(agent.name, stream.deliveries) : ''}${(stream?.speechRouting ?? 0) > 0 ? ` ${SPEECH_STILL_ROUTING}` : ''}`;
     try {
       storeOwnRow(
         agent,
@@ -13572,6 +13637,7 @@ export class AgentFramework {
     this.refusalStreak.delete(name);
     this.refusalRewinds.delete(name);
     this.rewindEpisode.delete(name);
+    this.refusedTurnsNote.delete(name);
     const session = this.forcedRewind.get(name);
     if (session) {
       this.forcedRewind.delete(name);
@@ -13640,6 +13706,7 @@ export class AgentFramework {
     this.logicalTurnToolCalls.delete(agent);
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== name);
     this.releaseWindowNowOrAfterResume(agent);
+    this.endRemovedTurnTyping(this.openLogical.get(name));
     this.turnRouting.delete(name);
     this.proseSpeechChains.delete(name);
     this.openLogical.delete(name);
@@ -14543,7 +14610,7 @@ export class AgentFramework {
         }
       }
       // Mark before cancellation: an adapter may synchronously settle its
-      // iterator, and this physical frame still owns terminal typing/outgoing
+      // iterator, and this physical frame still owns terminal outgoing
       // closure even though the ephemeral name is about to be deregistered.
       this.disposedEphemeralFrames.add(agent);
       // Cancel before deregistration. Adapters may still yield a queued event;
@@ -14567,11 +14634,12 @@ export class AgentFramework {
         // act on, goes on to the primary, now or, while quiesced, at resume.
         // The run's store keeps its namespace for investigation.
         // Exact-generation disposal owns these name-keyed entries. Remove them
-        // before deregistration; the late driveStream finally will see the
-        // generation mismatch and leave any future owner untouched. A fork's
-        // end does the same (disposeConversationAgent).
+        // before deregistration. The late driveStream finally leaves a future
+        // owner's entries alone, since they aren't its own. A fork's end does
+        // the same (disposeConversationAgent).
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
+        this.endRemovedTurnTyping(this.openLogical.get(agent.name));
         this.turnRouting.delete(agent.name);
         this.proseSpeechChains.delete(agent.name);
         this.openLogical.delete(agent.name);
@@ -15541,6 +15609,54 @@ export class AgentFramework {
   }
 
   /**
+   * Tell the agent that the provider refused its turn's last call, with ONE
+   * note for a run of refused turns. The run's first refused turn appends the
+   * note after what the turn stored. Each refused turn after it, while the
+   * provider has answered no call of the agent's in between, updates that
+   * row in place with how many turns followed: a run of refusals adds one
+   * row to the context, where a note per turn would add a row for every
+   * message the agent couldn't answer. Once a call is answered (a round's,
+   * or a turn's last) the agent has read the note, so it stays as written
+   * and the next refused turn starts a new one. So does a turn that ended
+   * another way in between (a failure, a stop, a refusal that isn't told),
+   * so that the turns the note counts are the ones right after it. A
+   * refusal a rewind takes doesn't end the run: its turn goes on as the
+   * retry. A note that has
+   * left the agent's window (removed from the record, or taken out of the
+   * window by an undo) is started anew too, and so is one from before a
+   * restart: the run is kept in memory.
+   *
+   * The note opens as a failed turn's does and names no category: it holds
+   * the framework's words only, none of the provider's (see failureWords).
+   * The category goes to the row's metadata, as the first refusal's.
+   * `SUPPRESS_INFERENCE_FAILED_MARKER=1` leaves it out, as it does a failed
+   * turn's note. No inference is triggered: the agent reads it at its next
+   * turn.
+   */
+  private noteRefusedTurn(agent: Agent, category: string): void {
+    if (process.env.SUPPRESS_INFERENCE_FAILED_MARKER === '1') return;
+    const cm = agent.getContextManager();
+    const run = this.refusedTurnsNote.get(agent.name);
+    const row = run && !this.rowLeftWindow(agent, run.id) ? run : undefined;
+    const after = row?.turns ?? 0;
+    const text =
+      `[${NOTICE_TAG.inferenceFailed}] Your previous turn did not complete: the provider API refused its last call.` +
+      (after === 0 ? '' : after === 1 ? ' The turn after it ended the same way.' : ` The ${after} turns after it ended the same way.`);
+    const blocks: ContentBlock[] = [{ type: 'text', text }];
+    try {
+      if (row) {
+        cm.editMessage(row.id, blocks);
+        row.turns = after + 1;
+      } else {
+        const id = storeOwnRow(agent, 'user', blocks, { system: true, kind: 'inference-refused', category });
+        this.refusedTurnsNote.set(agent.name, { id, turns: 1 });
+      }
+    } catch (err) {
+      console.error(`[inference-refusal] could not record the note for ${agent.name}: ${describeFailureWithFrames(err)}`);
+    }
+  }
+
+  /**
    * A turn that ended WITHOUT a refusal (a natural completion that wasn't
    * one, or a tool-ended turn) ends the rewind episode: the model responded.
    * Leave the consolidated marker in place as the durable record; just
@@ -15555,6 +15671,7 @@ export class AgentFramework {
     }
     this.rewindEpisode.delete(agentName);
     this.refusalStreak.delete(agentName);
+    this.refusedTurnsNote.delete(agentName);
   }
 
   /**
@@ -17458,6 +17575,7 @@ export class AgentFramework {
     for (const [agentName, writes] of [...kept]) {
       if (failures.some((failure) => failure.agentName === agentName)) continue;
       kept.delete(agentName);
+      if (writes.length === 0) continue;
       if (writes.some((write) => this.heldWriteTargetGone(write, agentName) !== undefined)) {
         this.passHeldWritesOn(agentName, writes);
         continue;
@@ -17507,7 +17625,7 @@ export class AgentFramework {
   /** Whether writes for `agentName` wait in memory for its context manager's recovery (heldForRecovery). */
   private waitsForRecovery(agentName: string): boolean {
     // Read defensively, as releaseSurgeryHeldWrites is.
-    return (this.heldForRecovery?.get(agentName)?.length ?? 0) > 0;
+    return this.heldForRecovery?.has(agentName) ?? false;
   }
 
   /**
@@ -20922,8 +21040,11 @@ export class AgentFramework {
       // The admission record rides the message; the hold's own bookkeeping
       // (cadence tally, suppressed-mention ack, reader wake) follows.
       metadata.tuneOut = { epochId: decision.held.epochId };
+      // An edit that carries an eventId shares its message's messageId (MCPL SPEC §20.3.1).
       this.tuneOutCoordinator?.recordHeld(
-        event.serverId, event.channelId, event.messageId, event.tags, event.author?.id, decision.gatePass,
+        event.serverId, event.channelId,
+        heldAcknowledgementId(event.eventIdAsMessageId ? undefined : event.messageId, event.tags, event.firstView === true || event.eventId !== undefined),
+        event.tags, event.author?.id, decision.gatePass,
       );
     }
 
@@ -20945,7 +21066,7 @@ export class AgentFramework {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
-        Object.assign(placement, this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored));
+        this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored, placement);
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -20979,9 +21100,7 @@ export class AgentFramework {
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       decision.recipients = [target.name];
     } else if (this.conversationRouter) {
-      const written = await this.routeConversationIncoming({ ...event, content }, metadata, decision);
-      if (written) Object.assign(placement, written);
-      return written;
+      return this.routeConversationIncoming({ ...event, content }, metadata, decision, placement);
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -21053,10 +21172,11 @@ export class AgentFramework {
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
-          addressed,
+          addressed: claimsAddressed(event.tags),
           ...ambientMark(event.tags),
           // A notice (chat:system) picks no channel for the turn.
           ...systemNoticeMark(event.tags),
+          ...markerMark(event.tags, event.firstView === true),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           ...this.readsRowFor(placement, agentName),
           ...this.answersOn(event),
@@ -21088,6 +21208,7 @@ export class AgentFramework {
     },
     messageMetadata: Record<string, unknown>,
     admission: AdmissionDecision,
+    placement: CoalescingPlacement,
   ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const channel: ChannelRef = { serverId: event.serverId, channelId: event.channelId };
@@ -21159,7 +21280,7 @@ export class AgentFramework {
     if (!this.logicalTurnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
-    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content), event.mayBeStored);
+    this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content), event.mayBeStored, placement);
     // Delivered to the channel's fork: the latest delivered inbound, as for a
     // resident (the channel context's `incoming`; the fallback locus under
     // the legacy rule). A held or dropped message never is.
@@ -21206,18 +21327,9 @@ export class AgentFramework {
    * is stored, and the fork is woken to read it, as addMessage places a
    * write it keeps. `mayBeStored`: storeInFork's.
    */
-  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean): CoalescingPlacement {
-    // Read before the write, as addMessage reads it: whether the fork's turn
-    // keeps the row out of its window. A placement that says so
-    // (`presented: false`) keeps a coalesced render the turn never read
-    // replaceable, and wakes the fork to read it.
-    const turnLive = this.logicalTurnAlive(agent);
-    const keptOut = this.keptOutOfWindow(agent, content, turnLive);
-    const id = this.storeInFork(agent, content, metadata as MessageMetadata, mayBeStored);
-    if (!id) return { agent: agent.name, presented: false };
-    return this.placedUnpresented(agent, keptOut, !turnLive, id)
-      ? { agent: agent.name, messageId: id, presented: false }
-      : { agent: agent.name, messageId: id };
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean, placement: CoalescingPlacement = { agent: agent.name }): CoalescingPlacement {
+    this.storeInFork(agent, content, metadata as MessageMetadata, { mayBeStored, placement });
+    return placement;
   }
 
   /**
@@ -22115,6 +22227,7 @@ export class AgentFramework {
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
       wakeToRead: (occ, placement, allAmbient) => this.queueCoalescedWakes(
         { ...occ, deliverTo: placement.agent }, true, this.readsRowFor(placement, placement.agent).readsRow, allAmbient,
+        placement.messageId === undefined ? placement : undefined,
       ),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
@@ -22571,7 +22684,9 @@ export class AgentFramework {
    *  its turn being assembled doesn't read (wakeToRead), reading `readsRow`
    *  (readsRowFor), marked ambient when every notice the render folds was
    *  (`allAmbient`). */
-  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false): Promise<void> {
+  private async queueCoalescedWakes(
+    occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false, kept?: WritePlacement,
+  ): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const push = occ.event.event;
@@ -22651,7 +22766,7 @@ export class AgentFramework {
     }
     if (!decision.wake) return;
     for (const agentName of await this.coalescedAudience(occ)) {
-      this.pendingRequests.push({
+      const request: MarkedRequest = {
         agentName,
         reason: 'mcpl:push-event',
         source: occ.serverId,
@@ -22668,7 +22783,9 @@ export class AgentFramework {
         // alone; only its wake is judged by what was read (readsRow).
         ...(plain && allAmbient ? { ambient: true as const } : {}),
         ...(plain ? (readsRow ? { readsRow } : {}) : { coalescingSubject: subject, coalescingBatch: true }),
-      });
+        ...(plain && !readsRow && kept ? { [KEPT_WRITES]: [kept] } : {}),
+      };
+      this.pendingRequests.push(request);
     }
   }
 
@@ -22716,12 +22833,9 @@ export class AgentFramework {
   }
 
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
-   *  shown watermark, never possibly shown (its isUnshown). A placement with
-   *  no stored row, a write kept in memory (a surgery's hold, or the wait
-   *  for its agent's recovery), counts as read and as shown: it can't be
-   *  found again once it is stored. */
+   *  shown watermark, never possibly shown (its isUnshown). */
   private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
-    if (!p.messageId) return false;
+    if (!p.messageId) return this.heldWriteOf(p) !== undefined;
     const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
   }
@@ -22837,10 +22951,27 @@ export class AgentFramework {
     this.presentation?.retractRemoved(remover, ids, reason);
   }
 
+  private heldWriteOf(p: CoalescingPlacement): { writes: SurgeryHeldWrite[]; at: number } | undefined {
+    const places = (write: SurgeryHeldWrite): boolean =>
+      write.placement === p && !write.opts?.mayBeStored && !write.direct?.mayBeStored;
+    const held = this.surgeryHeldWrites ?? [];
+    const at = held.findIndex(places);
+    if (at >= 0) return { writes: held, at };
+    for (const writes of this.heldForRecovery?.values() ?? []) {
+      const found = writes.findIndex(places);
+      if (found >= 0) return { writes, at: found };
+    }
+    return undefined;
+  }
+
   private removePlacement(p: CoalescingPlacement): boolean {
-    // A placement with no stored row (a write a surgery's hold keeps) can't
-    // be removed: it is stored at the hold's release.
-    if (!p.messageId) return false;
+    if (!p.messageId) {
+      const held = this.heldWriteOf(p);
+      if (!held) return false;
+      held.writes.splice(held.at, 1);
+      this.withdrawnPlacements.add(p);
+      return true;
+    }
     if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
@@ -23006,9 +23137,11 @@ export class AgentFramework {
     metadata.triggered = decision.wake;
     if (decision.held && triggerChannel) {
       metadata.tuneOut = { epochId: decision.held.epochId };
+      // A pushed edit's origin.messageId can be the edit line's own id (zulip_mcp), so only a first view counts as its message.
       this.tuneOutCoordinator?.recordHeld(
-        event.serverId, triggerChannel.channelId, event.eventId, event.tags,
-        typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass,
+        event.serverId, triggerChannel.channelId,
+        heldAcknowledgementId(typeof event.origin?.messageId === 'string' && event.origin.messageId !== '' ? event.origin.messageId : undefined, event.tags, event.firstView === true),
+        event.tags, typeof event.origin?.authorId === 'string' ? event.origin.authorId : undefined, decision.gatePass,
       );
     }
 
@@ -23049,9 +23182,10 @@ export class AgentFramework {
           // DMs and addressed-while-closed messages arrive as push events;
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
-          addressed: isAddressedMessage(event.tags),
+          addressed: claimsAddressed(event.tags),
           ...ambientMark(event.tags),
           ...systemNoticeMark(event.tags),
+          ...markerMark(event.tags, event.firstView === true),
           ...(silentHeartbeat ? {
             suppressProse: true,
             // The tick's instruction rides its request-only separator
@@ -23226,6 +23360,9 @@ export class AgentFramework {
     try {
       await this.runInferencePass(requestsByAgent);
     } finally {
+      const unvisited: InferenceRequest[] = [];
+      for (const requests of requestsByAgent.values()) appendAll(unvisited, requests);
+      if (unvisited.length > 0) this.pendingRequests = [...unvisited, ...this.pendingRequests];
       this.passRequests?.delete(requestsByAgent);
     }
   }
@@ -23384,11 +23521,11 @@ export class AgentFramework {
         // a turn alive at the quiesce can finish; everything else parks.
         const passThrough = requests.filter((r) => passesQuiesce(r));
         const parked = requests.filter((r) => !passesQuiesce(r));
-        // Coalesce per (reason, addressed): every channel wake shares one
-        // reason, so keying on reason alone would let an ambient message
-        // parked later evict a DM/mention parked earlier — and the
-        // addressed-outranks-ambient trigger selection below would then
-        // route the resumed turn into the wrong channel.
+        // Coalesce per (reason, addressed or marker): every channel wake
+        // shares one reason, so keying on reason alone would let an ambient
+        // message parked later evict a DM/mention parked earlier, or a marker
+        // evict a message — and the trigger selection below would then route
+        // the resumed turn into the wrong channel.
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
           // A coalesced wake is withdrawable by its subject (RFC-006 §4.2),
@@ -23397,7 +23534,7 @@ export class AgentFramework {
           // A heartbeat's wake keeps its own key, so a later channel-less wake
           // can't absorb it: resumed together, they make a heartbeat's batch
           // (heartbeatTurn), as they would have without the quiesce.
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${readsRowsKey(request)}|${budgetWaitOf(request) ? 'waited' : ''}`;
+          const key = `${request.reason}|${request.addressed ? 'a' : request.marker ? 'm' : 'n'}|${isHeartbeatWake(request) ? 'h' : ''}|${isUnprompted(request) ? 'u' : ''}|${request.coalescingSubject ?? ''}|${request.readsRow ?? ''}|${readsRowsKey(request)}|${budgetWaitOf(request) ? 'waited' : ''}`;
           const prev = newestByKey.get(key);
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
           if (prev && !answersSameMessage(prev, request)) kept.answersMessageId = undefined;
@@ -23510,6 +23647,8 @@ export class AgentFramework {
       // agent, so reading it was all its wake was for, as for a chat:system
       // notice. One with neither tag is judged as addressed.
       const read = requests.filter((r) => {
+        const kept = keptWritesOf(r);
+        if (kept !== undefined) return kept.every((p) => this.withdrawnPlacements.has(p));
         if (r.readsRows !== undefined) return r.readsRows.every(({ row, replyTo }) => this.rowDone(agent, row, replyTo));
         if (r.readsRow === undefined) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
@@ -23524,7 +23663,7 @@ export class AgentFramework {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         appendAll(requests, left);
-        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed` +
+        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed or withdrawn` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
           this.endPendingPrimary(agentName);
@@ -23606,18 +23745,25 @@ export class AgentFramework {
       //      message is still in what the agent is sent ranking with them
       //      (RETRY_RANK 'sent');
       //   2. else a rewind's retry whose message isn't (RETRY_RANK 'aside');
-      //   3. else the most recent channel-bearing request (ambient message in
-      //      an open channel — legacy last-inbound semantics).
+      //   3. else the most recent channel-bearing request that isn't a
+      //      marker's (ambient message in an open channel — legacy
+      //      last-inbound semantics).
       // A chat:system notice (RFC-001 rev 3: weather in a world, someone
       // joining) names no channel at all: nobody spoke there, so a turn it
       // wakes alone takes the global fallback, and the agent sends there
       // explicitly if it means to.
+      // A marker that doesn't address the agent (a reaction, an edit or a
+      // deletion: isMarkerTagged) ranks last, below a continuation
+      // (agent-framework#189). It names the channel only if no other request
+      // names one. If a heartbeat's wake is in the batch, it names none. A
+      // marker that wakes the agent alone still names its channel. A notice
+      // doesn't.
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
-      // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback, which an
-      // ephemeral run never takes (takesGlobalFallback), except a heartbeat's
-      // turn, which takes none (heartbeatTurn below).
+      // Non-channel wakes (heartbeats, module events) leave both undefined →
+      // global fallback, which an ephemeral run never takes
+      // (takesGlobalFallback), except a heartbeat's turn, which takes none
+      // (heartbeatTurn below).
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -23633,16 +23779,21 @@ export class AgentFramework {
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
       // An autoContinue wake names the finished turn's locus. It speaks for
-      // the turn only when nothing else in the batch names a channel: a
-      // message that arrived meanwhile, ambient included, outranks it, though
-      // its wake was queued first.
+      // the turn only when nothing else in the batch but a marker names a
+      // channel. Any message that arrived meanwhile outranks it, ambient ones
+      // included.
       let continuationReq: InferenceRequest | undefined;
       let retryReq: InferenceRequest | undefined;
+      let markerReq: InferenceRequest | undefined;
       let sawAddressed = false;
       for (const r of requests) {
         if (!r.channelId || r.systemNotice) continue;
         if (r.reason === AUTO_CONTINUE_REASON) {
           continuationReq ??= r;
+          continue;
+        }
+        if (r.marker && !r.addressed) {
+          if (!markerReq || eventAt(r) >= eventAt(markerReq)) markerReq = r;
           continue;
         }
         if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
@@ -23651,7 +23802,8 @@ export class AgentFramework {
         if ((r.addressed || rank === 'sent') && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
         if (rank === 'aside' && (!retryReq || eventAt(r) >= eventAt(retryReq))) retryReq = r;
       }
-      const channelReq = addressedReq ?? retryReq ?? ambientReq ?? continuationReq;
+      const heartbeatWake = requests.some((r) => isHeartbeatWake(r));
+      const channelReq = addressedReq ?? retryReq ?? ambientReq ?? continuationReq ?? (heartbeatWake ? undefined : markerReq);
       // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
       // is its own provenance, even when it names no author (a push event
       // can route without an author id): borrowing another request's author
@@ -23697,6 +23849,7 @@ export class AgentFramework {
           ? trigger?.answersMessageId : undefined,
         readsRows: requests.every((r) => readsRowsKey(r) === readsRowsKey(trigger))
           ? trigger?.readsRows : undefined,
+        [KEPT_WRITES]: requests.every((r) => sameKeptWrites(r, trigger)) ? keptWritesOf(trigger) : undefined,
         // A batched wake's line names the rows of every batch the turn is
         // for, and none where a wake that isn't a batch's is merged in.
         [BATCH_ROWS]: trigger ? this.mergedBatchRows(trigger.agentName, requests) : undefined,
@@ -23704,7 +23857,7 @@ export class AgentFramework {
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         // A heartbeat's turn when any cause is a heartbeat's wake and none
         // names a channel, whatever the batch's order (isHeartbeatWake).
-        heartbeatTurn: !channelReq && requests.some((r) => isHeartbeatWake(r)),
+        heartbeatTurn: !channelReq && heartbeatWake,
         // The channel and its server from the one request, so the turn's
         // channel is that message's, never one server's id with another's.
         channelId: channelReq?.channelId,
@@ -23717,6 +23870,7 @@ export class AgentFramework {
         // inherited from requests[0], it would hide that message's channel
         // from the selection if this start were merged again.
         systemNotice: undefined,
+        marker: channelReq?.marker,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
@@ -24949,16 +25103,9 @@ export class AgentFramework {
     if (list.length === 0 && suppressed === 0 && drafts.length === 0 && kept === 0 && !notHeld) return;
     routing.deliveries = [];
     routing.suppressed = 0;
-    const seen = new Set<string>();
-    const shown: string[] = [];
-    const landed: ChannelRef[] = [];
-    for (const channel of list ?? []) {
-      const key = destinationKey(channel);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      shown.push(this.channelShown(channel));
-      landed.push(channel);
-    }
+    const landed = distinctDestinations(list);
+    const seen = new Set(landed.map((channel) => destinationKey(channel)));
+    const shown = landed.map((channel) => this.channelShown(channel));
     const notes: string[] = [];
     // Each of the turn's drafts as it stands now: a mid-turn notice lets the
     // resident resend or dismiss one before the turn ends, so "not sent" is
@@ -25101,12 +25248,23 @@ export class AgentFramework {
     }
   }
 
+  private confirmedSpeech(agentName: string, deliveries: readonly ChannelRef[]): string {
+    const landed = distinctDestinations(deliveries);
+    if (landed.length === 0) return '';
+    // What a [delivered] line adds for the same list: speech that stayed in a
+    // channel the agent closed or declined says so.
+    const closedNotes = this.closedChannelNotes(agentName, landed);
+    return ` Confirmed delivered before that turn ended: plain speech → ${landed.map((channel) => this.channelShown(channel)).join(' · ')}.` +
+      ` No [${NOTICE_TAG.delivered}] line was written for this speech, so this note is its receipt.` +
+      (closedNotes.length > 0 ? ` ${closedNotes.join(' ')}${this.closedChannelNoteOff(agentName)}` : '');
+  }
+
   private noteFailedTurnEnd(agent: Agent, routing: TurnRouting): void {
     const callsCutOff = (routing.unflushedRounds ?? 0) > 0;
     if (gotPartway(routing)) {
       this.exhaustedTurns?.set(agent.name, {
         roundsRan: routing.roundsRan === true, callsCutOff, liveSpeech: routing.liveSpeech === true,
-        speechRouting: (routing.speechRouting ?? 0) > 0,
+        deliveries: [...routing.deliveries], speechRouting: (routing.speechRouting ?? 0) > 0,
       });
     }
   }
@@ -25122,13 +25280,7 @@ export class AgentFramework {
    * agent once. No-op otherwise.
    */
   private appendClosedChannelNoteAlone(agent: Agent, routing: TurnRouting): void {
-    const seen = new Set<string>();
-    const landed = routing.deliveries.filter((channel) => {
-      const key = destinationKey(channel);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const landed = distinctDestinations(routing.deliveries);
     routing.deliveries = [];
     const notes = this.closedChannelNotes(agent.name, landed);
     if (notes.length === 0) return;
@@ -25762,23 +25914,40 @@ export class AgentFramework {
    * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: () => void): MessageId {
+  private storeInFork(
+    target: Agent, content: ContentBlock[], metadata: MessageMetadata,
+    { mayBeStored, replayed, placement }: { mayBeStored?: boolean; replayed?: () => void; placement?: WritePlacement } = {},
+  ): MessageId {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
+      ...(placement ? { placement } : {}),
       heldFor: target, heldAt: Date.now(), heldOrder: ++this.heldWritesKept,
     });
+    const placeKept = (): void => {
+      if (!placement) return;
+      placement.agent = target.name;
+      placement.presented = false;
+    };
     if (this.surgeryHold || (this.replayingHeld && !replayed)) {
       // The write the release replays, met by a hold its clock row's
       // listener began, stays at the head of the queue (as addMessage's).
       if (replayed) this.replayHeldAgain = true;
       else this.surgeryHeldWrites.push(kept());
+      placeKept();
       return '' as MessageId;
     }
     if (this.waitsForRecovery(target.name)) {
       this.keepForRecovery(target.name, kept());
+      placeKept();
       return '' as MessageId;
     }
+    // Read before the write, as addMessage reads it: whether the fork's turn
+    // keeps the row out of its window. A placement that says so
+    // (`presented: false`) keeps a coalesced render the turn never read
+    // replaceable, and wakes the fork to read it.
+    const turnLive = this.logicalTurnAlive(target);
+    const keptOut = this.keptOutOfWindow(target, content, turnLive);
     let id: MessageId;
     // Its one id, or the rows a store that threw after they landed names,
     // which the write is stored as (landedThoughThrown), or those found of a
@@ -25797,6 +25966,7 @@ export class AgentFramework {
         if (!thrown) {
           if (!refusesUntilReinitialized(error)) throw error;
           this.keepForRecovery(target.name, kept(), error);
+          placeKept();
           return '' as MessageId;
         }
         if ('unknown' in thrown) {
@@ -25810,6 +25980,12 @@ export class AgentFramework {
     }
     replayed?.();
     this.presentation?.afterStore(target, rows);
+    if (placement) {
+      placement.agent = target.name;
+      placement.messageId = id;
+      if (this.placedUnpresented(target, keptOut, !turnLive, id)) placement.presented = false;
+      else delete placement.presented;
+    }
     return id;
   }
 
@@ -25950,9 +26126,9 @@ export class AgentFramework {
         if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
-        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, settle);
+        id = this.storeInFork(target, write.content, write.metadata ?? {}, { mayBeStored: write.direct.mayBeStored, replayed: settle, placement: write.placement });
       } else {
-        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: settle });
+        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, placement: write.placement, replayed: settle });
       }
       if (this.replayHeldAgain) {
         this.replayHeldAgain = false;
@@ -26350,6 +26526,36 @@ export class AgentFramework {
     if (routing.typing !== undefined && !sameChannel(routing.typing, channel)) this.channelRegistry?.stopTyping(routing.typing);
     this.channelRegistry?.startTyping(channel);
     routing.typing = channel;
+  }
+
+  /**
+   * A turn stops the typing that it shows itself, and none that a newer
+   * stream under its agent's name shows at the same address: an error
+   * policy's retry, which continues the turn's routing, or an agent that took
+   * the name, whose routing is its own. `frame` is the stopping frame's agent,
+   * with its stream's id at a stream's teardown.
+   */
+  private stopTurnTyping(routing: TurnRouting | undefined, frame?: { agent: Agent; streamId?: number }): void {
+    const typing = routing?.typing;
+    if (typing === undefined) return;
+    if (frame) {
+      const latest = this.turnRouting?.get(frame.agent.name);
+      const newer = this.agents?.get(frame.agent.name) !== frame.agent ? (latest !== routing ? latest : undefined)
+        : frame.streamId !== undefined && frame.agent.streamId !== frame.streamId ? latest : undefined;
+      if (newer?.typing !== undefined && sameChannel(newer.typing, typing)) return;
+    }
+    this.channelRegistry?.stopTyping(typing);
+  }
+
+  /**
+   * A removal's stop of its agent's open turn: the turn ends with its agent,
+   * so its record of where it types goes too, and the agent's late frame has
+   * nothing left to stop there. No newer stream can hold the name while a
+   * removal runs, so it stops without the check.
+   */
+  private endRemovedTurnTyping(routing: TurnRouting | undefined): void {
+    this.stopTurnTyping(routing);
+    if (routing) delete routing.typing;
   }
 
   private heardSince(agent: Agent, routing: TurnRouting, read: number): boolean {
@@ -28179,9 +28385,10 @@ export class AgentFramework {
     if (this.agents.get(agent.name) === agent) {
       if (!trigger?.suppressProse) {
         const err = error instanceof Error ? error : new Error(String(error));
+        this.stopTurnTyping(this.openLogical?.get(agent.name), { agent });
         this.settleAgent(agent.name, {
           stopReason: 'exhausted', speech: '', error: failureWords(err), cause: err,
-        }, this.openLogical.get(agent.name));
+        }, this.openLogical?.get(agent.name));
       }
       this.endStatedWaitRun(agent.name);
     }
@@ -28281,7 +28488,8 @@ export class AgentFramework {
       this.abortDroppedTurn(agentName, owner ?? -1,
         drop.kind === 'dropped' ? (drop.reason ?? CONTINUATION_DROPPED) : drop.kind === 'caller' ? (drop.reason ?? 'user') : drop.kind, startedAt,
         this.registry.ref(agentName).incarnation);
-      this.channelRegistry?.stopTyping();
+      const routing = this.openLogical?.get(agentName) ?? this.turnRouting?.get(agentName);
+      this.stopTurnTyping(routing, agent ? { agent } : undefined);
       if (agent) {
         agent.toolResultGuard.recovering = false;
         if (agent.toolResultGuard.hasPending) {
@@ -28292,7 +28500,6 @@ export class AgentFramework {
           }
         }
       }
-      const routing = this.openLogical.get(agentName) ?? this.turnRouting.get(agentName);
       if (routing) this.endDroppedTurn(agentName, routing);
       this.eventGate?.onInferenceEnded(agentName);
       // A registered ephemeral run's caller waits on the run's settle, which
@@ -28491,7 +28698,7 @@ export class AgentFramework {
     if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
     const sentNothing = opensTurn && !routing.roundsRan && !routing.unflushedRounds;
     console.error(`[turn] ${agent.name}: ${stop.kind === 'caller' ? 'a stop' : stop.kind === 'shutdown' ? "the framework's stop" : 'a quiesce abandon'} reached the turn's start before it ${sentNothing ? 'sent anything' : 'finished'}; it ends there`);
-    this.channelRegistry?.stopTyping();
+    this.stopTurnTyping(routing, { agent });
     // A start that continues a turn (a budget or guard restart) follows a
     // frame that kept the turn's tool-result batch, and the guard's recovery,
     // for its successor. The terminals below let a pending batch go; a
@@ -28693,8 +28900,9 @@ export class AgentFramework {
     // once this attempt's compile has moved the watermark past the row.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined
+      || keptWritesOf(trigger) !== undefined) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, [KEPT_WRITES]: _kept, ...retry } = trigger as MarkedRequest;
       trigger = retry;
     }
     if (trigger && mergedBatch(trigger) && !releasedTurnBatch(trigger)) {
@@ -29048,7 +29256,7 @@ export class AgentFramework {
         const reason = `a turn assembled while ${why} is dropped before it sends anything`;
         console.error(`[turn] ${agent.name}: ${reason}`);
         this.endDroppedTurn(agent.name, routing);
-        this.channelRegistry?.stopTyping();
+        this.stopTurnTyping(routing, { agent });
         this.endStartWindow(agent.name, turnToken);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
@@ -29135,15 +29343,8 @@ export class AgentFramework {
         // The agent lets go of the stream, which cancelStream() would cancel
         // a second time.
         agent.reset();
-        if (this.agents.get(agent.name) === agent) {
-          // The compile took the agent's stream id, so a frame that started
-          // this one (a guard or budget restart) no longer owns the entries
-          // it left, and its teardown leaves them to this frame.
-          this.activeStreams.delete(agent.name);
-          this.pendingAssistantBlocks.delete(agent.name);
-        }
         this.endDroppedTurn(agent.name, routing);
-        this.channelRegistry?.stopTyping();
+        this.stopTurnTyping(routing, { agent });
         this.endStartWindow(agent.name, turnToken);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
@@ -29153,10 +29354,6 @@ export class AgentFramework {
       const stopAfterCompile = this.takeStartStop(agent, checkWindow);
       if (stopAfterCompile) {
         this.cancelUnsentStream(agent, stream, 'stopped after its compile');
-        // As above: the compile took the agent's stream id from any frame
-        // that started this one.
-        this.activeStreams.delete(agent.name);
-        this.pendingAssistantBlocks.delete(agent.name);
         this.endStoppedStart(agent, stopAfterCompile, routing, turnStartedAt, compiledRequest, opensTurn, released);
         return false;
       }
@@ -29193,9 +29390,7 @@ export class AgentFramework {
               : this.providerAccelerationCooldowns.get(agent.name)?.heldRequests.some(isTurnRetry) ? 'turn held'
                 : 'the wait was released as the failure was reported, so the retry is queued'}, nothing sent`);
           this.endFailureAtStop(agent.name, turnToken, turnStartedAt, routing, myIncarnation);
-          this.activeStreams.delete(agent.name);
-          this.pendingAssistantBlocks.delete(agent.name);
-          this.channelRegistry?.stopTyping();
+          this.stopTurnTyping(routing, { agent });
           this.eventGate?.onInferenceEnded(agent.name);
           return false;
         }
@@ -29220,6 +29415,7 @@ export class AgentFramework {
       // start's checks are behind it, so its window closes now, before
       // driveStream can report a stream that fails at once.
       if (this.checkAhead.get(agent) === checkWindow) this.checkAhead.delete(agent);
+      const streamRef: { handle?: Promise<void> } = {};
       const handle = this.driveStream(
         agent,
         stream,
@@ -29240,7 +29436,9 @@ export class AgentFramework {
             }
           : undefined,
         streamCarry,
+        streamRef,
       );
+      streamRef.handle = handle;
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
       // its finally now owns clearing it. The caller's finally must not.
@@ -29259,7 +29457,7 @@ export class AgentFramework {
       // The early typing indicator has no driveStream `finally` on this path —
       // a hook/compile/stream-setup failure must not leave "typing…" stuck.
       // (Retries below restart it; stopTyping is idempotent.)
-      this.channelRegistry?.stopTyping();
+      this.stopTurnTyping(routing, { agent });
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
@@ -29409,6 +29607,17 @@ export class AgentFramework {
       } else {
         if (released) delete (released.turn as MarkedRequest)[RELEASED_ROUTING];
         this.noteFailedTurnEnd(agent, routing);
+        // A start that continues a turn (a budget or guard restart) follows a
+        // frame that kept the turn's batch and the guard's recovery for it. No
+        // successor follows this failure, so they end here, as at a stop.
+        agent.toolResultGuard.recovering = false;
+        if (agent.toolResultGuard.hasPending) {
+          try {
+            agent.toolResultGuard.abandon('aborted');
+          } catch (error) {
+            console.error(`[tool-result-guard] agent=${agent.name} failed to record aborted batch:`, error);
+          }
+        }
         // Terminal failure with no driveStream: this frame owns teardown.
         // Token-matched (like the finally in driveStream) so a stale frame
         // can never clear a successor turn's marker. A leaked token would
@@ -29470,6 +29679,8 @@ export class AgentFramework {
      *  record start (StartStreamResult's `placeDrops` and `thinkingRecordedAfter`). */
     thinkingDrops?: StreamThinkingDrops,
     carry: TurnCarry = { silence: null, sends: null, read: lastHeardAt },
+    /** The caller puts this stream's handle here as it registers the stream. */
+    streamRef: { handle?: Promise<void> } = {},
   ): Promise<void> {
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : this.proseRoutingOf(agent);
     const startTime = Date.now();
@@ -29480,6 +29691,8 @@ export class AgentFramework {
     // so the latest is everything the stream has been billed for so far:
     // the measure of a stream that ends without a final response.
     let latestUsage: DetailedUsage | undefined;
+    // The blocks that this stream's latest round put in pendingAssistantBlocks.
+    let myPendingBlocks: ContentBlock[] | undefined;
     const tokenUsageOf = (usage: DetailedUsage | undefined): InferenceLogEntry['tokenUsage'] => usage
       ? {
           input: usage.inputTokens,
@@ -30114,6 +30327,9 @@ export class AgentFramework {
             releaseGuardHeld();
             adoptInjectedRound();
             hadToolCalls = true;
+            // The provider answered this round's call, so a note of refused
+            // turns above it has been read: a later refusal starts a new one.
+            this.refusedTurnsNote.delete(agent.name);
             const toolRound = toolRounds++;
             streamRouting.unflushedRounds = (streamRouting.unflushedRounds ?? 0) + 1;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, calls.length);
@@ -30172,6 +30388,7 @@ export class AgentFramework {
             assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
+            myPendingBlocks = assistantBlocks;
             this.pendingRoundSent.set(assistantBlocks, roundContent && roundContent.length > 0
               ? roundContent.filter((b) => b.type !== 'tool_result')
               : null);
@@ -30613,7 +30830,7 @@ export class AgentFramework {
                   lifecyclePhase = 'aborted';
                   this.settleDeliberateCancel({
                     agent, myStreamId, startTime, compiledRequest,
-                    reason: callerStop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing',
+                    reason: callerStop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing', inWait: 'guard',
                   });
                   return;
                 }
@@ -30837,6 +31054,7 @@ export class AgentFramework {
             const terminalContent = stampThinkingTokenEstimates(terminalSent, outputTokensSinceStamp);
             outputTokensSinceStamp = 0;
             let refusedReplyId: MessageId | undefined;
+            let terminalReplyId: MessageId | undefined;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -30865,9 +31083,9 @@ export class AgentFramework {
               this.noteStreamEnd(agent, stream, { kind: 'reply', id: undefined, sent: terminalSent }, false);
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
-                if (response.stopReason === 'refusal') refusedReplyId = terminalId;
-                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+                terminalReplyId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+                if (response.stopReason === 'refusal') refusedReplyId = terminalReplyId;
+                this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalReplyId, sent: terminalSent }, false);
               } else {
                 // Nothing after the last results: the rows are judged as of now, the last batch settled.
                 this.noteStreamEnd(agent, stream, undefined, false);
@@ -30875,9 +31093,9 @@ export class AgentFramework {
             } else if (cut?.unnamed && terminalContent.length === 0) {
               this.noteStreamEnd(agent, stream, undefined, false);
             } else {
-              const terminalId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
-              if (response.stopReason === 'refusal') refusedReplyId = terminalId;
-              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalId, sent: terminalSent }, false);
+              terminalReplyId = agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
+              if (response.stopReason === 'refusal') refusedReplyId = terminalReplyId;
+              this.noteStreamEnd(agent, stream, { kind: 'reply', id: terminalReplyId, sent: terminalSent }, false);
             }
             if (cutResults) {
               agent.toolResultGuard.storeResults(cutResults.blocks, cutResults.wire, cutResults.completed,
@@ -30891,6 +31109,12 @@ export class AgentFramework {
                 text: `[${NOTICE_TAG.toolBoundary}] Your response was cut off at the output limit inside a tool-call block, before any call in it ` +
                   'was named, so nothing ran. To make a call, send less in one response.',
               }], { system: true, kind: 'cut-off-tool-block', ...this.silentTurnRowMetadata(agent.name) });
+            } else if (response.stopReason === 'max_tokens' && terminalReplyId !== undefined
+              && terminalContent.some((b) => b.type === 'text' && b.text.trim().length > 0)) {
+              storeOwnRow(agent, 'user', [{
+                type: 'text',
+                text: `[${NOTICE_TAG.outputLimit}] The output limit was reached in the response just before this note. The rest was not generated.`,
+              }], { system: true, kind: 'cut-off-reply', ...this.silentTurnRowMetadata(agent.name) });
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
@@ -31086,6 +31310,12 @@ export class AgentFramework {
               // refusal feeds the next one.)
               if (!handledByRewind) {
                 void this.reactToRefusal(agent.name, category);
+                // The agent is told too, in its own context, where the
+                // reaction never reaches it: one note for a run of such
+                // turns (noteRefusedTurn).
+                if (category === 'reasoning_extraction') this.noteRefusedTurn(agent, category);
+                // A turn refused untold ends the run: the next note counts from itself.
+                else this.refusedTurnsNote.delete(agent.name);
               }
             } else {
               this.endRefusalEpisode(agent.name);
@@ -31485,6 +31715,7 @@ export class AgentFramework {
             else this.deadlineCuts.delete(agent.name);
             if (!action.retry && cuts !== undefined && cuts > 0) this.freshCallsCut.add(agent.name);
             if (action.retry) {
+              if (cuts !== undefined) console.error(deadlineRetryLine(agent.name, durationMs, failureWords(err), action, policyAttempt + 2));
               // A stop made during the wait reaches no stream: the check after
               // the wait ends the turn, as the guard's check after its wait
               // does. Until then, that check is ahead, in a window of its own
@@ -31510,7 +31741,7 @@ export class AgentFramework {
                   } else {
                     this.settleDeliberateCancel({
                       agent, myStreamId, startTime, compiledRequest,
-                      reason: stop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing',
+                      reason: stop.reason ?? 'user', closes: streamRouting, log: logStream, before: 'finishing', inWait: 'retry',
                     });
                   }
                   return;
@@ -32009,12 +32240,14 @@ export class AgentFramework {
       }
       // A framework retry/budget restart can overlap physical streams on the
       // same Agent object. Name + Agent identity is not enough: only the
-      // current stream generation may mutate name-keyed teardown state.
+      // current stream generation may mutate the name-keyed teardown state
+      // below. This stream's own activeStreams and pendingAssistantBlocks
+      // entries go by identity instead.
       const ownsPhysicalStream =
         this.agents.get(agent.name) === agent && agent.streamId === myStreamId;
       // Ephemeral completion resolves its caller before this finally runs, so
       // runEphemeralToCompletion may already have deregistered the name. The
-      // terminal frame still owns its typing/outgoing completion unless it was
+      // terminal frame still owns its outgoing completion unless it was
       // genuinely superseded or handed EventGate liveness to a budget restart.
       const disposedEphemeralWithoutSuccessor =
         generationLost &&
@@ -32073,9 +32306,11 @@ export class AgentFramework {
       }
       if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
 
-      // Stop the typing indicator on every exit path (complete, error,
-      // exhausted, abort) so it never sticks after the turn ends.
-      if (frameReachedTerminal) this.channelRegistry?.stopTyping();
+      // Stop the turn's own typing indicator on every exit path (complete,
+      // error, exhausted, abort) so it never sticks after the turn ends,
+      // unless this frame handed the turn to a successor. The helper leaves
+      // the indicator to a newer stream under the name at the same address.
+      if (!preserveEventGateForSuccessor) this.stopTurnTyping(streamRouting, { agent, streamId: myStreamId });
 
       // A round of this stream still waiting for its code_execution calls
       // can't be routed now: whether its scripts would have silenced it is
@@ -32097,8 +32332,13 @@ export class AgentFramework {
       // since stopping closes the connections a queued delivery waits on.
       void turnSpeechChain.then(completeOutgoing);
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
-      if (ownsPhysicalStream) {
+      // When this frame ends, clear the entries that are still this stream's
+      // own. Do so even if this frame no longer holds the stream id. A later
+      // stream's entries are not this stream's, so they stay.
+      if (streamRef.handle !== undefined && this.activeStreams.get(agent.name) === streamRef.handle) {
         this.activeStreams.delete(agent.name);
+      }
+      if (myPendingBlocks !== undefined && this.pendingAssistantBlocks.get(agent.name) === myPendingBlocks) {
         this.pendingAssistantBlocks.delete(agent.name);
       }
 
@@ -34956,11 +35196,12 @@ export class AgentFramework {
     // only its agent. The other is a context manager refusing its work
     // (below).
     const kept = (): SurgeryHeldWrite => {
-      const { placement: _placement, replayed: _replayed, ...rest } = opts ?? {};
+      const { placement, replayed: _replayed, ...rest } = opts ?? {};
       return {
         participant, content,
         ...(given !== undefined ? { metadata: given } : {}),
         ...(opts ? { opts: rest } : {}),
+        ...(placement ? { placement } : {}),
         heldFor: agent,
         heldAt: Date.now(),
         heldOrder: ++this.heldWritesKept,
@@ -34969,8 +35210,7 @@ export class AgentFramework {
     // A write kept in memory is placed with no id, as not presented: no
     // request reads it before it is stored, so a coalesced render kept so
     // isn't the assembling turn's, and its recipient is woken to read it
-    // (wakeToRead), as main's deferred placement was. The replay at the
-    // release carries no placement.
+    // (wakeToRead), as main's deferred placement was.
     const placeKept = (): void => {
       if (!opts?.placement) return;
       opts.placement.agent = this.placementReaders(agent, metadata)[0]!.name;
@@ -35093,6 +35333,7 @@ export class AgentFramework {
     if (opts?.placement) {
       opts.placement.agent = placedFor[0]!.name;
       opts.placement.messageId = stored;
+      delete opts.placement.presented;
     }
     this.releaseLandedMail(metadata, agent.name);
     this.noteStored(agent, metadata, stored);
@@ -35959,13 +36200,19 @@ export class AgentFramework {
     return placement.messageId ? { readsRow: placement.messageId } : {};
   }
 
-  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<InferenceRequest, 'readsRows'> {
+  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<MarkedRequest, 'readsRows' | typeof KEPT_WRITES> {
     const rows: NonNullable<InferenceRequest['readsRows']> = [];
+    const kept: WritePlacement[] = [];
     for (const { after, replyTo } of writes) {
+      if (after.agent === agentName && after.messageId === undefined) {
+        kept.push(after);
+        continue;
+      }
       const row = this.readsRowFor(after, agentName).readsRow;
       if (row === undefined) return {};
       rows.push({ row, ...(replyTo ? { replyTo } : {}) });
     }
+    if (kept.length > 0) return rows.length === 0 ? { [KEPT_WRITES]: kept } : {};
     return rows.length > 0 ? { readsRows: rows } : {};
   }
 
@@ -36848,6 +37095,10 @@ export class AgentFramework {
       excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
+    // A failed turn between two refused ones ends the run of refused turns
+    // (noteRefusedTurn). Optional, as forcedRewind is below: tests call this
+    // on a framework they assembled field by field.
+    this.refusedTurnsNote?.delete(agentName);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
     const agent = this.agents.get(agentName);
     if (agent) this.failedLastTurnAt.set(agent, Date.now());
@@ -36903,7 +37154,7 @@ export class AgentFramework {
               `${madeAgain ? ` ${MADE_AGAIN}` : ''}` +
               `${ended.roundsRan ? ' Its earlier rounds ran, and their tool calls ran as their results show.' : ''}` +
               `${ended.callsCutOff ? ` ${CALLS_CUT_OFF}` : ''}` +
-              `${ended.liveSpeech ? ` ${LIVE_SPEECH_UNRECEIPTED}` : ''}` +
+              `${ended.liveSpeech ? this.confirmedSpeech(agentName, ended.deliveries) : ''}` +
               `${ended.speechRouting ? ` ${SPEECH_STILL_ROUTING}` : ''}` +
               `${shown}${timedOut ? ` ${TIMEOUT_ADVICE}` : ''}`,
           }],

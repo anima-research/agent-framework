@@ -24,6 +24,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import { qualifiedChannelName, type ChannelRef, type ChannelRegistry, type TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { isMarkerTagged } from '../mcpl/tags.js';
 import { armAfter, armAt } from '../deadline-timer.js';
 import type { TraceEventInput } from '../types/trace.js';
 
@@ -1042,6 +1043,20 @@ export interface TuneOutFrameworkHooks {
    */
   announce?: (serverId: string, channelId: string, text: string) => Promise<{ success: boolean; error?: string }>;
   emitTrace: (event: TraceEventInput) => void;
+}
+
+/**
+ * The id that a held line's `channels/acknowledge` names, or undefined when
+ * the line gets none. An acknowledgement names a platform message, or it
+ * isn't sent (#476): `id` is that message's id where the lane knows one. A
+ * marker (isMarkerTagged) gets none, since it is no mention. An edit counts
+ * as its message when `editNamesItsMessage`. This differs from the
+ * framework's answersOn on purpose: a reply anchors on a message, and the
+ * acknowledgement answers whether a mention was seen, which an edit that
+ * adds a mention asks.
+ */
+export function heldAcknowledgementId(id: string | undefined, tags: string[] | undefined, editNamesItsMessage: boolean): string | undefined {
+  return id && !isMarkerTagged(tags, editNamesItsMessage) ? id : undefined;
 }
 
 export class TuneOutCoordinator {
@@ -4298,7 +4313,7 @@ export class TuneOutCoordinator {
   ): { epochId: string } | null {
     const hold = this.holdFor(serverId, channelId);
     if (!hold) return null;
-    this.recordHeld(serverId, channelId, messageId, tags, authorId, gatePass);
+    this.recordHeld(serverId, channelId, heldAcknowledgementId(messageId, tags, false), tags, authorId, gatePass);
     return hold;
   }
 
@@ -4815,11 +4830,13 @@ export class TuneOutCoordinator {
    * the cadence tally, the deterministic acknowledgement of a suppressed
    * mention, and the reader wake when the resident's gate would have woken
    * them (`gatePass` is that verdict, probed without side effects).
+   * `acknowledgeId` is the platform message that an acknowledgement would
+   * name (heldAcknowledgementId), or undefined when the line gets none.
    */
   recordHeld(
     serverId: string,
     channelId: string,
-    messageId: string,
+    acknowledgeId: string | undefined,
     tags: string[] | undefined,
     authorId?: string,
     gatePass = true,
@@ -4836,13 +4853,13 @@ export class TuneOutCoordinator {
     // mentions and gate-privileged authors wake, per the issue.
     const addressed = Array.isArray(tags) && tags.includes('chat:addressed');
     const privileged = this.hooks.isPrivilegedAuthor(authorId);
-    if (gatePass && addressed) {
+    if (gatePass && addressed && acknowledgeId !== undefined) {
       // The mention-er always gets a deterministic signal, independent of
       // what the subconscious later decides (grant-gated; decline
       // precedent). Gate-suppressed mentions get NO reaction: main would
       // not have signaled either, and reacting would leak the resident's
       // standing mute to its subject.
-      void this.acknowledgeSuppressed(serverId, channelId, messageId);
+      void this.acknowledgeSuppressed(serverId, channelId, acknowledgeId);
     }
     if (gatePass && (addressed || privileged) && this.readerAvailable()) {
       this.scheduleWakeInvocation(serverId, channelId);

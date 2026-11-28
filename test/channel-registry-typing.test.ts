@@ -150,6 +150,18 @@ test('stopTyping() global branch only dispatches stops for channels with interva
   assert.equal(stops[0].channelId, 'ch1');
 });
 
+test('stopTyping() with no channel stops every channel that types', () => {
+  const { registry, calls } = makeRegistry();
+  (registry as unknown as {
+    channels: Map<string, { serverId: string; descriptor: { id: string }; open: boolean }>;
+  }).channels.set(destinationKey({ serverId: 'srv', channelId: 'ch2' }), { serverId: 'srv', descriptor: { id: 'ch2' }, open: true });
+  registry.startTyping('ch1');
+  registry.startTyping('ch2');
+  calls.length = 0;
+  registry.stopTyping();
+  assert.deepEqual(calls.filter((c) => c.op === 'stop').map((c) => c.channelId).sort(), ['ch1', 'ch2']);
+});
+
 test('a server without the channels.typing grant gets no typing notification, its stop included', () => {
   const { registry, calls } = makeRegistry(false);
 

@@ -1408,6 +1408,25 @@ describe("a stop while the guard's refusal retry waits", () => {
     }
   });
 
+  it("abortInference() writes the turn's own [turn] line on stderr, with the stop's reason", async () => {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    const g = await guardRetryWaiting();
+    try {
+      assert.equal(g.framework.abortInference('assistant', 'operator stop'), true, 'abortInference reports the stop');
+      g.releasePost();
+      await waitFor('the turn to end', g.turnEnded);
+      endedWithoutRetry(g, 'operator stop', /stopped before it finished/);
+    } finally {
+      console.error = original;
+      await g.cleanup();
+    }
+    assert.deepEqual(lines.filter((line) => line.startsWith('[turn] ')), [
+      `[turn] assistant: a stop ended the turn in the tool-result guard's wait; its retry wasn't sent: "operator stop"`,
+    ]);
+  });
+
   it("a quiesce's abandon ends the turn, and the retry doesn't run while quiesced", async () => {
     const g = await guardRetryWaiting();
     try {
