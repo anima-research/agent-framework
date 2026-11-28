@@ -376,7 +376,47 @@ describe("a module's edits and removals while the store is held", () => {
     assert.equal(alerts.length, 1);
     assert.match(alerts[0]!.message, /injected store failure/);
     assert.match(alerts[0]!.message, /took effect isn't known/);
-    assert.deepEqual(alerts[0]!.data?.kinds, { edit: 1 });
+    assert.deepEqual(alerts[0]!.data?.kinds, { 'edit of a stored row': 1 });
+  });
+
+  it("a write and a change that both throw at the release each reach the webhook, and the change's alert names its row and what to do", async () => {
+    const { inHold, open, rollback } = gatedRollback();
+    await inHold;
+    ctx().addMessage('user', text('added during the hold'));
+    ctx().editMessage(ids[0]!, text('m1 edited'));
+    const store = cm() as unknown as { addMessage: (...args: unknown[]) => unknown; editMessage: (...args: unknown[]) => unknown };
+    const { addMessage, editMessage } = store;
+    store.addMessage = (...args: unknown[]) => {
+      if (!JSON.stringify(args).includes('added during the hold')) return addMessage.apply(cm(), args);
+      store.addMessage = addMessage;
+      throw new Error('injected write failure');
+    };
+    store.editMessage = () => { store.editMessage = editMessage; throw new Error('injected store failure'); };
+    const posts: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      posts.push(String(JSON.parse(String(init?.body)).content));
+      return new Response('{}');
+    }) as typeof fetch;
+    const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+    process.env.CONNECTOME_OPS_WEBHOOK = 'http://webhook.invalid/hook';
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      open();
+      await rollback;
+    } finally {
+      console.error = quiet;
+      globalThis.fetch = realFetch;
+      if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK;
+      else process.env.CONNECTOME_OPS_WEBHOOK = hook;
+    }
+    const lost = posts.filter((post) => post.includes('store-held-lost'));
+    assert.equal(lost.length, 2, 'neither alert waits out the cooldown of the other');
+    assert(lost.some((post) => post.includes('injected write failure')));
+    const change = lost.find((post) => post.includes('injected store failure'));
+    assert(change?.includes(`an edit of ${ids[0]}`), 'the alert names the row');
+    assert(change?.includes('Read that row, and make again a change that didn\'t take effect.'));
   });
 
   it("a change that the release finds its manager refusing waits for the agent's recovery, which applies it", async () => {
@@ -396,6 +436,48 @@ describe("a module's edits and removals while the store is held", () => {
     await framework.switchBranch('main');
     assert.deepEqual(texts(), ['m1', 'm3', 'm4', 'm5']);
     assert.deepEqual(lostAlerts(), []);
+  });
+
+  it("a change of a row that a failed move's branch lacks waits for the agent's recovery, which applies it on a branch that has the row", async () => {
+    const source = framework.getStore().currentBranch().name;
+    await framework.rollbackToMessage('scout', { messageId: ids[2]! });
+    const cut = framework.getStore().currentBranch().name;
+    assert.notEqual(cut, source, 'premise: the rollback lands on a branch of its own');
+    await framework.switchBranch(source);
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5'], 'premise: the source branch has every row');
+    const internals = framework as unknown as { maintenanceRunning: () => boolean; settleMaintenancePass: () => Promise<void> };
+    const { maintenanceRunning, settleMaintenancePass } = internals;
+    let reached!: () => void;
+    const inHold = new Promise<void>((resolve) => { reached = resolve; });
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => { open = resolve; });
+    openHold = open;
+    internals.maintenanceRunning = () => { internals.maintenanceRunning = maintenanceRunning; return true; };
+    internals.settleMaintenancePass = async () => { internals.settleMaintenancePass = settleMaintenancePass; reached(); await gate; };
+    const strategy = cm().getStrategy() as unknown as { initialize?: (...args: unknown[]) => Promise<void> };
+    const own = Object.hasOwn(strategy, 'initialize');
+    const initialize = strategy.initialize;
+    strategy.initialize = async () => {
+      if (own) strategy.initialize = initialize;
+      else delete strategy.initialize;
+      throw new Error('injected initialization failure');
+    };
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      const move = framework.switchBranch(cut);
+      move.catch(() => {});
+      await within(inHold, "the switch's wait for maintenance");
+      ctx().editMessage(ids[4]!, text('m5 edited'));
+      open();
+      await move;
+    } finally {
+      console.error = quiet;
+    }
+    assert.equal(framework.getStore().currentBranch().name, cut, "premise: the failed move stays on the branch that lacks the row");
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1, 'the release kept the edit for the recovery');
+    await framework.switchBranch(source);
+    assert.deepEqual(texts(), ['m1', 'm2', 'm3', 'm4', 'm5 edited']);
   });
 
   it("a hold begun during the release keeps the changes still to replay for its own release", async () => {

@@ -1339,6 +1339,7 @@ const TURN_RETRY: unique symbol = Symbol('turn-retry');
  * rests copy it.
  */
 const MERGED_BATCH: unique symbol = Symbol('merged-batch');
+const HELD_MUTATION_ROWS_SHOWN = 10;
 const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
@@ -2096,7 +2097,9 @@ interface RecordedTurnCheckpoint {
 function heldWritesTold(writes: readonly HeldEntry[]): { kinds: Record<string, number>; mail: number; told: string } {
   const kinds: Record<string, number> = {};
   for (const write of writes) {
-    const kind = 'mutation' in write ? write.mutation.kind : (write.metadata as { kind?: unknown } | undefined)?.kind;
+    const kind = 'mutation' in write
+      ? (write.mutation.kind === 'edit' ? 'edit of a stored row' : 'removal of a stored row')
+      : (write.metadata as { kind?: unknown } | undefined)?.kind;
     const name = typeof kind === 'string' ? kind : 'message';
     kinds[name] = (kinds[name] ?? 0) + 1;
   }
@@ -26051,11 +26054,16 @@ export class AgentFramework {
   private tellHeldMutationsUnapplied(agentName: string, mutations: readonly HeldMutation[], reason: string): void {
     const { kinds, told } = heldWritesTold(mutations);
     const one = mutations.length === 1;
+    const rows = mutations.map(({ mutation }) => `${mutation.kind === 'edit' ? 'an edit' : 'a removal'} of ${mutation.id}`);
+    const shown = rows.slice(0, HELD_MUTATION_ROWS_SHOWN);
     const message = `${one ? '1 edit or removal' : `${mutations.length} edits and removals`} of stored rows for ${agentName}, ` +
       `kept in memory until a surgery's release, threw when applied there (${one ? '' : 'the first: '}${reason}). ` +
-      `Whether ${one ? 'it' : 'each'} took effect isn't known. ${told}`;
+      `Whether ${one ? 'it' : 'each'} took effect isn't known: ${shown.join(', ')}` +
+      `${rows.length > shown.length ? `, and ${rows.length - shown.length} more` : ''}. ` +
+      `Read ${one ? 'that row' : 'those rows'}, and make again a change that didn't take effect. ${told}`;
     console.error(`[surgery] agent=${agentName}: ${message}`);
     this.opsAlert('store-held-lost', agentName, message, {
+      key: 'mutations',
       data: { count: mutations.length, keptForRecovery: 0, heldBySurgery: mutations.length, kinds, mail: 0, mayBeApplied: mutations.length },
     });
   }
@@ -36266,7 +36274,7 @@ export class AgentFramework {
   }
 
   private storeOrKeepMutation(agent: Agent, mutation: HeldMutation['mutation'], kept: () => HeldMutation | undefined, skipAbsent = false): boolean {
-    if (this.waitsForRecovery(agent.name)) {
+    if (this.waitsForRecovery(agent.name) || (skipAbsent && this.refusesItsWork(agent.name))) {
       const write = kept();
       if (!write) return this.storeMutation(agent, mutation, skipAbsent);
       this.keepForRecovery(agent.name, write);

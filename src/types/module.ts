@@ -482,8 +482,11 @@ export interface ModuleContext {
    * the same way while the delivery agent's context manager refuses its
    * work, and the recovery applies it. A malformed edit throws at once, and
    * so does an edit of a row that the store doesn't hold. The release skips
-   * an edit of a row that the move cut away. If the store throws when the
-   * release applies an edit, a `store-held-lost` alert tells the operator.
+   * an edit of a row that the move cut away. If the move failed, the edit
+   * waits for the recovery instead. If the store refuses the edit at the
+   * release because the move left its context manager uninitialized, the
+   * edit waits for the recovery too. If the store throws for another
+   * reason, a `store-held-lost` alert tells the operator.
    */
   editMessage(id: MessageId, content: ContentBlock[]): void;
 
