@@ -1341,6 +1341,7 @@ const MERGED_BATCH: unique symbol = Symbol('merged-batch');
 const RELEASED_ROUTING: unique symbol = Symbol('released-routing');
 const REARMED: unique symbol = Symbol('rearmed');
 const RETRY_RANK: unique symbol = Symbol('retry-rank');
+const KEPT_WRITES: unique symbol = Symbol('kept-writes');
 /**
  * The rows a batched wake's line can name (the gate's BATCH_LINE_ROWS), on
  * the wake of every agent the batch wakes: a fresh start of the turn it
@@ -1366,10 +1367,20 @@ interface TurnCarry {
 }
 type ReleasedStart = { turn: InferenceRequest; wakes: InferenceRequest[] };
 type ReleasedRouting = { wasRetry: boolean; rows?: string[] } & ({ opened: true; turn?: TurnRouting; answered?: TurnRouting } | { opened: false; routing: TurnRouting; wakeChannels?: ChannelRef[] });
-type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside' };
+type MarkedRequest = InferenceRequest & { [TURN_RETRY]?: true; [MERGED_BATCH]?: InferenceRequest[]; [RELEASED_ROUTING]?: ReleasedRouting; [TURN_CARRY]?: TurnCarry; [REARMED]?: true; [UNPROMPTED]?: true; [BUDGET_WAIT]?: BudgetWait; [BATCH_ROWS]?: string[]; [RETRY_RANK]?: 'sent' | 'aside'; [KEPT_WRITES]?: readonly WritePlacement[] };
 
 function batchRowsOf(request: InferenceRequest | undefined): string[] | undefined {
   return request === undefined ? undefined : (request as MarkedRequest)[BATCH_ROWS];
+}
+
+function keptWritesOf(request: InferenceRequest | undefined): readonly WritePlacement[] | undefined {
+  return request === undefined ? undefined : (request as MarkedRequest)[KEPT_WRITES];
+}
+
+function sameKeptWrites(a: InferenceRequest | undefined, b: InferenceRequest | undefined): boolean {
+  const x = keptWritesOf(a);
+  const y = keptWritesOf(b);
+  return x === y || (x !== undefined && y !== undefined && x.length === y.length && x.every((p, i) => p === y[i]));
 }
 
 function isRearmed(request: InferenceRequest | undefined): boolean {
@@ -2117,6 +2128,7 @@ interface SurgeryHeldWrite {
   opts?: FrameworkWriteOptions;
   /** `mayBeStored`: storeInFork's, as FrameworkWriteOptions.mayBeStored. */
   direct?: { agentName: string; mayBeStored?: true };
+  placement?: WritePlacement;
   /** The agent the write was kept for, as registered then: the incarnation
    *  its name meant. Another agent registered under that name since isn't
    *  the write's (heldWriteTargetGone). */
@@ -2775,7 +2787,9 @@ interface FrameworkWriteOptions {
    *  stored while a turn of the agent's was alive, outside its start's
    *  assembly, or at rest with a presentation that failed. A write kept
    *  in memory (a surgery's hold, or its agent's recovery) names only its
-   *  agent, with no id, and is not presented. */
+   *  agent, with no id, and is not presented, until a release stores it:
+   *  that release fills this placement as a store outside a hold does
+   *  (its agent, its id, and `presented` set anew). */
   placement?: WritePlacement;
   /**
    * Who the message is for, when that is decided before it gets here:
@@ -4455,7 +4469,7 @@ function answersSameMessage(a: InferenceRequest, b: InferenceRequest | undefined
 function droppableAsRead(request: InferenceRequest): boolean {
   const batch = mergedBatch(request);
   if (batch?.length) return batch.every(droppableAsRead);
-  return request.readsRow !== undefined || request.readsRows !== undefined;
+  return request.readsRow !== undefined || request.readsRows !== undefined || keptWritesOf(request) !== undefined;
 }
 
 /** A stream's notes to the context manager: how to note (the stream start's `noteRequestSent`), its rows so far after
@@ -4618,6 +4632,7 @@ export class AgentFramework {
   private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   /** Run records whose failure repeated one already reported, and whose report was suppressed. */
   private maintenanceRepeats = new WeakSet<ContextMaintenanceAgentRun>();
+  private readonly withdrawnPlacements = new WeakSet<WritePlacement>();
   /** An operator's maintain (maintenanceTick) asked for the pass running or about to run: the run it records is kept in the history whatever it met. A pass with nothing to run records none. */
   private maintenancePassRequested = false;
   private providerGates: Map<string, LocalProviderGate> = new Map();
@@ -6003,6 +6018,7 @@ export class AgentFramework {
         // names it back, with its server where another server shares its id.
         channelShown: (channel) => framework.channelRegistry?.nameShown(channel) ?? suppliedValue(channel.channelId),
         isAnswered: (after) => framework.answeredWrite(after),
+        isWithdrawn: (after) => framework.withdrawnPlacements.has(after),
         // What a source can send, for the rule-order notes: an MCPL server's
         // events reach the gate as its pushes and channel messages only (a
         // module's events carry a source of the module's own, such as "cli"
@@ -7491,7 +7507,8 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId && a.channelServerId === b.channelServerId &&
       a.coalescingSubject === b.coalescingSubject && batchSubjects(a) === batchSubjects(b) &&
-      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b);
+      a.readsRow === b.readsRow && readsRowsKey(a) === readsRowsKey(b) && batchRowsKey(a) === batchRowsKey(b) &&
+      sameKeptWrites(a, b);
   }
   /** Keep `request` among a hold's `held` requests, once by
    *  sameInferenceRequest. A held turn's retry (TURN_RETRY) whose equal is
@@ -17501,6 +17518,7 @@ export class AgentFramework {
     for (const [agentName, writes] of [...kept]) {
       if (failures.some((failure) => failure.agentName === agentName)) continue;
       kept.delete(agentName);
+      if (writes.length === 0) continue;
       if (writes.some((write) => this.heldWriteTargetGone(write, agentName) !== undefined)) {
         this.passHeldWritesOn(agentName, writes);
         continue;
@@ -17550,7 +17568,7 @@ export class AgentFramework {
   /** Whether writes for `agentName` wait in memory for its context manager's recovery (heldForRecovery). */
   private waitsForRecovery(agentName: string): boolean {
     // Read defensively, as releaseSurgeryHeldWrites is.
-    return (this.heldForRecovery?.get(agentName)?.length ?? 0) > 0;
+    return this.heldForRecovery?.has(agentName) ?? false;
   }
 
   /**
@@ -20984,7 +21002,7 @@ export class AgentFramework {
           this.storeDueClock(target, 'event');
         }
         // The stored copy carries the author as the fork reads them (presentAuthor), and its digest is of that copy.
-        Object.assign(placement, this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored));
+        this.writeToFork(target, content, AgentFramework.withStoredDigest(metadata, content), event.mayBeStored, placement);
         // Delivered to the fork, so it is the latest delivered inbound too
         // (the channel context's `incoming`; the fallback locus under the
         // legacy rule), as a resident's delivery is below.
@@ -21018,9 +21036,7 @@ export class AgentFramework {
       if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
       decision.recipients = [target.name];
     } else if (this.conversationRouter) {
-      const written = await this.routeConversationIncoming({ ...event, content }, metadata, decision);
-      if (written) Object.assign(placement, written);
-      return written;
+      return this.routeConversationIncoming({ ...event, content }, metadata, decision, placement);
     }
 
     // Addressed-while-closed invitation — parity with the push-event path
@@ -21127,6 +21143,7 @@ export class AgentFramework {
     },
     messageMetadata: Record<string, unknown>,
     admission: AdmissionDecision,
+    placement: CoalescingPlacement,
   ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const channel: ChannelRef = { serverId: event.serverId, channelId: event.channelId };
@@ -21198,7 +21215,7 @@ export class AgentFramework {
     if (!this.logicalTurnAlive(agent) && takesClockBefore('user', event.content, messageMetadata, agent.name)) {
       this.storeDueClock(agent, 'event');
     }
-    const placement = this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content), event.mayBeStored);
+    this.writeToFork(agent, event.content, AgentFramework.withStoredDigest(messageMetadata, event.content), event.mayBeStored, placement);
     // Delivered to the channel's fork: the latest delivered inbound, as for a
     // resident (the channel context's `incoming`; the fallback locus under
     // the legacy rule). A held or dropped message never is.
@@ -21245,18 +21262,9 @@ export class AgentFramework {
    * is stored, and the fork is woken to read it, as addMessage places a
    * write it keeps. `mayBeStored`: storeInFork's.
    */
-  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean): CoalescingPlacement {
-    // Read before the write, as addMessage reads it: whether the fork's turn
-    // keeps the row out of its window. A placement that says so
-    // (`presented: false`) keeps a coalesced render the turn never read
-    // replaceable, and wakes the fork to read it.
-    const turnLive = this.logicalTurnAlive(agent);
-    const keptOut = this.keptOutOfWindow(agent, content, turnLive);
-    const id = this.storeInFork(agent, content, metadata as MessageMetadata, mayBeStored);
-    if (!id) return { agent: agent.name, presented: false };
-    return this.placedUnpresented(agent, keptOut, !turnLive, id)
-      ? { agent: agent.name, messageId: id, presented: false }
-      : { agent: agent.name, messageId: id };
+  private writeToFork(agent: Agent, content: ContentBlock[], metadata: Record<string, unknown>, mayBeStored?: boolean, placement: CoalescingPlacement = { agent: agent.name }): CoalescingPlacement {
+    this.storeInFork(agent, content, metadata as MessageMetadata, { mayBeStored, placement });
+    return placement;
   }
 
   /**
@@ -22154,6 +22162,7 @@ export class AgentFramework {
       wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
       wakeToRead: (occ, placement, allAmbient) => this.queueCoalescedWakes(
         { ...occ, deliverTo: placement.agent }, true, this.readsRowFor(placement, placement.agent).readsRow, allAmbient,
+        placement.messageId === undefined ? placement : undefined,
       ),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
@@ -22610,7 +22619,9 @@ export class AgentFramework {
    *  its turn being assembled doesn't read (wakeToRead), reading `readsRow`
    *  (readsRowFor), marked ambient when every notice the render folds was
    *  (`allAmbient`). */
-  private async queueCoalescedWakes(occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false): Promise<void> {
+  private async queueCoalescedWakes(
+    occ: CoalescedOccurrence<CoalescedDelivery>, plain = false, readsRow?: string, allAmbient = false, kept?: WritePlacement,
+  ): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const push = occ.event.event;
@@ -22690,7 +22701,7 @@ export class AgentFramework {
     }
     if (!decision.wake) return;
     for (const agentName of await this.coalescedAudience(occ)) {
-      this.pendingRequests.push({
+      const request: MarkedRequest = {
         agentName,
         reason: 'mcpl:push-event',
         source: occ.serverId,
@@ -22707,7 +22718,9 @@ export class AgentFramework {
         // alone; only its wake is judged by what was read (readsRow).
         ...(plain && allAmbient ? { ambient: true as const } : {}),
         ...(plain ? (readsRow ? { readsRow } : {}) : { coalescingSubject: subject, coalescingBatch: true }),
-      });
+        ...(plain && !readsRow && kept ? { [KEPT_WRITES]: [kept] } : {}),
+      };
+      this.pendingRequests.push(request);
     }
   }
 
@@ -22755,12 +22768,9 @@ export class AgentFramework {
   }
 
   /** Unread (the coalescer's isUnread) by the consumed watermark, or, by the
-   *  shown watermark, never possibly shown (its isUnshown). A placement with
-   *  no stored row, a write kept in memory (a surgery's hold, or the wait
-   *  for its agent's recovery), counts as read and as shown: it can't be
-   *  found again once it is stored. */
+   *  shown watermark, never possibly shown (its isUnshown). */
   private isUnreadPlacement(p: CoalescingPlacement, by: 'consumed' | 'shown' = 'consumed'): boolean {
-    if (!p.messageId) return false;
+    if (!p.messageId) return this.heldWriteOf(p) !== undefined;
     const agent = this.agents.get(p.agent);
     return !!agent && this.isUnreadStoredMessage(agent, p.messageId, by);
   }
@@ -22876,10 +22886,27 @@ export class AgentFramework {
     this.presentation?.retractRemoved(remover, ids, reason);
   }
 
+  private heldWriteOf(p: CoalescingPlacement): { writes: SurgeryHeldWrite[]; at: number } | undefined {
+    const places = (write: SurgeryHeldWrite): boolean =>
+      write.placement === p && !write.opts?.mayBeStored && !write.direct?.mayBeStored;
+    const held = this.surgeryHeldWrites ?? [];
+    const at = held.findIndex(places);
+    if (at >= 0) return { writes: held, at };
+    for (const writes of this.heldForRecovery?.values() ?? []) {
+      const found = writes.findIndex(places);
+      if (found >= 0) return { writes, at: found };
+    }
+    return undefined;
+  }
+
   private removePlacement(p: CoalescingPlacement): boolean {
-    // A placement with no stored row (a write a surgery's hold keeps) can't
-    // be removed: it is stored at the hold's release.
-    if (!p.messageId) return false;
+    if (!p.messageId) {
+      const held = this.heldWriteOf(p);
+      if (!held) return false;
+      held.writes.splice(held.at, 1);
+      this.withdrawnPlacements.add(p);
+      return true;
+    }
     if (this.surgeryHold) return false;
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
@@ -23549,6 +23576,8 @@ export class AgentFramework {
       // agent, so reading it was all its wake was for, as for a chat:system
       // notice. One with neither tag is judged as addressed.
       const read = requests.filter((r) => {
+        const kept = keptWritesOf(r);
+        if (kept !== undefined) return kept.every((p) => this.withdrawnPlacements.has(p));
         if (r.readsRows !== undefined) return r.readsRows.every(({ row, replyTo }) => this.rowDone(agent, row, replyTo));
         if (r.readsRow === undefined) return false;
         // A chat:system notice asks nothing either, ambient or not, and no
@@ -23563,7 +23592,7 @@ export class AgentFramework {
         const left = requests.filter((r) => !read.includes(r));
         requests.length = 0;
         appendAll(requests, left);
-        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed` +
+        console.error(`[wake] ${agentName}: dropped ${read.length} wake(s) for writes an answered request carried, and that it spoke after in the channel a reply was owed in, where one was, or that were removed or withdrawn` +
           (requests.length === 0 ? '; no turn starts' : ''));
         if (requests.length === 0) {
           this.endPendingPrimary(agentName);
@@ -23736,6 +23765,7 @@ export class AgentFramework {
           ? trigger?.answersMessageId : undefined,
         readsRows: requests.every((r) => readsRowsKey(r) === readsRowsKey(trigger))
           ? trigger?.readsRows : undefined,
+        [KEPT_WRITES]: requests.every((r) => sameKeptWrites(r, trigger)) ? keptWritesOf(trigger) : undefined,
         // A batched wake's line names the rows of every batch the turn is
         // for, and none where a wake that isn't a batch's is merged in.
         [BATCH_ROWS]: trigger ? this.mergedBatchRows(trigger.agentName, requests) : undefined,
@@ -25801,23 +25831,40 @@ export class AgentFramework {
    * presented (landedThoughThrown), as addMessage's. `mayBeStored`: as
    * FrameworkWriteOptions.mayBeStored, read back in the fork's store.
    */
-  private storeInFork(target: Agent, content: ContentBlock[], metadata: MessageMetadata, mayBeStored?: boolean, replayed?: () => void): MessageId {
+  private storeInFork(
+    target: Agent, content: ContentBlock[], metadata: MessageMetadata,
+    { mayBeStored, replayed, placement }: { mayBeStored?: boolean; replayed?: () => void; placement?: WritePlacement } = {},
+  ): MessageId {
     const kept = (): SurgeryHeldWrite => ({
       participant: 'user', content, metadata,
       direct: { agentName: target.name, ...(mayBeStored ? { mayBeStored: true as const } : {}) },
+      ...(placement ? { placement } : {}),
       heldFor: target, heldAt: Date.now(), heldOrder: ++this.heldWritesKept,
     });
+    const placeKept = (): void => {
+      if (!placement) return;
+      placement.agent = target.name;
+      placement.presented = false;
+    };
     if (this.surgeryHold || (this.replayingHeld && !replayed)) {
       // The write the release replays, met by a hold its clock row's
       // listener began, stays at the head of the queue (as addMessage's).
       if (replayed) this.replayHeldAgain = true;
       else this.surgeryHeldWrites.push(kept());
+      placeKept();
       return '' as MessageId;
     }
     if (this.waitsForRecovery(target.name)) {
       this.keepForRecovery(target.name, kept());
+      placeKept();
       return '' as MessageId;
     }
+    // Read before the write, as addMessage reads it: whether the fork's turn
+    // keeps the row out of its window. A placement that says so
+    // (`presented: false`) keeps a coalesced render the turn never read
+    // replaceable, and wakes the fork to read it.
+    const turnLive = this.logicalTurnAlive(target);
+    const keptOut = this.keptOutOfWindow(target, content, turnLive);
     let id: MessageId;
     // Its one id, or the rows a store that threw after they landed names,
     // which the write is stored as (landedThoughThrown), or those found of a
@@ -25836,6 +25883,7 @@ export class AgentFramework {
         if (!thrown) {
           if (!refusesUntilReinitialized(error)) throw error;
           this.keepForRecovery(target.name, kept(), error);
+          placeKept();
           return '' as MessageId;
         }
         if ('unknown' in thrown) {
@@ -25849,6 +25897,12 @@ export class AgentFramework {
     }
     replayed?.();
     this.presentation?.afterStore(target, rows);
+    if (placement) {
+      placement.agent = target.name;
+      placement.messageId = id;
+      if (this.placedUnpresented(target, keptOut, !turnLive, id)) placement.presented = false;
+      else delete placement.presented;
+    }
     return id;
   }
 
@@ -25989,9 +26043,9 @@ export class AgentFramework {
         if (!this.logicalTurnAlive(target) && takesClockBefore(write.participant, write.content, write.metadata, target.name)) {
           this.storeDueClock(target, 'event');
         }
-        id = this.storeInFork(target, write.content, write.metadata ?? {}, write.direct.mayBeStored, settle);
+        id = this.storeInFork(target, write.content, write.metadata ?? {}, { mayBeStored: write.direct.mayBeStored, replayed: settle, placement: write.placement });
       } else {
-        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, replayed: settle });
+        id = this.addMessage(write.participant, write.content, write.metadata, { ...write.opts, placement: write.placement, replayed: settle });
       }
       if (this.replayHeldAgain) {
         this.replayHeldAgain = false;
@@ -28705,8 +28759,9 @@ export class AgentFramework {
     // once this attempt's compile has moved the watermark past the row.
     // This frame's activeTurnTriggers entry keeps the trigger as it came; a
     // retry's frame records the copy it carries.
-    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined) {
-      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, ...retry } = trigger;
+    if (trigger?.coalescingSubject !== undefined || trigger?.coalescingBatch || trigger?.readsRow !== undefined || trigger?.readsRows !== undefined
+      || keptWritesOf(trigger) !== undefined) {
+      const { coalescingSubject: _subject, coalescingBatch: _batch, coalescingBatchSubjects: _subjects, readsRow: _read, readsRows: _reads, [KEPT_WRITES]: _kept, ...retry } = trigger as MarkedRequest;
       trigger = retry;
     }
     if (trigger && mergedBatch(trigger) && !releasedTurnBatch(trigger)) {
@@ -34930,11 +34985,12 @@ export class AgentFramework {
     // only its agent. The other is a context manager refusing its work
     // (below).
     const kept = (): SurgeryHeldWrite => {
-      const { placement: _placement, replayed: _replayed, ...rest } = opts ?? {};
+      const { placement, replayed: _replayed, ...rest } = opts ?? {};
       return {
         participant, content,
         ...(given !== undefined ? { metadata: given } : {}),
         ...(opts ? { opts: rest } : {}),
+        ...(placement ? { placement } : {}),
         heldFor: agent,
         heldAt: Date.now(),
         heldOrder: ++this.heldWritesKept,
@@ -34943,8 +34999,7 @@ export class AgentFramework {
     // A write kept in memory is placed with no id, as not presented: no
     // request reads it before it is stored, so a coalesced render kept so
     // isn't the assembling turn's, and its recipient is woken to read it
-    // (wakeToRead), as main's deferred placement was. The replay at the
-    // release carries no placement.
+    // (wakeToRead), as main's deferred placement was.
     const placeKept = (): void => {
       if (!opts?.placement) return;
       opts.placement.agent = this.placementReaders(agent, metadata)[0]!.name;
@@ -35067,6 +35122,7 @@ export class AgentFramework {
     if (opts?.placement) {
       opts.placement.agent = placedFor[0]!.name;
       opts.placement.messageId = stored;
+      delete opts.placement.presented;
     }
     this.releaseLandedMail(metadata, agent.name);
     this.noteStored(agent, metadata, stored);
@@ -35933,13 +35989,19 @@ export class AgentFramework {
     return placement.messageId ? { readsRow: placement.messageId } : {};
   }
 
-  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<InferenceRequest, 'readsRows'> {
+  private readsRowsFor(writes: readonly WakeWrite[], agentName: string): Pick<MarkedRequest, 'readsRows' | typeof KEPT_WRITES> {
     const rows: NonNullable<InferenceRequest['readsRows']> = [];
+    const kept: WritePlacement[] = [];
     for (const { after, replyTo } of writes) {
+      if (after.agent === agentName && after.messageId === undefined) {
+        kept.push(after);
+        continue;
+      }
       const row = this.readsRowFor(after, agentName).readsRow;
       if (row === undefined) return {};
       rows.push({ row, ...(replyTo ? { replyTo } : {}) });
     }
+    if (kept.length > 0) return rows.length === 0 ? { [KEPT_WRITES]: kept } : {};
     return rows.length > 0 ? { readsRows: rows } : {};
   }
 
