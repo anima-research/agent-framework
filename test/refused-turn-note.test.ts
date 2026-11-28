@@ -53,6 +53,7 @@ type Scripted = NormalizedResponse | 'failed' | 'stopped';
 type Internals = {
   logFailure(record: Record<string, unknown>): void;
   channelRegistry: { getDesiredState(serverId: string, channelId: string): string | undefined };
+  reactToRefusal(agent: string, category: string): Promise<void>;
 };
 
 async function rig(t: TestContext, opts: { agents?: unknown[]; tools?: unknown[] } = {}) {
@@ -129,6 +130,22 @@ describe('a turn the provider refused leaves the agent a note, one for a run of 
       'the note stays after the first refused turn, before the messages of the turns that followed');
     await r.turn(answer('here again'));
     assert.ok(r.f.lastRequest().includes(`${NOTE} The 3 turns after it ended the same way.`));
+  });
+
+  it('a reaction owner does not suppress the agent note or its run boundaries', async (t) => {
+    const r = await rig(t);
+    const legacy = t.mock.method(r.f.framework as unknown as Internals, 'reactToRefusal', async () => {});
+    const owner = t.mock.fn();
+    t.after(r.f.framework.getMainRefusalBridge().takeOwnership(owner));
+
+    await r.turn(refused());
+    await r.turn(refused());
+    assert.deepEqual(r.notes(), [`${NOTE} The turn after it ended the same way.`]);
+    await r.turn(refused('cyber'));
+    await r.turn(refused());
+    assert.deepEqual(r.notes(), [`${NOTE} The turn after it ended the same way.`, NOTE]);
+    assert.equal(owner.mock.callCount(), 4);
+    assert.equal(legacy.mock.callCount(), 0);
   });
 
   it('a refused turn after an answered one: the first note stays as written, and a new one is started', async (t) => {
