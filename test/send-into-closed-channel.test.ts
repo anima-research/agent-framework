@@ -937,6 +937,54 @@ test("a sleep announced into a channel the agent or a module closed says the age
   assert.equal(opens.length, opensBeforeUngranted, 'the post opened nothing');
 });
 
+test("a sleep that would end beyond the host's date range is refused before anything is set, and announces nothing in the turn's channel (#259)", async () => {
+  const { registry, framework, published } = await harness();
+  const slept: number[] = [];
+  framework.eventGate = { setSleep: (seconds: number) => { slept.push(seconds); return { until: Date.now() + seconds * 1000 }; } };
+  framework.activeTurnTriggers = new Map();
+  framework.timeZone = 'UTC';
+  framework.turnRouting.get('sol').locus = ref(channelId);
+  const routed: unknown[] = [];
+  const posts: Promise<unknown>[] = [];
+  const route = registry.routeSpeech.bind(registry);
+  registry.routeSpeech = ((...args: Parameters<typeof route>) => {
+    routed.push(args[2]);
+    const post = route(...args);
+    posts.push(post);
+    return post;
+  }) as typeof route;
+  let thrown: unknown;
+  const sleep = async (id: string, seconds: number) => {
+    const result = await new Promise<{ success: boolean; error?: string; isError?: boolean } | undefined>((resolve) => {
+      framework.pushEvent = (event: { type: string; callId?: string; result: never }) => {
+        if (event.type === 'tool-result' && event.callId === id) resolve(event.result);
+      };
+      try {
+        framework.dispatchSleepToolCall('sol', { id, name: 'sleep', callerTurnId: 't1', input: { seconds } });
+      } catch (error) {
+        thrown = error;
+        resolve(undefined);
+      }
+    });
+    await Promise.allSettled(posts.splice(0));
+    return result;
+  };
+
+  const refused = await sleep('call-sleep-huge', 1e13);
+  assert.deepEqual(slept, [], 'nothing was set');
+  assert.equal(thrown, undefined, 'the call answered and did not throw');
+  assert.equal(refused?.isError, true);
+  assert.equal(refused?.error, "sleep: that sleep would end beyond the host's date range. Your sleep settings haven't changed. Use a smaller number of seconds.");
+  assert.deepEqual(routed, [], 'nothing was routed');
+  assert.deepEqual(published, [], 'nothing was posted');
+
+  const accepted = await sleep('call-sleep-ten-minutes', 600);
+  assert.equal(accepted?.success, true);
+  assert.deepEqual(slept, [600]);
+  assert.equal(routed.length, 1, "an accepted sleep's announcement is routed in this turn");
+  assert.equal(published.length, 1, "and posted in the turn's channel");
+});
+
 test('a conversation agent gets no note on its send: channel_open is refused to it', async () => {
   const { registry, framework, reply, windowMessages } = await harness();
   assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);

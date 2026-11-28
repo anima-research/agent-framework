@@ -251,8 +251,7 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
   });
 
   it('a dispatch that throws after doing work is reported started then failed, not dropped', async () => {
-    // Some host tools change state and then throw synchronously (sleep with
-    // a huge `seconds` sets the gate, then fails formatting its reply).
+    // A host tool can change state and then throw synchronously.
     // Stand one in for test--send.
     const internals = framework as unknown as {
       dispatchToolCall(agentName: string, call: { name: string; input: unknown }): void;

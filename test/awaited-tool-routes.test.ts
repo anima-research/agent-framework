@@ -91,6 +91,24 @@ test('the puppet\'s gate tools answer as the agent\'s own calls do', { timeout: 
   ]);
 });
 
+test('a sleep that would end beyond the host\'s date range is refused alike for the puppet, a host and the agent\'s own call, and leaves the gate awake each time', { timeout: 30_000 }, async (t) => {
+  const h = await setup(t);
+  const gate = (h.f.framework as unknown as { eventGate: { getSleepState(): unknown } }).eventGate;
+  const refused = "sleep: that sleep would end beyond the host's date range. Your sleep settings haven't changed. Use a smaller number of seconds.";
+  const input = { seconds: 1e13, announce: false };
+  const routes: Array<[string, () => Promise<ToolResult>]> = [
+    ['puppet', () => h.viaPuppet('sleep', input)],
+    ['host', () => h.f.framework.executeToolCall({ id: 'host-sleep', name: 'sleep', input, callerAgentName: 'agent' })],
+    ['model', () => h.viaModel('m-sleep', 'sleep', input)],
+  ];
+  for (const [route, call] of routes) {
+    const got = await call();
+    assert.equal(got.isError, true, route);
+    assert.equal(got.error, refused, route);
+    assert.equal(gate.getSleepState(), null, `${route}: the gate is awake`);
+  }
+});
+
 test('the puppet\'s think and journal answer as the agent\'s own calls do, and skip_reply, which ends the turn it\'s called in, is refused off a turn: by the puppet before anything is stored, and to a host as its result', { timeout: 30_000 }, async (t) => {
   const h = await setup(t);
   await answersAsTheAgent(h, [
