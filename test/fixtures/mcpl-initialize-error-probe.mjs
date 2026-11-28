@@ -26,5 +26,5 @@ const outcome = await Promise.race([
 ]);
 clearTimeout(timer);
 assert.ok(outcome instanceof Error, String(outcome));
-assert.equal(outcome.message, 'MCPL server "probe" initialize error: [object Object]');
+assert.equal(outcome.message, 'MCPL server "probe" initialize error: the server answered without saying what went wrong (code -32603)');
 console.log('refused');

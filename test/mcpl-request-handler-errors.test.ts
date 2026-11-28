@@ -389,6 +389,37 @@ process.stdin.on('data', (chunk) => {
   );
 });
 
+// #750: only a string is the server's words, as for an error answer to a
+// request after the handshake; any other message reads as none, with the code.
+for (const [shape, error, expected] of [
+  ['a string message', { code: -32603, message: 'over the quota limit' }, 'over the quota limit'],
+  ['no message', { code: -32603 }, 'the server answered without saying what went wrong (code -32603)'],
+  ['an object message', { code: -32603, message: { reason: 'quota', detail: 'over the limit' } }, 'the server answered without saying what went wrong (code -32603)'],
+  ['a blank message', { code: -32000, message: '  ' }, 'the server answered without saying what went wrong (code -32000)'],
+  ['no message and no numeric code', { code: 'quota' }, 'the server answered without saying what went wrong'],
+] as const) {
+  test(`an initialize error with ${shape} reads as the server's words or says it gave none`, { timeout: 30_000 }, async () => {
+    const server = String.raw`
+let input = '';
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+  let end;
+  while ((end = input.indexOf('\n')) >= 0) {
+    const request = JSON.parse(input.slice(0, end));
+    input = input.slice(end + 1);
+    if (request.method === 'initialize') {
+      process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:request.id, error:${JSON.stringify(error)}}) + '\n');
+    }
+  }
+});
+`;
+    await assert.rejects(
+      McplServerConnection.connect({ id: 'init-error', command: process.execPath, args: ['-e', server] }, { version: '0.5' }),
+      { message: `MCPL server "init-error" initialize error: ${expected}` },
+    );
+  });
+}
+
 for (const value of [null, 42, 'hi', true, []]) {
   test('non-object inbound ' + JSON.stringify(value) + ' leaves the next notification deliverable', () => {
     const { connection, transport } = wireHarness();
