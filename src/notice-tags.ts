@@ -25,6 +25,7 @@ export const NOTICE_TAG = {
   continue: 'continue',
   proseRouting: 'prose-routing',
   toolBoundary: 'tool-boundary',
+  outputLimit: 'output-limit',
   gate: 'Gate',
   selfWake: 'self-wake',
   discordSendFailed: 'discord-send-failed',
