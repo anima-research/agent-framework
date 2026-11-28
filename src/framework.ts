@@ -19265,8 +19265,10 @@ export class AgentFramework {
         (r) => !this.quiesced || passesQuiesce(r),
       ) ||
       this.activeStreams.size > 0 ||
-      this.activeStartRetries.size > 0 ||
-      this.startRetryErrors.length > 0 ||
+      // Read defensively, as hasTurn reads its fields: tests build a
+      // framework from the prototype and set only the fields they use.
+      (this.activeStartRetries?.size ?? 0) > 0 ||
+      (this.startRetryErrors?.length ?? 0) > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
       await this.processNextEvent();
@@ -19785,7 +19787,7 @@ export class AgentFramework {
   }
 
   private async processNextEvent(): Promise<void> {
-    const failed = this.startRetryErrors.shift();
+    const failed = this.startRetryErrors?.shift();
     if (failed) throw failed.error;
     // Try to get next process event (with timeout to check running flag)
     const event = this.queue.tryPop();
@@ -19814,7 +19816,7 @@ export class AgentFramework {
     // turn; neither can recurse forever through already-resolved promises.
     if (!event) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-    } else if (this.pendingRequests.length > 0 || this.activeStreams.size > 0 || this.activeStartRetries.size > 0) {
+    } else if (this.pendingRequests.length > 0 || this.activeStreams.size > 0 || (this.activeStartRetries?.size ?? 0) > 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
