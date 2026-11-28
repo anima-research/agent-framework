@@ -2804,6 +2804,7 @@ interface FrameworkWriteOptions {
    * (untargetedAudience): every resident on a residents' host.
    */
   audience?: readonly string[];
+  heldFrom?: readonly string[];
   /**
    * Set on a coalesced occurrence's delivery at its batch's recovery, after
    * a delivery whose store couldn't tell whether the occurrence landed
@@ -5116,6 +5117,7 @@ export class AgentFramework {
   private replayHeldAgain = false;
   /** A release of the tune-outs on record with no reader (releaseTuneOutsWithoutReader) that met held writes, to run once they are stored. */
   private releaseWithoutReaderWaits = false;
+  private channelLogsUnread = false;
   /** How many writes this process has kept in memory (SurgeryHeldWrite.heldOrder): their arrival order across agents. */
   private heldWritesKept = 0;
   /**
@@ -16722,14 +16724,17 @@ export class AgentFramework {
   private async followBranchMove(except?: string, sameBranch = false): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
-      const held = sameBranch ? undefined : this.tuneOutCoordinator?.heldEpochs();
-      let holdsFollow = !sameBranch;
-      if (!sameBranch) {
+      const reads = !sameBranch || this.channelLogsUnread;
+      const held = reads ? this.tuneOutCoordinator?.heldEpochs() : undefined;
+      let holdsFollow = reads;
+      if (reads) {
         try {
           this.channelRegistry?.branchMoved();
+          this.channelLogsUnread = false;
         } catch (error) {
           holdsFollow = false;
-          console.error("[operator] the channel decisions of the branch moved to could not be read, so the channels and their tune-outs keep the branch left's until a later move reads them, or a start:", error);
+          this.channelLogsUnread = true;
+          console.error("[operator] the channel decisions of the branch moved to could not be read, so the channels and their tune-outs keep what they had until a later move or switchBranch() reads them, or a start:", error);
         }
       }
       this.tuneOutCoordinator?.branchMoved(sameBranch, holdsFollow ? held : undefined);
@@ -21105,7 +21110,8 @@ export class AgentFramework {
     // (inboundAudience).
     const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:channel-incoming', source: event.serverId } : undefined;
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
-      placement, audience: AgentFramework.inboundAudience(decision), ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
+      placement, audience: AgentFramework.inboundAudience(decision), ...(decision.held ? { heldFrom: [...decision.recipients] } : {}),
+      ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
       ...(suppressedBy ? { suppressedBy } : {}),
     });
     // A write kept in memory (no id yet) is traced once, as it is stored.
@@ -23112,7 +23118,8 @@ export class AgentFramework {
       // for it.
       const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:push-event', source: event.serverId } : undefined;
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
-        placement, audience: AgentFramework.inboundAudience(decision), ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
+        placement, audience: AgentFramework.inboundAudience(decision), ...(decision.held ? { heldFrom: [...decision.recipients] } : {}),
+        ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
         ...(suppressedBy ? { suppressedBy } : {}),
       });
       // A write kept in memory (no id yet) is traced once, as it is stored.
@@ -41725,17 +41732,27 @@ export class AgentFramework {
   private remarkKeptWrites(): void {
     const coordinator = this.tuneOutCoordinator;
     if (!coordinator) return;
+    const marked = [...this.surgeryHeldWrites, ...[...this.heldForRecovery.values()].flat()].filter((write) => {
+      const metadata = write.metadata as { tuneOut?: unknown; serverId?: unknown; channelId?: unknown } | undefined;
+      return !!metadata?.tuneOut && typeof metadata.serverId === 'string' && typeof metadata.channelId === 'string';
+    });
+    if (marked.length === 0) return;
     try {
       coordinator.getAllExcept();
-    } catch {
+    } catch (error) {
+      const kept = marked.length === 1 ? '1 message held as it arrived during the move keeps' : `${marked.length} messages held as they arrived during the move keep`;
+      console.error(`[tune-out] the all-except hold of the branch moved to could not be read, so ${kept} the branch left's tune-out, and a message whose tune-out the branch moved to doesn't hold never reaches the resident:`, error);
       return;
     }
-    for (const write of [...this.surgeryHeldWrites, ...[...this.heldForRecovery.values()].flat()]) {
-      const metadata = write.metadata as { tuneOut?: unknown; serverId?: unknown; channelId?: unknown } | undefined;
-      if (!metadata?.tuneOut || typeof metadata.serverId !== 'string' || typeof metadata.channelId !== 'string') continue;
+    for (const write of marked) {
+      const metadata = write.metadata as { tuneOut?: unknown; serverId: string; channelId: string };
       const hold = coordinator.holdFor(metadata.serverId, metadata.channelId);
-      if (hold) metadata.tuneOut = { epochId: hold.epochId };
-      else delete metadata.tuneOut;
+      if (hold) {
+        metadata.tuneOut = { epochId: hold.epochId };
+      } else {
+        delete metadata.tuneOut;
+        if (write.opts?.heldFrom) write.opts = { ...write.opts, audience: [...write.opts.heldFrom] };
+      }
     }
   }
 

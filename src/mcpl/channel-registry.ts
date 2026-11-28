@@ -1795,7 +1795,7 @@ export class ChannelRegistry {
     this.dmClassified = labels.dmClassified;
     const byServer = new Map<string, ChannelEntry[]>();
     for (const entry of this.channels.values()) {
-      if (entry.descriptor.metadata?.lazyRegistered === true) continue;
+      if (this.untargetedPushEntries.has(entry)) continue;
       const entries = byServer.get(entry.serverId);
       if (entries) entries.push(entry);
       else byServer.set(entry.serverId, [entry]);
@@ -1811,7 +1811,8 @@ export class ChannelRegistry {
       try {
         this.migrateLegacyPolicy(serverId, entries.map((entry) => entry.descriptor));
       } catch (err) {
-        console.error(`[mcpl] the "${serverId}" server's legacy recipe policy couldn't be migrated on the branch moved to, so its channels get the decisions a registration gives:`, err);
+        console.error(`[mcpl] the "${serverId}" server's legacy recipe policy couldn't be migrated on the branch moved to, so its channels get no decision on this move, as at a registration whose migration fails; a later move or a start migrates it:`, err);
+        continue;
       }
       if (!this.directsLifecycle(serverId)) continue;
       const policyOpened: Array<{ channelId: string; label?: string }> = [];
