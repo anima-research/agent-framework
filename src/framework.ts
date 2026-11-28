@@ -29449,7 +29449,7 @@ export class AgentFramework {
         console.error(`[turn] ${agent.name}: ${reason}:`, error);
         agent.reset();
         this.endDroppedTurn(agent.name, routing);
-        this.channelRegistry?.stopTyping();
+        this.stopTurnTyping(routing, { agent });
         this.endStartWindow(agent.name, turnToken);
         this.abortDroppedTurn(agent.name, turnToken, reason, turnStartedAt, myIncarnation);
         return false;
