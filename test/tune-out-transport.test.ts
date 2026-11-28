@@ -1626,6 +1626,26 @@ test('a tune-out on record when a start without servers connects one later ends 
   assert.deepEqual(unleased.data, { refusal: 'explicit-open', channelId: CHANNEL, serverId: 'disc' });
 });
 
+test('a tune-out on record on a branch that a host with a reader and no coordinator moves to ends as at that host\'s connect, not as a release for a host with no reader (AF #619)', async (t) => {
+  const store = await tunedOutStore(t, 0);
+  const second = await store.start(true, false);
+  const i = second as unknown as RestartInternals & {
+    rollbackToMessage(agent: string, opts: { messageId: string }): Promise<unknown>;
+  };
+  const point = String(second.getAgent('scout')!.getContextManager().addMessage('user', [{ type: 'text', text: 'before the connect' }]));
+  await store.capture(() => second.connectMcplServer(store.server));
+  assert.equal(store.logged.filter((l) => l === `[tune-out] ${endedLine}`).length, 1, 'premise: the connect ended it');
+  second.getAgent('scout')!.getContextManager().addMessage('user', [{ type: 'text', text: 'after the connect' }]);
+
+  await store.capture(() => i.rollbackToMessage('scout', { messageId: point }));
+
+  assert.equal(store.logged.filter((l) => l === `[tune-out] ${endedLine}`).length, 2, 'the move ended it as the connect did');
+  assert.equal(i.channelRegistry.getTuneOutState('disc', CHANNEL), null);
+  const released = second.getAgent('scout')!.getContextManager().getAllMessages()
+    .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'tune-out-cancel');
+  assert.deepEqual(released, [], 'no release for a host with no reader');
+});
+
 test("a tune-out on record when a start with no reader connects a server during an operator's hold on the store is released once the hold is over, its backlog delivered", async (t) => {
   const store = await tunedOutStore(t, 2);
   // No reader and no servers: the channel subsystem comes up at the connect,

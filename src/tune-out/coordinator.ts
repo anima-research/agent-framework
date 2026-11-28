@@ -30,6 +30,11 @@ import type { TraceEventInput } from '../types/trace.js';
 
 /** The options a tune-out call can give. */
 type TuneOutOption = 'durationSeconds' | 'cadenceSeconds' | 'backlogCap' | 'maxWakes';
+type ResumeOccasion = 'start' | 'branch-move';
+
+export function allExceptStateId(primary: string | null | undefined): string {
+  return `tune-out/${primary ?? 'default'}/all-except`;
+}
 
 /** A hold asked for with no reader to watch it: there is none (a reader ended, or none was configured). */
 const NO_READER_REFUSAL = "Nothing was tuned out: no reader is running here to read a held channel, and this host doesn't "
@@ -1172,6 +1177,7 @@ export class TuneOutCoordinator {
   private runStartedAt: number | undefined;
   /** The branch `runStartedAt` is a place on (currentBranch), where the host names one. */
   private runBranch: string | undefined;
+  private holdsBranch: string | undefined;
   /** Where this run's rows begin on each branch it has been on, by branch (branchMoved): a move back to one keeps its start. */
   private readonly runStarts = new Map<string, number | undefined>();
   /**
@@ -1327,34 +1333,52 @@ export class TuneOutCoordinator {
     } catch (err) {
       console.error(`[tune-out] the holds on record could not be read for the last stop's stamp, so none is checked against it: ${thrownReason(err)}`);
     }
+    this.resumeHolds('start');
+    // A loss told to the subconscious before the stop whose turn the stop
+    // lost is given its turn again; then a loss notice a stop left kept in
+    // the store is written, the holds' state above restored first, which it
+    // reads; then those for the holds the last stop didn't stamp.
+    this.askTurnsForUnreadLosses();
+    this.noteUnstampedStop(onRecord, this.restoreLossNotices(), bootHead);
+    // And the resident, of a hold still in force whose release reached it
+    // before the last stop, its end not recorded (tellResidentUnended).
+    this.tellResidentUnended(onRecord, bootHead);
+  }
+
+  private resumeHolds(occasion: ResumeOccasion): void {
+    const moved = occasion === 'branch-move';
+    const meanwhile = moved ? 'by the end of the branch move' : 'while the process was down';
     for (const { serverId, channelId, params } of this.listActive()) {
+      const key = this.key(serverId, channelId);
+      const kept = moved && (this.cadenceTimers.has(key) || this.expiryTimers.has(key));
       // An epoch whose deadline passed while the process was down cancels
       // immediately — the resident gets their backlog on the schedule they
       // committed to, not whenever the host happened to restart.
       const inForce = (): boolean => this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId === params.epochId;
-      const expired = params.expiresAtMs !== undefined && params.expiresAtMs <= Date.now();
+      const expired = !kept && params.expiresAtMs !== undefined && params.expiresAtMs <= Date.now();
       if (expired) {
         try {
           this.cancel(serverId, channelId, 'duration', 'duration elapsed');
           continue;
         } catch (err) {
           if (!inForce()) {
-            console.error(`[tune-out] ${this.shown(serverId, channelId)} reached its end time while the process was down and its cancel ended it, but a step after the end failed:`, err);
+            console.error(`[tune-out] ${this.shown(serverId, channelId)} reached its end time ${meanwhile} and its cancel ended it, but a step after the end failed:`, err);
             continue;
           }
-          console.error(`[tune-out] ${this.shown(serverId, channelId)} reached its end time while the process was down, and its cancel failed, so it stays tuned out and its cancel is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
+          console.error(`[tune-out] ${this.shown(serverId, channelId)} reached its end time ${meanwhile}, and its cancel failed, so it stays tuned out and its cancel is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
         }
       }
-      this.startCadence(serverId, channelId, params.cadenceSeconds);
+      if (!kept) this.startCadence(serverId, channelId, params.cadenceSeconds);
       const wakeCount = this.channelRegistry.getTuneOutState(serverId, channelId)?.wakeCount ?? 0;
       if (wakeCount > params.maxWakes) {
-        this.cancelPastBudget(serverId, channelId, params.maxWakes, 'start');
-      } else {
+        this.cancelPastBudget(serverId, channelId, params.maxWakes, occasion);
+      } else if (!kept) {
         this.armExpiry(serverId, channelId, expired ? { ...params, expiresAtMs: Date.now() + EXPIRY_RETRY_MS } : params);
       }
     }
     const scope = this.getAllExcept();
-    if (scope) {
+    const scopeKept = moved && (this.cadenceTimers.has(TuneOutCoordinator.SCOPE_KEY) || this.expiryTimers.has(TuneOutCoordinator.SCOPE_KEY));
+    if (scope && !scopeKept) {
       // Whether the hold is still in force, and so anchors the subconscious,
       // is read from the record below (anchorSubconscious), as a channel's is.
       if (scope.params.expiresAtMs <= Date.now()) {
@@ -1362,9 +1386,9 @@ export class TuneOutCoordinator {
           this.cancelAllExcept('duration', 'duration elapsed');
         } catch (err) {
           if (this.getAllExcept()?.params.epochId !== scope.params.epochId) {
-            console.error('[tune-out] the all-except hold reached its end time while the process was down and its release ended it, but a step after the end failed:', err);
+            console.error(`[tune-out] the all-except hold reached its end time ${meanwhile} and its release ended it, but a step after the end failed:`, err);
           } else {
-            console.error(`[tune-out] the all-except hold reached its end time while the process was down, and its release failed, so it stays in force and its release is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
+            console.error(`[tune-out] the all-except hold reached its end time ${meanwhile}, and its release failed, so it stays in force and its release is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
             this.armScopeTimers({ ...scope.params, expiresAtMs: Date.now() + EXPIRY_RETRY_MS });
           }
         }
@@ -1379,30 +1403,22 @@ export class TuneOutCoordinator {
     // What each held channel's reader hasn't looked at was counted in
     // memory, so it is counted again from the held rows: without it, a
     // channel held across the restart gets no cadence look until something
-    // new arrives. Every held message is stored as it arrives (#291), so the
-    // stored rows are all of them.
+    // new arrives. Every held message is stored as it arrives (#291), except
+    // those a surgery's hold keeps in memory, which a branch move counts too.
     const held = new Set<string>();
-    for (const m of this.hooks.getStoredMessages()) {
+    const holding = !moved || this.channelRegistry.tuneOutsOnRecord().length > 0 || this.getAllExcept() !== null;
+    for (const m of holding ? [...this.hooks.getStoredMessages(), ...(moved ? this.keptMessages() : [])] : []) {
       const meta = m.metadata as { tuneOut?: { epochId?: string }; serverId?: string; channelId?: string } | undefined;
       const epochId = meta?.tuneOut?.epochId;
       if (!meta || !epochId || !meta.channelId) continue;
       const key = this.key(meta.serverId ?? '', meta.channelId);
       if (!held.has(key) && this.holdFor(meta.serverId ?? '', meta.channelId)?.epochId === epochId) held.add(key);
     }
-    for (const key of held) {
+    for (const key of moved ? new Set([...held, ...this.divertedSinceInvocation.keys()]) : held) {
       const [serverId, channelId] = this.channelOf(key);
       this.rebuildTally(serverId, channelId);
     }
     this.pruneLooks();
-    // A loss told to the subconscious before the stop whose turn the stop
-    // lost is given its turn again; then a loss notice a stop left kept in
-    // the store is written, the holds' state above restored first, which it
-    // reads; then those for the holds the last stop didn't stamp.
-    this.askTurnsForUnreadLosses();
-    this.noteUnstampedStop(onRecord, this.restoreLossNotices(), bootHead);
-    // And the resident, of a hold still in force whose release reached it
-    // before the last stop, its end not recorded (tellResidentUnended).
-    this.tellResidentUnended(onRecord, bootHead);
   }
 
   /**
@@ -2865,6 +2881,7 @@ export class TuneOutCoordinator {
       // past what the notice told of.
       this.runStartedAt = bootHead;
       this.runBranch = this.branchNow();
+      this.holdsBranch = this.runBranch;
       if (this.runBranch !== undefined) this.runStarts.set(this.runBranch, bootHead);
       this.carriedBound = {
         ...(since !== undefined ? { runStartedAt: since } : {}), ...(stampBranch !== undefined ? { branch: stampBranch } : {}),
@@ -3216,9 +3233,13 @@ export class TuneOutCoordinator {
    * moved, and the cache keeps any look a refused write held only there.
    * Never throws.
    */
-  branchMoved(sameBranch = false): void {
+  branchMoved(sameBranch = false, before?: ReadonlyMap<string, string | undefined>): void {
     if (this.stopped) return;
-    if (!sameBranch) this.lastLooksCache = undefined;
+    if (!sameBranch) {
+      this.lastLooksCache = undefined;
+      this.dispositionsCache = null;
+    }
+    if (before) this.leaveBranch(before);
     try {
       const branch = this.branchNow();
       if (branch !== undefined && this.runStarts.has(branch)) {
@@ -3260,6 +3281,73 @@ export class TuneOutCoordinator {
       if (this.markerPending) this.armDeferredRetry();
     } catch (err) {
       console.error(`[tune-out] the stop stamp and loss record could not be moved to the store's new branch: ${thrownReason(err)}`);
+    }
+  }
+
+  private leaveBranch(before: ReadonlyMap<string, string | undefined>): void {
+    const source = this.holdsBranch;
+    const destination = this.branchNow();
+    this.holdsBranch = destination;
+    this.scopeCache = undefined;
+    let origin: { parent: string; branchPoint: number } | undefined;
+    try {
+      origin = destination === undefined ? undefined : this.hooks.branchOrigin?.(destination);
+    } catch (err) {
+      console.error(`[tune-out] where the branch moved to was made from couldn't be read, so what reader forks were handed is forgotten and a later fork may be handed some of it again: ${thrownReason(err)}`);
+      origin = undefined;
+    }
+    const fromSource = origin !== undefined && source !== undefined && origin.parent === source;
+    const survives = (key: string): boolean => {
+      const was = before?.get(key);
+      return was !== undefined && was === this.epochHolding(key);
+    };
+    for (const key of new Set([...this.cadenceTimers.keys(), ...this.expiryTimers.keys(), ...this.pendingWakes.keys()])) {
+      if (survives(key)) continue;
+      if (key === TuneOutCoordinator.SCOPE_KEY) this.clearScopeTimers();
+      else this.clearTimers(...this.channelOf(key));
+    }
+    for (const key of [...this.divertedSinceInvocation.keys()]) if (!survives(key)) this.divertedSinceInvocation.delete(key);
+    let highest = -1;
+    for (const cursor of this.readerCursor.values()) if (cursor > highest) highest = cursor;
+    if (this.runBranch !== source || !fromSource || origin!.branchPoint < highest) {
+      this.readerCursor.clear();
+      this.readerReturned.clear();
+    }
+  }
+
+  private epochHolding(key: string): string | undefined {
+    try {
+      if (key === TuneOutCoordinator.SCOPE_KEY) return this.getAllExcept()?.params.epochId;
+      return this.holdFor(...this.channelOf(key))?.epochId;
+    } catch (err) {
+      let what = 'the all-except hold';
+      if (key !== TuneOutCoordinator.SCOPE_KEY) {
+        const [serverId, channelId] = this.channelOf(key);
+        try {
+          what = `the tune-out of ${this.shown(serverId, channelId)}`;
+        } catch {
+          what = `the tune-out of ${channelId}`;
+        }
+      }
+      console.error(`[tune-out] whether ${what} still holds couldn't be read at the branch move, so its timers, any wake waiting to be sent and its count are dropped: ${thrownReason(err)}`);
+      return undefined;
+    }
+  }
+
+  heldEpochs(): Map<string, string | undefined> {
+    const held = new Map<string, string | undefined>();
+    for (const key of new Set([
+      ...this.cadenceTimers.keys(), ...this.expiryTimers.keys(), ...this.pendingWakes.keys(), ...this.divertedSinceInvocation.keys(),
+    ])) held.set(key, this.epochHolding(key));
+    return held;
+  }
+
+  branchFollowed(): void {
+    if (this.stopped || this.timersStopped) return;
+    try {
+      this.resumeHolds('branch-move');
+    } catch (err) {
+      console.error(`[tune-out] the holds on the branch moved to could not all be resumed, so a hold may run without its timers or its count until a later move or a start: ${thrownReason(err)}`);
     }
   }
 
@@ -3526,10 +3614,10 @@ export class TuneOutCoordinator {
           } catch {
             still = undefined;
           }
-          const later = scope ? 'A later all-except hold' : `A later tune-out of ${shown}`;
+          const other = scope ? 'Another all-except hold' : `Another tune-out of ${shown}`;
           why += still
-            ? ` ${later} is in force now, which your cancel was not for.`
-            : ` ${later}, which your cancel was not for, was in force when your cancel was dropped`
+            ? ` ${other} is in force now, which your cancel was not for.`
+            : ` ${other}, which your cancel was not for, was in force when your cancel was dropped`
               + `${still === false ? ', and has ended since' : ''}.`;
         }
       } else if (drop.reason === 'stopped') {
@@ -4341,7 +4429,7 @@ export class TuneOutCoordinator {
   // ==========================================================================
 
   private get scopeStateId(): string {
-    return `tune-out/${this.hooks.primaryName() ?? 'default'}/all-except`;
+    return allExceptStateId(this.hooks.primaryName());
   }
 
   /**
@@ -4963,7 +5051,7 @@ export class TuneOutCoordinator {
     this.pendingWakes.set(key, { count: 1, timer });
   }
 
-  private cancelPastBudget(serverId: string, channelId: string, maxWakes: number, from: 'wake' | 'start' = 'wake'): void {
+  private cancelPastBudget(serverId: string, channelId: string, maxWakes: number, from: 'wake' | ResumeOccasion = 'wake'): void {
     const key = this.key(serverId, channelId);
     const existing = this.expiryTimers.get(key);
     if (existing) clearTimeout(existing);
@@ -4974,11 +5062,12 @@ export class TuneOutCoordinator {
           this.clearTimers(serverId, channelId);
         }
       } catch (err) {
-        if (first && from === 'start') {
+        if (first && from !== 'wake') {
+          const at = from === 'start' ? 'at start' : 'at the branch move';
           if (this.channelRegistry.getTuneOutState(serverId, channelId)) {
-            console.error(`[tune-out] ${this.shown(serverId, channelId)} was past its wake budget at start, and its cancel failed, so it stays tuned out and its cancel is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
+            console.error(`[tune-out] ${this.shown(serverId, channelId)} was past its wake budget ${at}, and its cancel failed, so it stays tuned out and its cancel is tried again in ${EXPIRY_RETRY_MS / 1000} s:`, err);
           } else {
-            console.error(`[tune-out] ${this.shown(serverId, channelId)} was past its wake budget at start and its cancel ended it, but a step after the end failed:`, err);
+            console.error(`[tune-out] ${this.shown(serverId, channelId)} was past its wake budget ${at} and its cancel ended it, but a step after the end failed:`, err);
           }
         } else {
           this.timerFailed('wake', serverId, channelId, err);
@@ -5087,11 +5176,15 @@ export class TuneOutCoordinator {
 
   /** How many of the writes the framework keeps in memory (getSurgeryHeldMessages) `keep` keeps; 0 where they can't be read. */
   private keptInMemory(keep: (m: Pick<StoredMessage, 'metadata'>) => boolean): number {
+    return this.keptMessages().filter(keep).length;
+  }
+
+  private keptMessages(): Array<Pick<StoredMessage, 'metadata'>> {
     try {
-      return (this.hooks.getSurgeryHeldMessages?.() ?? []).filter(keep).length;
+      return this.hooks.getSurgeryHeldMessages?.() ?? [];
     } catch (err) {
       console.error('[tune-out] could not read the writes a surgery holds in memory, so none is counted:', err);
-      return 0;
+      return [];
     }
   }
 
@@ -5120,7 +5213,7 @@ export class TuneOutCoordinator {
       const mark = this.lastLooks()?.[hold.epochId]?.[key];
       count = mark === undefined ? rows.length : rows.filter((m) => m.sequence > mark).length;
     }
-    this.divertedSinceInvocation.set(key, count);
+    this.divertedSinceInvocation.set(key, count + this.keptInMemory(inEpoch));
   }
 
   private get lastLooksStateId(): string {

@@ -195,13 +195,13 @@ export class SubconsciousWindowAnchor {
    * and #44): the anchor the destination's strategy keeps stands until the
    * next enter or restart sets one.
    */
-  branchMoved(active?: readonly string[]): void {
+  branchMoved(active?: readonly string[], sameBranch = false): void {
     const holds = active === undefined ? undefined : new Set(active);
     this.pending = this.pending
       .filter((p) => {
         if (p.known && p.known.keep.length === 0) return false;
         const fixedThere = p.ordinal !== undefined || p.known !== undefined;
-        return !fixedThere || holds === undefined || p.start.epochIds.some((id) => holds.has(id));
+        return (sameBranch && !fixedThere) || holds === undefined || p.start.epochIds.some((id) => holds.has(id));
       })
       .map((p) => ({ start: p.start, inForce: p.inForce }));
   }

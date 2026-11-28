@@ -36,7 +36,7 @@ import {
   type ForkReaderConfig,
   type TuneOutReader,
 } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, alreadyTunedOutText, cancelWaitsNote, heldAcknowledgementId, type ReaderInvocation } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, allExceptStateId, alreadyTunedOutText, cancelWaitsNote, heldAcknowledgementId, type ReaderInvocation } from './tune-out/coordinator.js';
 import { SubconsciousWindowAnchor } from './tune-out/window-anchor.js';
 import { residentContextOptions, residentViewFilter, subconsciousContextOptions, subconsciousViewFilter } from './context-options.js';
 import { admit, type InboundEnvelope, type AdmissionDecision } from './admission/admit.js';
@@ -2830,6 +2830,7 @@ interface FrameworkWriteOptions {
    * (untargetedAudience): every resident on a residents' host.
    */
   audience?: readonly string[];
+  heldFrom?: readonly string[];
   /**
    * Set on a coalesced occurrence's delivery at its batch's recovery, after
    * a delivery whose store couldn't tell whether the occurrence landed
@@ -5149,6 +5150,7 @@ export class AgentFramework {
   private replayHeldAgain = false;
   /** A release of the tune-outs on record with no reader (releaseTuneOutsWithoutReader) that met held writes, to run once they are stored. */
   private releaseWithoutReaderWaits = false;
+  private channelLogsUnread = false;
   /** How many writes this process has kept in memory (SurgeryHeldWrite.heldOrder): their arrival order across agents. */
   private heldWritesKept = 0;
   /**
@@ -16770,8 +16772,28 @@ export class AgentFramework {
   private async followBranchMove(except?: string, sameBranch = false): Promise<ManagerReinitFailure[]> {
     let failures: ManagerReinitFailure[] = [];
     try {
-      this.subconsciousAnchor?.branchMoved(this.tuneOutCoordinator?.activeEpochIds());
-      this.tuneOutCoordinator?.branchMoved(sameBranch);
+      const reads = !sameBranch || this.channelLogsUnread;
+      const held = reads ? this.tuneOutCoordinator?.heldEpochs() : undefined;
+      let holdsFollow = reads;
+      if (reads) {
+        try {
+          this.channelRegistry?.branchMoved();
+          this.channelLogsUnread = false;
+        } catch (error) {
+          holdsFollow = false;
+          this.channelLogsUnread = true;
+          console.error("[operator] the channel decisions of the branch moved to could not be read, so the channels and their tune-outs keep what they had until a later move or switchBranch() reads them, or a start:", error);
+        }
+      }
+      this.tuneOutCoordinator?.branchMoved(sameBranch, holdsFollow ? held : undefined);
+      if (holdsFollow) this.remarkKeptWrites();
+      let active: string[] | undefined;
+      try {
+        active = this.tuneOutCoordinator?.activeEpochIds();
+      } catch (error) {
+        console.error("[operator] the tune-outs of the branch moved to could not be read, so the subconscious's window keeps every start it waits to fix:", error);
+      }
+      this.subconsciousAnchor?.branchMoved(active, sameBranch && !holdsFollow);
       if (!sameBranch) {
         this.redoStacks.clear();
         this.coalescingStore?.branchMoved(this.storedCoalescing());
@@ -16795,6 +16817,13 @@ export class AgentFramework {
         // or leave one in it.
         this.applyForeignRounds(agent);
         if (sameBranch && !this.presents(agent)) this.redoStacks.delete(agent.name);
+      }
+      if (holdsFollow) {
+        this.tuneOutCoordinator?.branchFollowed();
+        if (!this.tuneOutCoordinator && this.tuneOutsOnRecordHere()) {
+          if (this.tuneOutOffered) this.endTuneOutsWithoutCoordinator();
+          else this.releaseTuneOutsWithoutReader();
+        }
       }
       return failures;
     } catch (error) {
@@ -21132,7 +21161,8 @@ export class AgentFramework {
     // (inboundAudience).
     const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:channel-incoming', source: event.serverId } : undefined;
     const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), {
-      placement, audience: AgentFramework.inboundAudience(decision), ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
+      placement, audience: AgentFramework.inboundAudience(decision), ...(decision.held ? { heldFrom: [...decision.recipients] } : {}),
+      ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
       ...(suppressedBy ? { suppressedBy } : {}),
     });
     // A write kept in memory (no id yet) is traced once, as it is stored.
@@ -23140,7 +23170,8 @@ export class AgentFramework {
       // for it.
       const suppressedBy = decision.suppressed ? { rule: decision.suppressed.rule, eventType: 'mcpl:push-event', source: event.serverId } : undefined;
       const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), {
-        placement, audience: AgentFramework.inboundAudience(decision), ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
+        placement, audience: AgentFramework.inboundAudience(decision), ...(decision.held ? { heldFrom: [...decision.recipients] } : {}),
+        ...(event.mayBeStored ? { mayBeStored: true as const } : {}),
         ...(suppressedBy ? { suppressedBy } : {}),
       });
       // A write kept in memory (no id yet) is traced once, as it is stored.
@@ -41822,13 +41853,55 @@ export class AgentFramework {
         .some((name) => name != null && (this.waitsForRecovery(name) || this.refusesItsWork(name)));
   }
 
+  private remarkKeptWrites(): void {
+    const coordinator = this.tuneOutCoordinator;
+    if (!coordinator) return;
+    const marked = [...this.surgeryHeldWrites, ...[...this.heldForRecovery.values()].flat()].filter((write) => {
+      const metadata = write.metadata as { tuneOut?: unknown; serverId?: unknown; channelId?: unknown } | undefined;
+      return !!metadata?.tuneOut && typeof metadata.serverId === 'string' && typeof metadata.channelId === 'string';
+    });
+    if (marked.length === 0) return;
+    const holds: Array<{ epochId: string } | null> = [];
+    try {
+      for (const write of marked) {
+        const metadata = write.metadata as { serverId: string; channelId: string };
+        holds.push(coordinator.holdFor(metadata.serverId, metadata.channelId));
+      }
+    } catch (error) {
+      const kept = marked.length === 1 ? '1 message held as it arrived keeps' : `${marked.length} messages held as they arrived keep`;
+      console.error(`[tune-out] the all-except hold of the branch moved to could not be read, so ${kept} the tune-out it was held under, and one that the branch moved to doesn't hold won't reach the resident, unless it waits for an agent's recovery and a later move re-marks it:`, error);
+      return;
+    }
+    marked.forEach((write, i) => {
+      const metadata = write.metadata as { tuneOut?: unknown };
+      const hold = holds[i];
+      if (hold) {
+        metadata.tuneOut = { epochId: hold.epochId };
+      } else {
+        delete metadata.tuneOut;
+        if (write.opts?.heldFrom) write.opts = { ...write.opts, audience: [...write.opts.heldFrom] };
+      }
+    });
+  }
+
+  private tuneOutsOnRecordHere(): boolean {
+    if (!this.channelRegistry) return false;
+    try {
+      return this.channelRegistry.tuneOutsOnRecord().length > 0
+        || this.channelRegistry.readCoordinatorState(allExceptStateId(this.primaryAgentName)) != null;
+    } catch {
+      return true;
+    }
+  }
+
   /**
    * No reader is configured, so nothing can watch or end a hold: each hold
    * on record (one 0.32's `tuneOut.enabled` left, or one whose reader the
    * recipe no longer has) ends now, and its backlog goes to the resident,
    * the per-channel holds and the all-except scope alike, through a
    * coordinator made for that alone: at a start, or, where no MCPL server
-   * was configured, when the first one connects. One whose release fails
+   * was configured, when the first one connects, or after a move to a
+   * branch that holds some (followBranchMove). One whose release fails
    * stays on record for the next start.
    */
   private releaseTuneOutsWithoutReader(): void {

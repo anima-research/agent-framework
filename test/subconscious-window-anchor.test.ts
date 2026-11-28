@@ -646,6 +646,36 @@ describe('SubconsciousWindowAnchor', () => {
       "t1's start, fixed on the branch left, isn't set in force on the one moved to");
   });
 
+  it("a start not yet fixed, for tune-outs none of which is active on the branch moved to, is dropped there, so no later presentation sets it (AF #619)", () => {
+    const h = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+    h.state.owed = [20];
+    h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 50, epochIds: ['t1'] }]);
+    assert.deepEqual(h.fixed, [], 'premise: t1 waits for a row stored before it');
+    h.anchor.branchMoved([]);
+    h.state.owed = [];
+    h.state.rows.push({ sequence: 20, ordinal: 1 });
+    h.anchor.presented();
+    assert.deepEqual(h.fixed, []);
+    assert.deepEqual(h.calls.filter((c) => c.startsWith('setAnchorOrdinal')), []);
+  });
+
+  it("control: a switch to the branch the store is on keeps a start not yet fixed, its tune-outs active or not (AF #619)", () => {
+    const fixedAfter = (switched: boolean) => {
+      const h = host({ rows: [{ sequence: 10, ordinal: 0 }] });
+      h.state.owed = [20];
+      h.anchor.set({ sequence: 50, epochIds: ['t1'] }, [{ sequence: 50, epochIds: ['t1'] }]);
+      assert.deepEqual(h.fixed, [], 'premise: t1 waits for a row stored before it');
+      if (switched) h.anchor.branchMoved([], true);
+      h.state.owed = [];
+      h.state.rows.push({ sequence: 20, ordinal: 1 });
+      h.anchor.presented();
+      return h.fixed;
+    };
+    const unswitched = fixedAfter(false);
+    assert.ok(unswitched.length > 0, 'premise: without the switch, fixed at the next presentation');
+    assert.deepEqual(fixedAfter(true), unswitched);
+  });
+
   it("a start in force only (a cancelled tune-out's, set by its kept ordinal) whose setting failed isn't fixed again from the active tune-out's start after a branch move (AF #844 review 3, #44)", () => {
     // Row 1 (sequence 40) is the cancelled tune-out's traffic; Y, active, began at 60.
     const h = host({ rows: [{ sequence: 10, ordinal: 0 }, { sequence: 40, ordinal: 1 }, { sequence: 50, ordinal: 2 }] });
